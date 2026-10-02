@@ -203,6 +203,13 @@ func (m *OS) renderDockString() (string, int) {
 	var dockItemsStr strings.Builder
 	itemNumber := 1
 
+	// Cleared up here rather than down by the left block so a "workspaces" the
+	// user puts in the centre can populate them first. The left block still
+	// wins when workspaces is on the left, because renderDockWorkspaceStrip
+	// re-clears on every call.
+	m.dockWorkspaceHits = m.dockWorkspaceHits[:0]
+	m.dockWorkspaceArrowHits = m.dockWorkspaceArrowHits[:0]
+
 	// Where each entry lands inside the centre block, measured off the styled
 	// string as it is built. Turned into screen columns below, once the centring
 	// spacer this block is placed against is known.
@@ -213,11 +220,32 @@ func (m *OS) renderDockString() (string, int) {
 	var centerCustom []dockCustomHit
 	relX := 0
 	overflowX0, overflowX1 := 0, 0
+	// Where the workspace strip started inside the centre block, so the hit
+	// rectangles its renderer records with startX=0 can be offset to absolute
+	// screen columns once the centring spacer is known. -1 means no workspace
+	// strip was drawn here.
+	workspaceRelX := -1
 
 	// The centre block walks the plan too. Anything the plan puts before
 	// "windows" is drawn before the minimized entries, and the entries' relative
 	// spans carry the offset that produces.
 	for _, name := range m.dockPlan.Center {
+		if name == config.DockComponentWorkspaces {
+			// The left block's switch has a workspaces case, the centre block's
+			// did not, and dockCustomCell returns nothing for a built-in the
+			// engine has no value for, so listing workspaces here used to draw
+			// nothing at all. startX=0 lets the offset below turn the recorded
+			// pills into absolute columns once the centring spacer is known.
+			workspaceRelX = relX
+			chunk := m.renderDockWorkspaceStrip(layout.WorkspaceStrip, 0)
+			if chunk == "" {
+				continue
+			}
+			w := lipgloss.Width(chunk)
+			dockItemsStr.WriteString(chunk)
+			relX += w
+			continue
+		}
 		if name != config.DockComponentWindows {
 			cell := m.dockCustomCell(name)
 			if cell == "" {
@@ -300,8 +328,6 @@ func (m *OS) renderDockString() (string, int) {
 	// afterwards from a layout that may have moved.
 	m.dockCustomHits = m.dockCustomHits[:0]
 	dockY := m.GetDockbarContentYPosition()
-	m.dockWorkspaceHits = m.dockWorkspaceHits[:0]
-	m.dockWorkspaceArrowHits = m.dockWorkspaceArrowHits[:0]
 
 	var leftB strings.Builder
 	leftX := 0
@@ -398,8 +424,13 @@ func (m *OS) renderDockString() (string, int) {
 	}
 
 	availableSpace := barWidth - actualLeftWidth - rightWidth - centerWidth
-	leftSpacer := availableSpace / 2
-	rightSpacer := availableSpace - leftSpacer
+	// Centred on the bar, not between blocks. The equal-split rule puts the
+	// centre against whichever side has more content in it, which is right when
+	// the user has configured nothing on the right but reads as "pushed off
+	// centre" when the right is empty. The bar is the visual frame of
+	// reference for the centre block.
+	leftSpacer := max((barWidth-centerWidth)/2-actualLeftWidth, 0)
+	rightSpacer := max(availableSpace-leftSpacer, 0)
 
 	if leftSpacer < 0 {
 		leftSpacer = 0
@@ -445,6 +476,21 @@ func (m *OS) renderDockString() (string, int) {
 		m.dockCustomHits = append(m.dockCustomHits, dockCustomHit{
 			X0: itemsX + h.X0, X1: itemsX + h.X1, Y: itemY, Name: h.Name,
 		})
+	}
+	// The centre-block workspace strip was rendered with startX=0; lift the
+	// pills and arrows into the bar's own columns now that the centring spacer
+	// is known. The strip on the left block has already been recorded in
+	// absolute columns and needs no lift.
+	if workspaceRelX >= 0 {
+		lift := itemsX + workspaceRelX
+		for i := range m.dockWorkspaceHits {
+			m.dockWorkspaceHits[i].X0 += lift
+			m.dockWorkspaceHits[i].X1 += lift
+		}
+		for i := range m.dockWorkspaceArrowHits {
+			m.dockWorkspaceArrowHits[i].X0 += lift
+			m.dockWorkspaceArrowHits[i].X1 += lift
+		}
 	}
 	// The right block is drawn right-aligned inside the room it was given, so
 	// its cells sit against its right-hand end rather than its first column.

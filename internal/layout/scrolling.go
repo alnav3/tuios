@@ -74,7 +74,7 @@ type ScrollingLayout struct {
 func NewScrollingLayout() *ScrollingLayout {
 	return &ScrollingLayout{
 		DefaultWidth: 0.55,
-		PresetWidths: []float64{0.333, 0.5, 0.55, 0.667, 0.9},
+		PresetWidths: []float64{0.333, 0.5, 0.55, 0.667, 0.9, 1.0},
 		ZoomedCol:    -1,
 	}
 }
@@ -188,6 +188,24 @@ func (s *ScrollingLayout) CycleWidth() {
 		}
 	}
 	col.Proportion = s.PresetWidths[0]
+}
+
+// MaximizeColumn widens the focused column to the configured ceiling, the widest
+// the strip will give it. The ceiling is MaxProportion, which a user setting
+// (scroll_column_max) raises up to 1.0 for a full-width column. Cycling past 0.9
+// lands on the same place via the 1.0 preset, which is what this method shares
+// its clearing of FixedWidth with.
+func (s *ScrollingLayout) MaximizeColumn() {
+	if s.FocusedCol < 0 || s.FocusedCol >= len(s.Columns) {
+		return
+	}
+	col := &s.Columns[s.FocusedCol]
+	col.FixedWidth = 0
+	p := s.MaxProportion
+	if p <= 0 || p > 1 {
+		p = 0.9
+	}
+	col.Proportion = p
 }
 
 // ConsumeWindow moves the window from the next column into the focused column.
