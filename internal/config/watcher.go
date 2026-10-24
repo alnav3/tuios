@@ -2,9 +2,14 @@ package config
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,10 +63,25 @@ import (
 // ticker here and none is reachable from here: a file nobody edits produces no
 // events, so an idle client pays no wakeups. That is why notification was
 // chosen over a poll, and it is what BenchmarkIdleTick measures.
+//
+// The one exception is an asset directory that is a symlink on a system where
+// fsnotify uses kqueue (see relinkUnseen): it is read every relinkPoll, because
+// no event says it was pointed elsewhere.
 
 // configDebounce is how long the watcher waits for a save to finish before it
 // reads the file.
 const configDebounce = 200 * time.Millisecond
+
+// relinkUnseen is true where fsnotify watches with kqueue. kqueue reports a
+// change to a directory's entries only as a name that was not there before, so
+// a symlink replaced under the same name, the way home-manager and stow switch
+// a generation, produces no event at all.
+var relinkUnseen = runtime.GOOS == "darwin" || runtime.GOOS == "dragonfly" ||
+	strings.HasSuffix(runtime.GOOS, "bsd")
+
+// relinkPoll is how often an asset directory that is a symlink is read for
+// where it points, where relinkUnseen.
+const relinkPoll = 2 * time.Second
 
 // ConfigReloadCallback is called when config changes are detected. Exactly one
 // of newConfig and err is set. An err means the file on disk cannot be used and
@@ -85,12 +105,28 @@ type WatcherOptions struct {
 	// what is in force, and an edit and its undo inside one debounce must
 	// still reach it.
 	DeliverUnchanged bool
+	// AssetDirs are directories of files the config names by id, the themes
+	// and glyphs directories, watched beside the config. A directory that is
+	// not there at start is watched once it is made in the config directory.
+	// A change to a .json file in one, or to ThemeReloadStamp, calls OnAssets
+	// after the same debounce. OnAssets runs on the watcher's goroutine.
+	AssetDirs []string
+	OnAssets  func()
 }
 
-// Watcher watches the config file for changes and triggers reloads.
+// ThemeReloadStamp is a file in the config directory whose change asks every
+// watcher to read the theme and glyph files again: what tuios theme reload
+// writes.
+const ThemeReloadStamp = ".reload-themes"
+
+// Watcher watches the config file for changes and triggers reloads. A config
+// split over several files is watched as a whole: every included file, every
+// file in config.d, and config.d itself, so a drop-in file added or removed is
+// a change too.
 type Watcher struct {
 	watcher  *fsnotify.Watcher
 	path     string
+	dropIn   string
 	callback ConfigReloadCallback
 	opts     WatcherOptions
 	stopCh   chan struct{}
@@ -98,9 +134,22 @@ type Watcher struct {
 
 	mu            sync.Mutex
 	debounceTimer *time.Timer
-	// lastHash is the content the running config was built from, so a file that
-	// says what is already in force is not delivered again.
-	lastHash [sha256.Size]byte
+	// lastHashes is the content the running config was built from, file by
+	// file, so a set of files that says what is already in force is not
+	// delivered again.
+	lastHashes map[string][sha256.Size]byte
+	// files are the paths whose events count: every file read, and every
+	// included file that was not there.
+	files map[string]bool
+	// dirs are the directories under watch.
+	dirs map[string]bool
+	// assets are the asset directories, true once under watch.
+	assets      map[string]bool
+	assetsTimer *time.Timer
+	// links are the asset directories that have been symlinks, to where each
+	// pointed when it was last watched, kept only where relinkUnseen.
+	links       map[string]string
+	relinkTimer *time.Timer
 }
 
 // NewWatcher creates a file watcher for the config file.
@@ -116,29 +165,114 @@ func NewWatcherWithOptions(configPath string, callback ConfigReloadCallback, opt
 		return nil, err
 	}
 
+	main := absPath(configPath)
 	cw := &Watcher{
 		watcher:  w,
-		path:     filepath.Clean(configPath),
+		path:     main,
+		dropIn:   filepath.Join(filepath.Dir(main), DropInDirName),
 		callback: callback,
 		opts:     opts,
 		stopCh:   make(chan struct{}),
-	}
-	// The file as it stands is what the client is already running, so the first
-	// event that finds it unchanged is dropped rather than delivered.
-	if data, err := os.ReadFile(cw.path); err == nil {
-		cw.lastHash = sha256.Sum256(data)
+		files:    map[string]bool{main: true},
+		dirs:     map[string]bool{},
+		assets:   map[string]bool{},
+		links:    map[string]string{},
 	}
 
 	// The directory, not the file: see the note at the top of this file. Added
 	// before the goroutine starts so a failure is reported to the caller rather
 	// than logged into a watcher that then watches nothing.
-	if err := w.Add(filepath.Dir(cw.path)); err != nil {
+	if err := w.Add(filepath.Dir(main)); err != nil {
 		_ = w.Close()
 		return nil, err
+	}
+	cw.dirs[filepath.Dir(main)] = true
+	if opts.OnAssets != nil {
+		cw.mu.Lock()
+		for _, dir := range opts.AssetDirs {
+			// One watch per directory that is there. One that is not costs
+			// nothing until it is made.
+			cw.watchAsset(absPath(dir))
+		}
+		cw.mu.Unlock()
+	}
+
+	// The files as they stand are what the client is already running, so the
+	// first event that finds them unchanged is dropped rather than delivered.
+	if lc, err := LoadLayered(main); err == nil {
+		cw.lastHashes = layerHashes(lc)
+		cw.follow(lc)
+	} else if data, err := os.ReadFile(main); err == nil { //nolint:gosec // the user's own config file
+		cw.lastHashes = map[string][sha256.Size]byte{main: sha256.Sum256(data)}
 	}
 
 	go cw.run()
 	return cw, nil
+}
+
+// layerHashes is the content hash of every file of the config.
+func layerHashes(lc *LayeredConfig) map[string][sha256.Size]byte {
+	out := make(map[string][sha256.Size]byte, len(lc.Layers))
+	for _, l := range lc.Layers {
+		out[l.Path] = sha256.Sum256(l.Data)
+	}
+	return out
+}
+
+// follow brings the watch set in line with the files lc read. A directory
+// added stays watched until Stop: the set is small, and dropping one that an
+// include returns to a moment later would lose its events.
+func (cw *Watcher) follow(lc *LayeredConfig) {
+	files := map[string]bool{cw.path: true}
+	for _, l := range lc.Layers {
+		files[l.Path] = true
+		// A file that is a link is edited where the link points. An edit
+		// in place there changes the file and not the link, so the
+		// directory of the target is watched too.
+		if l.Real != "" {
+			files[l.Real] = true
+		}
+	}
+	for _, m := range lc.Missing {
+		files[m] = true
+	}
+	want := []string{cw.dropIn}
+	for p := range files {
+		want = append(want, filepath.Dir(p))
+	}
+	cw.mu.Lock()
+	cw.files = files
+	cw.mu.Unlock()
+	for _, dir := range want {
+		cw.mu.Lock()
+		have := cw.dirs[dir]
+		cw.mu.Unlock()
+		if have {
+			continue
+		}
+		// A directory that is not there cannot be watched. An include in a
+		// directory made later is seen on the next reload of a file that is
+		// watched.
+		if err := cw.watcher.Add(dir); err != nil {
+			continue
+		}
+		cw.mu.Lock()
+		cw.dirs[dir] = true
+		cw.mu.Unlock()
+	}
+}
+
+// relevant reports whether an event on name can change the config.
+func (cw *Watcher) relevant(name string) bool {
+	if name == cw.dropIn {
+		return true
+	}
+	if filepath.Dir(name) == cw.dropIn && strings.HasSuffix(name, ".toml") {
+		return true
+	}
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	return cw.files[name]
 }
 
 // run drains the event channel and arms the debounce.
@@ -149,7 +283,12 @@ func (cw *Watcher) run() {
 			if !ok {
 				return
 			}
-			if filepath.Clean(event.Name) != cw.path {
+			name := filepath.Clean(event.Name)
+			if cw.assetEvent(name, event) {
+				cw.armAssets()
+				continue
+			}
+			if !cw.relevant(name) {
 				continue
 			}
 			// Chmod alone is not a content change. Rename and Remove are: an
@@ -175,6 +314,157 @@ func (cw *Watcher) run() {
 	}
 }
 
+// assetEvent reports whether an event is about a theme or glyph file, and
+// starts watching an asset directory that has just been made.
+func (cw *Watcher) assetEvent(name string, event fsnotify.Event) bool {
+	if cw.opts.OnAssets == nil {
+		return false
+	}
+	if name == filepath.Join(filepath.Dir(cw.path), ThemeReloadStamp) {
+		return true
+	}
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if _, ok := cw.assets[name]; ok {
+		// The directory itself came or went. A watch follows an inode, so a
+		// directory removed and made again, or a symlink pointed at another
+		// directory (home-manager, stow), needs a new watch: the old one is
+		// gone, or still on the old target. Remove fails harmlessly when the
+		// kernel already dropped the watch.
+		switch {
+		case event.Has(fsnotify.Create):
+			cw.watchAsset(name)
+		case event.Has(fsnotify.Remove), event.Has(fsnotify.Rename):
+			_ = cw.watcher.Remove(name)
+			cw.assets[name] = false
+		}
+		return true
+	}
+	return cw.isAssetDir(filepath.Dir(name)) && strings.HasSuffix(strings.ToLower(name), ".json")
+}
+
+// watchAsset watches an asset directory, again if it already was. Called with
+// cw.mu held.
+func (cw *Watcher) watchAsset(dir string) {
+	if !relinkUnseen {
+		_ = cw.watcher.Remove(dir)
+		cw.assets[dir] = cw.watcher.Add(dir) == nil
+		return
+	}
+	// kqueue drops the watch of a directory removed, so there is no old watch
+	// on dir to drop, and dropping its entry in the config directory's watch
+	// would make the next change there report dir as made again.
+	//
+	// kqueue names the files behind a watched link by the link, and keeps them
+	// under that name when the link is pointed elsewhere, so a file of the same
+	// name behind the new target is never reported. The directory the link
+	// resolves to is watched instead, and dropped when the link moves.
+	to := linkTarget(dir)
+	if old := cw.links[dir]; old != "" && !cw.watchedElsewhere(old, dir) {
+		_ = cw.watcher.Remove(old)
+	}
+	watch := dir
+	if to != "" {
+		watch = to
+	}
+	cw.assets[dir] = cw.watcher.Add(watch) == nil
+	// A directory that was a link is read for as long as the watcher runs: a
+	// link made again under the same name is no event either.
+	if _, was := cw.links[dir]; was || to != "" {
+		cw.links[dir] = to
+	}
+	if len(cw.links) > 0 && cw.relinkTimer == nil {
+		cw.relinkTimer = time.AfterFunc(relinkPoll, cw.relink)
+	}
+}
+
+// watchedElsewhere reports whether path is still watched for something other
+// than the link at dir: another asset directory's target, an asset directory
+// itself, or a directory the config is read from. fsnotify keeps one watch per
+// path, so removing it for dir would remove it for those too. Called with
+// cw.mu held.
+func (cw *Watcher) watchedElsewhere(path, dir string) bool {
+	if cw.dirs[path] || cw.assets[path] {
+		return true
+	}
+	for d, to := range cw.links {
+		if d != dir && to == path {
+			return true
+		}
+	}
+	return false
+}
+
+// isAssetDir reports whether dir is an asset directory under watch, or the
+// directory one that is a link resolves to. Called with cw.mu held.
+func (cw *Watcher) isAssetDir(dir string) bool {
+	if cw.assets[dir] {
+		return true
+	}
+	for _, to := range cw.links {
+		if to != "" && to == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// linkTarget is the directory dir resolves to, or "" when dir is not a
+// symlink.
+func linkTarget(dir string) string {
+	if fi, err := os.Lstat(dir); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return ""
+	}
+	to, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ""
+	}
+	return to
+}
+
+// relink watches again every asset directory whose link points elsewhere, and
+// reports it as an asset change: the files behind it are other files.
+func (cw *Watcher) relink() {
+	select {
+	case <-cw.stopCh:
+		return
+	default:
+	}
+	cw.mu.Lock()
+	cw.relinkTimer = nil
+	moved := false
+	for dir, to := range cw.links {
+		if linkTarget(dir) != to {
+			cw.watchAsset(dir)
+			moved = true
+		}
+	}
+	if cw.relinkTimer == nil {
+		cw.relinkTimer = time.AfterFunc(relinkPoll, cw.relink)
+	}
+	cw.mu.Unlock()
+	if moved {
+		cw.armAssets()
+	}
+}
+
+// armAssets restarts the asset debounce, apart from the config's, so a theme
+// save does not delay a config save or make it read the config again.
+func (cw *Watcher) armAssets() {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if cw.assetsTimer != nil {
+		cw.assetsTimer.Stop()
+	}
+	cw.assetsTimer = time.AfterFunc(configDebounce, func() {
+		select {
+		case <-cw.stopCh:
+		default:
+			cw.opts.OnAssets()
+		}
+	})
+}
+
 // arm restarts the debounce timer.
 func (cw *Watcher) arm() {
 	cw.mu.Lock()
@@ -185,8 +475,8 @@ func (cw *Watcher) arm() {
 	cw.debounceTimer = time.AfterFunc(configDebounce, cw.reload)
 }
 
-// reload reads the file and calls the callback, unless the file says what is
-// already in force or tuios wrote it itself.
+// reload reads the files and calls the callback, unless they say what is
+// already in force or tuios wrote the changed ones itself.
 func (cw *Watcher) reload() {
 	select {
 	case <-cw.stopCh:
@@ -194,37 +484,67 @@ func (cw *Watcher) reload() {
 	default:
 	}
 
-	data, err := os.ReadFile(cw.path)
-	if err != nil {
+	lc, err := LoadLayered(cw.path)
+	if errors.Is(err, fs.ErrNotExist) {
 		// A file that is not there right now is an editor mid-save, not a
 		// change. The create that follows brings its own event.
 		return
 	}
-	sum := sha256.Sum256(data)
+	if err != nil {
+		// A file that does not parse. The running config stands, and the
+		// hashes are not recorded, so the fix is delivered.
+		cw.callback(nil, err)
+		return
+	}
+	cw.follow(lc)
+
+	sums := layerHashes(lc)
 	cw.mu.Lock()
-	same := sum == cw.lastHash && !cw.opts.DeliverUnchanged
+	same := maps.Equal(sums, cw.lastHashes) && !cw.opts.DeliverUnchanged
+	self := !cw.opts.DeliverSelfWrites && onlySelfWrites(cw.lastHashes, sums)
 	cw.mu.Unlock()
-	if same || (!cw.opts.DeliverSelfWrites && isSelfWrite(sum)) {
-		// Either the file says what is already in force, or tuios wrote it
-		// itself from a settings row. Both are already applied.
+	if same || self {
+		// Either the files say what is already in force, or tuios wrote the
+		// changed ones itself from a settings row. Both are already applied.
 		cw.mu.Lock()
-		cw.lastHash = sum
+		cw.lastHashes = sums
 		cw.mu.Unlock()
 		return
 	}
 
-	cfg, err := parseAndValidate(data)
+	cfg, err := validateLayered(lc)
 	if err != nil {
-		// The hash is not recorded: a file that could not be used is not what
-		// the client is running, so the next save is delivered even if the user
-		// only fixed the syntax and changed nothing else.
+		// The hashes are not recorded: files that could not be used are not
+		// what the client is running, so the next save is delivered even if
+		// the user only fixed the syntax and changed nothing else.
 		cw.callback(nil, err)
 		return
 	}
 	cw.mu.Lock()
-	cw.lastHash = sum
+	cw.lastHashes = sums
 	cw.mu.Unlock()
 	cw.callback(cfg, nil)
+}
+
+// onlySelfWrites reports whether every file that differs from before is one
+// tuios wrote itself. A file that went away is nobody's save.
+func onlySelfWrites(before, after map[string][sha256.Size]byte) bool {
+	changed := false
+	for p := range before {
+		if _, ok := after[p]; !ok {
+			return false
+		}
+	}
+	for p, sum := range after {
+		if old, ok := before[p]; ok && old == sum {
+			continue
+		}
+		if !isSelfWrite(sum) {
+			return false
+		}
+		changed = true
+	}
+	return changed
 }
 
 // Stop stops the file watcher.
@@ -235,35 +555,44 @@ func (cw *Watcher) Stop() {
 		if cw.debounceTimer != nil {
 			cw.debounceTimer.Stop()
 		}
+		if cw.assetsTimer != nil {
+			cw.assetsTimer.Stop()
+		}
+		if cw.relinkTimer != nil {
+			cw.relinkTimer.Stop()
+		}
 		cw.mu.Unlock()
 		_ = cw.watcher.Close()
 	})
 }
 
-// ReloadConfig loads and validates a config from the given path.
+// ReloadConfig loads and validates a config from the given path, with every
+// file it includes.
 func ReloadConfig(path string) (*UserConfig, error) {
-	data, err := os.ReadFile(path)
+	lc, err := LoadLayered(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+		return nil, err
 	}
-	return parseAndValidate(data)
+	return validateLayered(lc)
 }
 
-// parseAndValidate is the reload path's parse: every section filled from the
-// defaults, then validated. It is the same fill LoadUserConfig does, which is
-// the point of ParseUserConfig holding the list.
-func parseAndValidate(data []byte) (*UserConfig, error) {
+// validateLayered is the reload path's parse of a loaded config: every
+// section filled from the defaults, then the keys tuios cannot read taken
+// out. It is the same rule as LoadUserConfig: a bad key costs that key.
+// Rejecting the whole reload instead would keep the old config, so a file that
+// started fine with the keys dropped could then never reload.
+func validateLayered(lc *LayeredConfig) (*UserConfig, error) {
+	data, err := lc.Bytes()
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := ParseUserConfig(data)
 	if err != nil {
 		return nil, err
 	}
-	if v := ValidateConfig(cfg); v.HasErrors() {
-		first := v.Errors[0]
-		if len(v.Errors) == 1 {
-			return nil, fmt.Errorf("[%s] %s: %s", first.Field, first.Key, first.Message)
-		}
-		return nil, fmt.Errorf("[%s] %s: %s (and %d more)",
-			first.Field, first.Key, first.Message, len(v.Errors)-1)
-	}
+	cfg.LoadWarnings = append(append([]string(nil), lc.Warnings...), DroppedWarnings(DropUnreadableKeys(cfg, lc))...)
 	return cfg, nil
 }

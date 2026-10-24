@@ -39,8 +39,10 @@ async function boot(page) {
       return send(frame);
     };
   }, MSG_INPUT);
-  // tuios has to have drawn before a chord means anything.
-  await page.waitForTimeout(3000);
+  // tuios has to have drawn, and stopped redrawing, before a chord means
+  // anything.
+  await waitFor(page, 'tuios to draw', async () => (await screen(page)).some((l) => l.trim() !== ''), 40_000);
+  await settle(page);
 }
 
 /** Everything sent since the last clear, each frame as a printable string. */
@@ -48,6 +50,14 @@ const wire = (page) => page.evaluate(() => window.__sentInput.map((b) =>
   b.map((c) => (c >= 32 && c < 127 ? String.fromCharCode(c) : '\\x' + c.toString(16).padStart(2, '0'))).join('')));
 
 const clearWire = (page) => page.evaluate(() => { window.__sentInput.length = 0; });
+
+/**
+ * The keys sent since the last clear, as one string, without the replies the
+ * terminal sends on its own. tuios asks for the keyboard protocol flags when
+ * the size changes, and xterm.js answers with CSI ? flags u on the same wire.
+ * That answer is not a key anyone pressed.
+ */
+const keysSent = async (page) => (await wire(page)).join('').replace(/\\x1b\[\?\d+u/g, '');
 
 /** The visible terminal, line by line. */
 const screen = (page) => page.evaluate(() => {
@@ -98,11 +108,37 @@ const cell = (g, col, row) => ({
   y: Math.round(g.top + (row + 0.5) * g.h),
 });
 
-/** Tap a bar button and give tuios time to act on the chord. */
-async function press(page, cdp, label, wait = 1400) {
-  const { x, y } = await buttonCentre(page, label);
-  await tap(cdp, x, y);
-  await page.waitForTimeout(wait);
+/** The visible terminal as one string, to tell whether it changed. */
+const snapshot = async (page) => (await screen(page)).join('\n');
+
+/**
+ * Wait until tuios stops drawing: the buffer reads the same twice, quiet
+ * apart. A reading taken while tuios redraws can show a state that is gone a
+ * frame later. On a slow runner that is what the fixed waits read: a board
+ * that had not caught up with the last chord, and once a splash drawn with a
+ * pane still open, so the reset left two panes and the gestures hit the
+ * wrong one.
+ */
+async function settle(page, quiet = 400, timeout = 20_000) {
+  const deadline = Date.now() + timeout;
+  let last = await snapshot(page);
+  for (;;) {
+    await page.waitForTimeout(quiet);
+    const now = await snapshot(page);
+    if (now === last) return;
+    if (Date.now() > deadline) throw new Error(`tuios never stopped drawing:\n${now}`);
+    last = now;
+  }
+}
+
+/** Poll cond until it holds or the time is up, and say which. */
+async function waitFor(page, what, cond, timeout = 20_000) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (await cond()) return true;
+    if (Date.now() > deadline) return false;
+    await page.waitForTimeout(100);
+  }
 }
 
 /** The splash screen, which is what an empty desktop draws. */
@@ -110,14 +146,89 @@ const onSplash = async (page) =>
   (await screen(page)).some((l) => l.includes('Terminal UI Operating System'));
 
 /**
- * Whether the drawn pane is floating, read off its own title bar: only a
- * floating pane carries the maximize button, and a tiled one has nothing to
- * maximize into. Asked of the pane rather than of the dock's mode letter,
- * because the pane is what the gestures below are aimed at.
+ * Whether the one drawn pane is floating, read off where its frame sits. A
+ * tiled pane fills the area from the left edge of the screen to the right
+ * edge. A floating pane is inset from both. Asked of the pane rather than of
+ * a title-bar glyph or the dock's mode letter: the window controls change
+ * with the config, and the pane is what the gestures below are aimed at.
  */
 async function paneIsFloating(page) {
   const frame = await paneFrame(page);
-  return frame !== null && frame.top > 0 && (await screen(page))[frame.top].includes('□');
+  if (frame === null || frame.top <= 0) return false;
+  const cols = await page.evaluate(() => window.sipTerm.term.cols);
+  return frame.left > 0 && frame.right < cols - 1;
+}
+
+/**
+ * Toggle the layout between tiled and floating. Sent from the keyboard,
+ * because the bar's tile button sits behind a pan on a phone. The tiling
+ * toggle is leader Space. Leader t opens the window menu.
+ */
+async function toggleTiling(page) {
+  await page.keyboard.press('Control+b');
+  await page.keyboard.press(' ');
+  await settle(page);
+}
+
+/**
+ * Two taps on the same cell, close together. click_to_type ships as double,
+ * so one tap on a pane focuses it and the second tap enters terminal mode.
+ *
+ * Sent as raw touch events, which xterm's own gesture recognizer turns into
+ * taps. Input.synthesizeTapGesture puts about two seconds between two taps,
+ * even with tapCount 2, and tuios counts a second click only within 300 ms.
+ */
+async function doubleTap(page, cdp, x, y) {
+  for (let i = 0; i < 2; i++) {
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }] });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  }
+}
+
+/**
+ * Close every pane, and wait until the board shows the splash and no pane.
+ * Each close waits for a pane to go rather than for a fixed time, and the
+ * board is read only once tuios stops drawing.
+ */
+async function clearBoard(page, cdp) {
+  for (let i = 0; i < 10; i++) {
+    await settle(page);
+    const open = await paneCount(page);
+    if (open === 0) return;
+    const { x, y } = await buttonCentre(page, 'close');
+    await tap(cdp, x, y);
+    await waitFor(page, 'a pane to close', async () => (await paneCount(page)) < open, 5_000);
+  }
+  throw new Error(`could not close every pane:\n${await snapshot(page)}`);
+}
+
+/**
+ * Open one pane, and wait until it is drawn and tuios stops drawing. It
+ * returns how many panes are drawn then, which a caller checks: see
+ * resetToOneFloatingPane.
+ */
+async function newPane(page, cdp) {
+  const open = await paneCount(page);
+  const { x, y } = await buttonCentre(page, 'new');
+  await tap(cdp, x, y);
+  const drawn = await waitFor(page, 'the new pane', async () => (await paneCount(page)) > open);
+  await settle(page);
+  if (!drawn) throw new Error(`the new pane was never drawn:\n${await snapshot(page)}`);
+  return paneCount(page);
+}
+
+/**
+ * Load the page again after the board showed the splash while a pane was
+ * still open. About one run in 20 on this machine, the client drew the splash
+ * while the daemon still held a pane on the same workspace, and the pane came
+ * back with the next new one. Closing panes did not help, because the client
+ * did not know the pane was there. A new page attaches again and reads every
+ * pane from the daemon. The log keeps the screen, because the desync itself
+ * looks like a product bug.
+ */
+async function rebuildAfterDesync(page, drawn) {
+  console.log(`the board showed the splash with a pane still open; ${drawn} panes after one new:\n${await snapshot(page)}`);
+  await boot(page);
 }
 
 /**
@@ -128,24 +239,52 @@ async function paneIsFloating(page) {
  * layout mode the test before it left behind. A floating pane is what these
  * three want: it is inset, so there is room around it to drag into.
  *
- * Toggling the layout does not re-place a pane that already exists, so the
- * second attempt makes a fresh one rather than trusting the toggle to move it.
+ * Toggling the layout does not re-place a pane that already exists, so a
+ * board that came up tiled is cleared and made again after the toggle.
  */
 async function resetToOneFloatingPane(page, cdp) {
-  const clear = async () => {
-    for (let i = 0; i < 8 && !(await onSplash(page)); i++) {
-      await press(page, cdp, 'close');
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await clearBoard(page, cdp);
+    const drawn = await newPane(page, cdp);
+    if (drawn !== 1) {
+      await rebuildAfterDesync(page, drawn);
+      continue;
     }
-  };
-  await clear();
-  await press(page, cdp, 'new', 2500);
-  if (!(await paneIsFloating(page))) {
-    await press(page, cdp, 'tile');
-    await clear();
-    await press(page, cdp, 'new', 2500);
+    if (await paneIsFloating(page)) return;
+    await toggleTiling(page);
   }
-  expect(await paneIsFloating(page), 'could not get the board to one floating pane').toBe(true);
+  throw new Error(`could not get the board to one floating pane:\n${await snapshot(page)}`);
 }
+
+/**
+ * How many panes are drawn. The splash is what tuios draws when no pane is
+ * open, and its block letters hold corner glyphs, so it counts as none.
+ */
+const paneCount = async (page) => ((await onSplash(page)) ? 0 : (await paneCorners(page)).length);
+
+/**
+ * Every pane corner on screen, in cells. A pane's top edge is its title bar,
+ * with the window buttons on it. The drop preview a tiled drag draws is a
+ * frame in the same glyphs with a bare top edge, so it is not a pane. See
+ * paneFrame.
+ */
+const paneCorners = (page) => page.evaluate(() => {
+  const t = window.sipTerm.term;
+  const b = t.buffer.active;
+  const titled = (line, col) => {
+    const end = line.slice(col + 1).search(/[╮┐╗┓]/);
+    const edge = end === -1 ? line.slice(col + 1) : line.slice(col + 1, col + 1 + end);
+    return /[^─━═\s]/.test(edge);
+  };
+  const out = [];
+  for (let row = 0; row < t.rows; row++) {
+    const line = b.getLine(b.viewportY + row)?.translateToString(true) ?? '';
+    for (let col = 0; col < line.length; col++) {
+      if (/[╭┌╔┏]/.test(line[col]) && titled(line, col)) out.push({ col, row });
+    }
+  }
+  return out;
+});
 
 /**
  * The drawn frame of the topmost pane, in terminal cells.
@@ -153,15 +292,30 @@ async function resetToOneFloatingPane(page, cdp) {
  * Read off the buffer rather than asked of tuios, because a pane that has moved
  * has only moved if it is drawn somewhere else. The corner glyphs are the
  * border style's, so they are read from the line rather than assumed.
+ *
+ * A pane is a frame whose top edge is a title bar: it carries the window
+ * buttons or a title. The preview a tiled drag draws where the pane would land
+ * is a frame in the same border glyphs, with a bare top edge, so it is not
+ * read as a pane.
  */
 const paneFrame = (page) => page.evaluate(() => {
   const t = window.sipTerm.term;
   const b = t.buffer.active;
   const lines = Array.from({ length: t.rows }, (_, i) => b.getLine(b.viewportY + i)?.translateToString(true) ?? '');
-  const top = lines.findIndex((l) => /[╭┌╔┏]/.test(l));
+  const titled = (line, col) => {
+    const end = line.slice(col + 1).search(/[╮┐╗┓]/);
+    const edge = end === -1 ? line.slice(col + 1) : line.slice(col + 1, col + 1 + end);
+    return /[^─━═\s]/.test(edge);
+  };
+  const top = lines.findIndex((l) => {
+    const col = l.search(/[╭┌╔┏]/);
+    return col !== -1 && titled(l, col);
+  });
   if (top === -1) return null;
   const bottom = lines.findLastIndex((l) => /[╰└╚┗]/.test(l));
-  return { top, bottom, left: lines[top].search(/[╭┌╔┏]/) };
+  const left = lines[top].search(/[╭┌╔┏]/);
+  const right = left + lines[top].slice(left).search(/[╮┐╗┓]/);
+  return { top, bottom, left, right: right < left ? -1 : right };
 });
 
 test.describe('the touch key bar', () => {
@@ -201,7 +355,7 @@ test.describe('the touch key bar', () => {
     await page.waitForTimeout(1500);
 
     // Ctrl+B is 0x02, and the window key is c. One tap, both bytes.
-    expect((await wire(page)).join('')).toBe('\\x02c');
+    expect(await keysSent(page)).toBe('\\x02c');
     expect((await screen(page)).join('\n'), 'a new window left the screen unchanged').not.toBe(before);
   });
 
@@ -213,7 +367,7 @@ test.describe('the touch key bar', () => {
     const { x, y } = await buttonCentre(page, 'esc');
     await tap(cdp, x, y);
     await page.waitForTimeout(400);
-    expect((await wire(page)).join('')).toBe('\\x1b');
+    expect(await keysSent(page)).toBe('\\x1b');
   });
 
   test('survives the software keyboard taking the bottom of the screen', async ({ page }) => {
@@ -244,7 +398,7 @@ test.describe('the touch key bar', () => {
     const { x, y } = await buttonCentre(page, 'zoom');
     await tap(cdp, x, y);
     await page.waitForTimeout(600);
-    expect((await wire(page)).join('')).toBe('\\x02z');
+    expect(await keysSent(page)).toBe('\\x02z');
   });
 });
 
@@ -316,20 +470,28 @@ test.describe('a finger on tuios itself', () => {
 
     const g = await geom(page);
     const inside = cell(g, frame.left + 4, frame.top + 6);
-    await tap(cdp, inside.x, inside.y);
+    await clearWire(page);
+    const t0 = Date.now();
+    await doubleTap(page, cdp, inside.x, inside.y);
+    const tapMs = Date.now() - t0;
     await page.waitForTimeout(900);
+    const afterTap = await wire(page);
 
-    // Click-to-type: the tap hands the keyboard to the pane, so what the
+    // Click-to-type: the double tap hands the keyboard to the pane, so what the
     // software keyboard sends next is the pane's, not a window-management key.
     // "m" would minimize the pane if the tap had not landed. The marker is
-    // short because a floating pane on this viewport is 24 columns and the
-    // prompt has already spent ten of them.
+    // short because a floating pane on this viewport is about 20 columns wide.
+    const beforeType = await screen(page);
+    await clearWire(page);
     await page.keyboard.type('zqtap');
     await page.waitForTimeout(900);
+    const typed = await wire(page);
 
     const lines = await screen(page);
     const hit = lines.findIndex((l) => l.includes('zqtap'));
-    expect(hit, 'what was typed after the tap never reached a pane').toBeGreaterThan(-1);
+    expect(hit, `what was typed after the tap never reached a pane. The double tap took ${tapMs} ms `
+      + `and sent ${JSON.stringify(afterTap)}. Typing sent ${JSON.stringify(typed)}. Before typing:\n`
+      + `${beforeType.join('\n')}\nAfter:\n${lines.join('\n')}`).toBeGreaterThan(-1);
     expect(hit, 'it landed outside the pane the tap was in').toBeGreaterThan(frame.top);
     expect(hit).toBeLessThan(frame.bottom);
   });
@@ -345,14 +507,16 @@ test.describe('a finger on tuios itself', () => {
 
     // Into the pane first, so the press happens in the mode a user is in while
     // they are typing, which is where it used to reach nothing.
-    await tap(cdp, inside.x, inside.y);
+    await doubleTap(page, cdp, inside.x, inside.y);
     await page.waitForTimeout(900);
 
     await tap(cdp, inside.x, inside.y, 900);
-    await page.waitForTimeout(1200);
+    await waitFor(page, 'the pane menu', async () => (await snapshot(page)).includes('Split right'), 5_000);
 
     const text = (await screen(page)).join('\n');
-    expect(text, 'the long press opened no menu').toContain('Pane');
+    // Asked of the items, because the menu's heading is the pane title, and
+    // that is whatever the shell sets.
+    expect(text, 'the long press opened no pane menu').toContain('Split right');
     expect(text, 'the menu that opened is not the pane menu').toContain('Close pane');
   });
 
@@ -402,7 +566,10 @@ test.describe('a finger on tuios itself', () => {
     await page.waitForTimeout(700);
     for (let i = 1; i <= 8; i++) await touch('touchMove', grab.x - i * 8, grab.y + i * 18);
     await touch('touchEnd', grab.x - 64, grab.y + 144);
-    await page.waitForTimeout(1500);
+    await waitFor(page, 'the pane to move', async () => {
+      const f = await paneFrame(page);
+      return f !== null && f.top > before.top && f.left < before.left;
+    }, 5_000);
 
     const after = await paneFrame(page);
     expect(after, 'the pane vanished during the drag').not.toBeNull();
@@ -419,19 +586,12 @@ test.describe('a finger on tuios itself', () => {
     await boot(page);
     const cdp = await page.context().newCDPSession(page);
 
-    // Every pane corner on screen, in cells.
-    const corners = () => page.evaluate(() => {
-      const t = window.sipTerm.term;
-      const b = t.buffer.active;
-      const out = [];
-      for (let row = 0; row < t.rows; row++) {
-        const line = b.getLine(b.viewportY + row)?.translateToString(true) ?? '';
-        for (let col = 0; col < line.length; col++) {
-          if (/[╭┌╔┏]/.test(line[col])) out.push({ col, row });
-        }
-      }
-      return out;
-    });
+    // Every pane corner on screen, in cells. A pane's top edge is its title
+    // bar, with the window buttons on it. The drop preview draws a frame in
+    // the same glyphs where the pane would land, over its own slot when the
+    // drop would change nothing, and its top edge is bare: that frame is not
+    // the pane. See paneFrame.
+    const corners = () => paneCorners(page);
     const key = (c) => `${c.col},${c.row}`;
     const sorted = (cs) => cs.map(key).sort();
     // Two panes partition the box from its origin, so both corners sit on the
@@ -441,15 +601,22 @@ test.describe('a finger on tuios itself', () => {
     // Nothing open, then two panes. Tiling ships on, so they come up tiled
     // unless an earlier test left the session floating; the chord is sent
     // from the keyboard because the bar's tile button can sit behind a pan.
-    for (let i = 0; i < 8 && !(await onSplash(page)); i++) {
-      await press(page, cdp, 'close');
-    }
-    await press(page, cdp, 'new', 2500);
-    await press(page, cdp, 'new', 2500);
-    if (!tiled(await corners())) {
-      await page.keyboard.press('Control+b');
-      await page.keyboard.press('t');
-      await page.waitForTimeout(2500);
+    // Each step waits for the board to show it, not for a fixed time: on a
+    // slow runner the second pane was still being laid out when the corners
+    // were read.
+    // A board that came up with the wrong number of panes is made again,
+    // and so is one that came up floating, after the toggle.
+    for (let attempt = 0; attempt < 6; attempt++) {
+      await clearBoard(page, cdp);
+      let drawn = await newPane(page, cdp);
+      if (drawn === 1) drawn = await newPane(page, cdp);
+      if (drawn !== 2 && drawn !== 1) {
+        await rebuildAfterDesync(page, drawn);
+        continue;
+      }
+      if (drawn !== 2) continue;
+      if (tiled(await corners())) break;
+      await toggleTiling(page);
     }
 
     const before = await corners();
@@ -473,7 +640,10 @@ test.describe('a finger on tuios itself', () => {
     await page.waitForTimeout(700);
     const stepRows = Math.max(1, dropRow - target.row);
     for (let i = 1; i <= stepRows; i++) await touch('touchMove', grab.x, grab.y + Math.round(i * g.h));
-    await page.waitForTimeout(600);
+    await waitFor(page, 'the pane to follow the finger', async () => {
+      const cs = await corners();
+      return !cs.some((c) => key(c) === key(target)) && cs.some((c) => c.row > target.row + 1);
+    }, 5_000);
 
     const mid = await corners();
     expect(mid.some((c) => key(c) === key(target)), 'the grabbed pane is still drawn in its slot mid-drag').toBe(false);
@@ -481,7 +651,7 @@ test.describe('a finger on tuios itself', () => {
       'no pane corner is drawn lower than the slot mid-drag: the finger is not moving the pane').toBe(true);
 
     await touch('touchEnd', grab.x, grab.y + Math.round(stepRows * g.h));
-    await page.waitForTimeout(1500);
+    await waitFor(page, 'the drop to settle into two tiles', async () => tiled(await corners()), 5_000);
     expect(tiled(await corners()), 'the drop did not leave two tiled panes').toBe(true);
   });
 });

@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"image"
 	"image/color"
 	"math"
 	"slices"
@@ -20,8 +21,8 @@ import (
 // panes. The two tilers reserve their gaps differently, so each has to answer
 // for its own: the BSP tree knows its splits, and the master-stack tiler has
 // them read back off the panes it positioned. Asking the tree while master-stack
-// is driving is what used to paint a line down the pane beside it, because the
-// tree survives the mode switch holding the geometry it last laid out.
+// is driving would paint a line down the pane beside it, because the tree
+// survives the mode switch holding the geometry it last laid out.
 func (m *OS) separatorSplits() []layout.SplitLine {
 	// A divider stands in for the borders two panes gave up. Panes still drawing
 	// their own have nothing to share, so nothing is drawn between them whatever
@@ -37,10 +38,21 @@ func (m *OS) separatorSplits() []layout.SplitLine {
 		return nil
 	}
 	if m.UseScrollingLayout {
-		return nil
+		// The strip runs past the screen on both sides, so its dividers are
+		// read off the panes like master-stack's and then cut to the content
+		// region: a column half scrolled away has half a divider on screen,
+		// and none of it may land on the sidebar or the dock.
+		bounds := m.GetBSPBounds()
+		var splits []layout.SplitLine
+		for _, s := range layout.SplitsBetween(m.tiledPaneRects(), m.separatorGap()) {
+			if clipped, ok := clipSplit(s, bounds); ok {
+				splits = append(splits, clipped)
+			}
+		}
+		return splits
 	}
 	if !m.UseBSPLayout {
-		return layout.SplitsBetween(m.tiledPaneRects(), m.separatorGap())
+		return m.clipScratchSplits(layout.SplitsBetween(m.tiledPaneRects(), m.separatorGap()))
 	}
 	tree := m.WorkspaceTrees[m.CurrentWorkspace]
 	if tree == nil || tree.IsEmpty() {
@@ -59,7 +71,27 @@ func (m *OS) separatorSplits() []layout.SplitLine {
 	for i := range splits {
 		splits[i] = c.applySplit(splits[i])
 	}
-	return splits
+	return m.clipScratchSplits(splits)
+}
+
+// clipScratchSplits cuts the dividers to the inside of the scratch box while a
+// zoom's camera is up in a scratch group. The camera lays the group out in a
+// box larger than the scratch box, and the dividers of the panes it runs off
+// the edges were drawn over the frame and the workspace behind it. Outside the
+// scratch the content region's edge is chrome, which covers them, so those are
+// left as they are.
+func (m *OS) clipScratchSplits(splits []layout.SplitLine) []layout.SplitLine {
+	if !m.zoomCanvasNow.on || !m.InScratchView() {
+		return splits
+	}
+	bounds := m.GetBSPBounds()
+	out := splits[:0]
+	for _, s := range splits {
+		if clipped, ok := clipSplit(s, bounds); ok {
+			out = append(out, clipped)
+		}
+	}
+	return out
 }
 
 // paneLayer is a tiled pane as the divider grid sees it: the rectangle it holds
@@ -197,7 +229,7 @@ func (m *OS) dividerLines(bounds layout.Rect) ([]dividerLine, []paneLayer) {
 	// column of ground while master-stack drew a two-column rule. It also left
 	// layout.SplitsBetween (written for exactly this) reachable only from a
 	// test.
-	if !m.UseScrollingLayout && !m.transitioning() {
+	if !m.transitioning() {
 		splits := m.separatorSplits()
 		lines := make([]dividerLine, len(splits))
 		for i, s := range splits {
@@ -298,9 +330,10 @@ func (m *OS) chromeRules(bounds layout.Rect) chromeRules {
 	if !m.Settings.BorderJoinsChromeRules() {
 		return r
 	}
-	switch m.Settings.DockbarPosition {
-	case "hidden":
-	case "top":
+	switch {
+	case m.Settings.DockbarPosition == "hidden" || m.Settings.DockCompact:
+		// A compact dock draws no rule to join.
+	case m.Settings.DockbarPosition == "top":
 		r.top = bounds.Y - 1
 	default:
 		r.bottom = bounds.Y + bounds.H
@@ -368,6 +401,12 @@ func (m *OS) renderSeparatorOverlay() []*lipgloss.Layer {
 	focusColor := theme.BorderFocusedWindowOn(m.host.bg)
 	if m.Mode == TerminalMode {
 		focusColor = theme.BorderFocusedTerminalOn(m.host.bg)
+	}
+	if c := m.focusedStateBorder(m.GetFocusedWindow()); c != nil {
+		focusColor = c
+	} else if focus.ok && m.gradientOn() {
+		// The shared frame runs one cell outside the pane.
+		m.markGradient("", image.Rect(focus.left, focus.top, focus.right+1, focus.bottom+1), focusColor)
 	}
 	focusedStr := "\x1b[1m" + sgrForeground(focusColor)
 

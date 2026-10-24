@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/hooks"
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 	"github.com/Gaurav-Gosain/tuios/pkg/applist"
@@ -60,11 +61,19 @@ type OSOptions struct {
 	// of the whole file over the operator's and over every other client's.
 	ConfigReadOnly bool
 
+	// OpenInboxItem opens the Inbox on this item once attached. tuios-web
+	// sets it from a notification's link. See OS.OpenInboxOn.
+	OpenInboxItem string
+
 	// ShowKeys enables the key display overlay.
 	ShowKeys bool
 	// StartInTerminalMode starts the client in terminal mode on the focused
 	// pane, whatever [startup] says and whether the session is new or not.
 	StartInTerminalMode bool
+	// AfterRestart says this client was started by a daemon restart from
+	// the app, so the first frame says the session is back. See
+	// daemon_restart.go.
+	AfterRestart bool
 
 	// NumWorkspaces sets the number of workspaces (default: 9).
 	NumWorkspaces int
@@ -128,6 +137,10 @@ type OSOptions struct {
 	// know this, and only from the browser that connected.
 	TouchClient bool
 
+	// BrowserPaste says which keys make the browser paste, so the note that
+	// the browser keeps the clipboard can name them. Only tuios-web sets it.
+	BrowserPaste BrowserPasteKeys
+
 	// Caps describes the terminal this session draws to. The servers detect it
 	// per connection, because one process holds several connections and the
 	// terminal that has to render a forwarded image is the one at the far end
@@ -154,6 +167,10 @@ type OSOptions struct {
 // fields are properly initialized.
 func NewOS(opts OSOptions) *OS {
 	opts.applyClientKind()
+	// option_glyphs = "auto" needs the Mac's keyboard layout. Read it in the
+	// background now, so the answer is in before the first key and no key
+	// waits for it. Nothing happens off macOS.
+	config.StartMacLayoutDetection()
 
 	numWorkspaces := opts.NumWorkspaces
 	if numWorkspaces <= 0 {
@@ -195,12 +212,14 @@ func NewOS(opts OSOptions) *OS {
 		NumWorkspaces:     numWorkspaces,
 
 		// Workspace state maps
-		WorkspaceFocus:       make(map[int]int),
-		FocusHistory:         make(map[int][]string),
-		WorkspaceLayouts:     make(map[int][]WindowLayout),
-		WorkspaceHasCustom:   make(map[int]bool),
-		WorkspaceMasterRatio: make(map[int]float64),
-		WorkspaceStackRatio:  make(map[int]float64),
+		WorkspaceFocus:        make(map[int]int),
+		FocusHistory:          make(map[int][]string),
+		WorkspaceLayouts:      make(map[int][]WindowLayout),
+		WorkspaceHasCustom:    make(map[int]bool),
+		WorkspaceMasterRatio:  make(map[int]float64),
+		WorkspaceStackRatio:   make(map[int]float64),
+		WorkspaceMasterSplits: make(map[int]layout.MasterSplits),
+		WorkspaceLayoutMode:   make(map[int]string),
 
 		// Resize tracking
 		PendingResizes: make(map[string][2]int),
@@ -212,6 +231,7 @@ func NewOS(opts OSOptions) *OS {
 		LearnMode:         opts.LearnMode,
 		ShowKeys:          opts.ShowKeys,
 		forceTerminalMode: opts.StartInTerminalMode,
+		afterRestart:      opts.AfterRestart,
 		RecentKeys:        []KeyEvent{},
 		KeyHistoryMaxSize: 5,
 
@@ -226,6 +246,7 @@ func NewOS(opts OSOptions) *OS {
 		SSHSession:      opts.SSHSession,
 		SSHIsLoopback:   opts.SSHIsLoopback,
 		TouchClient:     opts.TouchClient,
+		BrowserPaste:    opts.BrowserPaste,
 		RemoteClient:    opts.RemoteClient,
 		Caps:            caps,
 
@@ -279,6 +300,7 @@ func NewOS(opts OSOptions) *OS {
 		ForceEnable: opts.ForceGraphicsEnabled,
 		Output:      opts.GraphicsOutput,
 		Caps:        caps,
+		Symbols:     symbolKind(seed.ImageSymbols, caps.Term),
 	})
 
 	// Tell the terminal package what tuios can forward, so shells spawned
@@ -310,22 +332,22 @@ func NewOS(opts OSOptions) *OS {
 		// Hold the loaded config so the in-app settings page can persist live
 		// changes back to disk.
 		os.UserConfig = cfg
+		os.ListKeys = listKeymap(cfg)
 		// Collected here and reported from Init, once there is a TUI to report
 		// them in.
 		os.ConfigWarnings = config.ConfigWarnings(cfg)
-		// A sink the client cannot deliver is a config problem like any other,
-		// and it is only knowable here, where the client is known.
+		// A setting the client cannot carry out is a notice, not a problem:
+		// the file is valid and the setting works on another client. It is
+		// only knowable here, where the client is known.
 		if opts.BrowserClient {
-			os.ConfigWarnings = append(os.ConfigWarnings, browserAlertWarnings(cfg)...)
-			os.ConfigWarnings = append(os.ConfigWarnings,
-				remoteDockComponentWarning(cfg, "tuios-web")...)
+			os.ConfigNotices = append(os.ConfigNotices, browserAlertNotices(cfg)...)
+			os.ConfigNotices = append(os.ConfigNotices,
+				remoteDockComponentNotice(cfg, "tuios-web")...)
 		}
 		if opts.IsSSHMode {
-			os.ConfigWarnings = append(os.ConfigWarnings,
-				remoteDockComponentWarning(cfg, "over SSH")...)
-		}
-		if opts.IsSSHMode {
-			os.ConfigWarnings = append(os.ConfigWarnings, sshAlertWarnings(cfg)...)
+			os.ConfigNotices = append(os.ConfigNotices,
+				remoteDockComponentNotice(cfg, "over SSH")...)
+			os.ConfigNotices = append(os.ConfigNotices, sshAlertNotices(cfg)...)
 		}
 		if cfg.Debug.ShowKeyEvents {
 			os.ShowKeys = true

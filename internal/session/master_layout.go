@@ -7,6 +7,7 @@ import (
 	"slices"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
 )
 
 // The master-stack shape of a workspace as an op.
@@ -16,9 +17,9 @@ import (
 // session has to lay a workspace out with the same ones. They are never carried
 // in a client's state push. A client that changes one sends MsgMasterLayout,
 // the daemon applies it under mutateState, Version advances, and every client
-// (the sender included) is sent the result. This is the end state issue #162
-// names for every session-owned field, so these fields start there instead of
-// adding another merge rule.
+// (the sender included) is sent the result. This is the rule every
+// session-owned field heads for, so these fields start there instead of adding
+// another merge rule.
 //
 // The op is recorded with noteTreeOpLocked. Like a tree op it changes one
 // field that no push carries, so a push built before it has missed nothing it
@@ -131,7 +132,7 @@ func (s *Session) ApplyMasterLayout(p *MasterLayoutPayload) (bool, error) {
 		}
 		next[p.Workspace] = p.Layout
 		state.WorkspaceMasterLayout = next
-		s.noteTreeOpLocked(state.Version+1, p.PushOrigin)
+		s.noteTreeOpLocked(state.Version+1, p.PushOrigin, p.Workspace)
 		return nil
 	})
 	switch {
@@ -151,11 +152,11 @@ func (s *Session) ApplyMasterLayout(p *MasterLayoutPayload) (bool, error) {
 // take.
 func (d *Daemon) handleMasterLayout(cs *connState, msg *Message) error {
 	if cs.sessionID == "" {
-		return d.sendError(cs, ErrCodeNotAttached, "not attached to any session")
+		return d.replyError(cs, msg, ErrCodeNotAttached, "not attached to any session")
 	}
 	session := d.manager.GetSessionByID(cs.sessionID)
 	if session == nil {
-		return d.sendError(cs, ErrCodeSessionNotFound, "session not found")
+		return d.replyError(cs, msg, ErrCodeSessionNotFound, "session not found")
 	}
 	var p MasterLayoutPayload
 	if err := msg.ParsePayload(&p); err != nil {
@@ -201,4 +202,17 @@ func (c *TUIClient) SendMasterLayout(ws int, st MasterLayoutState, ifAbsent bool
 	}
 	c.pushSeq.Store(seq)
 	return nil
+}
+
+// cloneMasterSplits copies a session's master-stack splits deep, so a copy of
+// the state shares no list with the session's own.
+func cloneMasterSplits(m map[int]layout.MasterSplits) map[int]layout.MasterSplits {
+	if m == nil {
+		return nil
+	}
+	out := make(map[int]layout.MasterSplits, len(m))
+	for ws, sp := range m {
+		out[ws] = sp.Clone()
+	}
+	return out
 }

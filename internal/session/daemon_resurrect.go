@@ -5,6 +5,7 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"time"
 )
 
 // hasWindow reports whether id names one of these windows.
@@ -28,7 +29,11 @@ func clearLiveAgent(w *WindowState) {
 	// below says ran in a process that is gone.
 	w.AgentQueued = 0
 	w.AgentSubagents = 0
+	w.AgentSubagentList = nil
 	w.ForegroundCmd = ""
+	// OSC 7501 records live in the pane's emulator, which a restore does
+	// not bring back.
+	w.ProgramStatus = nil
 }
 
 // restoreAllSessions recreates every resurrectable session that is not already
@@ -98,6 +103,13 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	if existing := d.manager.GetSession(state.Name); existing != nil {
 		return existing, nil, nil
 	}
+	// A fan's judge does not survive a restart: its pane comes back as a
+	// fresh shell, which must not keep the judge's reach.
+	if wt := state.Worktree; wt != nil && (wt.JudgeSession != "" || wt.JudgeWindow != "") {
+		w := *wt
+		w.JudgeSession, w.JudgeWindow = "", ""
+		state.Worktree = &w
+	}
 
 	// A session whose windows were all closed leaves a state file behind, and
 	// restoring it produced a session with nothing in it that no surface tells
@@ -122,9 +134,21 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	// The saved id comes back, so a client that knew the session by its id
 	// (a phone bridge, a script) still finds it. State from before ids were
 	// saved has none and gets a new one.
-	sess, err := d.manager.CreateSession(state.Name, &SessionConfig{restoreID: state.SessionID}, width, height)
+	sess, err := d.manager.CreateSession(state.Name, &SessionConfig{restoreID: state.SessionID, Space: state.Space}, width, height)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// The start directory comes back before any window is spawned. It is not
+	// checked: a folder missing when the daemon starts (a drive not mounted
+	// yet) would otherwise be saved as empty on the next save and lost. A
+	// shell asked to start in a missing folder starts in the daemon's.
+	sess.SetStartDir(state.StartDir)
+	// When the person last used it comes back too. Without it every restored
+	// session looked unused, and a bare attach fell to the restore order.
+	// Nothing below touches it: restoring panes is not the person.
+	if state.LastUsed > 0 {
+		sess.setLastUsed(time.Unix(0, state.LastUsed))
 	}
 
 	sessionID := sess.ID
@@ -139,8 +163,13 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	restored.WorkspaceFocus = maps.Clone(state.WorkspaceFocus)
 	restored.WorkspaceMasterRatio = maps.Clone(state.WorkspaceMasterRatio)
 	restored.WorkspaceStackRatio = maps.Clone(state.WorkspaceStackRatio)
+	restored.WorkspaceMasterSplits = cloneMasterSplits(state.WorkspaceMasterSplits)
 	restored.WorkspaceMasterLayout = maps.Clone(state.WorkspaceMasterLayout)
 	restored.WorkspaceHasCustom = maps.Clone(state.WorkspaceHasCustom)
+	restored.WorkspaceLayoutModes = maps.Clone(state.WorkspaceLayoutModes)
+	// A display order saved by a build that kept one comes back as the
+	// numbering it showed. See applyLegacyWorkspaceOrder.
+	restored.applyLegacyWorkspaceOrder()
 
 	// A window whose shell will not start is dropped rather than kept. Keeping it
 	// left its PTYID naming the dead daemon's PTY, which nothing will ever answer
@@ -172,6 +201,12 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 		// popup, before groups had a workspace, moves to one here.
 		if w.Popup && !w.Scratch {
 			debugLog("[DEBUG] dropping restored popup %s, a popup lives only as long as its command", shortID(w.ID))
+			continue
+		}
+		// A TML surface lives in the daemon, so the daemon that held it took
+		// it along. Its window would come back empty.
+		if w.Kind == WindowKindTML {
+			debugLog("[DEBUG] dropping restored TML window %s, its surface ended with the daemon", shortID(w.ID))
 			continue
 		}
 		if w.Scratch {
@@ -225,7 +260,17 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 		// the new shell's first instruction. Without this a pane narrowed on
 		// purpose would come back holding the default, which under open is
 		// admin.
-		pty, err := sess.restorePTYWithGrants(w.ID, ptyWidth, ptyHeight, w.Cwd, savedGrants(w.Grants), history[w.ID], w.Workspace, onExit)
+		// The start folder comes back from the saved state, which only the
+		// daemon writes. It is not taken from the restored shell's folder,
+		// which the pane chose.
+		sess.noteStartDir(w.ID, w.StartDir)
+		var pty *PTY
+		var err error
+		if w.Kind != "" && w.Kind != "terminal" {
+			pty, err = sess.restorePlaceholderPTY(w.ID, ptyWidth, ptyHeight, w.Cwd, w.Kind, w.URI, w.Workspace, onExit)
+		} else {
+			pty, err = sess.restorePTYWithGrants(w.ID, ptyWidth, ptyHeight, w.Cwd, savedGrants(w.Grants), history[w.ID], w.Workspace, onExit)
+		}
 		if err != nil {
 			LogError("Dropping restored window %s, its shell could not be respawned: %v", shortID(w.ID), err)
 			continue
@@ -260,9 +305,13 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	var offers []resumeOffer
 	ids := make(map[string]WindowState, len(kept))
 	grants := make(map[string][]string)
+	startedBy := make(map[string]*PaneRef)
 	for _, w := range kept {
 		if w.Grants != nil {
 			grants[w.ID] = w.Grants
+		}
+		if w.StartedBy != nil {
+			startedBy[w.ID] = w.StartedBy
 		}
 		if w.AgentSessionID == "" {
 			continue
@@ -274,19 +323,29 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	}
 
 	scratchPanes := map[string]scratchPane{}
+	views := map[string][2]string{}
 	for _, w := range kept {
 		if w.Scratch {
 			scratchPanes[w.ID] = scratchPane{name: w.ScratchName, workspace: w.Workspace}
 		}
+		if w.Kind != "" || w.URI != "" {
+			views[w.ID] = [2]string{w.Kind, w.URI}
+		}
 	}
 
+	// UpdateState takes the daemon-owned fields from the new session, the
+	// tab keys among them, so they are put back from here afterwards.
+	tabKeys, nextTabKey := restored.WorkspaceTabKeys, restored.NextWorkspaceTabKey
+	masterLayouts := restored.WorkspaceMasterLayout
 	sess.UpdateState(&restored)
 	// After UpdateState, which takes this field from canonical state and would
 	// undo it if the restore wrote it into the pushed snapshot instead.
 	sess.MarkRestored()
 	// The master-stack shapes are daemon-owned in the same way. See
 	// RestoreMasterLayouts.
-	sess.RestoreMasterLayouts(state.WorkspaceMasterLayout)
+	sess.RestoreMasterLayouts(masterLayouts)
+	// The herdr tab keys are daemon-owned in the same way.
+	sess.RestoreWorkspaceTabKeys(tabKeys, nextTabKey)
 	// Whether the rail is shown is daemon-owned in the same way. See
 	// RestoreSidebar.
 	sess.RestoreSidebar(state.Sidebar)
@@ -294,6 +353,11 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	// only the marks canonical state already has, and a new session has none.
 	if len(scratchPanes) > 0 {
 		sess.markRestoredScratch(scratchPanes)
+	}
+	// A window a renderer draws natively comes back as that kind of window,
+	// for the same reason.
+	if len(views) > 0 {
+		sess.markRestoredViews(views)
 	}
 
 	// The worktree record goes back on for the same reason: it is
@@ -334,6 +398,17 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 			return nil
 		})
 	}
+	// Which pane started each pane goes back on for the same reason.
+	if len(startedBy) > 0 {
+		_ = sess.mutateState(func(st *SessionState) error {
+			for i := range st.Windows {
+				if ref, ok := startedBy[st.Windows[i].ID]; ok {
+					st.Windows[i].StartedBy = ref
+				}
+			}
+			return nil
+		})
+	}
 	return sess, offers, nil
 }
 
@@ -348,6 +423,11 @@ func restoredWorktree(saved *WorktreeInfo) *WorktreeInfo {
 		return nil
 	}
 	wt := *saved
+	// A record from before launched_from_id names its lead by name alone,
+	// which another session may hold now. It reaches nothing, so drop it.
+	if wt.LaunchedFromID == "" {
+		wt.LaunchedFrom = ""
+	}
 	if PromptWaiting(wt.PromptStatus) {
 		wt.PromptStatus = PromptNotSent
 		wt.PromptNote = "The daemon restarted before the prompt was typed. Send the prompt with send-text."

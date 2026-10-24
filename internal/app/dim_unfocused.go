@@ -7,7 +7,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // Dimming an unfocused pane's content is the one appearance question the frame
@@ -42,9 +42,9 @@ import (
 // built, and FocusWindow deliberately gives the pane being left the lighter
 // invalidation that keeps that string, so without a key the pane you just
 // stepped away from would keep serving the undimmed frame until its guest next
-// wrote something. Keying the cache on the dim is the fix that no focus path
-// can get around, because it is checked where the cache is used rather than
-// where focus moves.
+// wrote something. Keying the cache on the dim holds for every focus path,
+// because it is checked where the cache is used rather than where focus
+// moves.
 func paneDim(isFocused bool, s *config.Settings) int {
 	if isFocused {
 		return 0
@@ -54,6 +54,10 @@ func paneDim(isFocused bool, s *config.Settings) int {
 
 // dimCell fills dst with src carried toward the pane's ground and returns it,
 // or returns src unchanged when there is nothing this can honestly dim.
+//
+// dimText says whether the text is carried toward the ground along with the
+// background. False, appearance.dim_foreground off, leaves the guest's text in
+// its own colour and quiets only the ground behind it.
 //
 // The scratch cell is the caller's because this runs once per style run rather
 // than once per cell: the batching loop compares undimmed cells to decide where
@@ -65,7 +69,7 @@ func paneDim(isFocused bool, s *config.Settings) int {
 // they look like, so there is no RGB here to carry anywhere; guessing one would
 // replace the user's own palette with ours on the panes they are not looking
 // at, which is a stranger result than not dimming.
-func dimCell(dst, src *uv.Cell, fg, bg color.Color, t float64, memo *blendMemo) *uv.Cell {
+func dimCell(dst, src *uv.Cell, fg, bg color.Color, t float64, dimText bool, memo *blendMemo) *uv.Cell {
 	if src == nil {
 		return src
 	}
@@ -94,7 +98,7 @@ func dimCell(dst, src *uv.Cell, fg, bg color.Color, t float64, memo *blendMemo) 
 	// The fg goes to the cell's own ground where it has one, so a cell painted
 	// on a block of colour dims into that block rather than into the pane
 	// behind it and keeps the block readable as a block.
-	if !isNilColor(cellFg) {
+	if dimText && !isNilColor(cellFg) {
 		toward := cellBg
 		if isNilColor(toward) {
 			toward = bg
@@ -104,6 +108,32 @@ func dimCell(dst, src *uv.Cell, fg, bg color.Color, t float64, memo *blendMemo) 
 		}
 	}
 	if !isNilColor(cellBg) && !isNilColor(bg) {
+		dst.Style.Bg = memo.mix(cellBg, bg, t)
+	}
+	return dst
+}
+
+// dimGlyphCell is dimCell for a cell of an image drawn as glyphs. Both of its
+// colours are picture colours, so both go toward the pane's ground by the same
+// amount. dimCell carries the foreground toward the cell's own background,
+// which is right for text on a block of colour and wrong here: in a flat area
+// the two colours are nearly equal, so the foreground hardly moves while the
+// background moves to the pane, and the area breaks into light and dark
+// sub-blocks. A cell that names no colour stays on the pane's ground and needs
+// nothing.
+func dimGlyphCell(dst, src *uv.Cell, bg color.Color, t float64, memo *blendMemo) *uv.Cell {
+	if src == nil || isNilColor(bg) {
+		return src
+	}
+	cellFg, cellBg := src.Style.Fg, src.Style.Bg
+	if isNilColor(cellFg) && isNilColor(cellBg) {
+		return src
+	}
+	*dst = *src
+	if !isNilColor(cellFg) {
+		dst.Style.Fg = memo.mix(cellFg, bg, t)
+	}
+	if !isNilColor(cellBg) {
 		dst.Style.Bg = memo.mix(cellBg, bg, t)
 	}
 	return dst

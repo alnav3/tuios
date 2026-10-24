@@ -2,7 +2,9 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"maps"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Gaurav-Gosain/tuios/internal/atomicfile"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
 )
@@ -38,18 +41,11 @@ func appliedGrantsPath() string {
 
 // recordAppliedGrants writes the default now in force.
 func (d *Daemon) recordAppliedGrants(r config.ResolvedPermissions) {
-	path := appliedGrantsPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return
-	}
 	data, err := json.Marshal(appliedGrants{Strict: r.Strict, Grants: r.Grants})
 	if err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) == nil {
-		_ = os.Rename(tmp, path)
-	}
+	_ = atomicfile.WritePrivate(appliedGrantsPath(), data, false)
 }
 
 // inForce is the default the grant table holds now, as a config value.
@@ -91,7 +87,7 @@ const (
 )
 
 // configWaitsNote is the summary of the configWaitsNotice item.
-const configWaitsNote = "Run tuios config apply in a terminal outside tuios. The change gives panes or other machines more, so it waits for you."
+const configWaitsNote = "Run tuios config apply in a terminal outside tuios. The change gives panes, other machines or a notification address more, so it waits for you."
 
 // closeConfigNotice closes the Inbox item about config.toml named name.
 func (a *attentionStore) closeConfigNotice(name string) {
@@ -138,18 +134,26 @@ func (d *Daemon) verbApplyConfig(cs *connState, params json.RawMessage) (any, *v
 	if d.configPath == "" {
 		return nil, newVerbError(ErrVerbCommandFailed, "this daemon reads no config file")
 	}
-	data, err := os.ReadFile(d.configPath)
-	if err != nil && !os.IsNotExist(err) {
+	var lc *config.LayeredConfig
+	var data []byte
+	lc, err := config.LoadLayered(d.configPath)
+	switch {
+	case err == nil:
+		if data, err = lc.Bytes(); err != nil {
+			return nil, newVerbError(ErrVerbCommandFailed, "config.toml could not be read: "+err.Error())
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		lc = nil
+	default:
 		return nil, newVerbError(ErrVerbCommandFailed, "config.toml could not be read: "+err.Error())
 	}
 	cfg, err := config.ParseUserConfig(data)
 	if err != nil {
 		return nil, newVerbError(ErrVerbCommandFailed, "config.toml has an error, so nothing was applied: "+err.Error())
 	}
-	if v := config.ValidateConfig(cfg); v.HasErrors() {
-		first := v.Errors[0]
-		return nil, newVerbError(ErrVerbCommandFailed, "config.toml has an error, so nothing was applied: ["+first.Field+"] "+first.Key+": "+first.Message)
-	}
+	// A key tuios cannot read is dropped, the same as on load, and the
+	// person is told which.
+	dropped := config.DroppedWarnings(config.DropUnreadableKeys(cfg, lc))
 
 	before := d.configSnapshot()
 	if p.Host != "" {
@@ -167,6 +171,7 @@ func (d *Daemon) verbApplyConfig(cs *connState, params json.RawMessage) (any, *v
 		"default_grants": after.grants,
 		"changes":        describeConfigChanges(before, after),
 		"still_waiting":  d.configWaiting(),
+		"dropped_keys":   dropped,
 	}
 	if p.Host != "" {
 		out["host"] = p.Host
@@ -265,14 +270,20 @@ func describeConfigChanges(before, after configSnapshot) []string {
 			peer = ""
 		}
 		was, now := config.LinkPolicyFor(before.links, peer), config.LinkPolicyFor(after.links, peer)
-		if slices.Equal(was.Allow, now.Allow) && was.HoldMail == now.HoldMail && was.HostedGrace == now.HostedGrace {
+		sameRoots := slices.Equal(linkRootPaths(was), linkRootPaths(now))
+		if slices.Equal(was.Allow, now.Allow) && was.HoldMail == now.HoldMail && was.HostedGrace == now.HostedGrace && sameRoots {
 			continue
 		}
 		who := "Machine " + k
 		if peer == "" {
 			who = "A machine with no table of its own"
 		}
-		out = append(out, fmt.Sprintf("%s may now do %s here. Before: %s.", who, grantWords(now.Allow), grantWords(was.Allow)))
+		if !slices.Equal(was.Allow, now.Allow) || was.HoldMail != now.HoldMail || was.HostedGrace != now.HostedGrace {
+			out = append(out, fmt.Sprintf("%s may now do %s here. Before: %s.", who, grantWords(now.Allow), grantWords(was.Allow)))
+		}
+		if !sameRoots {
+			out = append(out, fmt.Sprintf("%s may now write files in %s here. Before: %s.", who, grantWords(linkRootPaths(now)), grantWords(linkRootPaths(was))))
+		}
 	}
 	return out
 }

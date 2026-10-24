@@ -157,8 +157,9 @@ func startPacedGuest(t *testing.T, transport string) (base string, first *pacing
 }
 
 // guestFrames is how many frames the guest has written. The guest rewrites
-// the file for every frame, so a read can land between the truncate and the
-// write and find it empty: such a read is tried again.
+// the file for every frame through a rename, so a read never finds it empty.
+// A file that cannot be parsed is tried again, and a count of 0 means only that
+// no frame was written yet.
 func guestFrames(count string) int {
 	for range 100 {
 		b, err := os.ReadFile(count)
@@ -223,7 +224,7 @@ func pacingLog(t *testing.T, base string) []string {
 		t.Fatalf("tuios logs: %v: %s", err, out)
 	}
 	var lines []string
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		if strings.Contains(l, "output pacing") {
 			lines = append(lines, strings.TrimSpace(l))
 		}
@@ -428,7 +429,7 @@ var base64Run = regexp.MustCompile(`[A-Za-z0-9+/]{48,}`)
 // five of them.
 func base64Rows(screen string) []string {
 	var out []string
-	for _, line := range strings.Split(screen, "\n") {
+	for line := range strings.SplitSeq(screen, "\n") {
 		if base64Run.MatchString(line) {
 			out = append(out, fmt.Sprintf("  %.100s", line))
 			if len(out) == 5 {

@@ -1,9 +1,10 @@
 package risk
 
 import (
-	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/Gaurav-Gosain/tuios/internal/lazyre"
 )
 
 // Names of the shipped rules, as the Inbox shows them.
@@ -21,13 +22,14 @@ const (
 	RuleInfrastructure  = "infrastructure"
 	RuleOutsideWorktree = "outside the worktree"
 	// RuleCutShort is not a rule of its own: the daemon marks an approval
-	// with it when the only line it has for the call was cut short, so the
-	// rules could not read the rest. See CutShortHit.
+	// with it when the only line it has for the call does not show all of
+	// it (clipped, redacted, or only part of a dialog), so the rules could
+	// not read the rest. See CutShortHit.
 	RuleCutShort = "cut short"
 )
 
 // CutShortHit is the mark for a call whose line was cut short.
-var CutShortHit = Hit{Rule: RuleCutShort, Why: "the line was too long to read whole, so a risky part may be hidden"}
+var CutShortHit = Hit{Rule: RuleCutShort, Why: "the line does not show the whole call, so a risky part may be hidden"}
 
 // Why is what a shipped rule, or the cut short mark, guards against.
 func Why(name string) (string, bool) {
@@ -210,7 +212,7 @@ func baseName(p string) string {
 }
 
 // diskDevice matches a whole-disk device path.
-var diskDevice = regexp.MustCompile(`^/dev/(sd[a-z]|nvme\d|disk\d|rdisk\d|hd[a-z]|vd[a-z]|xvd[a-z]|mmcblk\d)`)
+var diskDevice = lazyre.New(`^/dev/(sd[a-z]|nvme\d|disk\d|rdisk\d|hd[a-z]|vd[a-z]|xvd[a-z]|mmcblk\d)`)
 
 func disk(c command, _ Call) bool {
 	name := c.name()
@@ -224,7 +226,7 @@ func disk(c command, _ Call) bool {
 			}
 		}
 	}
-	return slices.ContainsFunc(c.writes, diskDevice.MatchString)
+	return slices.ContainsFunc(c.writes, diskDevice().MatchString)
 }
 
 func widePermissions(c command, call Call) bool {
@@ -252,10 +254,10 @@ func widePermissions(c command, call Call) bool {
 }
 
 // dropTable matches the SQL that removes or empties a table.
-var dropTable = regexp.MustCompile(`(?i)\bDROP\s+(TABLE|DATABASE|SCHEMA)\b|\bTRUNCATE\s+(TABLE\b|[A-Za-z_"` + "`" + `])`)
+var dropTable = lazyre.New(`(?i)\bDROP\s+(TABLE|DATABASE|SCHEMA)\b|\bTRUNCATE\s+(TABLE\b|[A-Za-z_"` + "`" + `])`)
 
 func database(c command, _ Call) bool {
-	return dropTable.MatchString(c.raw)
+	return dropTable().MatchString(c.raw)
 }
 
 func infrastructure(c command, _ Call) bool {
@@ -280,9 +282,6 @@ func infrastructure(c command, _ Call) bool {
 // writesOutside is the outside-the-worktree rule for a command: a redirect,
 // or a program that writes the files it names, pointing outside the root.
 func writesOutside(c command, call Call) bool {
-	if call.Root == "" {
-		return false
-	}
 	for _, w := range c.writes {
 		if outside(w, call) {
 			return true
@@ -291,7 +290,32 @@ func writesOutside(c command, call Call) bool {
 	args := c.args()
 	ops := operands(args)
 	switch c.name() {
+	case "curl":
+		if anyOutside(flagValues(args, "o", "--output"), call) {
+			return true
+		}
+	case "wget":
+		if anyOutside(flagValues(args, "O", "--output-document"), call) || anyOutside(flagValues(args, "P", "--directory-prefix"), call) {
+			return true
+		}
+	case "tar":
+		short, long := flags(args)
+		if (strings.Contains(short, "x") || slices.Contains(long, "--extract") || slices.Contains(long, "--get")) &&
+			anyOutside(flagValues(args, "C", "--directory"), call) {
+			return true
+		}
+	case "git":
+		// git clone <repository> <folder>: the folder is written.
+		if len(ops) >= 3 && ops[0] == "clone" {
+			dir := ops[len(ops)-1]
+			if !strings.Contains(dir, "://") && !strings.Contains(dir, "@") && outside(dir, call) {
+				return true
+			}
+		}
 	case "cp", "mv", "ln", "install", "rsync":
+		if anyOutside(flagValues(args, "", "--target-directory"), call) {
+			return true
+		}
 		// The destination is the last operand.
 		if len(ops) >= 2 && outside(ops[len(ops)-1], call) {
 			return true
@@ -320,4 +344,43 @@ func writesOutside(c command, call Call) bool {
 		}
 	}
 	return false
+}
+
+// anyOutside reports whether any of paths is outside the root.
+func anyOutside(paths []string, call Call) bool {
+	return slices.ContainsFunc(paths, func(p string) bool { return outside(p, call) })
+}
+
+// flagValues are the values given to a flag that takes one: -o X, -oX (short
+// is the letter, "" for none), --output X and --output=X (long).
+func flagValues(args []string, short, long string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return out
+		case long != "" && a == long:
+			if i+1 < len(args) {
+				out = append(out, args[i+1])
+				i++
+			}
+		case long != "" && strings.HasPrefix(a, long+"="):
+			out = append(out, strings.TrimPrefix(a, long+"="))
+		case short != "" && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && len(a) > 1:
+			// The letter may close a bundle (-xzC dir) or carry its value
+			// (-oFILE).
+			j := strings.Index(a[1:], short)
+			if j < 0 {
+				continue
+			}
+			if rest := a[1+j+1:]; rest != "" {
+				out = append(out, rest)
+			} else if i+1 < len(args) {
+				out = append(out, args[i+1])
+				i++
+			}
+		}
+	}
+	return out
 }

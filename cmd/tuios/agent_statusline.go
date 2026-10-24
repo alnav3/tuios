@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/atomicfile"
 	"github.com/Gaurav-Gosain/tuios/internal/integration"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/spf13/cobra"
@@ -92,7 +94,7 @@ the assistant message's model and cost.
 
 It prints nothing of its own, so a Claude Code status line of only this is
 empty. --then runs your own status line command with the same stdin and
-prints its output unchanged, exiting with its status; that is how a status
+prints its output unchanged, exiting with its status. That is how a status
 line of your own is kept.
 
 Every field is optional: a field the payload does not have is not written.
@@ -151,7 +153,7 @@ goes wrong on the tuios side.`,
 	cmd.Flags().BoolVar(&o.explain, "explain", false, "Print what was decided and why to stderr")
 	cmd.Flags().BoolVar(&o.turnEnd, "turn-end", false, "The turn just ended: send changed values now, whatever the interval")
 	cmd.Flags().DurationVar(&o.timeout, "timeout", agentStatusLineDeadline, "Give up on the daemon after this long")
-	cmd.Flags().IntVar(&o.integration, "integration", 0, "Version marker of a managed entry; ignored")
+	cmd.Flags().IntVar(&o.integration, "integration", 0, "Version marker of a managed entry. tuios ignores it")
 	_ = cmd.Flags().MarkHidden("integration")
 	return cmd
 }
@@ -249,7 +251,7 @@ func reportStatusLine(o agentStatusLineOptions, harness string, payload []byte, 
 			stampDir = dir
 		}
 	}
-	out.Session = firstNonEmptyString(o.session, getenv("TUIOS_SESSION"))
+	out.Session = cmp.Or(o.session, getenv("TUIOS_SESSION"))
 	switch {
 	case o.window != "":
 		out.Window, out.PaneBy = o.window, "flag"
@@ -548,18 +550,7 @@ func saveStatusLineStamp(path string, st statusLineStamp) {
 	if err != nil {
 		return
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".statusline-*")
-	if err != nil {
-		return
-	}
-	name := tmp.Name()
-	defer func() { _ = os.Remove(name) }()
-	_, werr := tmp.Write(data)
-	cerr := tmp.Close()
-	if werr != nil || cerr != nil || os.Chmod(name, 0o600) != nil {
-		return
-	}
-	_ = os.Rename(name, path)
+	_ = atomicfile.Write(path, data, 0o600, false)
 }
 
 // runStatusLineThen runs the person's status line command through the shell,

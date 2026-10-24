@@ -81,11 +81,11 @@ func (s *Session) holdQuieterState(windowID string, next, current AgentState, so
 // scheduleHoldSettleLocked arms the one-shot that publishes the earliest hold
 // once its window elapses. Called with agentHoldMu held.
 //
-// The hold has to carry its own backstop. It used to rely on the stall monitor
-// calling settleAgentHolds on its tick, which meant turning the silence timer
-// off also stopped anything from ever publishing a held state: a harness that
-// cleared its progress bar once and then went quiet stayed working forever. A
-// timer belonging to the hold cannot be switched off by an unrelated setting.
+// The hold has to carry its own backstop. Relying on the stall monitor calling
+// settleAgentHolds on its tick would mean turning the silence timer off also
+// stops anything from ever publishing a held state: a harness that clears its
+// progress bar once and then goes quiet would stay working forever. A timer
+// belonging to the hold cannot be switched off by an unrelated setting.
 //
 // A pending timer is left alone rather than re-armed. Holds are recorded with
 // since = now, so the earliest deadline never moves closer, and a timer that
@@ -147,6 +147,14 @@ func (s *Session) settleAgentHolds(now time.Time) int {
 
 	settled := 0
 	for _, d := range due {
+		// A hold is its source speaking late, so it needs what the source
+		// needed when it spoke: an agent in the pane. An agent that cleared its
+		// progress bar and exited inside the window has had its pane cleared at
+		// the shell by now, and publishing the clear would bring the pane back
+		// to idle with no agent in it.
+		if _, exists, agentPane := s.progressTarget(d.window); !exists || !agentPane {
+			continue
+		}
 		if _, applied, err := s.ApplyAgentReport(d.window, AgentReport{State: d.hold.state, Source: d.hold.source}); err == nil && applied {
 			settled++
 		}

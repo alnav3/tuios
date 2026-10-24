@@ -41,11 +41,19 @@ const paletteStateHint = 2
 // paletteFooter is the palette's footer for this client: the "@ state" hint
 // waits until an agent has been seen, since the filter it announces lists
 // agent panes and there are none. Typing "@" works either way.
+//
+// A "#" search also shows the rebind key, after "run", since the rows it lists
+// are actions and the key does nothing on any other row. It is spelt "^e", the
+// way the keybind manager's footer spells its keys.
 func (m *OS) paletteFooter() []overlay.Hint {
-	if m.agentsSeen() {
-		return paletteHints
+	hints := paletteHints
+	if !m.agentsSeen() {
+		hints = slices.Delete(slices.Clone(hints), paletteStateHint, paletteStateHint+1)
 	}
-	return slices.Delete(slices.Clone(paletteHints), paletteStateHint, paletteStateHint+1)
+	if keybinds, _ := splitPaletteKeybinds(m.CommandPaletteQuery); keybinds && !m.fileSearch {
+		hints = slices.Insert(slices.Clone(hints), paletteStateHint, overlay.Hint{Key: overlay.ShortKey(PaletteRebindKey), Label: "rebind"})
+	}
+	return hints
 }
 
 // paletteLayout returns the palette's fitted inner width and visible row count.
@@ -274,7 +282,7 @@ func paletteRow(item CommandPaletteItem, selected bool, pal overlay.Palette, wid
 	}
 	name := overlay.Truncate(printableTitle(item.Name), max(width-2-rightW-1, 1))
 	left := overlay.Style(bg).Foreground(theme.Readable(pal.Accent, bg)).Bold(true).Render(marker) +
-		paletteRowName(name, item.AgentState, item.AgentSeen, item.Match, bg, nameColor, selected, pal)
+		paletteRowName(name, item.AgentState, item.AgentSeen, item.AgentSubagents, item.Match, bg, nameColor, selected, pal)
 
 	gap := max(width-lipgloss.Width(left)-rightW, 1)
 	return left + overlay.Style(bg).Render(strings.Repeat(" ", gap)) + right
@@ -286,9 +294,9 @@ func paletteRow(item CommandPaletteItem, selected bool, pal overlay.Palette, wid
 //
 // match holds offsets into the untruncated name, so any that fall past the
 // truncation simply never come up.
-func paletteRowName(name, agentState string, doneSeen bool, match []int, bg, nameColor color.Color, selected bool, pal overlay.Palette) string {
+func paletteRowName(name, agentState string, doneSeen bool, running int, match []int, bg, nameColor color.Color, selected bool, pal overlay.Palette) string {
 	nameStyle := overlay.Style(bg).Foreground(nameColor).Bold(selected)
-	glyph, glyphColor := agentMark(agentState, doneSeen, pal)
+	glyph, glyphColor := agentMark(agentState, doneSeen, running, pal)
 	glyphAt := -1
 	if glyph != "" {
 		glyphAt = strings.Index(name, glyph)

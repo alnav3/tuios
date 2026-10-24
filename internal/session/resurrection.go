@@ -8,22 +8,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/atomicfile"
 	"github.com/adrg/xdg"
 )
 
 const (
 	resurrectionDir = "tuios/sessions"
-	// resurrectionInterval is how often a session is saved regardless of whether
-	// anything changed, which is what keeps each window's captured working
+	// resurrectionInterval is the longest a session whose panes printed waits
+	// to be saved, which is what keeps each window's captured working
 	// directory current: a user typing cd changes no session structure.
 	resurrectionInterval = 30 * time.Second
-	// resurrectionDirtyInterval is how often the saver looks for a structural
-	// change, and so the most a SIGKILL can cost. It is a poll of a flag, not a
-	// write: a tick that finds nothing changed does nothing at all.
+	// resurrectionDirtyInterval is the longest a structural change waits to be
+	// saved, and so the most a SIGKILL can cost.
 	resurrectionDirtyInterval = 2 * time.Second
 
 	// ResurrectionVersion is the current on-disk resurrection schema version.
@@ -54,13 +55,6 @@ const (
 // running while a test sets or restores it.
 var resurrectionDirOverride atomic.Value // string
 
-// setResurrectionDirOverride redirects resurrection state, and returns the value
-// it replaced. Test-only.
-func setResurrectionDirOverride(dir string) string {
-	prev, _ := resurrectionDirOverride.Swap(dir).(string)
-	return prev
-}
-
 // getResurrectionDir returns the directory for session resurrection files.
 func getResurrectionDir() string {
 	if override, _ := resurrectionDirOverride.Load().(string); override != "" {
@@ -69,11 +63,32 @@ func getResurrectionDir() string {
 	return filepath.Join(xdg.StateHome, resurrectionDir)
 }
 
-// getResurrectionPath returns the path for a specific session's resurrection file.
-// Callers are responsible for having validated the name (see ValidateSessionName);
-// this is a plain join and cannot defend itself.
-func getResurrectionPath(sessionName string) string {
-	return filepath.Join(getResurrectionDir(), sessionName+".json")
+// getResurrectionPath returns the path for a specific session's resurrection
+// file. Callers still validate a name they are given (see
+// ValidateSessionName), but the join refuses a name that would leave the state
+// folder on its own: a session name reaches here from another machine too
+// (MsgResurrect over a link), and filepath.Join cleans "..".
+func getResurrectionPath(sessionName string) (string, error) {
+	return stateJoin(getResurrectionDir(), sessionName, ".json")
+}
+
+// stateJoin is dir/name+suffix, for a name that is one path element. Any
+// other name is an error, so a session name or a window id can never name a
+// file outside the state folder it is joined to.
+//
+// Windows drops the dots and spaces at the end of a path element, so "..." is
+// the folder itself there and "foo." is "foo", and "con" is a device. Such a
+// name is refused too.
+func stateJoin(dir, name, suffix string) (string, error) {
+	if name == "" || strings.Trim(name, ".") == "" || strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") ||
+		strings.ContainsAny(name, "/\\\x00") || (runtime.GOOS == "windows" && windowsDeviceName(name)) {
+		return "", fmt.Errorf("the name %q cannot name a saved state file", name)
+	}
+	path := filepath.Join(dir, name+suffix)
+	if filepath.Dir(path) != filepath.Clean(dir) {
+		return "", fmt.Errorf("the name %q cannot name a saved state file", name)
+	}
+	return path, nil
 }
 
 // ValidateSessionName rejects a name a session could never be saved under. The
@@ -90,16 +105,41 @@ func ValidateSessionName(name string) error {
 	if strings.TrimSpace(name) != name {
 		return fmt.Errorf("session name %q has leading or trailing whitespace", name)
 	}
-	if name == "." || name == ".." {
-		return fmt.Errorf("session name %q is reserved", name)
+	if strings.Trim(name, ".") == "" {
+		return fmt.Errorf("session name %q is reserved. Use a name with a letter or a digit", name)
 	}
 	if strings.ContainsAny(name, `/\`) {
-		return fmt.Errorf("session name %q contains a path separator; a session name is also the name of its state file", name)
+		return fmt.Errorf("session name %q contains a path separator. A session name is also the name of its state file", name)
+	}
+	// Windows drops a dot at the end of a file name, so "foo." and "foo"
+	// would share one state folder there. The rule holds on every system, so
+	// a saved session keeps its name when it moves to another machine.
+	if strings.HasSuffix(name, ".") {
+		return fmt.Errorf("session name %q ends in a dot. Remove the dot", name)
+	}
+	if windowsDeviceName(name) {
+		return fmt.Errorf("session name %q is a device name on Windows. Use a different name", name)
 	}
 	if strings.ContainsFunc(name, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return fmt.Errorf("session name %q contains a control character", name)
 	}
 	return nil
+}
+
+// windowsDeviceName reports whether Windows opens a file of this name as a
+// device: CON, PRN, AUX, NUL, COM1 to COM9 and LPT1 to LPT9, in any case, also
+// with an extension ("nul.txt").
+func windowsDeviceName(name string) bool {
+	base, _, _ := strings.Cut(name, ".")
+	base = strings.ToUpper(strings.TrimRight(base, " "))
+	switch base {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) {
+		return base[3] >= '1' && base[3] <= '9'
+	}
+	return false
 }
 
 // ResurrectionStateDir returns the directory holding saved session state, so a
@@ -152,6 +192,10 @@ func archivedNote(dest string) string {
 // directory's growth.
 const archiveRetention = 14 * 24 * time.Hour
 
+// staleTempAge is how old a leftover temporary file must be before a sweep
+// removes it from a folder where a write may still be in flight.
+const staleTempAge = 10 * time.Minute
+
 // CleanResurrectionDir removes what the save and archive paths leave behind:
 // temp files from writes that died before their rename, and archived state past
 // archiveRetention. Neither had anything cleaning it, so both grew forever.
@@ -166,8 +210,9 @@ func CleanResurrectionDir() {
 	}
 	for _, entry := range entries {
 		// A completed write renames the temp file into place, so one still sitting
-		// here is the residue of a write that never finished.
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json.tmp") {
+		// here is the residue of a write that never finished. The name ends in
+		// .tmp, from atomicfile or, before it, a fixed <name>.json.tmp.
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
@@ -176,6 +221,16 @@ func CleanResurrectionDir() {
 	}
 
 	cleanOrphanHistory()
+
+	// The other state folders are written through atomicfile too. A file
+	// there is only swept once it is old, since nothing here says no write is
+	// in flight in them.
+	for _, d := range []string{
+		filepath.Dir(outboxPath()), filepath.Dir(attentionPath()),
+		filepath.Dir(reviewNotesPath()), filepath.Dir(appliedGrantsPath()), pushDir(),
+	} {
+		atomicfile.SweepStale(d, staleTempAge)
+	}
 
 	archiveDir := ResurrectionArchiveDir()
 	archived, err := os.ReadDir(archiveDir)
@@ -218,15 +273,12 @@ func SaveSessionForResurrection(state *SessionState) error {
 		return fmt.Errorf("failed to marshal session state: %w", err)
 	}
 
-	path := getResurrectionPath(state.Name)
-	// Write to temp file then rename for atomicity
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
-		return fmt.Errorf("failed to write resurrection file: %w", err)
+	path, err := getResurrectionPath(state.Name)
+	if err != nil {
+		return err
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("failed to rename resurrection file: %w", err)
+	if err := atomicfile.Write(path, data, 0o600, false); err != nil {
+		return fmt.Errorf("failed to write resurrection file: %w", err)
 	}
 
 	return nil
@@ -236,7 +288,10 @@ func SaveSessionForResurrection(state *SessionState) error {
 // version-incompatible files are archived (not deleted) and returned as an
 // error, so a single bad file can never crash the daemon or block startup.
 func LoadResurrectionState(sessionName string) (*SessionState, error) {
-	path := getResurrectionPath(sessionName)
+	path, err := getResurrectionPath(sessionName)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path) // #nosec G304
 	if err != nil {
 		return nil, fmt.Errorf("no resurrection data for session %q: %w", sessionName, err)
@@ -263,6 +318,7 @@ type ResurrectableInfo struct {
 	Name        string    // Session name
 	WindowCount int       // Number of windows saved
 	SavedAt     time.Time // Modification time of the state file
+	Space       string    // The space the session was filed under, or empty
 }
 
 // ListResurrectableInfos returns metadata for every resurrectable session,
@@ -279,9 +335,11 @@ func ListResurrectableInfos() ([]ResurrectableInfo, error) {
 		if err != nil {
 			continue
 		}
-		info := ResurrectableInfo{Name: name, WindowCount: len(state.Windows)}
-		if fi, statErr := os.Stat(getResurrectionPath(name)); statErr == nil {
-			info.SavedAt = fi.ModTime()
+		info := ResurrectableInfo{Name: name, WindowCount: len(state.Windows), Space: state.Space}
+		if path, err := getResurrectionPath(name); err == nil {
+			if fi, statErr := os.Stat(path); statErr == nil {
+				info.SavedAt = fi.ModTime()
+			}
 		}
 		infos = append(infos, info)
 	}
@@ -313,49 +371,100 @@ func ListResurrectableSessions() ([]string, error) {
 // RemoveResurrectionState deletes the resurrection file for a session, and
 // its saved pane history.
 func RemoveResurrectionState(sessionName string) {
-	path := getResurrectionPath(sessionName)
+	path, err := getResurrectionPath(sessionName)
+	if err != nil {
+		return
+	}
 	_ = os.Remove(path)
 	// The session's pane history goes with it. It is only ever read back into
 	// a restore of this state, and it holds whatever the panes printed.
 	RemoveHistory(sessionName)
 }
 
-// StartPeriodicSave starts a goroutine that saves session state, and returns a
-// stop function to halt it.
+// startPeriodicSaveWith starts a goroutine that saves session state with the
+// write it is given, and returns a stop function to halt it. A session
+// passes its own write, which drops a snapshot taken under a name the session
+// has since been renamed from (see Session.persist).
 //
-// takeDirty reports whether the session's structure changed since the last save
-// and clears the mark; nil means every tick is a full save. It is what makes the
-// SIGKILL window small without making the saves frequent: the ticker runs at the
-// short interval but a tick that finds nothing changed does no work, so an idle
-// session still writes only once per resurrectionInterval (which is what keeps
-// each shell's working directory current) and a changed one reaches disk within
-// a couple of seconds. Before this, a session created less than a full interval
-// before a SIGKILL was lost entirely, which is the worst case there is: it is the
-// session the user just made.
-func StartPeriodicSave(getState func() *SessionState, takeDirty func() bool) func() {
-	return startPeriodicSaveWith(getState, takeDirty, SaveSessionForResurrection)
-}
-
-// startPeriodicSaveWith is StartPeriodicSave with the write it makes. A session
-// passes its own, which drops a snapshot taken under a name the session has
-// since been renamed from (see Session.persist).
-func startPeriodicSaveWith(getState func() *SessionState, takeDirty func() bool, save func(*SessionState) error) func() {
+// The saver sleeps until one of two latches wakes it, and arms no timer at all
+// while a session sits idle:
+//
+//   - dirty: the session's structure changed. The state reaches disk within
+//     resurrectionDirtyInterval, which is the most a SIGKILL can cost. Before
+//     this, a session created less than a full interval before a SIGKILL was
+//     lost entirely, and that is the session the user just made.
+//   - stale: a pane printed, or the person used the session. That can move what
+//     a save reads without changing the structure: a shell's working directory
+//     after a cd, a pane's history, the last-used time. The state reaches disk
+//     at most resurrectionInterval after the save before it.
+//
+// An idle session used to wake the saver every resurrectionDirtyInterval to
+// read the dirty flag, and write the same state every resurrectionInterval.
+// Nothing an idle session holds changes without one of the latches going up,
+// so both are gone: a pane that prints nothing costs the saver nothing.
+//
+// wakes, when not nil, counts the timer's fires, for the idle budget test.
+//
+// The first look comes resurrectionDirtyInterval after the start, as the old
+// ticker's did, so a session made dirty before its saver ran is written.
+func startPeriodicSaveWith(getState func() *SessionState, dirty, stale *wakeLatch, wakes *atomic.Int64, save func(*SessionState) error) func() {
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
 
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(resurrectionDirtyInterval)
-		defer ticker.Stop()
-		lastSave := time.Now()
+		start := time.Now()
+		lastSave := start
+		due := start.Add(resurrectionDirtyInterval)
+		timer := time.NewTimer(resurrectionDirtyInterval)
+		armed := true
+		defer timer.Stop()
+		// arm sets the timer for at, unless it is already set for earlier.
+		arm := func(at time.Time) {
+			if armed && !at.Before(due) {
+				return
+			}
+			due, armed = at, true
+			timer.Reset(time.Until(at))
+		}
+		// staleDue is when a stale session is next written.
+		staleDue := func(now time.Time) time.Time {
+			at := lastSave.Add(resurrectionInterval)
+			if soon := now.Add(resurrectionDirtyInterval); at.Before(soon) {
+				return soon
+			}
+			return at
+		}
 
 		for {
 			select {
-			case now := <-ticker.C:
-				dirty := takeDirty == nil || takeDirty()
-				if !dirty && now.Sub(lastSave) < resurrectionInterval {
+			case <-dirty.C():
+				// The token can outlive the flag: the save that took the
+				// flag ran before this token was read.
+				if dirty.Up() {
+					arm(time.Now().Add(resurrectionDirtyInterval))
+				}
+			case <-stale.C():
+				// The flag stays up until a save takes it, so a pane that keeps
+				// printing costs one atomic load per chunk and no wakeup.
+				if stale.Up() {
+					arm(staleDue(time.Now()))
+				}
+			case now := <-timer.C:
+				armed = false
+				if wakes != nil {
+					wakes.Add(1)
+				}
+				isDirty := dirty.Take()
+				if !isDirty && !(stale.Up() && now.Sub(lastSave) >= resurrectionInterval) {
+					if stale.Up() {
+						arm(staleDue(now))
+					}
 					continue
 				}
+				// Lowered before the snapshot, so a change made while it is
+				// taken raises the flag again and is written next time.
+				stale.Take()
 				lastSave = now
 				state := getState()
 				if state == nil {
@@ -363,6 +472,9 @@ func startPeriodicSaveWith(getState func() *SessionState, takeDirty func() bool,
 				}
 				if err := save(state); err != nil {
 					LogError("Resurrection save for session %q failed: %v", state.Name, err)
+					// Try again within resurrectionInterval, as the old
+					// blind tick did: an idle session raises nothing else.
+					stale.Set()
 				}
 			case <-stopCh:
 				return
@@ -371,8 +483,8 @@ func startPeriodicSaveWith(getState func() *SessionState, takeDirty func() bool,
 	}()
 
 	// Waits for the saver to return. Session.Stop stops saving and then writes
-	// the state itself, and both writes go through the same fixed <name>.json.tmp
-	// path, so a stop that did not wait let the two interleave on it.
+	// the state itself, so a stop that did not wait could let the saver's
+	// older snapshot land after it.
 	return func() {
 		close(stopCh)
 		<-done

@@ -14,11 +14,16 @@ func handleSettingsInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if o.SettingsSearchOpen() {
 		return handleSettingsSearchInput(msg, o)
 	}
-	if listKey(msg.String(), true, o.SettingsPageRows(), o.SettingsMove) {
+	if listKey(o, msg.String(), true, o.SettingsPageRows(), o.SettingsMove) {
 		return o, nil
 	}
 	switch msg.String() {
-	case "esc", "q", "ctrl+c":
+	case "esc", "q":
+		// Esc leaves the Agents tab's action rows before it closes the page.
+		if !o.SettingsBack() {
+			o.CloseSettings()
+		}
+	case "ctrl+c":
 		o.CloseSettings()
 	case "left", "h":
 		return o, o.SettingsAdjust(-1)
@@ -73,7 +78,7 @@ func startsSettingsSearch(msg tea.KeyPressMsg) bool {
 // where it was; the next esc closes the panel.
 func handleSettingsSearchInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	key := msg.String()
-	if listKey(key, false, o.SettingsPageRows(), o.SettingsMove) {
+	if listKey(o, key, false, o.SettingsPageRows(), o.SettingsMove) {
 		return o, nil
 	}
 	switch key {

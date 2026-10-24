@@ -33,6 +33,11 @@ func fakeFan(t *testing.T, d *Daemon, c *verbConn, repo, stem string, n int, lau
 		info := sess.Worktree()
 		info.Group = stem
 		info.LaunchedFrom = launchedFrom
+		// A lead that is a session now is named by its ID, as fan records
+		// it. One that is not leaves a record from before the ID.
+		if lead := d.manager.GetSession(launchedFrom); lead != nil {
+			info.LaunchedFromID = lead.ID
+		}
 		info.Agent = "claude"
 		if err := sess.SetWorktree(info); err != nil {
 			t.Fatal(err)
@@ -111,7 +116,7 @@ func TestFanVerbsReachOnlyTheSiblingsThePaneReaches(t *testing.T) {
 	stray := newWorktreeCall(t, c, repo, "fan/retry-3", map[string]any{"base": "main"})["session"].(string)
 	sess := d.manager.GetSession(stray)
 	info := sess.Worktree()
-	info.Group, info.LaunchedFrom = "fan/retry", "other"
+	info.Group, info.LaunchedFrom, info.LaunchedFromID = "fan/retry", "other", d.manager.GetSession("other").ID
 	_ = sess.SetWorktree(info)
 
 	setStrict(d, "read", "fan")
@@ -168,7 +173,7 @@ func TestCompareFanRefusalNamesOnlyFansThePaneReaches(t *testing.T) {
 	solo := newWorktreeCall(t, c, repo, "solo", nil)["session"].(string)
 	sess := d.manager.GetSession(solo)
 	info := sess.Worktree()
-	info.LaunchedFrom = "lead"
+	info.LaunchedFrom, info.LaunchedFromID = "lead", caller.ID
 	if err := sess.SetWorktree(info); err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +238,7 @@ func TestFanRowChangesRunsEveryGitCallUnderTheBound(t *testing.T) {
 		info := *wt
 		info.Base = base
 		var row fanCompareRow
-		fanRowChanges(ctx, &row, &info)
+		fanRowChanges(ctx, &row, &info, 0)
 		if row.BaseSHA != "" || row.Files != nil || row.Ahead != nil || row.Dirty != nil {
 			t.Errorf("base %q: a row past its bound ran git: %+v", base, row)
 		}

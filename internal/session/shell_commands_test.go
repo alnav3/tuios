@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // TestShellTrackFollowsMarks walks the state machine through the marks the
@@ -27,6 +27,7 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 		marks      []vt.SemanticMarker
 		wantEvents []string
 		wantPrompt bool
+		wantReady  bool
 		wantSeq    uint64
 		wantExit   *int
 		wantLast   string
@@ -36,14 +37,43 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), mark(vt.MarkerCommandStart)},
 			wantEvents: []string{EventPrompt},
 			wantPrompt: true,
+			wantReady:  true,
+		},
+		{
+			name:       "A-only prompt is ready",
+			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart)},
+			wantEvents: []string{EventPrompt},
+			wantPrompt: true,
+			wantReady:  true,
+		},
+		{
+			name:       "input ready without an A mark",
+			marks:      []vt.SemanticMarker{mark(vt.MarkerCommandStart)},
+			wantEvents: []string{EventPrompt},
+			wantPrompt: true,
+			wantReady:  true,
+		},
+		{
+			name:       "a redrawn prompt is ready",
+			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), mark(vt.MarkerCommandStart), mark(vt.MarkerPromptStart)},
+			wantEvents: []string{EventPrompt},
+			wantPrompt: true,
+			wantReady:  true,
+		},
+		{
+			name:       "D before an empty prompt clears readiness",
+			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), mark(vt.MarkerCommandStart), done(0)},
+			wantEvents: []string{EventPrompt},
+			wantPrompt: true,
 		},
 		{
 			name:       "a command that fails",
 			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), cmd("make test"), done(2), mark(vt.MarkerPromptStart)},
 			wantEvents: []string{EventPrompt, EventCommandStarted, EventCommandFinished, EventPrompt},
 			wantPrompt: true,
+			wantReady:  true,
 			wantSeq:    1,
-			wantExit:   intPtr(2),
+			wantExit:   new(2),
 			wantLast:   "make test",
 		},
 		{
@@ -51,18 +81,20 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), done(0), mark(vt.MarkerPromptStart)},
 			wantEvents: []string{EventPrompt},
 			wantPrompt: true,
+			wantReady:  true,
 		},
 		{
 			name:       "a prompt with no D ends the command with no status",
 			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), cmd("sleep 9"), mark(vt.MarkerPromptStart)},
 			wantEvents: []string{EventPrompt, EventCommandStarted, EventCommandFinished, EventPrompt},
 			wantPrompt: true,
+			wantReady:  true,
 			wantSeq:    1,
 			wantLast:   "sleep 9",
 		},
 		{
 			name:       "running is not at a prompt",
-			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), cmd("vim")},
+			marks:      []vt.SemanticMarker{mark(vt.MarkerPromptStart), mark(vt.MarkerCommandStart), cmd("vim")},
 			wantEvents: []string{EventPrompt, EventCommandStarted},
 		},
 		{
@@ -71,7 +103,7 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 			wantEvents: []string{EventCommandStarted, EventCommandFinished},
 			wantPrompt: true,
 			wantSeq:    1,
-			wantExit:   intPtr(0),
+			wantExit:   new(0),
 			wantLast:   "true",
 		},
 		{
@@ -83,7 +115,7 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 			wantEvents: []string{EventPrompt, EventCommandStarted, EventCommandFinished},
 			wantPrompt: true,
 			wantSeq:    1,
-			wantExit:   intPtr(0),
+			wantExit:   new(0),
 			wantLast:   "make",
 		},
 		{
@@ -92,7 +124,7 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 			wantEvents: []string{EventCommandStarted, EventCommandFinished},
 			wantPrompt: true,
 			wantSeq:    1,
-			wantExit:   intPtr(0),
+			wantExit:   new(0),
 			wantLast:   "curl -H 'token=[redacted]' x",
 		},
 	}
@@ -103,7 +135,7 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 			now := time.Unix(100, 0)
 			for _, m := range tt.marks {
 				now = now.Add(time.Second)
-				for _, ev := range track.note(m, now) {
+				for _, ev := range track.note(m, now, markContext{}) {
 					got = append(got, ev.Type)
 				}
 			}
@@ -119,8 +151,8 @@ func TestShellTrackFollowsMarks(t *testing.T) {
 			if !f.Seen {
 				t.Fatal("facts say no mark was seen")
 			}
-			if f.AtPrompt != tt.wantPrompt || f.CommandSeq != tt.wantSeq || f.LastCmdline != tt.wantLast {
-				t.Fatalf("facts = %+v, want at_prompt=%v seq=%d last=%q", f, tt.wantPrompt, tt.wantSeq, tt.wantLast)
+			if f.AtPrompt != tt.wantPrompt || f.PromptReady != tt.wantReady || f.CommandSeq != tt.wantSeq || f.LastCmdline != tt.wantLast {
+				t.Fatalf("facts = %+v, want at_prompt=%v prompt_ready=%v seq=%d last=%q", f, tt.wantPrompt, tt.wantReady, tt.wantSeq, tt.wantLast)
 			}
 			if (f.LastExit == nil) != (tt.wantExit == nil) || (f.LastExit != nil && *f.LastExit != *tt.wantExit) {
 				t.Fatalf("last exit = %v, want %v", f.LastExit, tt.wantExit)
@@ -198,7 +230,7 @@ func TestShellTrackTellsPromptMarksOnly(t *testing.T) {
 				if s.expect {
 					track.expect()
 				}
-				for _, ev := range track.note(s.mark, time.Unix(100, 0)) {
+				for _, ev := range track.note(s.mark, time.Unix(100, 0), markContext{}) {
 					if ev.Type == EventPrompt {
 						prompts++
 					}
@@ -248,7 +280,7 @@ func TestLastCommandOutputReadsBetweenTheMarks(t *testing.T) {
 	write("\x1b]133;A\x07$ \x1b]133;B\x07echo one\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07")
 	write("\x1b]133;A\x07$ \x1b]133;B\x07seq 3\r\n\x1b]133;C\x071\r\n2\r\n3\r\n\x1b]133;D;0\x07")
 	write("\x1b]133;A\x07$ ")
-	out, truncated, ok := p.LastCommandOutput()
+	out, truncated, ok := p.LastCommandOutput(false)
 	if !ok {
 		t.Fatal("no finished command was found")
 	}

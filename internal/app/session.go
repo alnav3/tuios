@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/Gaurav-Gosain/tuios/internal/hooks"
 	"github.com/Gaurav-Gosain/tuios/internal/layout"
@@ -101,8 +102,13 @@ func (m *OS) BuildSessionState() *session.SessionState {
 			Popup:       w.IsPopup,
 			PopupWidth:  w.PopupWidth,
 			PopupHeight: w.PopupHeight,
+			PopupDim:    w.PopupDim,
 			Scratch:     w.IsScratch,
 			ScratchName: w.ScratchName,
+			Stack:       w.Stack,
+			StackIndex:  w.StackIndex,
+			Kind:        w.Kind,
+			URI:         w.URI,
 		}
 	}
 
@@ -177,6 +183,19 @@ func (m *OS) BuildSessionState() *session.SessionState {
 	if len(m.WorkspaceStackRatio) > 0 {
 		state.WorkspaceStackRatio = maps.Clone(m.WorkspaceStackRatio)
 	}
+	// The other splits travel on the same terms.
+	if len(m.WorkspaceMasterSplits) > 0 {
+		state.WorkspaceMasterSplits = make(map[int]layout.MasterSplits, len(m.WorkspaceMasterSplits))
+		for ws, sp := range m.WorkspaceMasterSplits {
+			state.WorkspaceMasterSplits[ws] = sp.Clone()
+		}
+	}
+	// The layout modes travel for the same reason, and have no live value to
+	// fold in either: recording happens when a row names a layout, so the map
+	// is current by the time state is built.
+	if len(m.WorkspaceLayoutMode) > 0 {
+		state.WorkspaceLayoutModes = maps.Clone(m.WorkspaceLayoutMode)
+	}
 	// The master-stack shapes travel as ops (see master_layout.go), and the
 	// daemon keeps its own copy whatever a push holds. They are here for the
 	// state this client saves without a daemon.
@@ -250,6 +269,8 @@ func (m *OS) RestoreFromState(state *session.SessionState) error {
 		m.LogInfo("[RESTORE] RestoreFromState: state is nil")
 		return nil
 	}
+	// The focus an attach starts from is the one the daemon gave.
+	defer m.noteFocusGiven(state)
 
 	m.LogInfo("[RESTORE] RestoreFromState: restoring %d windows", len(state.Windows))
 
@@ -264,6 +285,13 @@ func (m *OS) RestoreFromState(state *session.SessionState) error {
 	m.SessionName = state.Name
 	m.adoptSessionLabels(state)
 	m.DaemonStateVersion = state.Version
+	// The dock's bell and activity marks name workspaces of the session being
+	// left. See workspace_marks.go.
+	m.workspaceMarkSet = nil
+	// A drag's order, and a move in flight, wait for the renumber of the
+	// session they were made in.
+	m.pendingWorkspaceOrder = nil
+	m.workspaceMoveInFlight = false
 	// Clamp to a valid workspace: SwitchToWorkspace rejects workspace < 1, so a
 	// state carrying 0 (legacy, or a freshly created session with no windows)
 	// would strand every subsequently created window on an unreachable workspace.
@@ -277,6 +305,12 @@ func (m *OS) RestoreFromState(state *session.SessionState) error {
 	m.adoptWorkspaceMasterRatio(state)
 	m.WorkspaceStackRatio = make(map[int]float64, len(state.WorkspaceStackRatio))
 	m.adoptWorkspaceStackRatio(state)
+	m.WorkspaceMasterSplits = make(map[int]layout.MasterSplits, len(state.WorkspaceMasterSplits))
+	m.adoptWorkspaceMasterSplits(state)
+	m.WorkspaceLayoutMode = make(map[int]string, len(state.WorkspaceLayoutModes))
+	maps.Copy(m.WorkspaceLayoutMode, state.WorkspaceLayoutModes)
+	m.sessionLayoutMode = ""
+	m.adoptSessionLayoutMode(state)
 	// The shapes belong to the session too, and the seeds this client sent
 	// were sent to the session being left.
 	m.WorkspaceMasterLayout = maps.Clone(state.WorkspaceMasterLayout)
@@ -519,6 +553,9 @@ func (m *OS) ApplyStateSyncFrom(state *session.SessionState, sourceID string) er
 		return nil
 	}
 	fromPeer := sourceID != ""
+	// A renumber goes first, so everything below reads the windows and the
+	// workspace maps under the numbers the state uses.
+	m.adoptWorkspaceRenumbering(state)
 
 	// The daemon now holds what arrived here, which is not necessarily what
 	// this client last pushed, so the record of that push no longer describes
@@ -550,6 +587,10 @@ func (m *OS) ApplyStateSyncFrom(state *session.SessionState, sourceID string) er
 	}
 	defer func() {
 		m.applyingPeerSync = false
+		// The trees sent from here on were worked out from this state, except
+		// the ones the user had changed before it arrived.
+		m.treeAnswerBase, m.treeAnswerUser = state.Version, unsentBefore
+		defer func() { m.treeAnswerBase, m.treeAnswerUser = 0, nil }()
 		if m.syncAnswerOwed {
 			m.syncAnswerOwed = false
 			// One push for the whole sync, after it has been applied, so the
@@ -565,6 +606,9 @@ func (m *OS) ApplyStateSyncFrom(state *session.SessionState, sourceID string) er
 			m.sendTreeOps()
 		}
 	}()
+	// Runs before the answer above is pushed, which then says whether this
+	// client moved the focus away from what the daemon gave it.
+	defer m.noteFocusGiven(state)
 
 	// Which window was focused before any of this was applied. It is read here
 	// rather than beside the focus adoption below because the window list is
@@ -721,6 +765,8 @@ func (m *OS) ApplyStateSyncFrom(state *session.SessionState, sourceID string) er
 	workspaceChanged := previousWorkspace != m.CurrentWorkspace
 	m.adoptWorkspaceMasterRatio(state)
 	m.adoptWorkspaceStackRatio(state)
+	m.adoptWorkspaceMasterSplits(state)
+	m.adoptWorkspaceLayoutMode(state)
 	m.adoptWorkspaceHasCustom(state)
 	masterRetile := m.adoptWorkspaceMasterLayout(state)
 
@@ -881,6 +927,12 @@ func (m *OS) ApplyStateSyncFrom(state *session.SessionState, sourceID string) er
 		}
 		if m.UseScrollingLayout {
 			m.ScrollingOnWindowAdded(w)
+			continue
+		}
+		// Master-stack places panes by order, not by the tree, and
+		// AddWindowToBSPTree would lay them out as BSP. The peer that tiled
+		// the pane placed it, and its rectangles arrive in this sync.
+		if !m.UseBSPLayout {
 			continue
 		}
 		if tree := m.WorkspaceTrees[m.CurrentWorkspace]; tree != nil {
@@ -1063,9 +1115,22 @@ func (m *OS) ApplyStateSyncFrom(state *session.SessionState, sourceID string) er
 		}
 	})
 
+	// A pane a switch to an empty workspace asked for has arrived.
+	m.settlePaneRequests()
+
 	// After the sizes settle, so a pane primed here takes its snapshot at
 	// the size it is shown at.
 	m.reconcilePaneStreams()
+
+	// A focus this sync moved was moved somewhere else: by another client, a
+	// verb or the daemon. The daemon fires the hook for it and this client
+	// stays silent on session-side hooks (see firesHere), so FocusWindow's
+	// notice never happens here. A dock component watching the focus is drawn
+	// by this client and has to refresh in it, whichever side moved the focus.
+	// Last, so the rail section is told the pane and the size this sync left.
+	if focusChanged {
+		m.NotifyDockEvent(string(hooks.AfterFocusChange))
+	}
 
 	m.MarkAllDirty()
 	return nil
@@ -1100,6 +1165,35 @@ func (m *OS) adoptWorkspaceStackRatio(state *session.SessionState) {
 		m.WorkspaceStackRatio = make(map[int]float64, len(state.WorkspaceStackRatio))
 	}
 	maps.Copy(m.WorkspaceStackRatio, state.WorkspaceStackRatio)
+}
+
+// adoptWorkspaceMasterSplits is adoptWorkspaceStackRatio for the splits of the
+// other master-stack panes, merged on the same terms.
+func (m *OS) adoptWorkspaceMasterSplits(state *session.SessionState) {
+	if len(state.WorkspaceMasterSplits) == 0 {
+		return
+	}
+	if m.WorkspaceMasterSplits == nil {
+		m.WorkspaceMasterSplits = make(map[int]layout.MasterSplits, len(state.WorkspaceMasterSplits))
+	}
+	for ws, sp := range state.WorkspaceMasterSplits {
+		m.WorkspaceMasterSplits[ws] = sp.Clone()
+	}
+}
+
+// adoptWorkspaceLayoutMode takes the session's per-workspace layout modes onto
+// this client, merged on the same terms as the ratios beside it: a state that
+// says nothing about a workspace leaves what this client holds alone, and an
+// entry that is present wins. An older peer that never sends the field changes
+// nothing, which is what makes it additive.
+func (m *OS) adoptWorkspaceLayoutMode(state *session.SessionState) {
+	if len(state.WorkspaceLayoutModes) == 0 {
+		return
+	}
+	if m.WorkspaceLayoutMode == nil {
+		m.WorkspaceLayoutMode = make(map[int]string, len(state.WorkspaceLayoutModes))
+	}
+	maps.Copy(m.WorkspaceLayoutMode, state.WorkspaceLayoutModes)
 }
 
 // adoptWorkspaceHasCustom takes the session's custom-layout flags onto this
@@ -1181,6 +1275,22 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 		adoptGeometry = false
 	}
 
+	// A pane that is sliding is drawn where its animation has it, and the
+	// animation lands it on the target and resizes the guest once when it
+	// gets there. The rectangle in a sync is a target, not a frame: writing it
+	// on the window drew the pane at that rectangle for one frame, the next
+	// tick of the animation put it back mid-slide, and the guest was resized
+	// twice on the way. So a sliding pane is turned toward the sync's
+	// rectangle instead. That is nothing at all when the sync is this
+	// client's own layout coming back, which is the usual case: the push
+	// carries each animation's target. See BuildSessionState.
+	if adoptGeometry {
+		if anim := m.snapInFlight(w); anim != nil {
+			anim.Retarget(ws.X, ws.Y, ws.Width, ws.Height, 0, m.layoutClock())
+			adoptGeometry = false
+		}
+	}
+
 	// Check if size changed
 	sizeChanged := adoptGeometry && (w.Width != ws.Width || w.Height != ws.Height)
 
@@ -1210,8 +1320,11 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 	w.IsPopup = ws.Popup
 	w.IsScratch = ws.Scratch
 	w.ScratchName = ws.ScratchName
+	w.Stack, w.StackIndex = ws.Stack, ws.StackIndex
+	w.Kind, w.URI = ws.Kind, ws.URI
 	w.PopupWidth = ws.PopupWidth
 	w.PopupHeight = ws.PopupHeight
+	w.PopupDim = ws.PopupDim
 	w.PreZoomX = ws.PreZoomX
 	w.PreZoomY = ws.PreZoomY
 	w.PreZoomWidth = ws.PreZoomW
@@ -1235,9 +1348,12 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 	w.AgentMessage = ws.AgentMessage
 	w.AgentKind = ws.AgentKind
 	w.AgentHarness = ws.AgentHarness
+	w.StartedBySession, w.StartedByWindow = startedByFromWire(ws.StartedBy)
 	w.AgentMeta = agentMetaFromWire(w.AgentMeta, ws.AgentMeta)
 	w.AgentQueued = ws.AgentQueued
 	w.AgentSubagents = ws.AgentSubagents
+	w.AgentSubagentList = subagentsFromWire(w.AgentSubagentList, ws.AgentSubagentList)
+	w.ProgramStatus = programStatusFromWire(w.ProgramStatus, ws.ProgramStatus)
 	w.AgentStateAt = ws.AgentStateAt
 	prevSeq := w.AgentCompletionSeq
 	w.AgentCompletionSeq = ws.CompletionSeq
@@ -1254,6 +1370,7 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 	// message and harness above, which have to be the ones that arrived with the
 	// state rather than the ones it replaced.
 	m.noteAgentState(w, string(ws.AgentState))
+	m.markHostProgramStatus()
 	w.ForegroundCmd = ws.ForegroundCmd
 	// The shell's pid, as the daemon that spawned it knows it, and the only
 	// second source a daemon-backed pane has for the directory it reports over
@@ -1306,7 +1423,7 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 		// interactive resize drag (which syncs sizes rapidly) never pays for a
 		// per-motion round-trip.
 		if m.ScriptMode && w.DaemonMode && w.PTYID != "" && m.DaemonClient != nil {
-			if state, err := m.DaemonClient.GetTerminalState(w.PTYID, 0, w.ScrollbackLenSync()); err == nil && state != nil {
+			if state, err := m.DaemonClient.GetTerminalState(w.PTYID, m.SnapshotScrollback, m.snapshotHave(w)); err == nil && state != nil {
 				m.restoreTerminalContent(w, state)
 			}
 			w.HasNewOutput.Store(true)
@@ -1345,8 +1462,11 @@ func adoptWindowState(window *terminal.Window, ws session.WindowState) {
 	window.IsPopup = ws.Popup
 	window.IsScratch = ws.Scratch
 	window.ScratchName = ws.ScratchName
+	window.Stack, window.StackIndex = ws.Stack, ws.StackIndex
+	window.Kind, window.URI = ws.Kind, ws.URI
 	window.PopupWidth = ws.PopupWidth
 	window.PopupHeight = ws.PopupHeight
+	window.PopupDim = ws.PopupDim
 	window.PreZoomX = ws.PreZoomX
 	window.PreZoomY = ws.PreZoomY
 	window.PreZoomWidth = ws.PreZoomW
@@ -1360,9 +1480,12 @@ func adoptWindowState(window *terminal.Window, ws session.WindowState) {
 	window.AgentMessage = ws.AgentMessage
 	window.AgentKind = ws.AgentKind
 	window.AgentHarness = ws.AgentHarness
+	window.StartedBySession, window.StartedByWindow = startedByFromWire(ws.StartedBy)
 	window.AgentMeta = agentMetaFromWire(nil, ws.AgentMeta)
 	window.AgentQueued = ws.AgentQueued
 	window.AgentSubagents = ws.AgentSubagents
+	window.AgentSubagentList = subagentsFromWire(nil, ws.AgentSubagentList)
+	window.ProgramStatus = programStatusFromWire(nil, ws.ProgramStatus)
 	window.AgentStateAt = ws.AgentStateAt
 	window.AgentCompletionSeq = ws.CompletionSeq
 	window.ForegroundCmd = ws.ForegroundCmd
@@ -1392,6 +1515,10 @@ func (m *OS) newWindowFromState(ws *session.WindowState) *terminal.Window {
 		m.PTYDataChan,
 		m.Settings.ScrollbackLines,
 	)
+	if m.streamTap != nil {
+		// The tap's renderer keeps the history; nothing reads this copy.
+		window.DiscardScrollback()
+	}
 	adoptWindowHost(window, ws.Host)
 	m.takeDaemonCwd(window, ws)
 	window.HostLink = ws.HostLink
@@ -1580,6 +1707,12 @@ func (m *OS) adoptSyncedWindows(created []*terminal.Window, removed []int, place
 				m.ScrollingOnWindowAdded(w)
 			}
 		}
+		// A split recorded for the BSP tree has no side in the strip: the
+		// new pane takes the column after the focused one, like any other.
+		// Clear it, or it would split some later pane after a switch to BSP.
+		if len(created) > 0 {
+			m.CancelPendingSplit()
+		}
 	} else {
 		// A pane closed on the daemon has to leave the tree here, the way the
 		// scrolling layout above is told. Leaving it in meant the tree held a leaf
@@ -1688,7 +1821,7 @@ func (m *OS) RestoreTerminalStates() error {
 
 	for _, w := range m.Windows {
 		if w.DaemonMode && w.PTYID != "" {
-			state, err := m.DaemonClient.GetTerminalState(w.PTYID, 0, w.ScrollbackLenSync())
+			state, err := m.DaemonClient.GetTerminalState(w.PTYID, m.SnapshotScrollback, m.snapshotHave(w))
 			if err != nil {
 				m.LogError("Failed to get terminal state for PTY %s: %v", shortID(w.PTYID), err)
 				continue
@@ -1696,6 +1829,10 @@ func (m *OS) RestoreTerminalStates() error {
 
 			if state != nil && w.Terminal != nil {
 				// Restore IsAltScreen flag and emulator state
+				// The snapshot's own bounds, before any of it is written,
+				// as primePaneFromDaemon does. A window built at the layout's
+				// size is wider or taller than the snapshot as often as not.
+				w.ResizeEmulatorToSnapshot(state.Width, state.Height)
 				m.restoreTerminalContent(w, state)
 				// Remembered for the subscribe that SetupPTYOutputHandlers is
 				// about to make, so the stream resumes where this snapshot
@@ -1820,6 +1957,9 @@ func (m *OS) restoreTerminalContent(w *terminal.Window, state *session.TerminalS
 	// duplicated.
 	w.DiscardPendingOutput()
 
+	// Before the apply, which packs the state in place.
+	m.tapSnapshot(w.PTYID, state)
+
 	w.LockIO()
 	// Re-check under the lock; Close() nils Terminal while holding it.
 	session.ApplyTerminalState(w.Terminal, state)
@@ -1862,6 +2002,8 @@ func (m *OS) SetupPTYOutputHandlers() error {
 
 	// Always reset subscribed PTYs to prevent stale entries from previous sessions
 	m.SubscribedPTYs = make(map[string]bool)
+	// The same for requests for panes: they were made before this attach.
+	m.paneRequests = nil
 
 	m.LogInfo("[SETUP] SetupPTYOutputHandlers: setting up handlers for %d windows", len(m.Windows))
 
@@ -1888,12 +2030,22 @@ func (m *OS) wireDaemonPTY(window *terminal.Window, subscribe func()) {
 	ptyID := window.PTYID
 
 	window.DaemonWriteFunc = func(data []byte) error {
+		// Keys typed while the client waits for a new daemon are dropped,
+		// and the wait note says so. See daemon_reconnect.go.
+		if m.daemonWaiting.Load() {
+			return nil
+		}
 		return m.DaemonClient.WritePTY(ptyID, data)
 	}
 	window.DaemonResizeFunc = func(width, height int) error {
 		return m.DaemonClient.ResizePTY(ptyID, width, height)
 	}
 
+	// The daemon's emulator answers the guest's kitty uploads. This one's
+	// answers would be drained, and it must not open the files they name.
+	if window.Terminal != nil {
+		window.Terminal.SetKittyUploadAnswers(false)
+	}
 	window.StartDaemonResponseReader()
 
 	if window.Workspace == m.CurrentWorkspace {
@@ -1934,7 +2086,7 @@ func (m *OS) primePaneFromDaemon(window *terminal.Window) {
 	// snapshot's window, and the screen at the end.
 	window.DrainPendingOutput()
 
-	state, err := m.DaemonClient.GetTerminalState(window.PTYID, 0, window.ScrollbackLenSync())
+	state, err := m.DaemonClient.GetTerminalState(window.PTYID, m.SnapshotScrollback, m.snapshotHave(window))
 	if err != nil || state == nil {
 		m.subscribeToPTY(window, 0)
 		return
@@ -1951,7 +2103,7 @@ func (m *OS) primePaneFromDaemon(window *terminal.Window) {
 	if state.Width != window.ContentWidth() || state.Height != window.ContentHeight() {
 		window.SeedAnnouncedSize(state.Width, state.Height)
 		window.Resize(window.Width, window.Height)
-		if fresh, err := m.DaemonClient.GetTerminalState(window.PTYID, 0, window.ScrollbackLenSync()); err == nil && fresh != nil {
+		if fresh, err := m.DaemonClient.GetTerminalState(window.PTYID, m.SnapshotScrollback, m.snapshotHave(window)); err == nil && fresh != nil {
 			state = fresh
 		}
 	}
@@ -1986,13 +2138,44 @@ func (m *OS) subscribeToPTY(window *terminal.Window, fromSeq int64) {
 	m.LogInfo("[SUBSCRIBE] Subscribing to PTY %s for window %s", shortID(ptyID), shortID(window.ID))
 	// Registered before the subscribe, so the first resize the daemon announces
 	// cannot arrive with nothing listening for it.
-	m.DaemonClient.OnPTYResized(ptyID, window.ResizeFromStream)
+	tap := m.streamTap
+	if tap == nil {
+		m.DaemonClient.OnPTYResized(ptyID, window.ResizeFromStream)
+	} else {
+		m.DaemonClient.OnPTYResized(ptyID, func(w, h int) {
+			tap.Resized(ptyID, w, h)
+			window.ResizeFromStream(w, h)
+		})
+		if fromSeq == 0 {
+			tap.Snapshot(ptyID, nil)
+		}
+	}
 	window.SetStreamOwnsSize(true)
 	// A subscribe that follows a restored snapshot is told to the daemon: a
 	// rolled catch-up must replay the tail on top of the snapshot, not clear
 	// it (issue #123). The only path that subscribes with fromSeq zero is the
 	// no-snapshot fallback, so fromSeq > 0 is exactly "a snapshot was applied".
-	err := m.DaemonClient.SubscribePTY(ptyID, fromSeq, fromSeq > 0, func(data []byte) {
+	// A tap whose renderer kept the pane's emulator asks for the stream from
+	// where that emulator stopped. The bytes up to fromSeq are already in this
+	// model's emulator, by the snapshot, so they go to the tap only.
+	from, skip := fromSeq, int64(0)
+	if r, ok := tap.(StreamResumer); ok && fromSeq > 0 {
+		if at := r.ResumeFrom(ptyID, fromSeq); at > 0 && at < fromSeq {
+			from, skip = at, fromSeq-at
+		}
+	}
+	err := m.DaemonClient.SubscribePTY(ptyID, from, from > 0, func(data []byte) {
+		if tap != nil {
+			tap.Output(ptyID, data)
+		}
+		if skip > 0 {
+			n := min(skip, int64(len(data)))
+			skip -= n
+			data = data[n:]
+			if len(data) == 0 {
+				return
+			}
+		}
 		window.WriteOutputAsync(data)
 	})
 	if err != nil {
@@ -2020,7 +2203,7 @@ func (m *OS) unsubscribeFromPTY(window *terminal.Window) {
 	// The pinned pane is drawn in the picture-in-picture view wherever it
 	// is, so its stream stays open. Unpinning it, or its closing, clears the
 	// pin first and lets this through. See pip.go.
-	if m.pipKeepsStream(window) {
+	if m.pipKeepsStream(window) || m.cockpitKeepsStream(window) {
 		return
 	}
 
@@ -2169,6 +2352,10 @@ func (m *OS) SyncStateToDaemon() {
 	if m.syncedFPSet && m.syncedFP == fp {
 		return
 	}
+	// Set after the fingerprint: it says how the push relates to the last
+	// one, not what the state is.
+	key := focusKey(state)
+	state.FocusUnmoved = m.focusGivenSet && key == m.focusGiven
 
 	if err := m.DaemonClient.UpdateState(state); err != nil {
 		m.LogError("Failed to sync state to daemon: %v", err)
@@ -2178,14 +2365,40 @@ func (m *OS) SyncStateToDaemon() {
 	}
 	m.syncedFP, m.syncedFPSet = fp, true
 	m.layoutGenPushed = state.LayoutGen
+	m.focusGiven, m.focusGivenSet = key, true
+}
+
+// focusKey is what a state says of the session's focus: the workspace, the
+// focused window, each workspace's focus and the strip offset.
+func focusKey(state *session.SessionState) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d|%s", state.CurrentWorkspace, state.FocusedWindowID)
+	for _, w := range slices.Sorted(maps.Keys(state.WorkspaceFocus)) {
+		fmt.Fprintf(&b, "|%d=%s", w, state.WorkspaceFocus[w])
+	}
+	if s := state.ScrollStrip; s != nil {
+		fmt.Fprintf(&b, "|x%d", s.ViewportX)
+	}
+	return b.String()
+}
+
+// noteFocusGiven records the focus a state from the daemon gave this client.
+// A push that still shows it says the focus did not move here. See
+// SessionState.FocusUnmoved.
+func (m *OS) noteFocusGiven(state *session.SessionState) {
+	m.focusGiven, m.focusGivenSet = focusKey(state), true
 }
 
 // warnOnBuildMismatch says so when the daemon is running a different build of
 // tuios from this client. The two still speak, so this is a note and not a
 // refusal, but it is the difference between "the fix does not work" and "the
 // fix is not installed on both sides", and nothing else says it out loud.
+//
+// Where this client can restart the daemon, the note is the way to do it: a
+// click on it, or prefix+j, opens the restart dialog, and esc puts it off for
+// the rest of this run. It stays until it is answered.
 func (m *OS) warnOnBuildMismatch() {
-	if m.DaemonClient == nil || !m.IsDaemonSession {
+	if m.DaemonClient == nil || !m.IsDaemonSession || m.restartLater {
 		return
 	}
 	clientBuild, daemonBuild := m.DaemonClient.BuildMismatch()
@@ -2193,9 +2406,35 @@ func (m *OS) warnOnBuildMismatch() {
 		return
 	}
 	m.LogWarn("Build mismatch: client %s, daemon %s", clientBuild, daemonBuild)
-	m.ShowNotification(fmt.Sprintf(
-		"The daemon is version %s and this window is version %s. To use one version in both, run 'tuios kill-server', then start tuios again.",
-		daemonBuild, clientBuild), "warning", 0)
+	if !m.DaemonRestartAvailable() {
+		m.ShowNotification("The daemon runs "+daemonBuild+" and this window runs "+clientBuild+
+			". Run 'tuios restart-server' on the machine that runs the daemon.", "warning", 0)
+		return
+	}
+	// Two short sentences, so the notice fits the dock of a 100-column
+	// terminal with release versions: what is wrong, then the way out. This
+	// window's version is in the dialog. The whole notice is the click
+	// target, and draws underlined for it; the key is the jump key as it is
+	// bound now.
+	how := "Click it to restart it."
+	if key := contextMenuHint(m.KeybindRegistry, "prefix_jump_notif", &m.Settings); key != "" {
+		how = key + " restarts it."
+	}
+	m.ShowNotificationFrom("The daemon runs "+daemonBuild+". "+how, "warning", 0, NotifTarget{DaemonRestart: true})
+	if n := len(m.Notifications); n > 0 && isRestartNotice(m.Notifications[n-1].Target) {
+		m.Notifications[n-1].Sticky = true
+	}
+}
+
+// announceRestart says the restart worked, on the first frame of the client
+// a restart from the app started.
+func (m *OS) announceRestart() {
+	if !m.afterRestart || m.DaemonClient == nil {
+		return
+	}
+	m.afterRestart = false
+	m.ShowNotification("The daemon restarted on "+m.DaemonClient.DaemonVersion()+". Your session is back.",
+		"success", 2*m.Settings.NotificationDuration)
 }
 
 // AnnounceLayoutReserve tells the daemon what this client keeps for its own
@@ -2278,4 +2517,13 @@ func adoptWindowHost(w *terminal.Window, host string) {
 		return
 	}
 	w.Host = host
+}
+
+// startedByFromWire splits a window's started_by into its session and window,
+// both empty when no pane started it.
+func startedByFromWire(ref *session.PaneRef) (sessionName, window string) {
+	if ref == nil {
+		return "", ""
+	}
+	return ref.Session, ref.Window
 }

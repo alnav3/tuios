@@ -41,9 +41,10 @@ func (m *OS) sidebarCursorRow() (sidebarNavRow, bool) {
 // the rail is not already showing. The cursor lands on the current session so
 // navigation starts where the eye is.
 func (m *OS) EnterSidebarFocus() {
-	if m.SidebarFocused {
+	if m.SidebarFocused && m.sidebarFocusSecondary == m.sidebarDrawing {
 		return
 	}
+	m.sidebarFocusSecondary = m.sidebarDrawing
 	// Shown on this client alone, over the panes: the scope is this
 	// person's keyboard, not a change to the session's rail, so it takes no
 	// columns from anybody's panes. See OwnLayoutReserve.
@@ -55,7 +56,7 @@ func (m *OS) EnterSidebarFocus() {
 	m.beginSidebarReturn()
 	// The rail comes back to the row it was left on, which is most of the point
 	// of leaving by activating one: enter on a terminal row goes to that pane,
-	// and returning used to start over at the attached session's row.
+	// and returning does not start over at the attached session's row.
 	if m.restoreSidebarRow() {
 		return
 	}
@@ -66,6 +67,18 @@ func (m *OS) EnterSidebarFocus() {
 	// rows exist.
 	m.sidebarFollowSession = m.sidebarCurrentSessionID()
 	m.sidebarSetCursor(m.sidebarCurrentSessionNavIndex())
+}
+
+// FocusOtherSidebar moves keyboard ownership between visible rails without
+// changing either rail's saved cursor or leaking a key to the pane underneath.
+func (m *OS) FocusOtherSidebar() {
+	if !m.SidebarFocused || m.sidebarWidthFor(m.sidebarPreferredWidth()) == 0 || m.secondarySidebarWidth() == 0 {
+		return
+	}
+	// HandleSidebarKey scopes the secondary rail around dispatch. The view
+	// fields will be restored when it returns; the focus owner is not swapped.
+	m.sidebarClearPeek()
+	m.sidebarFocusSecondary = !m.sidebarFocusSecondary
 }
 
 // sidebarSetCursor moves the keyboard cursor and re-derives the preview from
@@ -88,6 +101,7 @@ func (m *OS) ExitSidebarFocus() {
 		return
 	}
 	m.SidebarFocused = false
+	m.sidebarFocusSecondary = false
 	// The rows at rest fold away again once the rail lets go of the keyboard.
 	m.sidebarAgentsUnfolded = false
 	m.recordSidebarRow()
@@ -131,8 +145,7 @@ func (m *OS) SidebarCursorLast() {
 // SidebarCursorExpand and SidebarCursorCollapse step the cursor one section
 // down and up. With the tree gone there is nothing left to expand, and the keys
 // that walked its depth are the natural pair for walking the sections. The
-// config action names stay, so a config file written before this still resolves
-// both keys.
+// config action names stay, so an older config file still resolves both keys.
 func (m *OS) SidebarCursorExpand()   { m.sidebarStepSection(1) }
 func (m *OS) SidebarCursorCollapse() { m.sidebarStepSection(-1) }
 
@@ -165,11 +178,11 @@ func (m *OS) sidebarStepSection(delta int) {
 // control that belongs to none.
 func sidebarSectionOfKind(kind sidebarRowKind) sidebarSection {
 	switch kind {
-	case sidebarRowSession, sidebarRowHostSession, sidebarRowHostNew, sidebarRowGlobalNew, sidebarRowHost, sidebarRowRepo:
+	case sidebarRowSession, sidebarRowHostSession, sidebarRowHostNew, sidebarRowHostSignIn, sidebarRowGlobalNew, sidebarRowHost, sidebarRowRepo:
 		return sidebarSectionSessions
 	case sidebarRowWindow:
 		return sidebarSectionTerminals
-	case sidebarRowAgent, sidebarRowAgentFilter, sidebarRowAgentSort, sidebarRowAgentMail, sidebarRowAgentFold:
+	case sidebarRowAgent, sidebarRowAgentFilter, sidebarRowAgentSort, sidebarRowAgentMail, sidebarRowAgentFold, sidebarRowSubagentToggle:
 		return sidebarSectionAgents
 	case sidebarRowFileUp, sidebarRowFileEntry, sidebarRowFileCd:
 		return sidebarSectionFiles
@@ -228,6 +241,8 @@ func (m *OS) SidebarActivateCursor() bool {
 		m.queueSidebarCmd(m.OpenAgentMail())
 	case sidebarRowAgentFold:
 		m.SidebarUnfoldAgents()
+	case sidebarRowSubagentToggle:
+		m.SidebarToggleSubagents(row.SessionID, row.WindowID)
 	case sidebarRowNewSession:
 		m.SidebarNewSessionHere()
 	case sidebarRowNewWindow:
@@ -242,6 +257,9 @@ func (m *OS) SidebarActivateCursor() bool {
 	case sidebarRowHostNew:
 		m.createRemoteSession(row.SessionID)
 		return true
+	case sidebarRowHostSignIn:
+		// The page opens in a browser, so the keyboard stays in the rail.
+		m.queueSidebarCmd(m.openHostSignIn(row.SessionID))
 	case sidebarRowGlobalNew:
 		// A new global session is where the user asked to end up, so the rail
 		// hands the keyboard back the way the other create controls do.
@@ -319,8 +337,8 @@ func (m *OS) sidebarReorderHost(host string, delta int) {
 	from := slices.Index(order, host)
 	if from < 0 {
 		// This machine. It is not in the order at all, so the swap below would
-		// have done nothing and said nothing, which is how a person decides a
-		// feature is missing.
+		// do nothing and say nothing, which is how a person decides a feature
+		// is missing.
 		m.sidebarSayMachinePinned()
 		return
 	}
@@ -383,11 +401,8 @@ func (m *OS) SidebarJumpToSession(n int) {
 // mouse path so a key and a right-click on the same row open the same menu.
 //
 // It targets the row the cursor is on and nothing else, which is the rule every
-// other cursor key in the rail already follows. The kill key used to force the
-// kind to session before handing it over, so pressing it on a terminal opened
-// the session's menu instead of the pane's, and pressing it on a footer control
-// opened the attached session's menu; a key that acts on something other than
-// the row under the cursor is a key the user cannot aim.
+// other cursor key in the rail already follows: a key that acts on something
+// other than the row under the cursor is a key the user cannot aim.
 //
 // destructive is what is left of that key's intent, now that the row decides
 // the menu: it lands the selection on the row's own destructive action, so the
@@ -450,7 +465,7 @@ func (m *OS) sidebarCursorAnchor(row sidebarNavRow) (int, int) {
 		}
 	}
 	x := 0
-	if m.Settings.SidebarPosition == "right" {
+	if m.railEdge() == sidebarRight {
 		x = m.GetRenderWidth() - m.GetSidebarWidth()
 	}
 	return x, m.viewReserve().Top
@@ -525,12 +540,32 @@ func (m *OS) SidebarCanCreateSession() bool {
 // three-stop ladder had a middle width no control named and no way back out of
 // except by stepping through it, and the responsive clamp already owns that
 // width on the screens where it belongs.
-func (m *OS) SidebarToggleCollapsed() { m.SidebarSetCollapsed(!m.SidebarCollapsed) }
+func (m *OS) SidebarToggleCollapsed() {
+	if m.sidebarDrawing {
+		m.SidebarSetCollapsed(!m.secondaryCollapsed)
+		return
+	}
+	m.SidebarSetCollapsed(!m.SidebarCollapsed)
+}
 
 // SidebarSetCollapsed is the directed half: the footer's arrow and the keys
 // point somewhere, so pressing the same one twice is a no-op rather than a
 // flicker.
 func (m *OS) SidebarSetCollapsed(collapsed bool) {
+	if m.sidebarDrawing {
+		if collapsed == m.secondaryCollapsed {
+			return
+		}
+		m.secondaryCollapsed = collapsed
+		m.sidebarClearPeek()
+		m.tooltipClear()
+		if m.AutoTiling {
+			m.TileAllWindows()
+		} else {
+			m.ClampWindowsToView()
+		}
+		return
+	}
 	if collapsed == m.SidebarCollapsed {
 		return
 	}
@@ -541,11 +576,11 @@ func (m *OS) SidebarSetCollapsed(collapsed bool) {
 		return
 	}
 	m.SidebarCollapsed = collapsed
-	// Folding no longer closes the files section. Three columns cannot draw a
+	// Folding does not close the files section. Three columns cannot draw a
 	// listing, so the strip does not draw one, and unfolding brings the section
-	// back exactly as it brings the other three back. That is only safe now the
-	// section is a section: as a mode it took the whole rail, so a folded rail
-	// left in it had nothing on screen mentioning the mode and no way out.
+	// back exactly as it brings the other three back. That is only safe because
+	// the section is a section: a mode that took the whole rail would leave a
+	// folded rail with nothing on screen mentioning the mode and no way out.
 	m.sidebarClearPeek()
 	m.tooltipClear()
 	if m.AutoTiling {
@@ -668,8 +703,7 @@ func (m *OS) nextSessionName() string {
 
 // SidebarAccentCursor opens the colour picker on the cursor row: the pane's own
 // accent on a window row, and the session's on a session row, which is the
-// colour every pane in it inherits. The key used to refuse on a session row
-// because a session had no colour to set.
+// colour every pane in it inherits.
 func (m *OS) SidebarAccentCursor() {
 	if w := m.sidebarCursorWindow(); w != nil {
 		m.OpenAccentPicker(w.ID)

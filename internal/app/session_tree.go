@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"path"
 	"slices"
 	"strconv"
@@ -14,6 +15,9 @@ import (
 
 // windowRowTitle is the label a session-management surface shows for a window.
 func windowRowTitle(w *terminal.Window) string {
+	if label, ok := tmlRailLabel(w); ok {
+		return label
+	}
 	return railWindowLabel(w.CustomName, w.ForegroundCmd, w.Title())
 }
 
@@ -72,21 +76,23 @@ func (m *OS) currentSessionInput() sessiontree.SessionInput {
 		state, seen := m.railAgentState(w.ID, w.AgentState, w.AgentCompletionSeq)
 		message, kind := m.paneAskNote(w.ID, w.AgentMessage, w.AgentKind)
 		windows = append(windows, sessiontree.WindowInput{
-			ID:         w.ID,
-			Title:      m.railTitleShown(w),
-			AgentState: state,
-			DoneSeen:   seen,
-			StateAt:    w.AgentStateAt,
-			Harness:    w.AgentHarness,
-			Message:    message,
-			AgentKind:  kind,
-			Meta:       w.AgentMeta,
-			Queued:     w.AgentQueued,
-			Subagents:  w.AgentSubagents,
-			Focused:    i == m.FocusedWindow,
-			Workspace:  w.Workspace,
-			Host:       w.Host,
-			HostLink:   w.HostLink,
+			ID:           w.ID,
+			Title:        m.railTitleShown(w),
+			AgentState:   state,
+			DoneSeen:     seen,
+			StateAt:      w.AgentStateAt,
+			Harness:      w.AgentHarness,
+			Message:      message,
+			AgentKind:    kind,
+			Meta:         w.AgentMeta,
+			Queued:       w.AgentQueued,
+			Subagents:    w.AgentSubagents,
+			SubagentList: w.AgentSubagentList,
+			Program:      w.ProgramStatus,
+			Focused:      i == m.FocusedWindow,
+			Workspace:    w.Workspace,
+			Host:         w.Host,
+			HostLink:     w.HostLink,
 		})
 	}
 	name := m.SessionName
@@ -107,6 +113,7 @@ func (m *OS) currentSessionInput() sessiontree.SessionInput {
 		Global:           m.SessionGlobal,
 		CurrentWorkspace: m.dockWorkspace(),
 		Worktree:         worktreeRef(m.SessionWorktree),
+		Space:            m.SessionSpace,
 		Windows:          windows,
 	}
 }
@@ -129,17 +136,19 @@ func (m *OS) foreignSessionInput(client *session.TUIClient, name string) session
 			ID: w.ID,
 			// The daemon folds a custom name into Title and withholds a command
 			// for a named pane, so passing no name here still lets one win.
-			Title:      railWindowLabel("", w.ForegroundCmd, w.Title),
-			AgentState: state,
-			DoneSeen:   seen,
-			StateAt:    w.AgentStateAt,
-			Harness:    w.AgentHarness,
-			Message:    message,
-			AgentKind:  kind,
-			Meta:       agentMetaFromWire(nil, w.AgentMeta),
-			Queued:     w.AgentQueued,
-			Subagents:  w.Subagents,
-			Workspace:  w.Workspace,
+			Title:        railWindowLabel("", w.ForegroundCmd, w.Title),
+			AgentState:   state,
+			DoneSeen:     seen,
+			StateAt:      w.AgentStateAt,
+			Harness:      w.AgentHarness,
+			Message:      message,
+			AgentKind:    kind,
+			Meta:         agentMetaFromWire(nil, w.AgentMeta),
+			Queued:       w.AgentQueued,
+			Subagents:    w.Subagents,
+			SubagentList: subagentsFromWire(nil, w.SubagentList),
+			Program:      programStatusFromWire(nil, w.ProgramStatus),
+			Workspace:    w.Workspace,
 		})
 	}
 	display, _ := client.SessionLabel(name)
@@ -153,6 +162,7 @@ func (m *OS) foreignSessionInput(client *session.TUIClient, name string) session
 		Global:           client.SessionGlobal(name),
 		CurrentWorkspace: client.SessionCurrentWorkspace(name),
 		Worktree:         worktreeRef(client.SessionWorktree(name)),
+		Space:            client.SessionSpace(name),
 		Windows:          windows,
 	}
 }
@@ -215,7 +225,21 @@ func (m *OS) BuildSessionTree() sessiontree.Tree {
 // machine's sessions as the prefix.
 func (m *OS) withHostGroups(tree sessiontree.Tree) sessiontree.Tree {
 	tree.Sessions = append(tree.Sessions, m.hostGroupNodes()...)
+	// With the agent features off no row wears an agent mark, a machine's
+	// or a session's on another machine included, whose daemon may still
+	// have them on. See agents_off.go.
+	if !m.agentsOn() {
+		clearAgentMarks(tree.Sessions)
+	}
 	return tree
+}
+
+// clearAgentMarks takes the agent state off every node and its children.
+func clearAgentMarks(nodes []sessiontree.Node) {
+	for i := range nodes {
+		nodes[i].AgentState, nodes[i].AgentKind, nodes[i].DoneSeen = "", "", false
+		clearAgentMarks(nodes[i].Children)
+	}
 }
 
 // railNeighbourSession returns the session delta places from the current one in
@@ -248,11 +272,27 @@ func (m *OS) CycleSession(delta int) {
 	m.openSession("", target)
 }
 
+// SwitchToSessionByIndex attaches to the session at the rail position n
+// (0-based), the same order the rail draws the rows in and the same
+// local-only scope CycleSession cycles. Pressing a number past the sessions
+// there are says so instead of failing inside the switch.
+func (m *OS) SwitchToSessionByIndex(n int) {
+	sessions := localSessionNodes(m.BuildSessionTree().Sessions)
+	if n < 0 || n >= len(sessions) {
+		m.ShowNotification(fmt.Sprintf("No session %d", n+1), "info", m.Settings.NotificationDuration)
+		return
+	}
+	if sessions[n].IsCurrent {
+		return
+	}
+	m.openSession("", sessions[n].ID)
+}
+
 // sessionPaletteLabel formats a "Session: " or "Window: " palette row, folding
 // in the agent-state glyph the same way the window title bar does, so the
 // palette and the title bar never disagree about what a glyph means.
-func sessionPaletteLabel(prefix, name, agentState string, doneSeen bool) string {
-	if glyph := agentStateIndicator(sidebarGlyphState(agentState, doneSeen)); glyph != "" {
+func sessionPaletteLabel(prefix, name, agentState string, doneSeen bool, running int) string {
+	if glyph := agentStateIndicator(displayState(agentState, doneSeen, running)); glyph != "" {
 		return prefix + glyph + " " + name
 	}
 	return prefix + name
@@ -310,15 +350,16 @@ func getSessionPaletteItems(m *OS) []CommandPaletteItem {
 		if isRemoteNode(s) {
 			host, name := s.Host, remoteSessionName(s)
 			items = append(items, CommandPaletteItem{
-				Name:       sessionPaletteLabel("Session: ", name+" @ "+host, s.AgentState, s.DoneSeen),
-				Shortcut:   "another machine",
-				Category:   "Sessions",
-				AgentState: s.AgentState,
-				AgentSeen:  s.DoneSeen,
+				Name:           sessionPaletteLabel("Session: ", name+" @ "+host, s.AgentState, s.DoneSeen, s.Subagents),
+				Shortcut:       "another machine",
+				Category:       "Sessions",
+				AgentState:     s.AgentState,
+				AgentSeen:      s.DoneSeen,
+				AgentSubagents: s.Subagents,
 				Action: func(m *OS) (*OS, tea.Cmd) {
 					m.sidebarLeaveForJump()
 					m.openRemoteSession(host, name)
-					return m, nil
+					return m, m.TakeSidebarCmd()
 				},
 			})
 			continue
@@ -329,10 +370,11 @@ func getSessionPaletteItems(m *OS) []CommandPaletteItem {
 		items = append(items, CommandPaletteItem{
 			// The rail's title for the session, so a session reads by one name
 			// here and there; the action still switches by its identity.
-			Name:       sessionPaletteLabel("Session: ", s.Title, s.AgentState, s.DoneSeen),
-			Category:   "Sessions",
-			AgentState: s.AgentState,
-			AgentSeen:  s.DoneSeen,
+			Name:           sessionPaletteLabel("Session: ", s.Title, s.AgentState, s.DoneSeen, s.Subagents),
+			Category:       "Sessions",
+			AgentState:     s.AgentState,
+			AgentSeen:      s.DoneSeen,
+			AgentSubagents: s.Subagents,
 			Action: func(m *OS) (*OS, tea.Cmd) {
 				if isCurrent {
 					m.ShowNotification("Already on this session", "info", m.Settings.NotificationDuration)
@@ -352,11 +394,12 @@ func getSessionPaletteItems(m *OS) []CommandPaletteItem {
 				label, warn = s.Title+"/"+w.Title, "switches session"
 			}
 			items = append(items, CommandPaletteItem{
-				Name:       sessionPaletteLabel("Window: ", label, w.AgentState, w.DoneSeen),
-				Shortcut:   warn,
-				Category:   "Sessions",
-				AgentState: w.AgentState,
-				AgentSeen:  w.DoneSeen,
+				Name:           sessionPaletteLabel("Window: ", label, w.AgentState, w.DoneSeen, w.Subagents),
+				Shortcut:       warn,
+				Category:       "Sessions",
+				AgentState:     w.AgentState,
+				AgentSeen:      w.DoneSeen,
+				AgentSubagents: w.Subagents,
 				Action: func(m *OS) (*OS, tea.Cmd) {
 					m.sidebarLeaveForJump()
 					if !isCurrent {

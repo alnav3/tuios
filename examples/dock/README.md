@@ -35,7 +35,8 @@ reorders. A list you write as `[]` draws nothing on that side, which is
 different from leaving the key out.
 
 The built-ins are `mode`, `workspaces`, `trail`, `tape`, `windows`,
-`notifications`, `copy-help`, `cpu`, `ram`, `clock`, `session-controls`. Each
+`notifications`, `copy-help`, `cpu`, `ram`, `clock`, `session-controls`,
+`transfers`, `session`. Each
 keeps its own condition: naming `cpu` makes it eligible to draw, `show_cpu`
 still says whether it is on.
 
@@ -43,6 +44,30 @@ Two of them are not really cells. `notifications` and `copy-help` take the
 right-hand end for as long as they have something to say, wherever they sit in
 the list, because they are transient claims rather than segments.
 `session-controls` always holds the bar's right-hand end and is never truncated.
+
+## The session cell and cell colours
+
+`session` shows the session name, the current workspace and the focused pane's
+place in it, `main 2:1`. It is in no default list; add it where you want it.
+`[dock.session]` sets its text and look:
+
+```toml
+[dock]
+left = ["mode", "workspaces", "session"]
+
+[dock.session]
+format    = "{session} {workspace}:{pane}"  # the default
+fg        = "#272e33"
+bg        = "#7fbbb3"
+bold      = true
+cap_left  = "\ue0b6"                     # drawn in bg, round the cell's ends
+cap_right = "\ue0b4"
+```
+
+`fg`, `bg`, `bold`, `cap_left` and `cap_right` work the same way in a
+`[dock.custom.NAME]` table. Colours take hex, an ANSI number, a slot name such
+as `bright_magenta`, a role such as `accent`, or a CharmTone name. See "Colour
+values" in docs/CONFIGURATION.md. Anything else is warned about and ignored. With none of them set a cell draws as it always has.
 
 ## The clock
 
@@ -57,6 +82,28 @@ format = "15:04"
 The format is a Go time layout. It also sets the cadence: a layout showing
 seconds refreshes once a second, one without refreshes on the minute. The same
 format drives the status badge that `show_clock` turns on.
+
+## Workspace tabs
+
+```toml
+[dock.tabs]
+style         = "flat"   # pill (default) | flat
+separator     = " • "
+active_bg     = "#a7c080"
+active_bold   = true
+number_glyphs = ["I", "II", "III"]   # the first entry is workspace 1
+zoom_marker   = " [ ]"
+```
+
+`style = "flat"` draws the `workspaces` component as a tmux-like window list
+instead of pills. `number_glyphs` and `zoom_marker` feed the `{icon}` and
+`{zoom}` placeholders of `appearance.dock_workspace_tab_format`. With no
+colours set, the current tab sits on the theme's accent. `attention_fg`,
+`bell_marker` and `activity_marker` mark a workspace out of view whose pane
+waits for you, rang the bell or printed. Attached to a daemon, the daemon
+reports the first bell and the first output of such a pane, once. The full
+key list is in
+`docs/CONFIGURATION.md`.
 
 ## Writing a component
 
@@ -89,9 +136,11 @@ In order of preference, because the order is also the order of cost:
   going to redraw anyway. The types are the hook events
   (`after-focus-change`, `after-agent-state`, `after-workspace-switch`,
   `after-new-window`, `after-close-window`, `after-layout-change`,
-  `after-attach`, `after-detach`, `after-resize`) and their event-hub spellings
-  (`window-focused`, `agent-state`, `workspace-switched`, `window-created`,
-  `window-closed`, `layout-changed`, `attached`, `detached`, `resized`).
+  `after-attach`, `after-detach`, `after-resize`) and other names for them.
+  `window-focused`, `agent-state`, `workspace-switched`, `window-created` and
+  `window-closed` are the names `tuios subscribe` uses. `layout-changed`,
+  `attached`, `detached` and `resized` are names only the dock knows: the
+  daemon sends no event by those names.
   Several at once: `refresh = "event:after-focus-change,after-new-window"`.
 - **`push`** keeps your command running and takes each line it writes as an
   update. Bring your own `inotifywait`, `upower --monitor`, or a loop around
@@ -154,6 +203,39 @@ monitor.
 
 Anything that has to happen while nothing is attached is a hook, not a
 component.
+
+## The rail's custom section
+
+The same contract draws a section of the rail. Put `custom` in
+`appearance.sidebar.sections` and write the table:
+
+```toml
+[appearance.sidebar]
+sections = "sessions:25,terminals,custom:35,agents:30"
+
+[appearance.sidebar.custom]
+title   = "Brief"
+command = "~/.config/tuios/dock/brief.sh"
+refresh = "event:window-focused,agent-state"
+```
+
+Three differences from a dock cell. Every line of stdout is a row, cut to the
+rail's width and to the section's lines. There is no `push`: a command that
+stays running keeps the environment it started with, and the rows are about
+the focused pane, so events re-run the command with fresh values instead,
+and an event that lands mid-run costs one more run after it. And the
+environment says where the rows go: `TUIOS_RAIL_SECTION=custom`,
+`TUIOS_RAIL_WIDTH`, `TUIOS_RAIL_HEIGHT` (a ceiling), `TUIOS_ACTIVE_PANE_ID`
+and `TUIOS_ACTIVE_PANE_CWD`, beside `TUIOS_SESSION` and `TUIOS_SOCKET`.
+The command does not run while the rail is hidden or folded, so
+`TUIOS_RAIL_WIDTH` is never `0`, and it runs again when the rail opens.
+
+Everything else is the dock's: the timeout, the bounded read, the sanitiser,
+the empty section on failure, the five-failure stop, and
+`tuios list-dock-components`, which lists it as `rail/custom` on side `rail`.
+`tuios refresh-dock rail/custom` re-runs it. The table is read from the
+config file only; `set-config` can place the section and cannot set its
+command.
 
 ## The recipes
 

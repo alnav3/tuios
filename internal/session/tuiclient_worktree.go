@@ -23,3 +23,28 @@ func (c *TUIClient) SessionWorktree(name string) *WorktreeInfo {
 	}
 	return nil
 }
+
+// RepoRoot returns the main checkout of the repository the rail groups under
+// repo, read from the worktree record of any cached session in it, or "" when
+// no cached session names the repository. It reads the cache for the same
+// reason SessionWorktree does.
+//
+// The rail groups sessions by the repository's base name, so two different
+// checkouts both named app share one group header, and this returns whichever
+// root a cached session carries first — not necessarily the one the user
+// meant. The dialog's context line names the path it resolved to, so the
+// mismatch is visible before enter; the session-row way in is exact, since it
+// reads one session's own record.
+func (c *TUIClient) RepoRoot(repo string) string {
+	if repo == "" {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.availableSessions {
+		if s.Worktree != nil && s.Worktree.Repo == repo && s.Worktree.RepoRoot != "" {
+			return s.Worktree.RepoRoot
+		}
+	}
+	return ""
+}

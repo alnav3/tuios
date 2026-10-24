@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/harness"
 )
 
@@ -210,6 +211,7 @@ func (d *Daemon) listAgentsAllSessions(all bool, sel *Selector) map[string]any {
 // agentRows is one session's rows of a list-agents answer. sel, when not nil,
 // keeps only the rows it matches.
 func (d *Daemon) agentRows(sess *Session, all bool, unread map[string]int, now int64, sel *Selector) []map[string]any {
+	seen := d.agents.seenCounts(sess.Name())
 	state := sess.GetState()
 	group := ""
 	if state.Worktree != nil {
@@ -247,6 +249,7 @@ func (d *Daemon) agentRows(sess *Session, all bool, unread map[string]int, now i
 			"workspace":      w.Workspace,
 			"focused":        w.ID == state.FocusedWindowID,
 			"unread":         unread[w.ID],
+			"seen":           seen[w.ID],
 			"ready":          d.agentReady(w, agentRestStates),
 			"blocked_by":     agentBlockedBy(w),
 			"needs_you":      w.AgentState.NeedsYou(),
@@ -275,7 +278,14 @@ func (d *Daemon) agentRows(sess *Session, all bool, unread map[string]int, now i
 			"queued": w.AgentQueued,
 			// How many subagents the pane's agent is running.
 			"subagents": w.AgentSubagents,
+			// The subagents themselves, running and finished a moment ago.
+			"subagent_list": subagentListOut(w.AgentSubagentList),
+			// The pane's OSC 7501 records, the root first.
+			"program_status": programStatusList(w.ProgramStatus),
 		})
+		if w.StartedBy != nil {
+			agents[len(agents)-1]["started_by"] = w.StartedBy
+		}
 	}
 	return agents
 }
@@ -354,10 +364,14 @@ type sendAgentMessageParams struct {
 	Text        string   `json:"text"`
 	ReplyTo     uint64   `json:"reply_to"`
 	Attachments []string `json:"attachments"`
-	HumanNonce  string   `json:"human_nonce"`
-	Host        string   `json:"host"`
-	Select      string   `json:"select"`
-	Confirm     string   `json:"confirm"`
+	// Parts is the message in parts, as queue-prompt takes them: a long
+	// paste or an image is written to the paste folder and attached. With
+	// parts, text is ignored. See mailParts.
+	Parts      []queuePart `json:"parts"`
+	HumanNonce string      `json:"human_nonce"`
+	Host       string      `json:"host"`
+	Select     string      `json:"select"`
+	Confirm    string      `json:"confirm"`
 	// raw is the call's params as sent, which a send with host forwards to
 	// the far machine as they are, so an older daemon there sees only the
 	// names the caller used.
@@ -424,6 +438,38 @@ func (d *Daemon) sendAgentMessageSelect(cs *connState, p sendAgentMessageParams)
 // pane is in one session and the recipients are in many.
 func (d *Daemon) sendAgentMessage(cs *connState, p sendAgentMessageParams, fromAnySession bool) (map[string]any, *verbError) {
 	viaLink := cs != nil && cs.viaLink
+	// A message in parts is checked here, and its files are written only
+	// once every other check has passed. Mail to another machine carries
+	// its parts there, and that machine writes them.
+	var filed bool
+	if p.Parts != nil && p.Host == "" {
+		shown, size, verr := checkParts(p.Parts, agentMsgMaxText)
+		if verr != nil {
+			return nil, verr
+		}
+		joined, images := partsText(p.Parts)
+		filed = images || size > agentMsgMaxText
+		if filed {
+			p.Text = shown
+			n := len(p.Attachments)
+			for _, part := range p.Parts {
+				if part.Kind != queuePartText {
+					n++
+				}
+			}
+			if n > agentMsgMaxAttachments {
+				return nil, invalidParam("parts", "a message carries at most 8 attachments, its pastes and images included")
+			}
+			if viaLink && !d.linkPolicy(cs).Allows(config.LinkAllowFiles) {
+				cs.mu.Lock()
+				peer := cs.linkPeer
+				cs.mu.Unlock()
+				return nil, linkFilesRefusal(peer)
+			}
+		} else {
+			p.Text = joined
+		}
+	}
 	if strings.TrimSpace(p.Text) == "" {
 		return nil, invalidParam("text", "text is required: a message with no body tells the reader nothing")
 	}
@@ -595,6 +641,21 @@ func (d *Daemon) sendAgentMessage(cs *connState, p sendAgentMessageParams, fromA
 		}
 	}
 
+	if filed {
+		text, paths, err := d.fileParts(p.Parts)
+		if err != nil {
+			return nil, newVerbError(ErrVerbInternal, "send-agent-message: a pasted block could not be saved: "+err.Error())
+		}
+		msg.Text = text
+		for _, path := range paths {
+			att, err := classifyAttachment(path)
+			if err != nil {
+				return nil, newVerbError(ErrVerbInternal, "send-agent-message: a saved block cannot be attached: "+err.Error())
+			}
+			msg.Attachments = append(msg.Attachments, att)
+		}
+	}
+
 	stored := d.agents.send(sess.Name(), msg)
 
 	// The attached clients get the whole message, not only the event: they
@@ -613,6 +674,12 @@ func (d *Daemon) sendAgentMessage(cs *connState, p sendAgentMessageParams, fromA
 	})
 	// Mail to the person waits in the Inbox until it is read.
 	d.attention.noteMail(stored)
+	// Mail to an agent at rest wakes it if nobody tells it sooner.
+	if stored.Kind == agentMsgDirect {
+		if origin, ok := d.mailOriginOf(cs, stored.VerifiedHuman); ok {
+			d.noteMailSent(sess.Name(), stored.To, stored.ID, origin)
+		}
+	}
 
 	return map[string]any{
 		"type":       "agent_message_sent",
@@ -666,7 +733,7 @@ func (d *Daemon) verbReleaseAgentMessage(cs *connState, params json.RawMessage) 
 	if p.ID == 0 {
 		return nil, invalidParam("id", "id is required: the message_id of the held message")
 	}
-	if !d.verifyAnyHumanNonce(p.HumanNonce, cs) {
+	if !d.humanNonceHeld(p.HumanNonce, cs) {
 		return nil, hintedVerbError(ErrVerbNotHuman, "release-agent-message is for the person at an attached client", &VerbHint{
 			Param:  "human_nonce",
 			Detail: "Mail from another machine is held so the person decides whether an agent sees it. Only a client attached right now can pass it on, with the nonce its attach reply carried.",
@@ -675,6 +742,9 @@ func (d *Daemon) verbReleaseAgentMessage(cs *connState, params json.RawMessage) 
 	sess, verr := d.resolveVerbSession(p.Session)
 	if verr != nil {
 		return nil, verr
+	}
+	if _, ok := d.humanNonceFor(p.HumanNonce, sess.ID, cs); !ok {
+		return nil, nonceScopeError("release-agent-message")
 	}
 	held, ok := d.agents.takeHeld(sess.Name(), p.ID)
 	if !ok {
@@ -768,6 +838,8 @@ func (d *Daemon) verbReadAgentMessages(cs *connState, params json.RawMessage) (a
 	if q.inbox == AgentInboxHuman && !q.peek && !d.mayActAsHuman(cs) {
 		q.peek, peekForced = true, true
 	}
+	// A peek marks the inbox seen only when the caller is its reader.
+	q.markSeen = q.peek && !peekForced && d.callerReadsInbox(cs, q.inbox)
 	// The person's inbox is always live: it has no window to close.
 	live := map[string]bool{AgentInboxHuman: true}
 	for i := range state.Windows {
@@ -790,6 +862,26 @@ func (d *Daemon) verbReadAgentMessages(cs *connState, params json.RawMessage) (a
 	}
 	if len(marked) > 0 {
 		d.broadcastToSession(sess.ID, MsgAgentMail, &AgentMailPayload{ReadIDs: marked, ReadAt: readAt}, "")
+	}
+	// A peek that marked messages seen is news too: the sender reads seen_at,
+	// and the mailbox and the Inbox draw it.
+	var seenIDs []uint64
+	var seenAt int64
+	seenThreads := map[uint64]bool{}
+	for _, m := range res.Messages {
+		if q.markSeen && m.WasUnread && !m.WasSeen && m.SeenAt != 0 && m.ReadAt == 0 {
+			seenIDs = append(seenIDs, m.ID)
+			seenAt = m.SeenAt
+			seenThreads[m.ThreadID] = true
+		}
+	}
+	if len(seenIDs) > 0 {
+		d.broadcastToSession(sess.ID, MsgAgentMail, &AgentMailPayload{SeenIDs: seenIDs, SeenAt: seenAt}, "")
+		if q.inbox == AgentInboxHuman {
+			for thread := range seenThreads {
+				d.attention.noteMailSeen(sess.Name(), thread, d.agents.threadSeen(sess.Name(), AgentInboxHuman, thread))
+			}
+		}
 	}
 	// A thread of the person's mail with nothing left unread in it is no
 	// longer waiting in the Inbox.
@@ -821,13 +913,42 @@ func (d *Daemon) verbReadAgentMessages(cs *connState, params json.RawMessage) (a
 		// skill trips over it in the shape of the answer.
 		"untrusted": true,
 		"messages":  res.Messages,
-		"unread":    res.Unread,
-		"total":     res.Total,
-		"evicted":   res.Evicted,
+		// unread is how many of the returned messages were not read before
+		// this call, seen ones included. seen is how many of those had been
+		// seen, and marked_read and marked_seen are what this call changed.
+		"unread":      res.Unread,
+		"seen":        res.Seen,
+		"marked_read": res.MarkedRead,
+		"marked_seen": res.MarkedSeen,
+		"total":       res.Total,
+		"evicted":     res.Evicted,
 		// True when the read asked to mark the person's mail read and was
 		// served as a peek instead, because the caller runs in a pane.
 		"peek_forced": peekForced,
 	}, nil
+}
+
+// callerReadsInbox reports whether the caller on cs is the reader of an inbox,
+// which is the only caller whose peek means the inbox's owner looked at its
+// mail. Another pane that peeks to check on a message has not looked as the
+// recipient, so it must not turn the message seen.
+//
+//   - A window inbox is read by the pane the caller runs in, placed the way
+//     the grants code places it. A caller in a different pane, in an unplaced
+//     pane, over a link, or in no pane at all is not that reader. A plain CLI
+//     in no pane is not an agent reading its own mail, so it marks nothing.
+//   - The person's inbox is read by the person: a caller that may act as the
+//     person (see mayActAsHuman), such as the CLI run outside every pane.
+//   - No inbox named means no reader.
+func (d *Daemon) callerReadsInbox(cs *connState, inbox string) bool {
+	switch inbox {
+	case "":
+		return false
+	case AgentInboxHuman:
+		return d.mayActAsHuman(cs)
+	}
+	pa := d.paneAuthority(cs)
+	return pa != nil && pa.window == inbox
 }
 
 // verbAskAgent is the composition that turns "type into a pane" into "ask
@@ -1072,9 +1193,19 @@ func (d *Daemon) askAgent(cs *connState, sess *Session, state *SessionState, tar
 	// prompt. See prompt_submit.go. The gate reads the pane first, so it can
 	// tell afterwards whether the pane took the question. See prompt_gate.go.
 	gate := d.newPromptGate(sess, target.ID)
-	submittedAt, werr := submitPrompt(d.ctx, pty, p.Text, d.inputProfileFor(sess, target.ID))
+	// And once more right before the submit key, which would answer a
+	// prompt that came up while the paste was taken in.
+	ctx := withSubmitGuard(d.ctx, func() *verbError {
+		if !p.AllowBlocked {
+			if verr := d.refuseBlockedAgent(sess, target.ID); verr != nil {
+				return verr
+			}
+		}
+		return d.recheckTyping(cs, "ask-agent", sess, target.ID)
+	})
+	submittedAt, werr := submitPrompt(ctx, pty, p.Text, d.inputProfileFor(sess, target.ID))
 	if werr != nil {
-		return nil, newVerbError(ErrVerbInternal, werr.Error())
+		return nil, promptWriteError(werr)
 	}
 	gate.markSubmitted(submittedAt)
 
@@ -1187,6 +1318,8 @@ func agentBlockedError(w WindowState) *verbError {
 		what = "an approval"
 	case harness.PromptKindQuestion:
 		what = "a question"
+	case harness.PromptKindAuth:
+		what = "a login"
 	}
 	msg := "the target agent is waiting on " + what + ", and text typed now would answer it"
 	if note := printableClaim(w.AgentMessage, agentMsgMaxSubject); note != "" {
@@ -1422,8 +1555,8 @@ func contentLines(s string) int {
 // needs both the count and the lines does not split a ten-thousand-line
 // scrollback twice.
 func countContent(lines []string) int {
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.TrimSpace(lines[i]) != "" {
+	for i, line := range slices.Backward(lines) {
+		if strings.TrimSpace(line) != "" {
 			return i + 1
 		}
 	}

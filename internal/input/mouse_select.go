@@ -9,8 +9,8 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/app"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
 	uv "github.com/charmbracelet/ultraviolet"
+	"tuios.dev/vt"
 )
 
 // multiClickInterval is how long after a click a second one still counts as
@@ -159,8 +159,8 @@ func copyModeLineCells(window *terminal.Window, absY int) []uv.Cell {
 // appearance.copy_on_select is on, puts the selected text on the clipboard.
 //
 // Copying on release is what a graphical terminal does (X11's primary
-// selection, kitty's copy_on_select), and it is why a selection here no longer
-// needs a separate keystroke to be useful. It is a setting because a stray drag
+// selection, kitty's copy_on_select), and it is why a selection here does not
+// need a separate keystroke to be useful. It is a setting because a stray drag
 // overwriting the clipboard is a real annoyance for some people.
 //
 // A drag writes at once: the button coming up ended the gesture and nothing can
@@ -174,8 +174,8 @@ func copyModeLineCells(window *terminal.Window, absY int) []uv.Cell {
 // the next press clears it, as does typing.
 //
 // The clipboard path is the same tea.SetClipboard (OSC 52) that copy mode's y
-// has always used, so it reaches exactly the environments that already did,
-// including over SSH, and no more.
+// uses, so it reaches exactly the same environments, including over SSH, and
+// no more.
 func finishMouseSelection(o *app.OS, window *terminal.Window) tea.Cmd {
 	cm := window.CopyMode
 	if cm == nil || !cm.Active {
@@ -204,7 +204,9 @@ func finishMouseSelection(o *app.OS, window *terminal.Window) tea.Cmd {
 	}
 
 	if o.SelectionDragged || window.ClickCount < 2 {
-		return o.CopyToClipboard(text)
+		// A copied selection is also kept as a paste buffer. The deferred
+		// write keeps it when it lands (app.HandlePendingCopy).
+		return tea.Batch(o.CopyToClipboard(text), o.SaveToPasteBuffers(text))
 	}
 	return o.DeferCopyToClipboard(text, remainingClickWindow(window))
 }

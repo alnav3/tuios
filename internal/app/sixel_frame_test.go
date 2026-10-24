@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // sixelTestImage is cols x rows cells of 10x20 pixels, each cell its own
@@ -238,7 +238,7 @@ func TestSixelFallbackModes(t *testing.T) {
 func TestFrameHookWriterOrder(t *testing.T) {
 	var buf strings.Builder
 	w := NewFrameHookWriter(&buf)
-	w.SetHook(func([]byte) []byte { return []byte("IMG") })
+	w.SetHook(func(f []byte) ([]byte, []byte) { return f, []byte("IMG") })
 	_, _ = w.Write([]byte("\x1b[?2026hFRAME\x1b[?2026l"))
 	if got := buf.String(); got != "\x1b[?2026hFRAMEIMG\x1b[?2026l" {
 		t.Fatalf("wrote %q", got)
@@ -307,5 +307,67 @@ func TestSixelUnknownCellsAreBlank(t *testing.T) {
 		if strings.Contains(frame, bad) {
 			t.Fatalf("unknown image cells drew %q", bad)
 		}
+	}
+}
+
+// TestSixelOnKittyKeepsTheOldImageUntilTheNewOne: a program that draws a new
+// sixel over the last one, as a browser does for every frame, must never leave
+// the cells empty. On a kitty host the new image is compressed in the
+// background, so the frame that first sees it cannot place it yet. That frame
+// used to delete the old placement anyway, and the pane blinked between the
+// picture and nothing.
+func TestSixelOnKittyKeepsTheOldImageUntilTheNewOne(t *testing.T) {
+	m, win := sixelOS(t, sixelViaKitty)
+	var mu sync.Mutex
+	var out string
+	m.SixelPassthrough.direct = func(b []byte) { mu.Lock(); out += string(b); mu.Unlock() }
+	frame := func() string {
+		m.testFrame()
+		b := m.GraphicsFrameBytes(nil)
+		mu.Lock()
+		defer mu.Unlock()
+		out += string(b)
+		return string(b)
+	}
+	waitFor := func(what string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			done := strings.Count(out, what)
+			mu.Unlock()
+			if done > 0 {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("no %q reached the host", what)
+	}
+
+	win.WriteOutput(sixelTestImage(20, 3))
+	win.MarkContentDirty()
+	frame()
+	waitFor("a=p,")
+	mu.Lock()
+	out = ""
+	mu.Unlock()
+
+	// The same cells, a new image.
+	win.WriteOutput([]byte("\x1b[H"))
+	win.WriteOutput(sixelTestImage(20, 3))
+	win.MarkContentDirty()
+	if got := frame(); strings.Contains(got, "a=d,") {
+		t.Fatalf("the old image was deleted before its replacement was placed: %q", got)
+	}
+	waitFor("a=p,")
+	frame()
+	mu.Lock()
+	defer mu.Unlock()
+	place, del := strings.Index(out, "a=p,"), strings.Index(out, "a=d,d=i,")
+	if del < 0 {
+		t.Fatalf("the old placement was never deleted: %q", out[:min(300, len(out))])
+	}
+	if del < place {
+		t.Fatalf("the delete went out before the new placement")
 	}
 }

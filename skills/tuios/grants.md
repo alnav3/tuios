@@ -16,11 +16,41 @@ tuios pane-grants --json | jq -r '.grants | join(",")'
 | `write` | Type into the panes of your own session that hold nothing you do not, and leave mail and stashed files there |
 | `fan` | Write in your fan group and the sessions you launched, and start agents with `fan` and `start-agent` |
 | `respond` | Answer another pane's prompt with `respond`, for the person, and type into a pane waiting on a prompt |
-| `admin` | Everything else: other sessions, listings across sessions, windows, layouts, options, `kill-session`, `run-command`, attach. Includes `read`, `write` and `fan`, never `respond` |
+| `files` | Copy files with `tuios cp`, and see and control your own copies with `tuios transfers` |
+| `admin` | Everything else: other sessions, listings across sessions, windows, layouts, options, `kill-session`, `run-command`, `switch-session`, `detach-client`, attach. Includes `read`, `write`, `fan` and `files`, never `respond` |
 
 Whatever you hold, you can report about your own pane (`set-agent-state`,
-`set-agent-meta`, `set-agent-session`, `report-agent-activity`, `ask-human`,
-`request-approval`) and ask what you hold. So `tuios agent-hook` works in every pane.
+`set-agent-meta`, `set-agent-session`, `report-agent-activity`, `agent-mail-notice`,
+`ask-human`, `request-approval`) and ask what you hold. So `tuios agent-hook` works in every pane.
+A report about another pane needs `respond`, with `admin` too, because the
+state it sets decides whether that pane waits on a prompt. A process tuios
+starts outside every pane, such as a hook, reports for no pane.
+
+The paste buffers hold what the person copied, so they need grants too:
+`list-buffers` and `show-buffer` need `read`, `set-buffer` and `delete-buffer`
+need `write`, and `paste-buffer` needs both, since what it types into your own
+pane comes back to you. Without `admin` a buffer you set is your pane's own,
+and you see, read, change and paste only your own buffers: not the person's,
+and not another pane's. `set-buffer` makes a buffer with no name, and a `-b`
+name that is not yours answers `no_buffer`. A connection restricted to its own session
+(`tuios mcp` without `--scope all`) reaches no buffers, since every session
+shares them.
+
+The `files` grant reaches the copies that stay near your work. A copy may
+start when each end on this machine is inside your pane's folder. That is
+the session's worktree when tuios made it, else the folder the pane started
+in. A `cd` or an OSC 7 does not move it. Every file the copy reads or writes
+here stays inside it, and a link does not lead out. The home folder, the
+folders above it and a folder another user owns are never a pane's folder: start the pane in a project
+folder or a worktree. A pane without admin starts windows and agents only
+inside its folder, and types only into panes whose folder is inside its
+own. Each end on a host must be under its home folder, or be its receive folder
+(`HOST:`). A copy out of the project into the person's other folders, or into
+a host's system folders, needs the person. `files` sees, pauses, resumes,
+cancels, answers and clears only the copies your pane started, never the
+person's or another pane's. Every copy carries the name of the pane that
+started it, whatever the pane holds. A refusal is `forbidden`, and
+`tuios cp` exits 4.
 
 `TUIOS_PANE_GRANTS` is what the pane held when its process started;
 `tuios pane-grants` is what it holds now.
@@ -32,10 +62,13 @@ typing into any pane but your own (`send-text`, `send-keys`, `run`,
 `ask-agent`, `queue`) is refused when the target holds a grant you do not.
 Typing into another pane on `needs_input` is refused unless you hold
 `respond`, with `admin` too, because keys typed there answer its prompt.
+A pane that something other than itself moved off `needs_input` is refused the
+same way, because its prompt can still be on the screen. This lasts until the
+pane reports for itself, comes to a prompt again, or runs another program.
 A permission prompt is for the person. `queue` waits until the pane is at rest,
 so it is not refused for this. Without `respond`, `send-keys` with no window
 types into the focused pane, `PREFIX` is refused, and `run-command` may not
-type or press keys. A message you queue is checked against your
+type, press keys or run an action. A message you queue is checked against your
 grants again when it is typed, and dropped if they no longer cover the
 target. Your keys always go to the target's terminal, never to the
 window manager.

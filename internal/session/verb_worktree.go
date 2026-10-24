@@ -1,15 +1,22 @@
 package session
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 )
@@ -34,6 +41,17 @@ const (
 	// uncommitted changes and the caller did not say what to do with them.
 	// Nothing was removed. The remedy is stash or force, and the hint says so.
 	ErrVerbWorktreeDirty = "worktree_dirty"
+	// ErrVerbWorktreeDetached reports a removal refused because the worktree
+	// sits on a detached HEAD holding commits no branch, tag or remote has.
+	// Removing the worktree would leave those commits unreachable. Nothing was
+	// removed; force removes them anyway.
+	ErrVerbWorktreeDetached = "worktree_detached"
+	// ErrVerbWorktreeNested reports a removal refused because an ignored or
+	// untracked path in the worktree holds a git repository of its own. git
+	// worktree remove deletes it with everything around it, and no stash can
+	// save a nested repository's history. Nothing was removed; force removes
+	// it anyway.
+	ErrVerbWorktreeNested = "worktree_nested"
 	// ErrVerbGitFailed reports a git command that failed, with git's own
 	// message. It is final: the repository is as it was.
 	ErrVerbGitFailed = "git_failed"
@@ -114,8 +132,9 @@ func repoRootParam(dir string) (string, *verbError) {
 // the session in it, then the record that ties them. The worktree is never
 // removed on a later failure. It exists on disk and git lists it, and taking
 // it away because a session failed to start would be removing something the
-// caller asked for and can still use.
-func (d *Daemon) createWorktreeSession(root, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
+// caller asked for and can still use. The session gets the caller's terminal
+// from its hello, as one made by new-session does.
+func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
 	path := worktree.PathFor(worktree.DefaultDir(), root, branch)
 	if _, err := os.Lstat(path); err == nil {
 		return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
@@ -146,7 +165,7 @@ func (d *Daemon) createWorktreeSession(root, branch, base, sessionName string, c
 		})
 	}
 
-	sess, err := d.manager.CreateSession(sessionName, &SessionConfig{}, defaultVerbSessionWidth, defaultVerbSessionHeight)
+	sess, err := d.manager.CreateSession(sessionName, callerSessionConfig(cs), defaultVerbSessionWidth, defaultVerbSessionHeight)
 	if err != nil {
 		return nil, hintedVerbError(ErrVerbInternal, "the worktree was created at "+path+" but its session could not: "+err.Error(), &VerbHint{
 			Detail: "The worktree is kept. Start a session in it with: tuios new-window --cwd " + path,
@@ -161,6 +180,12 @@ func (d *Daemon) createWorktreeSession(root, branch, base, sessionName string, c
 		},
 		Base:    base,
 		Managed: true,
+	}
+	// Where the branch starts, so list-worktrees can tell a branch with
+	// commits of its own from a fresh one. A failure leaves it empty, and the
+	// listing falls back to the merge base.
+	if start, err := worktree.HeadCommit(path); err == nil {
+		info.StartCommit = start
 	}
 	if record != nil {
 		record(info)
@@ -218,9 +243,12 @@ func (d *Daemon) verbNewWorktree(cs *connState, params json.RawMessage) (any, *v
 	if verr != nil {
 		return nil, verr
 	}
-	out, verr := d.createWorktreeSession(root, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
+	out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
 	if verr != nil {
 		return nil, verr
+	}
+	if id, _ := out["window_id"].(string); id != "" {
+		d.noteStartedBy(cs, id)
 	}
 	out["type"] = "worktree_created"
 	if cloned {
@@ -233,6 +261,7 @@ func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *
 	var p struct {
 		Repo    string `json:"repo"`
 		Group   string `json:"group"`
+		Session string `json:"session"`
 		Changes bool   `json:"changes"`
 	}
 	if verr := decodeParams(params, &p); verr != nil {
@@ -248,6 +277,12 @@ func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *
 			continue
 		}
 		if p.Group != "" && wt.Group != p.Group {
+			continue
+		}
+		// One session only. The counts under changes walk ignored and
+		// untracked trees — node_modules included — and the close dialog is
+		// the only caller that needs them, for one worktree it names.
+		if p.Session != "" && s.Name != p.Session {
 			continue
 		}
 		states := make([]string, 0, len(s.Windows))
@@ -270,6 +305,7 @@ func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *
 			"path":          wt.Path,
 			"base":          wt.Base,
 			"group":         wt.Group,
+			"fan_id":        wt.FanID,
 			"managed":       wt.Managed,
 			"gone":          wt.Gone,
 			"state":         state,
@@ -286,6 +322,9 @@ func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *
 		if wt.LaunchedFrom != "" {
 			row["launched_from"] = wt.LaunchedFrom
 		}
+		if wt.PR != nil {
+			row["pr"] = wt.PR
+		}
 		if p.Changes && !wt.Gone {
 			// A git status per worktree, only when asked for: the rail never
 			// asks, and a listing an agent polls should not run git it did not
@@ -295,10 +334,32 @@ func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *
 			} else {
 				row["changes"] = -1
 			}
+			// What the close dialog says the delete row will take. Ignored is
+			// the part nothing saves, counted in files, not in the entries git
+			// lists; own_commits is the part the delete refuses. -1 is a
+			// failed read, not a count.
+			if n, err := worktree.Ignored(wt.Path); err == nil {
+				row["ignored"] = n
+			} else {
+				row["ignored"] = -1
+			}
+			if n, err := worktree.OwnCommits(wt.Path); err == nil {
+				row["own_commits"] = n
+			} else {
+				row["own_commits"] = -1
+			}
 			if wt.Base != "" {
 				if n, err := worktree.Ahead(wt.Path, wt.Base); err == nil {
 					row["ahead"] = n
 				}
+			}
+			// Merged into its base, or into the base's upstream. Cached per
+			// tip in the worktree package, so a polled listing runs git
+			// again only when a branch moves.
+			into, _ := worktree.Merged(wt.Path, wt.RepoRoot, wt.StartCommit, wt.Base)
+			row["merged"] = into != ""
+			if into != "" {
+				row["merged_into"] = into
 			}
 		}
 		rows = append(rows, row)
@@ -331,6 +392,7 @@ func (d *Daemon) verbRemoveWorktree(_ *connState, params json.RawMessage) (any, 
 	}
 	// Resolved now, while the directory is there to resolve.
 	notesRoot := canonRoot(info.Path)
+	killed := false
 
 	out := map[string]any{
 		"type":        "worktree_removed",
@@ -359,9 +421,53 @@ func (d *Daemon) verbRemoveWorktree(_ *connState, params json.RawMessage) (any, 
 			})
 		}
 		out["changes"] = changes
+		if own, err := worktree.OwnCommits(info.Path); err == nil {
+			out["own_commits"] = own
+			if own > 0 && !p.Force {
+				return nil, hintedVerbError(ErrVerbWorktreeDetached,
+					fmt.Sprintf("%s sits on a detached HEAD holding %d %s no branch has. Nothing was removed.", info.Path, own, plural.Word(own, "commit", "commits")),
+					&VerbHint{
+						Param:  "force",
+						Detail: "Commit them onto a branch first, or pass force to remove the worktree and lose the commits.",
+					})
+			}
+		} else {
+			out["own_commits"] = -1
+		}
+		// Ignored files are counted in files, not in the entries git lists: an
+		// ignored directory is one entry however many files it holds. They are
+		// not saved: git never stashes them, and git worktree remove deletes
+		// them without --force. -1 is a count git would not give, so the caller
+		// can tell a failed read from a clean 0.
+		if ignored, err := worktree.Ignored(info.Path); err == nil {
+			out["ignored"] = ignored
+		} else {
+			out["ignored"] = -1
+		}
+		// A nested repository in an ignored or untracked path is the one thing
+		// even a clean read cannot save: the removal deletes its .git, and no
+		// stash holds a nested repository's history.
+		if nested, err := worktree.NestedRepo(info.Path); err != nil {
+			// The check is what stands between the removal and a nested
+			// repository's history, so a failed read fails closed.
+			// The walk of the untracked and ignored paths fails with a
+			// *fs.PathError; git fails with a plain error.
+			detail := "git could not read the worktree's status for the nested repository check. Nothing was removed."
+			if _, walk := errors.AsType[*fs.PathError](err); walk {
+				detail = "tuios could not read the untracked and ignored folders for the nested repository check. Nothing was removed."
+			}
+			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{Detail: detail})
+		} else if nested != "" && !p.Force {
+			return nil, hintedVerbError(ErrVerbWorktreeNested,
+				fmt.Sprintf("%s holds a nested git repository at %s. Nothing was removed.", info.Path, nested),
+				&VerbHint{
+					Param:  "force",
+					Detail: "Remove the nested repository first, or pass force to delete it with the worktree, its history included.",
+				})
+		}
 		if changes > 0 && !p.Force && !p.Stash {
 			return nil, hintedVerbError(ErrVerbWorktreeDirty,
-				fmt.Sprintf("%s holds %d uncommitted %s. Nothing was removed.", info.Path, changes, plural(changes, "change", "changes")),
+				fmt.Sprintf("%s holds %d uncommitted %s. Nothing was removed.", info.Path, changes, plural.Word(changes, "change", "changes")),
 				&VerbHint{
 					Param:   "stash",
 					Command: "tuios worktree rm " + sess.Name() + " --stash",
@@ -378,18 +484,42 @@ func (d *Daemon) verbRemoveWorktree(_ *connState, params json.RawMessage) (any, 
 			out["stash_message"] = "tuios: " + info.Branch
 		}
 		discard := changes > 0 && !p.Stash
+		// On Windows the session's shells hold the worktree as their cwd, and
+		// git cannot remove a directory a process sits inside. The stash has
+		// already run, so the session goes first and the removal has the
+		// directory to itself. Everywhere else the session outlives the verb
+		// when it is asked to, so the client can show the note before it kills.
+		if runtime.GOOS == "windows" && !p.KeepSession {
+			if err := d.manager.DeleteSession(sess.Name()); err == nil {
+				killed = true
+			}
+		}
 		if err := worktree.Remove(info.RepoRoot, info.Path, discard); err != nil {
-			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
-				Detail: "git refused to remove the worktree. It is still there.",
-			})
+			msg := "git refused to remove the worktree: " + err.Error() + " It is still there."
+			if stashed, _ := out["stashed"].(bool); stashed {
+				// The stash ran before the remove, so the refusal leaves the
+				// worktree in place but empty: the changes are in git stash,
+				// and this error is the one place that says so.
+				msg += " The changes were already stashed: they are in git stash under the message \"tuios: " + info.Branch + "\"."
+			}
+			if killed {
+				msg += " The session was killed to free the directory for the removal."
+			}
+			// The message carries the whole story — the refusal, the stash, the
+			// kill — and the client prints message and Detail together, so a
+			// Detail that repeats it prints the story twice.
+			return nil, hintedVerbError(ErrVerbGitFailed, msg, nil)
 		}
 		out["discarded"] = discard
 	}
 	// The notes on the worktree's changes go with it.
 	d.reviewNotes.dropRoot(notesRoot)
+	// So do the checkpoints taken in it. The refs are the repository's, so
+	// git runs in the main checkout, which is still there.
+	d.dropCheckpointsOf(info.RepoRoot, notesRoot)
 
-	out["session_killed"] = false
-	if !p.KeepSession {
+	out["session_killed"] = killed
+	if !killed && !p.KeepSession {
 		if err := d.manager.DeleteSession(sess.Name()); err == nil {
 			out["session_killed"] = true
 		}
@@ -465,6 +595,7 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 		Prompts      []string          `json:"prompts"`
 		Base         string            `json:"base"`
 		Name         string            `json:"name"`
+		Join         string            `json:"join"`
 		ReadyTimeout int               `json:"ready_timeout"`
 		Env          map[string]string `json:"env"`
 		Grants       []string          `json:"grants"`
@@ -552,12 +683,31 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 		}
 	}
 	stem := strings.TrimSpace(p.Name)
-	if stem == "" {
+	if verr := fanStemPlain(stem); verr != nil {
+		return nil, verr
+	}
+	if join := strings.TrimSpace(p.Join); join != "" && stem == "" {
+		// The fan to join names itself.
+		if s := d.manager.GetSession(join); s != nil {
+			if wt := s.Worktree(); wt != nil {
+				stem = wt.Group
+			}
+		}
+	}
+	named := stem != ""
+	if !named {
 		stem = fanStem(promptFor(0))
 	}
 	if err := worktree.ValidBranch(stem); err != nil {
 		return nil, invalidParam("name", err.Error())
 	}
+	stem, fanID, release, verr := d.reserveFan(cs, root, stem, named, strings.TrimSpace(p.Join))
+	if verr != nil {
+		return nil, verr
+	}
+	// The name is held from the check until the call's sessions exist, so
+	// two calls cannot both take it as new.
+	defer release()
 	branches := fanBranches(root, stem, p.Count)
 	if len(branches) < p.Count {
 		return nil, invalidParam("name", "could not find "+strconv.Itoa(p.Count)+" free branch names from "+stem)
@@ -565,14 +715,19 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	readyTimeout := durationOr(p.ReadyTimeout, fanDefaultReadyTimeout)
 	// The session of the pane that asked, so a connection restricted to that
 	// session reaches the agents it started. See conn_scope.go.
-	launchedFrom := d.callerSession(cs)
+	launchedFrom, launchedFromID := "", ""
+	if s := d.callerSession(cs); s != nil {
+		launchedFrom, launchedFromID = s.Name(), s.ID
+	}
 
 	sessions := make([]map[string]any, 0, p.Count)
 	for i, branch := range branches {
 		launch, prompt := launches[i%len(launches)], promptFor(i)
-		out, verr := d.createWorktreeSession(root, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
+		out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
 			info.Group = stem
+			info.FanID = fanID
 			info.LaunchedFrom = launchedFrom
+			info.LaunchedFromID = launchedFromID
 			info.Prompt = prompt
 			info.PromptStatus = PromptPending
 			info.Agent = launch.spec
@@ -593,6 +748,7 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 		}
 		sess := d.manager.GetSession(out["session"].(string))
 		windowID := out["window_id"].(string)
+		d.noteStartedBy(cs, windowID)
 		go d.deliverFanPrompt(sess, windowID, launch.harness, prompt, readyTimeout)
 		sessions = append(sessions, map[string]any{
 			"session":   out["session"],
@@ -609,6 +765,7 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	out := map[string]any{
 		"type":      "fan_started",
 		"group":     stem,
+		"fan_id":    fanID,
 		"repo":      filepath.Base(root),
 		"repo_root": root,
 		"agent":     launches[0].harness,
@@ -654,9 +811,176 @@ func (d *Daemon) deliverFanPrompt(sess *Session, windowID, harness, text string,
 	sess.setPromptStatus(status, note, at)
 }
 
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return one
+// fanReservations hold the names of the fans being made now, by canonical
+// repository root and stem, from the check until the sessions exist.
+type fanReservations struct {
+	mu    sync.Mutex
+	names map[string]bool
+}
+
+// fanKey is the key of the fan stem in the repository at root.
+func fanKey(root, stem string) string { return canonRoot(root) + "\x00" + stem }
+
+// newFanID is a random ID for a new fan. Every session of the fan saves it,
+// a join copies it, and the fan's sessions are the ones that share it, so a
+// fan made later under the same name is never taken for this one, also
+// across a restart.
+func newFanID() string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// sameFan reports whether a and b are sessions of one fan: the same group,
+// repository and fan ID. Two records from before the ID match by name.
+func sameFan(a, b *WorktreeInfo) bool {
+	return a != nil && b != nil && a.Group != "" && a.Group == b.Group &&
+		a.RepoRoot == b.RepoRoot && a.FanID == b.FanID
+}
+
+// reachedNames keeps the names of the sessions the caller on cs reaches. A
+// refusal lists a fan's sessions only to a caller that could list them
+// anyway.
+func (d *Daemon) reachedNames(cs *connState, names []string) []string {
+	var out []string
+	for _, n := range names {
+		if d.callerReachesSession(cs, n) {
+			out = append(out, n)
+		}
 	}
-	return many
+	return out
+}
+
+// fanMembers are the sessions of the fan stem in the repository at root.
+func (d *Daemon) fanMembers(root, stem string) []*Session {
+	var out []*Session
+	for _, s := range d.manager.AllSessions() {
+		if wt := s.Worktree(); wt != nil && wt.Group == stem && canonRoot(wt.RepoRoot) == canonRoot(root) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// reserveFan decides the fan a call makes or joins, and holds its name until
+// release. A fan's sessions reach each other (sessionInScope), so joining
+// one is never implicit:
+//
+//   - A name that is no fan yet starts a new fan.
+//   - A name that is already a fan, or is being made by another call now,
+//     is refused for every caller, the person included, unless the call
+//     names a session of that fan with join and the caller reaches it.
+//   - A name the caller did not give, the one fan makes from the prompt, is
+//     moved on to a free one: name-2, name-3.
+//
+// join with no fan of that name is refused too, so a join never starts one.
+//
+// It returns the fan's name and ID: a new ID for a new fan, the joined
+// session's for a join.
+func (d *Daemon) reserveFan(cs *connState, root, stem string, named bool, join string) (string, string, func(), *verbError) {
+	r := &d.fanReserved
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.names == nil {
+		r.names = map[string]bool{}
+	}
+	key := func(st string) string { return fanKey(root, st) }
+	taken := func(st string) bool { return r.names[key(st)] || len(d.fanMembers(root, st)) > 0 }
+	switch {
+	case join != "":
+		var names []string
+		var joined *Session
+		for _, m := range d.fanMembers(root, stem) {
+			names = append(names, m.Name())
+			if m.Name() == join {
+				joined = m
+			}
+		}
+		in := joined != nil
+		if !in {
+			return "", "", nil, hintedVerbError(ErrVerbInvalidParams, "join names "+echoName(join)+", which is not a session of the fan "+echoName(stem)+" in this repository", &VerbHint{
+				Param: "join", Available: d.reachedNames(cs, names),
+				Detail: "Nothing was made. join takes a session of the fan to add attempts to.",
+			})
+		}
+		if !d.callerReachesSession(cs, join) {
+			return "", "", nil, newVerbError(ErrVerbForbidden, "the caller cannot reach "+echoName(join)+", so it cannot add attempts to its fan")
+		}
+		// Joining an existing fan holds no reservation: the fan exists.
+		return stem, joined.Worktree().FanID, func() {}, nil
+	case taken(stem) && named:
+		var names []string
+		for _, m := range d.fanMembers(root, stem) {
+			names = append(names, m.Name())
+		}
+		return "", "", nil, hintedVerbError(ErrVerbFanExists, "a fan named "+echoName(stem)+" already exists in this repository", &VerbHint{
+			Param: "name", Available: d.reachedNames(cs, names),
+			Detail: "Nothing was made. Choose another name for a new fan. To add attempts to this fan on purpose, pass join with one of its sessions (tuios fan --join SESSION).",
+		})
+	case taken(stem):
+		base := stem
+		for i := 2; taken(stem); i++ {
+			if i > 99 {
+				return "", "", nil, invalidParam("name", "no free fan name from "+base)
+			}
+			stem = base + "-" + strconv.Itoa(i)
+		}
+	}
+	k := key(stem)
+	r.names[k] = true
+	return stem, newFanID(), func() {
+		r.mu.Lock()
+		delete(r.names, k)
+		r.mu.Unlock()
+	}, nil
+}
+
+// fanStemPlain refuses a fan name with a character outside A-Z, a-z, 0-9 and
+// / . _ -, the characters the name fan makes from a prompt already keeps to.
+// Anything wider lets a name read on screen as another fan's: a zero-width
+// space, a blank letter such as the Hangul filler, or a letter from another
+// script that looks like a Latin one.
+func fanStemPlain(stem string) *verbError {
+	for _, r := range stem {
+		if !FanNameChar(r) {
+			return invalidParam("name", fmt.Sprintf("the fan name %s has the character U+%04X. A fan name can have only the letters A to Z and a to z, the digits 0 to 9, and / . _ -. Nothing was made.", strconv.QuoteToASCII(stem), r))
+		}
+	}
+	if stem != "" && !FanNameRefOK(stem) {
+		return invalidParam("name", "git does not accept "+strconv.QuoteToASCII(stem)+" as a branch name. Nothing was made.")
+	}
+	return nil
+}
+
+// FanNameRefOK reports whether git takes name as a branch, by the rules of
+// git check-ref-format --branch, without running git, so the cockpit's
+// new-agent form can check a name in its update loop. The daemon checks the
+// same, and git checks again when it makes the branch.
+func FanNameRefOK(name string) bool {
+	if name == "" || name == "@" || name == "HEAD" || strings.HasPrefix(name, "-") || strings.HasPrefix(name, "/") ||
+		strings.HasSuffix(name, "/") || strings.HasSuffix(name, ".") || strings.Contains(name, "..") ||
+		strings.Contains(name, "//") || strings.Contains(name, "@{") {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(" ~^:?*[\\", r) {
+			return false
+		}
+	}
+	for part := range strings.SplitSeq(name, "/") {
+		if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
+// FanNameChar reports whether a fan name may hold r: A-Z, a-z, 0-9 or
+// / . _ -. The cockpit's new-agent form checks a name by it before start.
+func FanNameChar(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	}
+	return r == '/' || r == '.' || r == '_' || r == '-'
 }

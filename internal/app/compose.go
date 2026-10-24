@@ -306,7 +306,12 @@ func (m *OS) composeLayersIn(canvas *frameCanvas, layers []*lipgloss.Layer, pane
 	// order, so none of them reaches a layer drawn above it. See scrim.go,
 	// motion.go and shimmer.go.
 	now := time.Now()
-	scrimmed := m.Settings.ModalDim <= 0
+	popup, popupDim := m.popupScrimTarget()
+	scrimmed := m.Settings.ModalDim <= 0 && popupDim <= 0
+	// The dock and the rails sit above the panes, so they take the popup's
+	// scrim after they are drawn. Only TML also shades the dialog ground.
+	dialogScrim := popup != "" && m.isTMLPopup(m.GetFocusedWindow())
+	chromeScrim := false
 	fading := m.motion.fading > 0
 	shimmer := len(m.motion.rail) > 0
 
@@ -320,22 +325,61 @@ func (m *OS) composeLayersIn(canvas *frameCanvas, layers []*lipgloss.Layer, pane
 			if !at.Overlaps(view.clip) {
 				continue
 			}
+			if !scrimmed && (popup != "" && cl.layer.GetID() == popup) {
+				m.drawImageSymbols(canvas)
+				m.applyScrim(canvas, popupDim)
+				scrimmed, chromeScrim = true, true
+			}
 			m.drawPaneLayer(canvas, cl, at, view.clip, painted, &grounds)
+			if chromeScrim && dialogScrim && cl.layer.GetID() == popup {
+				m.scrimDialogGround(canvas, at.Intersect(view.clip), popupDim)
+			}
+			if m.gradient.on && m.gradientLayer(cl.layer.GetID()) {
+				m.applyBorderGradient(canvas, at.Intersect(view.clip), image.Pt(view.dx, view.dy))
+			}
 			if m.hints != nil {
 				m.applyHints(canvas, cl.layer.GetID(), &grounds)
+			}
+			if m.paneLabels != nil {
+				m.applyPaneLabels(canvas, cl.layer.GetID())
+			}
+			if m.dropZoneShown {
+				m.applyDropZone(canvas, cl.layer.GetID())
 			}
 			continue
 		}
 		if !cl.bounds.Overlaps(area) {
 			continue
 		}
-		if !scrimmed && scrimBehind(cl.layer.GetID()) {
-			m.applyScrim(canvas)
+		if !scrimmed && (popup != "" && cl.layer.GetID() == popup) {
+			m.drawImageSymbols(canvas)
+			m.applyScrim(canvas, popupDim)
+			scrimmed, chromeScrim = true, true
+		}
+		if !scrimmed && m.Settings.ModalDim > 0 && scrimBehind(cl.layer.GetID()) {
+			// Image glyphs first, so the scrim fades them like text.
+			m.drawImageSymbols(canvas)
+			m.applyScrim(canvas, m.Settings.ModalDim)
 			scrimmed = true
 		}
 		m.drawComposedLayer(canvas, cl, painted, &grounds, area)
+		if chromeScrim && scrimmedChrome(cl.layer.GetID()) {
+			m.applyScrimIn(canvas, cl.bounds, popupDim)
+		}
+		if chromeScrim && dialogScrim && cl.layer.GetID() == popup {
+			m.scrimDialogGround(canvas, cl.bounds, popupDim)
+		}
+		if m.gradient.on && m.gradientLayer(cl.layer.GetID()) {
+			m.applyBorderGradient(canvas, cl.bounds, image.Point{})
+		}
 		if m.hints != nil {
 			m.applyHints(canvas, cl.layer.GetID(), &grounds)
+		}
+		if m.paneLabels != nil {
+			m.applyPaneLabels(canvas, cl.layer.GetID())
+		}
+		if m.dropZoneShown {
+			m.applyDropZone(canvas, cl.layer.GetID())
 		}
 		switch id := cl.layer.GetID(); {
 		case fading:

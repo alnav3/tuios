@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -26,7 +27,18 @@ type VerbClient struct {
 	daemon *DaemonHandshake
 	// host is the machine the verbs run on, "" for this one.
 	host string
+	// broken is why the connection can no longer be trusted to pair a reply
+	// with its request, or nil. A call that timed out or failed part way
+	// leaves its reply, if one ever comes, waiting on the connection, and the
+	// next call would read that reply as its own: a capture of one pane
+	// handed back as the capture of another. So every call after such a
+	// failure fails at once, and the caller dials again.
+	broken error
 }
+
+// ErrVerbClientBroken is wrapped by every call on a connection an earlier
+// call left out of step. Dial again.
+var ErrVerbClientBroken = fmt.Errorf("the verb connection is out of step after an earlier failed call; dial again")
 
 // VerbCallError is returned by VerbClient.Call when the daemon answers with an
 // error envelope. It exposes the stable string code and the structured hint
@@ -40,6 +52,12 @@ type VerbCallError struct {
 // ErrorCode returns the daemon's stable error code, such as unknown_verb, for
 // a caller that tests it through an interface rather than this type.
 func (e *VerbCallError) ErrorCode() string { return e.Code }
+
+// Is matches ErrTooManyConnections for the refusal of a daemon whose
+// socket is full.
+func (e *VerbCallError) Is(target error) bool {
+	return target == ErrTooManyConnections && e.Code == ErrVerbTooManyConnections
+}
 
 func (e *VerbCallError) Error() string {
 	if e.Code == "" {
@@ -84,25 +102,50 @@ func DialVerbClientAt(socketPath, clientVersion string) (*VerbClient, error) {
 		return nil, err
 	}
 	c.daemon = hs
-	c.presentPaneToken(peerPIDSupported, os.Getenv)
+	if err := c.presentPaneToken(peerPIDSupported, os.Getenv, socketPath); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 	return c, nil
 }
 
 // presentPaneToken places this connection in the caller's pane where the
 // daemon cannot place it by pid, so a call from a pane is held to the pane's
 // grants on every platform. It sends TUIOS_PANE_ID and TUIOS_PANE_TOKEN with
-// pane-grants when both are set and the daemon takes them. Presenting a token
-// can only narrow what the connection may do, so a failure is ignored: the
-// daemon holds the call to what it can prove either way.
-func (c *VerbClient) presentPaneToken(kernelPlaces bool, getenv func(string) string) {
-	if kernelPlaces || c.daemon == nil || !c.daemon.PaneGrants {
-		return
+// pane-grants when both are set and the daemon takes them. Presenting a pane
+// token can only narrow what the connection may do, so a failure is
+// ignored: the daemon holds the call to what it can prove either way.
+//
+// A native plugin's process presents TUIOS_PLUGIN_ID and TUIOS_PLUGIN_TOKEN
+// on every platform. That one must take: a refusal, or a daemon that does
+// not know the parameters, fails the connection, so a plugin's call never
+// goes through unplaced. See plugin_token.go.
+func (c *VerbClient) presentPaneToken(kernelPlaces bool, getenv func(string) string, socketPath string) error {
+	if c.daemon == nil || !c.daemon.PaneGrants {
+		return nil
+	}
+	// Only to the plugin's own daemon, whose socket the plugin's processes
+	// get as TUIOS_SOCKET: another daemon cannot prove the token, and a
+	// call there with --server must not fail for it.
+	if id, tok := getenv("TUIOS_PLUGIN_ID"), getenv("TUIOS_PLUGIN_TOKEN"); (id != "" || tok != "") && sameSocket(getenv("TUIOS_SOCKET"), socketPath) {
+		if _, err := c.Call("pane-grants", map[string]any{"plugin_id": id, "plugin_token": tok}); err != nil {
+			return fmt.Errorf("this process belongs to plugin %s, and the daemon did not take its token: %w", id, err)
+		}
+	}
+	if kernelPlaces {
+		return nil
 	}
 	id, tok := getenv("TUIOS_PANE_ID"), getenv("TUIOS_PANE_TOKEN")
 	if id == "" || tok == "" {
-		return
+		return nil
 	}
 	_, _ = c.Call("pane-grants", map[string]any{"pane_id": id, "pane_token": tok})
+	return nil
+}
+
+// sameSocket reports whether two socket paths name the same socket.
+func sameSocket(a, b string) bool {
+	return a != "" && b != "" && filepath.Clean(a) == filepath.Clean(b)
 }
 
 // DialVerbClientThroughHost connects to the daemon on host by way of the daemon
@@ -148,6 +191,8 @@ func (c *VerbClient) Host() string { return c.host }
 func (c *VerbClient) Daemon() *DaemonHandshake { return c.daemon }
 
 // Close closes the underlying connection. It is safe on a nil client.
+//
+//go:noinline
 func (c *VerbClient) Close() error {
 	if c == nil || c.conn == nil {
 		return nil
@@ -181,6 +226,8 @@ const defaultCallTimeout = 30 * time.Second
 
 // Call sends a verb request with the given params (may be nil) and returns the
 // raw result object. A daemon error envelope is returned as a *VerbCallError.
+//
+//go:noinline
 func (c *VerbClient) Call(verb string, params any) (json.RawMessage, error) {
 	return c.CallWithTimeout(verb, params, defaultCallTimeout)
 }
@@ -190,8 +237,18 @@ func (c *VerbClient) Call(verb string, params any) (json.RawMessage, error) {
 // must widen this deadline too or the connection gives up before the daemon
 // answers, turning a satisfied wait into a read failure.
 func (c *VerbClient) CallWithTimeout(verb string, params any, timeout time.Duration) (json.RawMessage, error) {
+	// A call to another machine is held to this machine's agent switch. See
+	// HostCallGuard.
+	if c.host != "" && HostCallGuard != nil {
+		if err := HostCallGuard(verb, params); err != nil {
+			return nil, err
+		}
+	}
 	c.callMu.Lock()
 	defer c.callMu.Unlock()
+	if c.broken != nil {
+		return nil, fmt.Errorf("%w (%v)", ErrVerbClientBroken, c.broken)
+	}
 
 	c.nextID++
 	id := c.nextID
@@ -218,18 +275,28 @@ func (c *VerbClient) CallWithTimeout(verb string, params any, timeout time.Durat
 
 	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.conn.Write(line); err != nil {
+		c.broken = err
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
 	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
 	respLine, err := c.r.ReadBytes('\n')
 	if err != nil {
+		c.broken = err
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	var resp verbResponse
 	if err := json.Unmarshal(respLine, &resp); err != nil {
+		c.broken = err
 		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	// A reply that names another request is one an earlier call gave up
+	// on. Taking it would hand this caller an answer to a different
+	// question.
+	if len(resp.ID) > 0 && string(bytes.TrimSpace(resp.ID)) != fmt.Sprintf("%d", id) {
+		c.broken = fmt.Errorf("reply %s to request %d", resp.ID, id)
+		return nil, fmt.Errorf("%w (%v)", ErrVerbClientBroken, c.broken)
 	}
 	if resp.Error != nil {
 		return nil, &VerbCallError{

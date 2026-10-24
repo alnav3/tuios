@@ -42,6 +42,18 @@ import (
 // shifted forward. Nothing is cached per offset, so the style cache and the
 // per-pane cell layers are reused as the view moves.
 
+// A session smaller than this client.
+//
+// The same mapping places a session smaller than the terminal. Under latest
+// another client may own the size, and under smallest a smaller client does.
+// The rail, the dock and the rest of the chrome stay at this client's own
+// edges, the session's panes sit at the top left of the pane area between
+// them, and the rest of that area is the leftover, drawn by renderLeftover:
+// a dotted pattern, as tmux fills it, and a line that names the client that
+// sets the size. Drawing the whole client in the session's size instead would
+// put a right rail just past the panes and run a blank strip from there to the
+// screen's edge, which reads as a bug.
+
 // windowSizeAware reports whether the daemon may hand this client a session
 // larger than its terminal. Against a daemon that predates the policy the
 // session is never larger, and this keeps the client drawing as it did.
@@ -64,10 +76,68 @@ func (m *OS) ViewCropped() bool {
 	return m.cropsWidth() || m.cropsHeight()
 }
 
+// widthDiffers reports whether the session's panes are drawn as a view in
+// this client's frame across: the session is narrower or wider than this
+// client, or, under latest, its agreed left and right reserve is not this
+// client's own chrome (see reserveDiffers).
+func (m *OS) widthDiffers() bool {
+	if !m.windowSizeAware() {
+		return false
+	}
+	if m.Width > 0 && m.EffectiveWidth > 0 && m.EffectiveWidth != m.Width {
+		return true
+	}
+	own, agreed, ok := m.reserveDiffers()
+	return ok && (own.Left > agreed.Left || own.Right > agreed.Right)
+}
+
+// heightDiffers is widthDiffers for the height.
+func (m *OS) heightDiffers() bool {
+	if !m.windowSizeAware() {
+		return false
+	}
+	if m.Height > 0 && m.EffectiveHeight > 0 && m.EffectiveHeight != m.Height {
+		return true
+	}
+	own, agreed, ok := m.reserveDiffers()
+	return ok && (own.Top > agreed.Top || own.Bottom > agreed.Bottom)
+}
+
+// reserveDiffers returns this client's own chrome and the session's agreed
+// reserve, with ok true under latest while another client sets the size.
+// Under latest the agreed reserve counts only the clients of the session's
+// size, so a client of another size, or one whose chrome the daemon has not
+// counted yet, can have more chrome than the agreed reserve. Floored by its
+// own, it would put the panes in a box no other client uses. Along an axis
+// where its chrome is larger, it lays them out around the agreed reserve,
+// like every client, and draws them as a view inside its own chrome. Where
+// its chrome is smaller, the floor changes nothing.
+//
+// The client that sets the size keeps its own chrome as the floor, so a
+// change to its rail moves its panes at once, before the daemon has agreed
+// the new reserve. Under smallest and largest the agreed reserve is the
+// largest, so it is never less than a client's own, and nothing changes.
+func (m *OS) reserveDiffers() (own, agreed session.LayoutReserve, ok bool) {
+	// With no size from the daemon yet (an empty session's attach carries
+	// none), there is no agreed box to lay out around, and the floor stays.
+	if m.DaemonClient == nil || m.DaemonClient.SessionWindowSize() != config.WindowSizeLatest ||
+		!m.DaemonClient.ViewChrome() || !m.DaemonClient.SessionSizedByOther() ||
+		m.EffectiveWidth <= 0 || m.EffectiveHeight <= 0 {
+		return own, agreed, false
+	}
+	return m.OwnLayoutReserve(), m.SessionReserve, true
+}
+
+// viewShifted reports whether the panes are drawn through the session view:
+// the session is larger or smaller than this client along some axis.
+func (m *OS) viewShifted() bool {
+	return m.widthDiffers() || m.heightDiffers()
+}
+
 // GetLayoutWidth is the width the panes are laid out in: the session's when
-// it is wider than this client, otherwise the render width.
+// its size differs from this client's, otherwise the render width.
 func (m *OS) GetLayoutWidth() int {
-	if m.cropsWidth() {
+	if m.widthDiffers() {
 		return m.EffectiveWidth
 	}
 	return m.GetRenderWidth()
@@ -75,23 +145,24 @@ func (m *OS) GetLayoutWidth() int {
 
 // GetLayoutHeight is the height the panes are laid out in. See GetLayoutWidth.
 func (m *OS) GetLayoutHeight() int {
-	if m.cropsHeight() {
+	if m.heightDiffers() {
 		return m.EffectiveHeight
 	}
 	return m.GetRenderHeight()
 }
 
 // viewReserve is the chrome this client takes around its own screen. Along
-// an axis the session fits, it is the layout's reserve. Along an axis the
-// session overflows, only this client's own chrome is kept: the session's
-// agreed reserve is a layout quantity, and the view has no blank band to leave.
+// an axis where the session is this client's size, it is the layout's
+// reserve. Along an axis where it is larger or smaller, only this client's
+// own chrome is kept: the session's agreed reserve is a layout quantity, and
+// the view has no blank band to leave.
 func (m *OS) viewReserve() session.LayoutReserve {
 	r := m.paneReserve()
 	own := m.OwnLayoutReserve()
-	if m.cropsWidth() {
+	if m.widthDiffers() {
 		r.Left, r.Right = own.Left, own.Right
 	}
-	if m.cropsHeight() {
+	if m.heightDiffers() {
 		r.Top, r.Bottom = own.Top, own.Bottom
 	}
 	w, h := m.GetRenderWidth(), m.GetRenderHeight()
@@ -103,9 +174,11 @@ func (m *OS) viewReserve() session.LayoutReserve {
 	}
 }
 
-// ViewContentWidth is the width of this client's pane area on its own screen.
+// ViewContentWidth is the width of this client's pane area on its own
+// screen: the room between its own chrome. With a session smaller than this
+// client it is more than the session's panes take, and the rest is leftover.
 func (m *OS) ViewContentWidth() int {
-	if !m.cropsWidth() {
+	if !m.widthDiffers() {
 		return m.GetContentWidth()
 	}
 	r := m.viewReserve()
@@ -114,7 +187,7 @@ func (m *OS) ViewContentWidth() int {
 
 // ViewUsableHeight is the height of this client's pane area on its own screen.
 func (m *OS) ViewUsableHeight() int {
-	if !m.cropsHeight() {
+	if !m.heightDiffers() {
 		return m.GetUsableHeight()
 	}
 	r := m.viewReserve()
@@ -126,8 +199,12 @@ type sessionView struct {
 	on bool
 	// dx and dy are added to a layout position to place it on the screen.
 	dx, dy int
-	// clip is the view's pane area, on the screen.
+	// clip is the part of the screen the session's panes are drawn in.
 	clip image.Rectangle
+	// frame is this client's whole pane area, on the screen. It is clip
+	// unless the session is smaller than the area along some axis, and then
+	// what frame has beyond clip is the leftover.
+	frame image.Rectangle
 	// box is the session's pane area, in the layout frame, and off is how far
 	// into it the view starts.
 	box  image.Rectangle
@@ -159,15 +236,19 @@ func (v sessionView) visible() image.Rectangle {
 // mode tuios follows the copy-mode cursor. Only a pane with no position to
 // follow shows its own top left corner.
 func (m *OS) computeSessionView() sessionView {
-	if !m.ViewCropped() {
+	if !m.viewShifted() {
 		return sessionView{}
 	}
 	box := image.Rect(m.GetLeftMargin(), m.GetTopMargin(),
 		m.GetLeftMargin()+m.GetContentWidth(), m.GetTopMargin()+m.GetUsableHeight())
 	view := m.viewReserve()
-	clip := image.Rect(view.Left, view.Top,
+	frame := image.Rect(view.Left, view.Top,
 		view.Left+m.ViewContentWidth(), view.Top+m.ViewUsableHeight())
-	v := sessionView{on: true, box: box, clip: clip}
+	// The panes take the top left of the frame, no more of it than the
+	// session's pane area.
+	clip := image.Rect(frame.Min.X, frame.Min.Y,
+		frame.Min.X+min(frame.Dx(), box.Dx()), frame.Min.Y+min(frame.Dy(), box.Dy()))
+	v := sessionView{on: true, box: box, clip: clip, frame: frame}
 
 	cx, cy, cursor := m.viewTarget()
 	v.offX = followOffset(cx-box.Min.X, box.Dx(), clip.Dx(), cursor, false)
@@ -278,12 +359,24 @@ func (m *OS) ScreenPoint(x, y int) (int, int) {
 // for itself and for the drag and the release that follow it, so a pane
 // dragged over the rail stays a pane drag. internal/input calls it first for
 // every mouse event and clears the mark with SetPointerInLayout(false) after.
+//
+// The leftover (pane_leftover.go) is its own region. A mouse event over it, or
+// a drag or release that follows a press on it, is swallowed: see
+// PointerSwallowed. Without that it reached the window manager with screen
+// positions, which the panes read in the layout frame, so a click on the dots
+// focused, moved or resized whichever pane those positions named.
 func (m *OS) MapPointer(msg tea.Msg) tea.Msg {
 	m.pointerInLayout = false
+	m.pointerSwallowed = false
 	if !m.sessionView.on {
 		if _, ok := msg.(tea.MouseMsg); ok {
 			m.pressInLayout = false
+			m.pressInLeftover = false
 		}
+		return msg
+	}
+	if m.leftoverTakes(msg) {
+		m.pointerSwallowed = true
 		return msg
 	}
 	switch e := msg.(type) {
@@ -313,6 +406,56 @@ func (m *OS) MapPointer(msg tea.Msg) tea.Msg {
 	}
 	return msg
 }
+
+// leftoverTakes reports whether a mouse event belongs to the leftover: one
+// over it, or a drag or release that follows a press that landed on it. A
+// press there is remembered, so the drag after it stays the leftover's even
+// when the pointer moves onto a pane.
+func (m *OS) leftoverTakes(msg tea.Msg) bool {
+	mouse, ok := msg.(tea.MouseMsg)
+	if !ok {
+		return false
+	}
+	ev := mouse.Mouse()
+	switch msg.(type) {
+	case tea.MouseClickMsg:
+		m.pressInLeftover = m.pointerOverLeftover(ev.X, ev.Y)
+		return m.pressInLeftover
+	case tea.MouseReleaseMsg:
+		held := m.pressInLeftover
+		m.pressInLeftover = false
+		return held
+	case tea.MouseMotionMsg:
+		if ev.Button != tea.MouseNone {
+			return m.pressInLeftover
+		}
+	}
+	return m.pointerOverLeftover(ev.X, ev.Y)
+}
+
+// pointerOverLeftover reports whether a pointer on the screen is over the
+// leftover with nothing drawn above it there.
+func (m *OS) pointerOverLeftover(x, y int) bool {
+	v := m.sessionView
+	p := image.Pt(x, y)
+	if !p.In(v.frame) || p.In(v.clip) {
+		return false
+	}
+	if m.ContextMenuActive() || m.AnyOverlayOpen() || m.OverlayActive() ||
+		m.Renaming() || m.CaptureActive() || m.ReviewOpen() || m.ShowScrollbackBrowser {
+		return false
+	}
+	// A rail opened over the panes for the keyboard (OwnLayoutReserve leaves
+	// it out of the reserve) can sit on the leftover. It is the rail's.
+	if m.SidebarBandContains(x, y) {
+		return false
+	}
+	return !m.PiPAt(x, y)
+}
+
+// PointerSwallowed reports whether the mouse event MapPointer last mapped
+// belongs to the leftover. internal/input then does nothing with it.
+func (m *OS) PointerSwallowed() bool { return m.pointerSwallowed }
 
 // mouseToLayout maps a mouse event's position to the layout frame and marks
 // the event being handled as mapped.
@@ -344,12 +487,12 @@ const viewMarkLayerID = "view-mark"
 // It sits at the right end of the dock's rule, the line between the panes and
 // the dock. That row is chrome that carries nothing else, so the mark covers
 // no pane, no title bar and no dock control, and it is always in the same
-// place. With the dock hidden there is no such row, and the mark goes in the
+// place. With the dock hidden or compact there is no such row, and the mark goes in the
 // bottom right corner of the view's pane area, over pane content, which is the
 // one place left. Nil when the whole session is on the screen.
 func (m *OS) renderViewMark() *lipgloss.Layer {
 	v := m.sessionView
-	if !v.on || v.clip.Empty() {
+	if !v.on || v.clip.Empty() || (v.clip.Dx() >= v.box.Dx() && v.clip.Dy() >= v.box.Dy()) {
 		return nil
 	}
 	var arrows uint8
@@ -379,10 +522,11 @@ func (m *OS) renderViewMark() *lipgloss.Layer {
 	}
 	label, width := c.label, c.width
 	x, y := m.GetRenderWidth()-width-1, v.clip.Max.Y-1
-	switch m.Settings.DockbarPosition {
-	case "hidden":
+	switch {
+	case m.Settings.DockbarPosition == "hidden" || m.Settings.DockCompact:
+		// No rule to sit on: a compact dock is its pills alone.
 		x = v.clip.Max.X - width
-	case "top":
+	case m.Settings.DockbarPosition == "top":
 		y = m.viewReserve().Top - 1
 	default:
 		y = m.viewReserve().Top + m.ViewUsableHeight()

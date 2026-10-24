@@ -2,14 +2,15 @@ package session
 
 import (
 	"fmt"
-	"github.com/google/uuid"
 	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/guestenv"
+	"github.com/google/uuid"
 )
 
 // Manager manages all persistent sessions for a user.
@@ -26,7 +27,9 @@ type Manager struct {
 	aliases map[string]string
 
 	// Configuration
-	socketPath string // Path to socket
+	// socketPath is the pinned socket, a string. Atomic: the daemon pins it
+	// in Start while its goroutines may already read it.
+	socketPath atomic.Value
 	// scrollbackLines is stamped into every session made here, so each pane
 	// keeps the history depth the daemon was configured with.
 	scrollbackLines int
@@ -41,6 +44,20 @@ type Manager struct {
 	// reaches the next pane of a session that already exists. It is atomic so
 	// a spawn never needs m.mu.
 	preferredShell atomic.Pointer[string]
+	// stayOnEmpty is workspaces.return_when_empty turned off. The zero value
+	// is the default, on. Every session reads it through ReturnWhenEmpty.
+	stayOnEmpty atomic.Bool
+	// sshAgentFollow is [daemon] ssh_agent = "follow": a new pane gets
+	// SSH_AUTH_SOCK naming its session's agent link. See ssh_agent_follow.go.
+	sshAgentFollow atomic.Bool
+	// displayFollow is [daemon] display = "follow" on a daemon with no
+	// display of its own. displaySource gives a new pane its session's
+	// display. See display_follow.go.
+	displayFollow atomic.Bool
+	displaySource atomic.Pointer[func(sessionID string) []string]
+	// cellSource gives a new pane its session's cell in pixels. See
+	// Daemon.newPaneCellSize.
+	cellSource atomic.Pointer[func(sessionID string) (w, h int, ok bool)]
 	// herdrSocket is the herdr protocol socket the daemon listens on, "" when
 	// it does not. herdrMode is [agents] herdr_protocol. Both are read at
 	// spawn time through HerdrEnv. See herdr_compat.go.
@@ -56,6 +73,9 @@ type Manager struct {
 	// [agents.permissions] default. It is stamped into every session made
 	// here. See pane_grants.go.
 	grants *paneGrantTable
+	// paneLife is held for reading while a pane starts or closes, and for
+	// writing by a handoff. See SessionConfig.paneLife.
+	paneLife sync.RWMutex
 
 	// Lifecycle hooks (set by the daemon). onCreate fires after a session is
 	// registered; onDelete fires after it is removed but before it is stopped.
@@ -142,6 +162,16 @@ func (m *Manager) SetPreferredShell(shell string) {
 	m.preferredShell.Store(&shell)
 }
 
+// SetReturnWhenEmpty sets workspaces.return_when_empty for every session.
+func (m *Manager) SetReturnWhenEmpty(on bool) {
+	m.stayOnEmpty.Store(!on)
+}
+
+// ReturnWhenEmpty is what SetReturnWhenEmpty last set, true when nothing did.
+func (m *Manager) ReturnWhenEmpty() bool {
+	return !m.stayOnEmpty.Load()
+}
+
 // PreferredShell is what SetPreferredShell last set, or "".
 func (m *Manager) PreferredShell() string {
 	if p := m.preferredShell.Load(); p != nil {
@@ -176,9 +206,9 @@ func (m *Manager) SetHerdrBin(path string) {
 // naming tuios's own socket, HERDR_PANE_ID, HERDR_TAB_ID and
 // HERDR_WORKSPACE_ID naming the pane, its workspace and its session in
 // herdr's form (herdr_ids.go), and HERDR_BIN_PATH naming the herdr link, for
-// a tool that runs herdr's CLI rather than the socket. workspace is the tuios
-// workspace the pane starts on, which is herdr's tab; 0 gives no
-// HERDR_TAB_ID. A pane gets it when the daemon listens on the socket and
+// a tool that runs herdr's CLI rather than the socket. workspace is the tab
+// key of the tuios workspace the pane starts on, which is herdr's tab (see
+// herdrTabFor); 0 gives no HERDR_TAB_ID. A pane gets it when the daemon listens on the socket and
 // [agents] herdr_protocol is not off: every pane by default, as in herdr, or
 // with "agents" only a pane that starts a harness known to report this way.
 // See herdr_compat.go.
@@ -220,15 +250,15 @@ func (m *Manager) HostName() string {
 	return h
 }
 
-// SetSocketPath sets the socket path (for testing).
+// SetSocketPath pins the socket path. The daemon pins the one it listens on.
 func (m *Manager) SetSocketPath(path string) {
-	m.socketPath = path
+	m.socketPath.Store(path)
 }
 
 // SocketPath returns the configured socket path.
 func (m *Manager) SocketPath() string {
-	if m.socketPath != "" {
-		return m.socketPath
+	if p, _ := m.socketPath.Load().(string); p != "" {
+		return p
 	}
 	path, _ := GetSocketPath()
 	return path
@@ -275,8 +305,20 @@ func (m *Manager) CreateSession(name string, cfg *SessionConfig, width, height i
 	if cfg.PaneToken == nil {
 		cfg.PaneToken = m.PaneToken
 	}
+	if cfg.ReturnWhenEmpty == nil {
+		cfg.ReturnWhenEmpty = m.ReturnWhenEmpty
+	}
 	if cfg.HerdrEnv == nil {
 		cfg.HerdrEnv = m.HerdrEnv
+	}
+	if cfg.AgentEnv == nil {
+		cfg.AgentEnv = m.agentEnv
+	}
+	if cfg.DisplayEnv == nil {
+		cfg.DisplayEnv = m.displayEnv
+	}
+	if cfg.CellSize == nil {
+		cfg.CellSize = m.cellSize
 	}
 	if cfg.history == nil {
 		cfg.history = m.history
@@ -284,6 +326,7 @@ func (m *Manager) CreateSession(name string, cfg *SessionConfig, width, height i
 	if cfg.grants == nil {
 		cfg.grants = m.grants
 	}
+	cfg.paneLife = &m.paneLife
 
 	// A restored id is kept only when it is a well-formed id no live session
 	// holds. Anything else gets a new one, as before ids were saved.
@@ -393,7 +436,9 @@ func (m *Manager) RenameSession(old, newName string) (*Session, error) {
 
 	// A saved session that is not running still owns its state file. Taking
 	// its name would overwrite that file, and the saved session would be lost.
-	if _, err := os.Stat(getResurrectionPath(newName)); err == nil && m.GetSession(newName) == nil {
+	if path, err := getResurrectionPath(newName); err != nil {
+		return nil, err
+	} else if _, err := os.Stat(path); err == nil && m.GetSession(newName) == nil {
 		return nil, fmt.Errorf("a saved session is named '%s'. Restore it with 'tuios resurrect %s', or pick another name", newName, newName)
 	}
 
@@ -436,6 +481,10 @@ func (m *Manager) RenameSession(old, newName string) (*Session, error) {
 			moved.LaunchedFrom = newName
 			_ = s.SetWorktree(&moved)
 		}
+	}
+	// So do the panes a pane of this session started, in any session.
+	for _, s := range append(others, sess) {
+		s.renameStartedBy(old, newName)
 	}
 
 	// The new file is written before the old one goes, so a crash between
@@ -544,15 +593,65 @@ func (m *Manager) AllSessions() []*Session {
 	return out
 }
 
-// GetDefaultSession returns the first/default session, creating one if none exist.
+// MostRecentSession returns the most recently active session, or nil when
+// there is none. It is the session every command that leaves its session out
+// acts on.
+func (m *Manager) MostRecentSession() *Session {
+	return mostRecentSession(m.AllSessions(), false)
+}
+
+// LastUsedSession returns the session the person used last, or nil when there
+// is none. It is the one a bare attach lands on. A session the person never
+// used ranks below every one they did, and sessions tied there are ranked as
+// MostRecentSession ranks them.
+func (m *Manager) LastUsedSession() *Session {
+	return mostRecentSession(m.AllSessions(), true)
+}
+
+// mostRecentSession picks the session with the latest LastActive, or with
+// byUse the latest LastUsed and then the latest LastActive. It compares the
+// full-precision times: SessionInfo truncates them to whole seconds, so two
+// sessions used in the same second tied and the pick fell to list order. A
+// tie that remains goes to the newer session, then to the lower name, so the
+// answer never depends on map order.
+func mostRecentSession(sessions []*Session, byUse bool) *Session {
+	var best *Session
+	var bestUsed, bestActive time.Time
+	for _, s := range sessions {
+		var used time.Time
+		if byUse {
+			used = s.LastUsed()
+		}
+		active := s.LastActive()
+		if best == nil || newerPick(used, bestUsed, active, bestActive, s, best) {
+			best, bestUsed, bestActive = s, used, active
+		}
+	}
+	return best
+}
+
+// newerPick reports whether s, used and active at the times given, ranks
+// above best: the later use, then the later activity, then the newer
+// session, then the lower name.
+func newerPick(used, bestUsed, active, bestActive time.Time, s, best *Session) bool {
+	switch {
+	case !used.Equal(bestUsed):
+		return used.After(bestUsed)
+	case !active.Equal(bestActive):
+		return active.After(bestActive)
+	case !s.Created.Equal(best.Created):
+		return s.Created.After(best.Created)
+	}
+	return s.Name() < best.Name()
+}
+
+// GetDefaultSession returns the session the person used last, creating one if
+// none exist. It used to return the first session a range over the map gave,
+// which Go randomises, so a bare attach landed on any session at all.
 func (m *Manager) GetDefaultSession(cfg *SessionConfig, width, height int) (*Session, error) {
-	m.mu.RLock()
-	// Return first session if any exist
-	for _, session := range m.sessions {
-		m.mu.RUnlock()
+	if session := m.LastUsedSession(); session != nil {
 		return session, nil
 	}
-	m.mu.RUnlock()
 
 	// No sessions, create default with generated name
 	name := m.GenerateSessionName()

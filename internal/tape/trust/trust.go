@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/atomicfile"
 	"github.com/adrg/xdg"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -154,6 +155,9 @@ func Load() (*Store, error) {
 // user, its contents are ignored and Warning is set, so tampering downgrades
 // trust to nothing rather than being honored.
 func LoadFromPath(path string) (*Store, error) {
+	// A save that died before its rename leaves a temporary file beside the
+	// store. Old ones are removed here; a young one may be another save.
+	atomicfile.SweepStale(filepath.Dir(path), 10*time.Minute)
 	s := &Store{
 		path:    path,
 		trusted: make(map[string]trustEntry),
@@ -188,8 +192,18 @@ func LoadFromPath(path string) (*Store, error) {
 		return s, nil
 	}
 
-	// #nosec G304 - path is the trust store location, reading it is the point.
-	data, err := os.ReadFile(path)
+	// Read from a descriptor that did not wait on the open, and only from a
+	// regular file: a FIFO or a device would block the read or never end it.
+	f, err := openNoBlock(path)
+	if err != nil {
+		return s, fmt.Errorf("reading tape trust store: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		s.Warning = fmt.Sprintf("tape trust store %s is not a regular file; ignoring it", path)
+		return s, nil
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return s, fmt.Errorf("reading tape trust store: %w", err)
 	}
@@ -252,8 +266,8 @@ func (s *Store) Check(tapePath string) (Result, error) {
 
 	// Open once and stat the descriptor. Doing hygiene on the fd (not a second
 	// path stat) ties the checks to the same inode the bytes come from.
-	// #nosec G304 - opening the resolved tape to hash it is the intended action.
-	f, err := os.Open(real)
+	// It does not wait on a FIFO: the hygiene rules turn one away.
+	f, err := openNoBlock(real)
 	if err != nil {
 		return Result{
 			Status: StatusIneligible,
@@ -389,35 +403,8 @@ func (s *Store) saveLocked() error {
 		return fmt.Errorf("encoding tape trust store: %w", err)
 	}
 
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("creating tape trust store directory: %w", err)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".tape-trust-*.tmp")
-	if err != nil {
-		return fmt.Errorf("creating tape trust store temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	cleanup := func() { _ = os.Remove(tmpName) }
-
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return fmt.Errorf("setting tape trust store permissions: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		cleanup()
+	if err := atomicfile.WritePrivate(s.path, data, false); err != nil {
 		return fmt.Errorf("writing tape trust store: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
-		return fmt.Errorf("closing tape trust store temp file: %w", err)
-	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		cleanup()
-		return fmt.Errorf("replacing tape trust store: %w", err)
 	}
 	return nil
 }

@@ -121,7 +121,7 @@ func rectsOf(m *OS, a, b *terminal.Window) surfaceRects {
 	sw := m.GetSidebarWidth()
 	return surfaceRects{
 		sidebar:  image.Rect(0, m.GetTopMargin(), sw, m.GetTopMargin()+m.GetUsableHeight()),
-		dock:     image.Rect(0, dockY, m.GetRenderWidth(), dockY+config.DockHeight),
+		dock:     image.Rect(0, dockY, m.GetRenderWidth(), dockY+m.Settings.DockHeight()),
 		paneA:    image.Rect(a.X, a.Y, a.X+a.Width, a.Y+a.Height),
 		paneB:    image.Rect(b.X, b.Y, b.X+b.Width, b.Y+b.Height),
 		contentA: paneContentRect(a),
@@ -384,7 +384,8 @@ func TestBackgroundsOffAllocateNothing(t *testing.T) {
 // A program in a pane asks what it is drawn on. The pane's emulator answers
 // with the painted ground once the frame is composed, and with its own answer
 // again when the paint is off. The daemon's emulators are told through the
-// state this client pushes, and that is checked here too.
+// state this client pushes, and that is checked here too: with the paint off
+// they are told the theme's colours, since the daemon loads no theme.
 func TestPaneBackgroundAnswersOSC11(t *testing.T) {
 	withTheme(t, "catppuccin_mocha")
 	win := paneBgWindow(t, "osc-11", 2, 2, 40, 10)
@@ -409,8 +410,10 @@ func TestPaneBackgroundAnswersOSC11(t *testing.T) {
 	}
 	_ = m.composeFrame()
 	before := ask("\x1b]11;?\x1b\\")
-	if state := m.BuildSessionState(); state.PaneReportBg != "" || state.PaneReportFg != "" {
-		t.Errorf("with the pane background off the state carries %q/%q", state.PaneReportBg, state.PaneReportFg)
+	themeBg, themeFg := colorHex(theme.TerminalBg()), colorHex(theme.TerminalFg())
+	if state := m.BuildSessionState(); state.PaneReportBg != themeBg || state.PaneReportFg != themeFg {
+		t.Errorf("with the pane background off the state carries %q/%q, want the theme's %s/%s",
+			state.PaneReportBg, state.PaneReportFg, themeBg, themeFg)
 	}
 
 	m.Settings.Background = paneBgHex

@@ -20,7 +20,7 @@ func handleFilePromptInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		return o, nil
 	}
 	if o.FileConfirmOpen() {
-		if listKey(key, true, listPage, o.FileConfirmMove) {
+		if listKey(o, key, true, listPage, o.FileConfirmMove) {
 			return o, nil
 		}
 		switch key {
@@ -32,21 +32,13 @@ func handleFilePromptInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		return o, nil
 	}
 
-	switch key {
-	case "enter":
+	if key == "enter" {
 		return o, o.FilePromptSubmit()
-	case "backspace":
-		o.FilePromptBackspace()
-	case "ctrl+u":
-		o.FilePromptClearInput()
-	case "space":
-		o.FilePromptType(" ")
-	default:
-		if msg.Text != "" {
-			o.FilePromptType(msg.Text)
-		} else if len(key) == 1 && key[0] >= 32 && key[0] <= 126 {
-			o.FilePromptType(key)
-		}
 	}
+	promptTextKeys{
+		Backspace: o.FilePromptBackspace,
+		Clear:     o.FilePromptClearInput,
+		Type:      o.FilePromptType,
+	}.handle(msg)
 	return o, nil
 }

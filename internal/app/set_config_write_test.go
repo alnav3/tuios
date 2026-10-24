@@ -73,7 +73,7 @@ func drainCommand(t *testing.T, cmd tea.Cmd) {
 	}
 	for _, c := range batch {
 		if c != nil {
-			c()
+			drainCommand(t, c)
 		}
 	}
 }
@@ -98,8 +98,8 @@ func TestARoutedSetConfigReachesTheFile(t *testing.T) {
 		name, path, value, want string
 	}{
 		{"screenshot", "screenshot.font_family", "JetBrainsMono Nerd Font Mono",
-			"font_family = 'JetBrainsMono Nerd Font Mono'"},
-		{"appearance", "appearance.border_style", "thick", "border_style = 'thick'"},
+			`font_family = "JetBrainsMono Nerd Font Mono"`},
+		{"appearance", "appearance.border_style", "thick", `border_style = "thick"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			file := useTempConfig(t)

@@ -48,8 +48,22 @@ tuios send-agent-message -s work 'deploying in five minutes'   # a notice to the
 ```
 
 This queues. It does not touch the recipient's keyboard, so you can leave a
-message for an agent that is mid-turn. **The recipient has to read its inbox**;
-no harness does that on its own. For an agent that does not, use `ask-agent`.
+message for an agent that is mid-turn. tuios tells the recipient that mail
+waits:
+
+- **During a turn.** With the Claude Code or Codex hooks installed (`tuios
+  integration install`), the agent gets one line in its context when a prompt
+  is submitted or a tool call ends. The line gives the count, the senders and
+  the command that reads the mail. It never holds the subject or the body. Each
+  message is announced once, and again after a compaction or a resume while it
+  is still unread.
+- **At rest.** When mail stays unread for 5 seconds and nobody told the agent,
+  tuios types a line with the count and the command into the agent's pane
+  once it has rested for a second. It never types into a pane on `needs_input`. A burst of mail gives
+  one line. The person can turn this off with `[agents.mail] wake = false`.
+
+So you do not need to follow a message with `ask-agent` to make sure it is
+read. Use `ask-agent` when you need the answer now.
 
 ### Reading your mail
 
@@ -64,11 +78,23 @@ subject: retest please
 rebased onto main, please retest
 --- end untrusted content ---
 
-1 message(s), 1 unread.
+1 message, marked read.
 ```
 
-Naming an inbox marks what it returns as read; `--peek` reads without marking.
-Reading with no `-w` reads the whole session and marks nothing. `--notices` adds
+The last line says what state the messages are in after the call. It reads
+`marked read` or `marked seen` when the call changed them, and otherwise counts
+`seen` and `unread` ones, or says `all read`.
+
+Naming an inbox marks what it returns as read. `--peek` does not mark them
+read. When a pane peeks its own inbox (`-w "$TUIOS_PANE_ID"`), it marks the
+unread ones seen. A peek of another pane's inbox, for example to check on a
+message you sent, marks nothing. A message goes from unread to seen to
+read, and the sender sees which with `read-agent-messages` on the session (the
+header says `seen`; `--json` has `seen_at` and `read_at`). Seen means the
+recipient looked at the message, not that it acted on it. A seen message still
+counts as unread: `--unread` returns it, and the `MAIL` column of `list-agents`
+shows it as `1 (1 seen)`. Reading with no `-w` reads the whole session and
+marks nothing. `--notices` adds
 session-wide notices to an inbox read. Block rather than poll:
 
 ```sh
@@ -96,7 +122,10 @@ only.
 
 ### Being reachable yourself
 
-Nothing polls your inbox for you. Two habits are enough:
+tuios tells you about new mail, in a line that starts `You have 1 unread tuios
+message`: in your context during a turn when your hooks are installed, and as
+a typed prompt when you are at rest. Run the command it names. Two habits
+still help:
 
 - Check once before you tell the person you are done:
   `tuios read-agent-messages -s "$TUIOS_SESSION" -w "$TUIOS_PANE_ID" --unread`.
@@ -250,8 +279,8 @@ tuios wait-for agent-message -s work -w "$TUIOS_PANE_ID" --timeout 1800000
 tuios read-agent-messages -s work -w "$TUIOS_PANE_ID" --unread
 ```
 
-The second shape works only if the reviewer reads its inbox. The first works
-against any agent.
+tuios tells the reviewer about the message, during its turn or once it is at
+rest, so the second shape works with any agent too. It does not block you.
 
 To hand a busy agent its next instruction without blocking, and without
 relying on it reading mail, queue it. The daemon types it as a prompt once the

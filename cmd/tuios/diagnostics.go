@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/fang"
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/charmbracelet/colorprofile"
 	"github.com/spf13/cobra"
@@ -48,13 +51,16 @@ func (e *diagnosticError) Error() string {
 	var b strings.Builder
 	b.WriteString(e.What)
 	if e.Cause != "" {
-		b.WriteString("\nMost likely cause: " + e.Cause)
+		b.WriteString("\nMost likely cause: ")
+		b.WriteString(e.Cause)
 	}
 	for _, line := range e.Extra {
-		b.WriteString("\n" + line)
+		b.WriteString("\n")
+		b.WriteString(line)
 	}
 	if e.Fix != "" {
-		b.WriteString("\nFix: " + e.Fix)
+		b.WriteString("\nFix: ")
+		b.WriteString(e.Fix)
 	}
 	return b.String()
 }
@@ -90,6 +96,7 @@ func exitStatus(err error) int {
 	if err == nil {
 		return 0
 	}
+	err = agentsOffAnswer(err)
 	code := 1
 	var coded interface{ ExitStatus() int }
 	if errors.As(err, &coded) {
@@ -110,6 +117,9 @@ func exitStatus(err error) int {
 // or wrapping, so piped output and CI logs stay parseable and a path in the
 // message stays on one line.
 func diagnosticErrorHandler(w io.Writer, styles fang.Styles, err error) {
+	// An agent command while the agent features are off prints the one line
+	// that says so, however the command wrapped the daemon's answer.
+	err = agentsOffAnswer(err)
 	if !isTerminalWriter(w) {
 		_, _ = fmt.Fprintln(w, err.Error())
 		return
@@ -229,7 +239,7 @@ func requireDaemon() error {
 //
 // It dials first and diagnoses only on failure. explainDialError runs the same
 // DiagnoseDaemon a probe beforehand would, so the message and exit status are
-// the same, and a command against a running daemon no longer pays for a probe
+// the same, and a command against a running daemon does not pay for a probe
 // connection the daemon has to accept and drop.
 func dialVerb() (*session.VerbClient, error) {
 	client, err := session.DialVerbClientAs(version)
@@ -246,6 +256,15 @@ func dialVerb() (*session.VerbClient, error) {
 func explainDialError(err error) error {
 	if mismatch, ok := errors.AsType[*session.ProtocolMismatchError](err); ok {
 		return mismatch
+	}
+
+	if errors.Is(err, session.ErrTooManyConnections) {
+		return &diagnosticError{
+			What:  "The tuios daemon has too many connections.",
+			Cause: "other clients, commands or linked machines hold all of its connections.",
+			Fix:   "close some clients or commands, then run this command again.",
+			Err:   err,
+		}
 	}
 
 	d := session.DiagnoseDaemon()
@@ -271,6 +290,11 @@ func explainVerbError(verb string, err error) error {
 	if !errors.As(err, &callErr) {
 		return err
 	}
+	// The agent features are off. The one line says what to change, and
+	// nothing about the daemon helps more.
+	if callErr.Code == session.ErrVerbAgentsDisabled {
+		return &agentsOffError{call: callErr}
+	}
 	if current, ok := session.RenamedSessionTarget(err); ok {
 		return &diagnosticError{
 			What:  strings.ToUpper(callErr.Message[:1]) + callErr.Message[1:] + ".",
@@ -283,7 +307,7 @@ func explainVerbError(verb string, err error) error {
 		return &diagnosticError{
 			What:  fmt.Sprintf("The running daemon does not know %s.", verb),
 			Cause: "the daemon is older than this tuios.",
-			Fix:   "run 'tuios kill-server' and start tuios again. Saved sessions come back with new shells.",
+			Fix:   "run 'tuios restart-server'. Saved sessions come back with new shells.",
 			Err:   err,
 		}
 	}
@@ -304,7 +328,7 @@ func explainVerbError(verb string, err error) error {
 	}
 	if len(hint.Accepted) > 0 {
 		d.Extra = append(d.Extra, fmt.Sprintf("Accepted values for %s: %s.",
-			nonEmpty(hint.Param, "this parameter"), strings.Join(hint.Accepted, ", ")))
+			cmp.Or(hint.Param, "this parameter"), strings.Join(hint.Accepted, ", ")))
 	}
 	if len(hint.Available) > 0 {
 		d.Extra = append(d.Extra, "Available: "+strings.Join(truncateList(hint.Available, 12), ", ")+".")
@@ -324,12 +348,42 @@ func explainVerbError(verb string, err error) error {
 	return d
 }
 
-// nonEmpty returns s, or fallback when s is empty.
-func nonEmpty(s, fallback string) string {
-	if s == "" {
-		return fallback
+// agentsOffError is the answer to an agent command while the agent features
+// are off: the one line that says what to change, with the daemon's answer
+// under it, so --json can still name the code.
+type agentsOffError struct {
+	call *session.VerbCallError
+}
+
+func (e *agentsOffError) Error() string { return config.AgentsOffMessage }
+func (e *agentsOffError) Unwrap() error { return e.call }
+
+// agentsOffAnswer is err as the CLI prints it: an agent command while the
+// agent features are off prints the one line that says so, however the
+// command wrapped the answer. Any other error is returned as it is.
+func agentsOffAnswer(err error) error {
+	if here, ok := errors.AsType[*session.AgentsOffHereError](err); ok {
+		return here
 	}
-	return s
+	if call, ok := errors.AsType[*session.VerbCallError](err); ok && call.Code == session.ErrVerbAgentsDisabled {
+		return &agentsOffError{call: call}
+	}
+	return err
+}
+
+// refuseAgentCallHere is session.HostCallGuard for the CLI: an agent call to
+// another machine is refused while this machine's config has the agent
+// features off. The config is read only for an agent call.
+func refuseAgentCallHere(verb string, params any) error {
+	if !session.AgentOnlyCall(verb, params) {
+		return nil
+	}
+	cfg, err := config.LoadUserConfig()
+	if err != nil || cfg == nil || cfg.Agents.On() {
+		return nil
+	}
+	path, _ := config.GetConfigPath()
+	return &session.AgentsOffHereError{Path: path}
 }
 
 // truncateList caps a list for display so a hundred window ids do not bury the
@@ -358,7 +412,7 @@ func explainMissingSession(name string, available []string) error {
 	// wrong".
 	if info, ok := savedSession(name); ok {
 		e.Cause = "the daemon is running but has not restored it."
-		e.Extra = append(e.Extra, fmt.Sprintf("It has saved state (%d window(s)) and can be brought back.", info.WindowCount))
+		e.Extra = append(e.Extra, fmt.Sprintf("It has saved state (%s) and can be brought back.", plural.Count(info.WindowCount, "window")))
 		e.Fix = fmt.Sprintf("run 'tuios resurrect %s' to restore it and attach.", name)
 		return e
 	}

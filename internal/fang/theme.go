@@ -8,7 +8,7 @@ import (
 	"unicode/utf8"
 
 	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/exp/charmtone"
+	"charm.land/tone"
 	"github.com/charmbracelet/x/term"
 )
 
@@ -32,52 +32,25 @@ type ColorScheme struct {
 	ErrorDetails   color.Color
 }
 
-// DefaultTheme is the default colorscheme.
-//
-// Deprecated: use [DefaultColorScheme] instead.
-func DefaultTheme(isDark bool) ColorScheme {
-	return DefaultColorScheme(lipgloss.LightDark(isDark))
-}
-
 // DefaultColorScheme is the default colorscheme.
 func DefaultColorScheme(c lipgloss.LightDarkFunc) ColorScheme {
 	return ColorScheme{
-		Base:           c(charmtone.Charcoal, charmtone.Ash),
-		Title:          charmtone.Charple,
-		Codeblock:      c(charmtone.Salt, lipgloss.Color("#2F2E36")),
-		Program:        c(charmtone.Malibu, charmtone.Guppy),
-		Command:        c(charmtone.Pony, charmtone.Cheeky),
-		DimmedArgument: c(charmtone.Squid, charmtone.Oyster),
-		Comment:        c(charmtone.Squid, lipgloss.Color("#747282")),
-		Flag:           c(lipgloss.Color("#0CB37F"), charmtone.Guac),
-		Argument:       c(charmtone.Charcoal, charmtone.Ash),
-		Description:    c(charmtone.Charcoal, charmtone.Ash), // flag and command descriptions
-		FlagDefault:    c(charmtone.Smoke, charmtone.Squid),  // flag default values in descriptions
-		QuotedString:   c(charmtone.Coral, charmtone.Salmon),
+		Base:           c(tone.Charcoal, tone.Ash),
+		Title:          tone.Charple,
+		Codeblock:      c(tone.Salt, lipgloss.Color("#2F2E36")),
+		Program:        c(tone.Malibu, tone.Guppy),
+		Command:        c(tone.Pony, tone.Cheeky),
+		DimmedArgument: c(tone.Squid, tone.Oyster),
+		Comment:        c(tone.Squid, lipgloss.Color("#747282")),
+		Flag:           c(lipgloss.Color("#0CB37F"), tone.Guac),
+		Argument:       c(tone.Charcoal, tone.Ash),
+		Description:    c(tone.Charcoal, tone.Ash), // flag and command descriptions
+		FlagDefault:    c(tone.Smoke, tone.Squid),  // flag default values in descriptions
+		QuotedString:   c(tone.Coral, tone.Salmon),
 		ErrorHeader: [2]color.Color{
-			charmtone.Butter,
-			charmtone.Cherry,
+			tone.Butter,
+			tone.Cherry,
 		},
-	}
-}
-
-// AnsiColorScheme is a ANSI colorscheme.
-func AnsiColorScheme(c lipgloss.LightDarkFunc) ColorScheme {
-	base := c(lipgloss.Black, lipgloss.White)
-	return ColorScheme{
-		Base:         base,
-		Title:        lipgloss.Blue,
-		Description:  base,
-		Comment:      c(lipgloss.BrightWhite, lipgloss.BrightBlack),
-		Flag:         lipgloss.Magenta,
-		FlagDefault:  lipgloss.BrightMagenta,
-		Command:      lipgloss.Cyan,
-		QuotedString: lipgloss.Green,
-		Argument:     base,
-		Help:         base,
-		Dash:         base,
-		ErrorHeader:  [2]color.Color{lipgloss.Black, lipgloss.Red},
-		ErrorDetails: lipgloss.Red,
 	}
 }
 

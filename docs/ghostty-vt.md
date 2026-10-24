@@ -3,7 +3,7 @@
 tuios has two terminal emulator implementations behind one interface
 (`vt.Terminal`), selected at build time:
 
-- **Pure Go** (default): `internal/vt`'s own emulator. `go install` works
+- **Pure Go** (default): `vt`'s own emulator. `go install` works
   with no toolchain, `CGO_ENABLED=0` cross-compilation works, nothing
   changes.
 - **libghostty-vt** (`-tags ghostty`): parsing and grid state run inside
@@ -14,10 +14,25 @@ tuios has two terminal emulator implementations behind one interface
 
 Exactly one implementation is compiled into a binary. The two never run
 together in one process; comparing them is the differential harness's job
-(`internal/vt/ghostty_differential_test.go`,
+(`vt/ghostty_differential_test.go`,
 `internal/session/ghostty_wire_test.go`), which feeds identical bytes to
 both and asserts screens, cursor, scrollback, modes and wire snapshots
 agree.
+
+## Installing with Homebrew (Linux)
+
+```sh
+brew uninstall tuios
+brew install gaurav-gosain/tap/tuios-ghostty
+```
+
+The cask installs the release `tuios` built with libghostty-vt. The `tuios`
+formula installs a binary with the same name, so uninstall the formula first.
+To go back, run `brew uninstall --cask tuios-ghostty`, then `brew install tuios`.
+
+The cask is for Linux only. On macOS, download the
+`tuios-ghostty_*_Darwin_*` archive from the
+[release page](https://github.com/Gaurav-Gosain/tuios/releases).
 
 ## Installing a local build
 
@@ -85,7 +100,7 @@ does not cross-compile cleanly.
 
 ## Architecture
 
-`GhosttyTerminal` (`internal/vt/ghostty_*.go`) owns what tuios needs on
+`GhosttyTerminal` (`vt/ghostty_*.go`) owns what tuios needs on
 top of the library:
 
 - **Stream scanner** (`ghostty_scan.go`, pure Go, unit-tested without
@@ -96,7 +111,11 @@ top of the library:
   (answered Go-side so the library cannot answer queries a second time),
   OSC 66 text sizing, OSC 133 semantic markers, and the CSI/ESC
   dispatches whose state the library keeps but does not expose (DECSTBM
-  values, charset designations, the kitty keyboard stack).
+  values, charset designations, the kitty keyboard stack). SOS, PM and
+  any other APC are withheld too: the library does nothing with them. The
+  scanner follows the library's parser state by state, 8-bit controls
+  inside a sequence included, so what it observes is what the library
+  carried out (see REHYDRATION.md).
 - **Shadow grid**: a uv-typed copy of the viewport, refreshed from the
   render state's dirty rows on the first read after a write. Each cell
   costs one Go memory read: the packed cell layout is decoded using the
@@ -157,7 +176,7 @@ is a SIGSEGV that cannot be recovered and takes every session with it.
 Three things bound that risk:
 
 - The library is the same code Ghostty ships to production terminals,
-  fuzzed and exercised far beyond what `internal/vt` sees.
+  fuzzed and exercised far beyond what `vt` sees.
 - `FuzzGhosttyTerminalWrite` fuzzes tuios's own cgo boundary: arbitrary
   bytes in adversarial chunkings through the full adapter path,
   interleaved with reads and resizes.

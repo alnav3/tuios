@@ -87,6 +87,8 @@ func serveStub(conn net.Conn, handle func(string, json.RawMessage) (any, *Remote
 			return
 		}
 	}
+	// The stub serves until the connection ends, for any reason.
+	_ = sc.Err()
 }
 
 // dial opens a connection to the stub.
@@ -144,7 +146,9 @@ func proxyDialer(t *testing.T, d *stubDaemon) Dialer {
 	t.Helper()
 	return func(_ context.Context, _ Host) (Transport, error) {
 		hub, remote := duplexPipe(t)
-		go func() { _ = ServeProxy(remote, remote, d.dial) }()
+		go func() {
+			_ = ServeProxyFor(remote, remote, func(StreamOpen) (net.Conn, error) { return d.dial() })
+		}()
 		return hub, nil
 	}
 }

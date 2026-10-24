@@ -12,6 +12,26 @@ package sessiontree
 
 import "strconv"
 
+// Subagent is one subagent of a pane's agent, as the daemon reported it:
+// what it was asked to do, the tool it runs, and once it ended, how.
+type Subagent struct {
+	ID          string
+	Type        string
+	Description string
+	// State is running, done, failed or stopped.
+	State string
+	// StartedAt and EndedAt are Unix nanoseconds. EndedAt is 0 while it runs.
+	StartedAt, EndedAt int64
+	// Now is the tool it runs, Last the tool it ran last.
+	Now, Last string
+	Tools     int
+	// Result is the first line it ended with, or the error.
+	Result string
+}
+
+// Running reports whether the subagent has not ended.
+func (s Subagent) Running() bool { return s.State == "running" }
+
 // NodeKind distinguishes a session row from a window row in the tree.
 type NodeKind int
 
@@ -29,6 +49,10 @@ const (
 	// sessions of that repository, which follow it in the same list. See
 	// GroupByRepo in worktree.go.
 	KindRepo
+	// KindSpace is a space's heading. Its rows are the sessions filed under
+	// that space, which follow it in the same list. See GroupBySpace in
+	// space.go.
+	KindSpace
 )
 
 // Node is one row in the tree: a session or a window under it.
@@ -68,9 +92,17 @@ type Node struct {
 	// Queued is how many messages wait in the pane's delivery queue to be
 	// typed when its agent comes to rest. Never rolled up.
 	Queued int
-	// Subagents is how many subagents the pane's agent is running. Never
-	// rolled up.
+	// Subagents is how many subagents the pane's agent is running. On a
+	// session node it belongs to the window that won the roll-up, like
+	// DoneSeen, so the session's mark says "waiting" when that pane is at
+	// rest with work going on.
 	Subagents int
+	// SubagentList is the pane's subagents themselves, in start order. Never
+	// rolled up.
+	SubagentList []Subagent
+	// Program is the pane's OSC 7501 records, the root first. Nil for none.
+	// Never rolled up.
+	Program []ProgramRecord
 	// Workspace is the workspace a window node sits on, or 0 when unknown. On a
 	// session node it is the workspace that session is showing, which is what
 	// decides which of its panes count as "here".
@@ -122,6 +154,11 @@ type Node struct {
 	// draw the tree glyph that closes the group. Set by GroupByRepo and
 	// meaningless anywhere else.
 	GroupLast bool
+	// Space is the space a session is filed under, empty for one in none. After
+	// GroupBySpace it is set on exactly the rows drawn under a space's heading,
+	// the heading and a repository's row inside the space included, and on no
+	// other row.
+	Space string
 	// Children are the window nodes of a session. Nil for a window node, and nil
 	// for a session whose windows are not known yet (a non-attached session over
 	// the coarse control protocol), which still carries a rolled-up glyph and a
@@ -135,6 +172,23 @@ type Node struct {
 type MetaToken struct {
 	Key   string
 	Value string
+}
+
+// ProgramRecord is one OSC 7501 record (the Program Status Protocol) a pane
+// reported, as the daemon synced it: the display half of the daemon's
+// session.ProgramStatusRecord. Title and Msg are already free of control and
+// invisible formatting characters.
+type ProgramRecord struct {
+	ID       string
+	State    string
+	Kind     string
+	Progress int
+	App      string
+	Title    string
+	Msg      string
+	// At is when the record was last replaced, in Unix nanoseconds. It
+	// breaks a tie between two records of the same state.
+	At int64
 }
 
 // Tree is the full set of sessions, each with its windows when known.
@@ -166,6 +220,11 @@ type WindowInput struct {
 	Queued int
 	// Subagents is how many subagents the pane's agent is running.
 	Subagents int
+	// SubagentList is the pane's subagents themselves, in start order. Nil
+	// from a daemon that sends only the count.
+	SubagentList []Subagent
+	// Program is the pane's OSC 7501 records, the root first. Nil for none.
+	Program []ProgramRecord
 	// Focused marks the currently focused window in its session.
 	Focused bool
 	// Workspace is the workspace the pane sits on, or 0 when the caller does
@@ -212,7 +271,9 @@ type SessionInput struct {
 	// Worktree is the git worktree this session sits in, nil for a session
 	// that is not one.
 	Worktree *WorktreeRef
-	Windows  []WindowInput
+	// Space is the space the session is filed under, empty for none.
+	Space   string
+	Windows []WindowInput
 }
 
 // AgentRank ranks agent states for both the session roll-up and the sidebar's
@@ -297,6 +358,7 @@ func BuildSession(s SessionInput) Node {
 		Restored:    s.Restored,
 		Global:      s.Global,
 		Worktree:    s.Worktree,
+		Space:       s.Space,
 	}
 	if len(s.Windows) == 0 {
 		return node
@@ -306,25 +368,27 @@ func BuildSession(s SessionInput) Node {
 	bestRank := 0
 	for _, w := range s.Windows {
 		children = append(children, Node{
-			Kind:       KindWindow,
-			ID:         w.ID,
-			Title:      w.Title,
-			AgentState: w.AgentState,
-			DoneSeen:   w.DoneSeen,
-			StateAt:    w.StateAt,
-			Harness:    w.Harness,
-			Message:    w.Message,
-			AgentKind:  w.AgentKind,
-			Meta:       w.Meta,
-			Queued:     w.Queued,
-			Subagents:  w.Subagents,
-			IsCurrent:  w.Focused,
-			Workspace:  w.Workspace,
-			Host:       w.Host,
-			HostLink:   w.HostLink,
+			Kind:         KindWindow,
+			ID:           w.ID,
+			Title:        w.Title,
+			AgentState:   w.AgentState,
+			DoneSeen:     w.DoneSeen,
+			StateAt:      w.StateAt,
+			Harness:      w.Harness,
+			Message:      w.Message,
+			AgentKind:    w.AgentKind,
+			Meta:         w.Meta,
+			Queued:       w.Queued,
+			Subagents:    w.Subagents,
+			SubagentList: w.SubagentList,
+			Program:      w.Program,
+			IsCurrent:    w.Focused,
+			Workspace:    w.Workspace,
+			Host:         w.Host,
+			HostLink:     w.HostLink,
 		})
 		if r := AgentRank(w.AgentState, w.DoneSeen); r > bestRank {
-			node.AgentState, node.DoneSeen, bestRank = w.AgentState, w.DoneSeen, r
+			node.AgentState, node.DoneSeen, node.Subagents, bestRank = w.AgentState, w.DoneSeen, w.Subagents, r
 		}
 	}
 	node.Children = disambiguate(children)

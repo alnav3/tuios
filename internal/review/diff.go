@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/childproc"
 
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 )
@@ -129,6 +131,10 @@ type Options struct {
 	// AgainstDir is another worktree of the same repository whose working
 	// state is the old side instead of Base.
 	AgainstDir string
+	// Tree, when set, is the new side instead of Dir's working state: a tree
+	// written earlier, such as a checkpoint's. Base.SHA may then be a tree
+	// too. Dir is still where git runs.
+	Tree string
 	// Paths keeps only these paths, relative to the worktree's root. Each is
 	// taken literally, never as a pattern.
 	Paths []string
@@ -136,6 +142,10 @@ type Options struct {
 	Context int
 	// Limits bound the diff; the zero value is DefaultLimits.
 	Limits Limits
+	// MaxUntracked is the size in bytes past which an untracked file is not
+	// read: it is listed as Skipped, with no counts and no hunks. Zero or
+	// less is no limit.
+	MaxUntracked int64
 }
 
 // Build reads the diff. Nothing in the repository, its index or its working
@@ -146,14 +156,19 @@ func Build(ctx context.Context, opt Options) (*Diff, error) {
 	if lim.Files <= 0 {
 		lim = DefaultLimits
 	}
-	tree, err := worktree.SnapshotTree(ctx, opt.Dir)
-	if err != nil {
-		return nil, err
+	tree := opt.Tree
+	var skipped []string
+	var err error
+	if tree == "" {
+		tree, skipped, err = worktree.SnapshotTree(ctx, opt.Dir, opt.MaxUntracked)
+		if err != nil {
+			return nil, err
+		}
 	}
 	d := &Diff{TreeSHA: tree, Files: []File{}}
 	from := opt.Base.SHA
 	if opt.AgainstDir != "" {
-		from, err = worktree.SnapshotTree(ctx, opt.AgainstDir)
+		from, _, err = worktree.SnapshotTree(ctx, opt.AgainstDir, opt.MaxUntracked)
 		if err != nil {
 			return nil, fmt.Errorf("the other worktree: %w", err)
 		}
@@ -179,7 +194,7 @@ func Build(ctx context.Context, opt Options) (*Diff, error) {
 	if err != nil {
 		return nil, err
 	}
-	if opt.AgainstDir == "" {
+	if opt.AgainstDir == "" && opt.Tree == "" {
 		markUntracked(ctx, opt.Dir, files, spec)
 	}
 	for i := range files {
@@ -194,6 +209,11 @@ func Build(ctx context.Context, opt Options) (*Diff, error) {
 		}
 		d.Truncated = truncated
 	}
+	for _, p := range skipped {
+		if underPaths(p, opt.Paths) {
+			files = append(files, File{Path: p, Status: StatusUntracked, Skipped: true, Hunks: []Hunk{}})
+		}
+	}
 	d.Files = files
 	for _, f := range files {
 		d.Totals.Files++
@@ -201,6 +221,21 @@ func Build(ctx context.Context, opt Options) (*Diff, error) {
 		d.Totals.Removed += f.Removed
 	}
 	return d, nil
+}
+
+// underPaths reports whether path is one of paths or inside one of them, the
+// way a literal pathspec matches. No paths matches every path.
+func underPaths(path string, paths []string) bool {
+	if len(paths) == 0 {
+		return true
+	}
+	for _, p := range paths {
+		p = strings.TrimSuffix(p, "/")
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // pathspec is the "--" and the paths, each literal.
@@ -248,7 +283,7 @@ func markUntracked(ctx context.Context, dir string, files []File, spec []string)
 func streamUnified(ctx context.Context, dir string, args []string, files []File, lim Limits) (bool, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := childproc.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = gitEnv(nil)
 	var stderr bytes.Buffer
@@ -396,7 +431,7 @@ func revParse(ctx context.Context, dir, rev string) (string, error) {
 
 // emptyTree is the hash of the empty tree in the repository's hash format.
 func emptyTree(ctx context.Context, dir string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "hash-object", "-t", "tree", "--stdin")
+	cmd := childproc.CommandContext(ctx, "git", "hash-object", "-t", "tree", "--stdin")
 	cmd.Dir = dir
 	cmd.Env = gitEnv(nil)
 	cmd.Stdin = strings.NewReader("")
@@ -421,10 +456,19 @@ func gitEnv(extra []string) []string {
 	return append(env, extra...)
 }
 
+// gitWaitDelay is how long git's output is read after ctx ends.
+const gitWaitDelay = 2 * time.Second
+
 // git runs one git command in dir, bounded by ctx, and returns its stdout. A
 // failure carries git's own message.
 func git(ctx context.Context, dir string, extra []string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := childproc.CommandContext(ctx, "git", args...)
+	// A child of git, such as git-remote-https on a remote that stopped
+	// answering, keeps the output pipes open after the context kills git.
+	// Without a delay, Run would wait for that child and the timeout would
+	// not hold.
+	cmd.WaitDelay = gitWaitDelay
+	cmd.Cancel = killTree(cmd)
 	cmd.Dir = dir
 	cmd.Env = gitEnv(extra)
 	var stdout, stderr bytes.Buffer

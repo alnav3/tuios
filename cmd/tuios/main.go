@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -15,12 +16,13 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/cliflags"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/fang"
+	"github.com/Gaurav-Gosain/tuios/internal/herdrplugin"
+	"github.com/Gaurav-Gosain/tuios/internal/serverscope"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
-	"github.com/Gaurav-Gosain/tuios/internal/shot"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
-	"github.com/Gaurav-Gosain/tuios/skills"
-	tint "github.com/lrstanley/bubbletint/v2"
 	"github.com/spf13/cobra"
+	"tuios.dev/shot"
+	"tuios.dev/vt"
 )
 
 // Version information (set by goreleaser)
@@ -34,6 +36,7 @@ var (
 // Global flags
 var (
 	debugMode      bool
+	serverName     string
 	cpuProfile     string
 	pprofAddr      string
 	listThemes     bool
@@ -46,10 +49,30 @@ var (
 )
 
 func main() {
+	// A plugin command's reaper does nothing else (internal/herdrplugin,
+	// reaper.go).
+	if len(os.Args) > 1 && os.Args[1] == herdrplugin.ReaperArg {
+		os.Exit(herdrplugin.RunReaper(os.Args[2:]))
+	}
+	session.PluginReaper = pluginReaper()
+	// A `go install ...@vX` build has no ldflags; its module version stands in
+	// for them before anything below reads the stamps.
+	applyModuleVersion()
+
 	// The build identity, handed to internal/app before anything can crash.
 	// A crash report that cannot say which build produced it cannot be placed
 	// against a commit, and internal/app cannot read these vars itself.
 	app.SetBuildStamp(version, commit)
+	// XTVERSION names the build to the programs in a pane.
+	vt.SetBuildVersion(version)
+
+	// The server a pane's daemon was started for reaches every tuios run in
+	// that pane through TUIOS_SERVER, the tmux and herdr links included, so it
+	// is applied before either can take over. --server replaces it later.
+	if err := serverscope.ApplyEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "tuios: %v.\n", err)
+		os.Exit(1)
+	}
 
 	// Run through the `tmux` link that tuios tmux-shim installs, this binary
 	// is tmux: the shim answers, or hands the call to the real tmux.
@@ -61,6 +84,9 @@ func main() {
 	if isHerdrName(os.Args[0]) {
 		os.Exit(runAsHerdr(os.Args[1:]))
 	}
+
+	// This machine's agent switch governs an agent call to another machine.
+	session.HostCallGuard = refuseAgentCallHere
 
 	rootCmd := newRootCommand()
 	rootCmd.SetArgs(skillArgs(rootCmd, os.Args[1:]))
@@ -77,6 +103,11 @@ func main() {
 		fang.WithVersion(versionReport()),
 		fang.WithErrorHandler(diagnosticErrorHandler),
 	); err != nil {
+		// A command may say what a wrong flag exits with (tuios cp exits 2).
+		var coded interface{ ExitStatus() int }
+		if errors.As(err, &coded) {
+			os.Exit(coded.ExitStatus())
+		}
 		os.Exit(1)
 	}
 	if code := exitStatus(cmdErr); code != 0 {
@@ -88,357 +119,13 @@ func main() {
 // test can resolve a command line against the real tree rather than against a
 // second description of it that would drift.
 func newRootCommand() *cobra.Command {
-	rootCmd := &cobra.Command{
-		Use:   "tuios",
-		Short: "Terminal UI Operating System",
-		Long: `TUIOS: Terminal UI Operating System
+	rootCmd := newRootCommandBase()
 
-A terminal-based window manager that provides a modern interface for managing
-multiple terminal sessions with workspace support, tiling modes, and
-comprehensive keyboard/mouse interactions.`,
-		Example: `  # Run TUIOS
-  tuios
+	sshCmd := newSSHCommand()
 
-  # Run with debug logging
-  tuios --debug
+	configCmd := newConfigCommand()
 
-  # Run with ASCII-only mode (no Nerd Font icons)
-  tuios --ascii-only
-
-  # Run with CPU profiling
-  tuios --cpuprofile cpu.prof
-
-  # Run with a specific theme
-  tuios --theme dracula
-
-  # List all available themes
-  tuios --list-themes
-
-  # Preview a theme's colors
-  tuios --preview-theme dracula
-
-  # Interactively select theme with fzf and preview
-  tuios --theme $(tuios --list-themes | fzf --preview 'tuios --preview-theme {}')
-
-  # Run as SSH server
-  tuios ssh --port 2222
-
-  # Edit configuration
-  tuios config edit
-
-  # List all keybindings
-  tuios keybinds list
-
-  # Print the agent skill for driving tuios from a pane
-  tuios --skill
-
-  # Print one topic of it, or all of it
-  tuios --skill fleet
-  tuios --skill all`,
-		Version: version,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			// The skill is printed before anything else can decide to draw: it is
-			// a document, and a caller asking for it never wants the interface.
-			if cmd.Flags().Changed("skill") {
-				text, err := skills.Lookup(skillTopic)
-				if err != nil {
-					return err
-				}
-				fmt.Print(text)
-				return nil
-			}
-
-			if previewTheme != "" {
-				return previewThemeColors(previewTheme)
-			}
-
-			if listThemes {
-				theme.EnsureRegistry()
-				themes := tint.TintIDs()
-				for _, t := range themes {
-					fmt.Println(t)
-				}
-				return nil
-			}
-			return runLocal()
-		},
-		SilenceUsage: true,
-	}
-
-	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug logging")
-	rootCmd.PersistentFlags().StringVar(&cpuProfile, "cpuprofile", "", "Write CPU profile to file")
-	rootCmd.PersistentFlags().StringVar(&pprofAddr, "pprof", "", "Serve /debug/pprof profiles on this address, for example :6060. With no host, it listens on 127.0.0.1 only. The profiles have no password")
-
-	// Local to the root command: the skill describes tuios as a whole, and the
-	// theme listing and preview are root-level actions that print and exit, so
-	// offering them on every subcommand would only add noise to their help.
-	//
-	// --skill takes an optional topic. A bare --skill prints the core, and
-	// skillArgs turns "--skill TOPIC" into "--skill=TOPIC" before cobra sees
-	// it, because an optional value only binds with "=", and a topic such as
-	// mcp or hosts is also the name of a subcommand.
-	rootCmd.Flags().StringVar(&skillTopic, "skill", "", "Print the agent skill for driving tuios from a pane and exit; --skill TOPIC prints one topic, --skill all prints every topic")
-	rootCmd.Flags().Lookup("skill").NoOptDefVal = "core"
-	// The way out of startup.daemon for one run. It is on the root command
-	// because that is the only command the setting changes.
-	rootCmd.Flags().BoolVar(&standaloneMode, "standalone", false, "Run a standalone session without the daemon, overriding startup.daemon (TUIOS_NO_DAEMON=1 does the same for a whole shell)")
-	rootCmd.Flags().BoolVar(&listThemes, "list-themes", false, "List all available themes and exit")
-	rootCmd.Flags().StringVar(&previewTheme, "preview-theme", "", "Preview a theme's 16 ANSI colors")
-
-	var sshPort, sshHost, sshKeyPath, sshDefaultSession, sshAuthorizedKeys string
-	var sshEphemeral, sshNoAuth bool
-
-	sshCmd := &cobra.Command{
-		Use:   "ssh",
-		Short: "Run TUIOS as SSH server",
-		Long: `Run TUIOS as an SSH server
-
-Allows remote connections to TUIOS via SSH. The server will generate
-a host key automatically if not specified.
-
-By default, SSH sessions connect to the TUIOS daemon for persistent sessions.
-Session selection priority:
-  1. --default-session flag (if specified)
-  2. SSH username (if not generic like "tuios", "root", "anonymous")
-  3. SSH command argument (e.g., "ssh host attach mysession")
-  4. First available session or create new
-
-Use --ephemeral for standalone sessions (legacy behavior).
-
-Every connection gets a shell on this machine, so the server checks who is
-connecting. It reads public keys from ~/.config/tuios/authorized_keys. It does
-not read ~/.ssh/authorized_keys unless you name it with --authorized-keys.
-TUIOS does not accept a key with options such as command=, from= or restrict.
-With no keys file, the server does not start, on localhost too, until you add
-keys, pass --authorized-keys, or pass --no-auth.
-
-To let your own key in, use your public key file:
-  mkdir -p ~/.config/tuios
-  cat ~/.ssh/id_ed25519.pub >> ~/.config/tuios/authorized_keys`,
-		Example: `  # Start SSH server on default port (needs ~/.config/tuios/authorized_keys)
-  tuios ssh
-
-  # Start on custom port
-  tuios ssh --port 2222
-
-  # Specify custom host key
-  tuios ssh --key-path /path/to/host_key
-
-  # Use a default session for all connections
-  tuios ssh --default-session mysession
-
-  # Run in ephemeral mode (standalone, no daemon)
-  tuios ssh --ephemeral
-
-  # Read the allowed public keys from somewhere else
-  tuios ssh --authorized-keys /etc/tuios/authorized_keys
-
-  # Use the keys that sshd accepts (keys with options are not accepted)
-  tuios ssh --authorized-keys ~/.ssh/authorized_keys
-
-  # Serve the network with no authentication (trusted networks only)
-  tuios ssh --host 0.0.0.0 --no-auth`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return runSSHServer(sshServerFlags{
-				host:           sshHost,
-				port:           sshPort,
-				keyPath:        sshKeyPath,
-				defaultSession: sshDefaultSession,
-				authorizedKeys: sshAuthorizedKeys,
-				ephemeral:      sshEphemeral,
-				noAuth:         sshNoAuth,
-			})
-		},
-	}
-
-	sshCmd.Flags().StringVar(&sshPort, "port", "2222", "SSH server port")
-	sshCmd.Flags().StringVar(&sshHost, "host", "localhost", "SSH server host")
-	sshCmd.Flags().StringVar(&sshKeyPath, "key-path", "", "Path to SSH host key (auto-generated if not specified)")
-	sshCmd.Flags().StringVar(&sshDefaultSession, "default-session", "", "Default session name for all connections")
-	sshCmd.Flags().BoolVar(&sshEphemeral, "ephemeral", false, "Run in ephemeral mode (standalone, no daemon)")
-	sshCmd.Flags().StringVar(&sshAuthorizedKeys, "authorized-keys", "", "Path to the public keys allowed to connect (default ~/.config/tuios/authorized_keys). Keys with options are not accepted")
-	sshCmd.Flags().BoolVar(&sshNoAuth, "no-auth", false, "Give every connection a shell without checking who it is (trusted networks only)")
-
-	configCmd := &cobra.Command{
-		Use:   "config",
-		Short: "Manage TUIOS configuration",
-		Long:  `Manage TUIOS configuration file and settings`,
-	}
-
-	configPathCmd := &cobra.Command{
-		Use:   "path",
-		Short: "Print configuration file path",
-		Long:  `Print the path to the TUIOS configuration file`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return printConfigPath()
-		},
-	}
-
-	configEditCmd := &cobra.Command{
-		Use:   "edit",
-		Short: "Edit configuration in $EDITOR",
-		Long: `Open the TUIOS configuration file in your default editor
-
-The editor is determined by checking $EDITOR, $VISUAL, or common editors
-like vim, vi, nano, and emacs in that order.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return editConfigFile()
-		},
-	}
-
-	configResetCmd := &cobra.Command{
-		Use:   "reset",
-		Short: "Reset configuration to defaults",
-		Long: `Reset the TUIOS configuration file to default settings
-
-This will overwrite your existing configuration after confirmation.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return resetConfigToDefaults()
-		},
-	}
-
-	configApplyCmd := &cobra.Command{
-		Use:   "apply",
-		Short: "Apply config.toml to the running daemon now",
-		Long: `Apply config.toml to the running daemon now, including changes that give panes or other machines more.
-
-The daemon applies a change to the file at once only where it gives less. A change that gives more waits for this command or a daemon restart. Run it from a terminal outside tuios. It is refused from inside a pane.`,
-		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			client, err := dialVerb()
-			if err != nil {
-				return err
-			}
-			defer func() { _ = client.Close() }()
-			raw, err := client.Call("apply-config", nil)
-			if err != nil {
-				return explainVerbError("apply-config", err)
-			}
-			fmt.Print(describeConfigApplied(raw))
-			return nil
-		},
-	}
-
-	configCmd.AddCommand(configPathCmd, configEditCmd, configResetCmd, configApplyCmd)
-
-	keybindsCmd := &cobra.Command{
-		Use:     "keybinds",
-		Aliases: []string{"keys", "kb"},
-		Short:   "View keybinding configuration",
-		Long:    `View and inspect TUIOS keybinding configuration`,
-	}
-
-	keybindsListCmd := &cobra.Command{
-		Use:   "list",
-		Short: "List the common keybindings",
-		Long: `Display the common keybindings, as configured, in formatted tables.
-tuios keybinds doctor lists every scope.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return listKeybindings()
-		},
-	}
-
-	keybindsCustomCmd := &cobra.Command{
-		Use:   "list-custom",
-		Short: "List customized keybindings",
-		Long: `Display only keybindings that differ from defaults
-
-Shows a comparison of default and custom keybindings.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return listCustomKeybindings()
-		},
-	}
-
-	var (
-		keybindsJSON  bool
-		keybindsGuest string
-	)
-
-	keybindsDoctorCmd := &cobra.Command{
-		Use:   "doctor",
-		Short: "Report keybind conflicts",
-		Long: `Report every key claimed twice, every key tuios takes from the pane,
-and every one of those a common program wants.
-
-Each finding carries the evidence it rests on: certain (tuios's own routing),
-observed (read from a pane), or reference (a list of common program defaults,
-not detection). --json emits the same analysis the keybind overlay draws.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return keybindsDoctor(keybindsJSON, keybindsGuest)
-		},
-	}
-	keybindsDoctorCmd.Flags().BoolVar(&keybindsJSON, "json", false, "emit the report as JSON")
-	keybindsDoctorCmd.Flags().StringVar(&keybindsGuest, "guest", "", "treat this program as the one running in the pane")
-
-	keybindsExplainCmd := &cobra.Command{
-		Use:   "explain <key>",
-		Short: "Say what tuios does with one key",
-		Long: `Print every scope the key acts in, whether the pane's program would
-receive it, the terminal-level pair it belongs to, and which common programs
-bind it. This prints the same answer the overlay's key recorder shows.`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return keybindsExplain(args[0], keybindsJSON, keybindsGuest)
-		},
-	}
-	keybindsExplainCmd.Flags().BoolVar(&keybindsJSON, "json", false, "emit the answer as JSON")
-	keybindsExplainCmd.Flags().StringVar(&keybindsGuest, "guest", "", "treat this program as the one running in the pane")
-
-	keybindsUnbindCmd := &cobra.Command{
-		Use:   "unbind <action> [key]",
-		Short: "Take a key off one action",
-		Long: `Take a key off one action and write the change to config.toml.
-
-Name a key to remove that one. Name none and the action loses every key it has.
-An action with no keys is written as an empty list, which is different from
-leaving it out of the file: an action the file does not mention gets its default
-back at the next load, and an empty list does not.
-
-This changes one action. To stop tuios taking a key at all, so the program in
-your pane receives it, use ` + "`tuios keybinds free`" + `.`,
-		Example: `  # Stop w closing a window, leaving x
-  tuios keybinds unbind close_window w
-
-  # Leave the action with no key at all
-  tuios keybinds unbind close_window`,
-		Args: cobra.RangeArgs(1, 2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			key := ""
-			if len(args) > 1 {
-				key = args[1]
-			}
-			return keybindsUnbind(args[0], key)
-		},
-	}
-
-	keybindsFreeCmd := &cobra.Command{
-		Use:   "free <key>",
-		Short: "Hand a key back to the program in the pane",
-		Long: `Take one key off every action in every scope and write the change to
-config.toml.
-
-Every scope at once is the point. A key tuios still claims anywhere is a key the
-program in your pane never sees, so freeing one table at a time does not free
-the key. Each action that runs out of keys is written as an empty list, so the
-default does not come back at the next load.
-
-Two things this cannot take. The leader key is keybindings.leader_key rather
-than an entry in a table, so it is moved rather than unbound. A few keys are
-read by the input path itself and have no config entry. Either way the command
-says so instead of reporting a success.`,
-		Example: `  # Give alt+left back to your shell
-  tuios keybinds free alt+left
-
-  # Check first: this says every scope the key acts in
-  tuios keybinds explain alt+left`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return keybindsFree(args[0])
-		},
-	}
-
-	keybindsCmd.AddCommand(keybindsListCmd, keybindsCustomCmd, keybindsDoctorCmd,
-		keybindsExplainCmd, keybindsUnbindCmd, keybindsFreeCmd)
+	keybindsCmd := newKeybindsCommand()
 
 	tapeCmd := &cobra.Command{
 		Use:   "tape",
@@ -478,14 +165,17 @@ in the terminal UI. Press Ctrl+P to pause/resume playback.`,
 		},
 	}
 
+	var tapeListJSON bool
 	tapeListCmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all saved tape recordings",
-		Long:  `Display all tape files in the TUIOS data directory`,
+		Long: `List the tape files in the tape recordings directory, with the size and the
+time each one last changed. 'tuios tape dir' prints the directory.`,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return listTapeFiles()
+			return listTapeFiles(tapeListJSON)
 		},
 	}
+	tapeListCmd.Flags().BoolVar(&tapeListJSON, "json", false, "Output as JSON")
 
 	tapeDirCmd := &cobra.Command{
 		Use:   "dir",
@@ -536,6 +226,10 @@ then opens one of those. With nothing saved and no
 name given, a new session is opened instead. A name that matches no session
 is an error unless -c is given.
 
+With -d every other client of the session detaches as this one attaches,
+as tmux attach -d does. Each of them exits with a message. To do this on
+every attach, set single_client = true in [daemon].
+
 With --host the session is on another machine. tuios runs ssh to the host
 named in the [hosts] table and attaches with the tuios on that machine. The
 client you see is the remote one. Press the prefix key twice to send it to
@@ -548,6 +242,9 @@ the remote client. See 'tuios hosts --help'.`,
 
   # Attach and create if session doesn't exist
   tuios attach mysession -c
+
+  # Attach and detach every other client of the session
+  tuios attach -d mysession
 
   # Attach to a session on the machine named build
   tuios attach --host build mysession`,
@@ -571,7 +268,12 @@ the remote client. See 'tuios hosts --help'.`,
 	attachCmd.Flags().BoolVar(&attachSSH, "ssh", false, "With --host, run ssh to the host and its own tuios instead of attaching here")
 	attachCmd.Flags().BoolVar(&attachHold, "hold", false, "After a failure, wait for enter before the command exits")
 	attachCmd.Flags().BoolVar(&attachForce, "force", false, "Attach even from a pane of the same session")
+	attachCmd.Flags().BoolVarP(&attachDetachOthers, "detach-others", "d", false, "Detach every other client of the session, as tmux attach -d does")
 	attachCmd.Flags().BoolVar(&attachTerminalMode, "terminal-mode", false, "Start in terminal mode, whatever startup.start_in_terminal_mode says")
+	attachCommand = attachCmd
+	// Set by the client a restart from the app starts. See restart_reattach.go.
+	attachCmd.Flags().BoolVar(&attachAfterRestart, "after-restart", false, "Say that the daemon restarted when the client starts")
+	_ = attachCmd.Flags().MarkHidden("after-restart")
 	registerHostNameCompletion(attachCmd, "host")
 
 	var newDetach bool
@@ -579,6 +281,8 @@ the remote client. See 'tuios hosts --help'.`,
 	var newHold bool
 	var newGlobal bool
 	var newSSH bool
+	var newCwd string
+	var newSpace string
 	newCmd := &cobra.Command{
 		Use:   "new [session-name]",
 		Short: "Create a new TUIOS session",
@@ -594,10 +298,17 @@ gets an initial window, is immediately usable by control commands
 Sessions persist even when you detach, allowing you to reconnect later
 with 'tuios attach'.
 
+The session's windows start in the directory you run the command from.
+--cwd names another directory. A window opened later with no pane to take
+a directory from starts there too.
+
 With --host the session is created on another machine. tuios runs ssh to the
 host named in the [hosts] table and runs 'tuios new' there. The client you
 see is the remote one. With --detach the far side creates the session and
-returns. See 'tuios hosts --help'.`,
+returns. See 'tuios hosts --help'.
+
+With --space the session is filed under a space, a named group of related
+sessions that 'tuios ls' and the sidebar list together.`,
 		Example: `  # Create a new session with auto-generated name
   tuios new
 
@@ -606,6 +317,12 @@ returns. See 'tuios hosts --help'.`,
 
   # Create a headless session without attaching
   tuios new mysession --detach
+
+  # Create a session whose windows start in ~/dev/api
+  tuios new api --cwd ~/dev/api
+
+  # Create a session in the space payments
+  tuios new api --space payments --detach
 
   # Create a session on the machine named build and attach to it
   tuios new --host build
@@ -619,7 +336,24 @@ returns. See 'tuios hosts --help'.`,
 				name = args[0]
 			}
 			if newHost != "" {
+				if newCwd != "" {
+					return fmt.Errorf("--cwd is a directory on this machine, so it cannot be used with --host")
+				}
+				if newSpace != "" {
+					return fmt.Errorf("--space cannot be used with --host. Run 'tuios set-session-space' on the host after you create the session")
+				}
 				return runNewOnHost(newHost, name, newDetach, newHold, newSSH)
+			}
+			dir, err := newSessionStartDir(newCwd)
+			if err != nil {
+				return err
+			}
+			newSessionDir = dir
+			if newSpace != "" {
+				if newGlobal {
+					return errors.New(session.GlobalSpaceRefusal)
+				}
+				return runNewSessionInSpace(name, newSpace, newDetach)
 			}
 			if newGlobal {
 				// A global session is created with no windows whether or not
@@ -638,6 +372,8 @@ returns. See 'tuios hosts --help'.`,
 	newCmd.Flags().BoolVar(&newSSH, "ssh", false, "With --host, run ssh to the host and its own tuios instead of attaching here")
 	newCmd.Flags().BoolVar(&newGlobal, "global", false, "Create a global session, which holds panes from more than one machine")
 	newCmd.Flags().BoolVar(&newHold, "hold", false, "After a failure, wait for enter before the command exits")
+	newCmd.Flags().StringVar(&newCwd, "cwd", "", "Directory the session's windows start in (default: the current directory)")
+	newCmd.Flags().StringVar(&newSpace, "space", "", "File the session under this space, a named group of related sessions")
 	registerHostNameCompletion(newCmd, "host")
 
 	var lsJSON bool
@@ -655,7 +391,7 @@ marked "saved", and the command exits 3. Exit 3 lets a script tell a
 stopped daemon from a running daemon with no sessions, which exits 0
 with an empty list.
 
-Use --json for machine-readable output; saved rows carry "saved": true.
+Use --json for machine-readable output. Saved rows carry "saved": true.
 
 With --all-hosts the listing also covers every machine in the [hosts] config
 table. Local comes first. A host that does not answer gets a row saying so,
@@ -675,6 +411,18 @@ and it never fails the command.`,
 	lsCmd.Flags().BoolVar(&lsAllHosts, "all-hosts", false, "List sessions on this machine and on every host in the [hosts] config table")
 	lsCmd.Flags().StringVar(&lsHost, "host", "", "List sessions on one host by name (\"local\" means this machine)")
 
+	var listClientsJSON bool
+	listClientsCmd := &cobra.Command{
+		Use:   "list-clients",
+		Short: "List daemon client connections",
+		Long:  "List every connection to the TUIOS daemon, its kernel peer pid, and its current session.",
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runListClients(listClientsJSON)
+		},
+	}
+	listClientsCmd.Flags().BoolVar(&listClientsJSON, "json", false, "Output as JSON")
+
 	killSessionCmd := &cobra.Command{
 		Use:   "kill-session <session-name>",
 		Short: "Kill a TUIOS session",
@@ -688,19 +436,19 @@ This will close all windows in the session and disconnect any attached clients.`
 		},
 	}
 
+	var resurrectJSON bool
 	resurrectCmd := &cobra.Command{
 		Use:   "resurrect [session-name]",
 		Short: "Restore a previously saved session",
-		Long: `Restore a session that was saved before a daemon restart, crash, or reboot.
+		Long: `Restore a session that was saved before a daemon restart, a crash or a reboot.
 
-With no arguments, lists the sessions that can be resurrected (from saved
-state on disk). With a session name, restores that session in the daemon
-(respawning fresh shells in each window's saved working directory) and
-attaches to it.
+With no argument, the command lists the sessions saved on disk. A session that
+the daemon holds now is marked live. With a session name, the daemon restores
+that session and the command attaches to it. Each window gets a new shell in
+its saved working directory.
 
-Sessions are normally auto-restored when the daemon starts; this command is
-useful when the daemon was started with --no-restore, or to bring back a
-specific session on demand.`,
+The daemon restores every saved session when it starts. Use this command when
+the daemon was started with --no-restore, or to bring back one session.`,
 		Example: `  # List resurrectable sessions
   tuios resurrect
 
@@ -713,9 +461,10 @@ specific session on demand.`,
 			if len(args) > 0 {
 				name = args[0]
 			}
-			return runResurrect(name)
+			return runResurrect(name, resurrectJSON)
 		},
 	}
+	resurrectCmd.Flags().BoolVar(&resurrectJSON, "json", false, "List the saved sessions as JSON")
 
 	startDaemonCmd := &cobra.Command{
 		Use:   "start-server",
@@ -734,6 +483,7 @@ run this command manually.`,
 
 	var daemonLogLevel string
 	var daemonNoRestore bool
+	var daemonAdoptFD int
 	daemonCmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run the TUIOS daemon in the foreground",
@@ -759,12 +509,20 @@ Debug log levels:
 			// the process a memory question is about. --pprof is a
 			// persistent flag, so it has to be honoured here too.
 			startPprofServer()
+			if daemonAdoptFD > 0 {
+				return runAdoptingDaemon(daemonAdoptFD)
+			}
 			return runDaemon(true, daemonNoRestore)
 		},
 	}
 	daemonCmd.Flags().StringVar(&daemonLogLevel, "log-level", "", "Debug log level: off, errors, basic, messages, verbose, trace")
 	daemonCmd.Flags().BoolVar(&daemonNoRestore, "no-restore", false, "Do not auto-restore saved sessions on start (use 'tuios resurrect' to restore on demand)")
+	// Set only by a live upgrade, which execs the next daemon image with the
+	// descriptor of the manifest its predecessor wrote. See daemon_upgrade.go.
+	daemonCmd.Flags().IntVar(&daemonAdoptFD, adoptFDFlag, 0, "Adopt the panes a live upgrade handed over on this descriptor")
+	_ = daemonCmd.Flags().MarkHidden(adoptFDFlag)
 
+	var killRestart bool
 	killDaemonCmd := &cobra.Command{
 		Use:   "kill-server",
 		Short: "Stop the TUIOS daemon",
@@ -777,9 +535,10 @@ session's state and removed its socket, so a new daemon can be started as soon
 as it returns. It fails if the daemon has not finished within 10 seconds.`,
 		Example: `  tuios kill-server`,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return runKillDaemon()
+			return runKillDaemon(killRestart)
 		},
 	}
+	killDaemonCmd.Flags().BoolVar(&killRestart, "restart", false, "Tell the attached clients that a new daemon follows, so they attach to it again")
 
 	// Remote control commands
 	var sendKeysSession string
@@ -796,12 +555,12 @@ as it returns. It fails if the daemon has not finished within 10 seconds.`,
 With -w the keys go to that window's terminal, whether or not a client is
 attached and whichever window has the focus. Without -w they go to the attached
 client as if the person pressed them, which drives the window manager or the
-focused window; with no client attached they go to the focused window.
+focused window. With no client attached they go to the focused window.
 
 To type text, use send-text. send-keys splits its argument on spaces and commas,
 so 'echo hello' types "echohello".
 
-Keys (case-insensitive; the argument is split on spaces and commas):
+Keys (case-insensitive, and the argument is split on spaces and commas):
   Enter Tab BTab Space Comma Escape Backspace
   Up Down Left Right Home End PageUp PageDown Insert Delete F1-F12
   a single character: q, j, /, G
@@ -873,6 +632,7 @@ it matched.`,
 	var capturePanePalette []string
 	var capturePaneLines int
 	var capturePaneLastCommand bool
+	var capturePaneUnwrap, capturePaneTrim bool
 	var capturePaneJSON bool
 	capturePaneCmd := &cobra.Command{
 		Use:   "capture-pane",
@@ -888,6 +648,9 @@ Use --resolved to rewrite ANSI index colours to 24-bit RGB, optionally against
 --palette (16 hex colours of your theme, xterm defaults otherwise).
 Use --last-command to read only what the last finished command printed. It
 needs a shell that marks its commands with OSC 133, and it is plain text.
+Use --unwrap to join the rows that the pane wrapped because a line was longer
+than the pane. Each line then comes back as the program wrote it.
+Use --trim to drop the blank lines at the end of the capture.
 
 A capture from a session on another machine (-s host:session) is fenced as
 untrusted content. With --ansi or --resolved, only colour and style codes are
@@ -907,6 +670,9 @@ kept from it. With --json the result carries host and "untrusted": true.`,
   # Capture with colours resolved to RGB against your theme palette
   tuios capture-pane --ansi --resolved --palette "#45475a,#f38ba8,#a6e3a1,#f9e2af,#89b4fa,#f5c2e7,#94e2d5,#bac2de,#585b70,#f38ba8,#a6e3a1,#f9e2af,#89b4fa,#f5c2e7,#94e2d5,#a6adc8"
 
+  # Search the whole log for a long line that wrapped in the pane
+  tuios capture-pane -w build --scrollback --unwrap --trim | grep 'FAIL'
+
   # Pipe to a file
   tuios capture-pane -w editor --scrollback > pane.txt
 
@@ -916,7 +682,12 @@ kept from it. With --json the result carries host and "untrusted": true.`,
   # Read pane 0 of session api on host build, as JSON
   tuios capture-pane -w build:api:0 --json`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runCapturePane(capturePaneSession, capturePaneWindow, capturePaneScrollback, capturePaneANSI, capturePaneResolved, capturePanePalette, capturePaneLines, capturePaneLastCommand, capturePaneJSON)
+			return runCapturePane(captureOptions{
+				session: capturePaneSession, window: capturePaneWindow,
+				scrollback: capturePaneScrollback, ansi: capturePaneANSI, resolved: capturePaneResolved,
+				palette: capturePanePalette, lines: capturePaneLines, lastCommand: capturePaneLastCommand,
+				unwrap: capturePaneUnwrap, trim: capturePaneTrim, jsonOut: capturePaneJSON,
+			})
 		},
 	}
 	capturePaneCmd.Flags().BoolVar(&capturePaneLastCommand, "last-command", false, "Capture only what the last finished command printed (needs OSC 133 shell integration)")
@@ -927,6 +698,8 @@ kept from it. With --json the result carries host and "untrusted": true.`,
 	capturePaneCmd.Flags().BoolVar(&capturePaneResolved, "resolved", false, "Rewrite ANSI index colours to 24-bit RGB")
 	capturePaneCmd.Flags().StringSliceVar(&capturePanePalette, "palette", nil, "16 hex colours (#rrggbb) to resolve against (default: xterm)")
 	capturePaneCmd.Flags().IntVar(&capturePaneLines, "lines", 0, "Keep only the last N lines (0 keeps all)")
+	capturePaneCmd.Flags().BoolVar(&capturePaneUnwrap, "unwrap", false, "Join the rows that the pane wrapped, so each line is one line")
+	capturePaneCmd.Flags().BoolVar(&capturePaneTrim, "trim", false, "Drop the blank lines at the end")
 	capturePaneCmd.Flags().BoolVar(&capturePaneJSON, "json", false, "Output result as JSON")
 	_ = capturePaneCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
@@ -943,7 +716,7 @@ rounded corners, a shadow and a title bar. Every part of that is a
 screenshot.* option.
 
 The daemon renders the file, so this works on a detached session with nobody
-attached. png and svg carry the frame; ansi and txt are the bare stream.
+attached. png and svg carry the frame. ansi and txt are the bare stream.
 
 With no theme set, basic and indexed colors fall back to the xterm defaults.
 Only your terminal knows its own palette, so that is a guess and the result
@@ -1050,6 +823,7 @@ exists: get-window and list-windows read windows with the read grant.`,
 	}
 
 	var setConfigSession string
+	var setConfigJSON bool
 	setConfigCmd := &cobra.Command{
 		Use:   "set-config <path> <value>",
 		Short: "Set a configuration option in a running TUIOS session",
@@ -1057,7 +831,16 @@ exists: get-window and list-windows read windows with the read grant.`,
 
 Run 'tuios list-options' for every path, with its type, default and accepted
 values. An [appearance] option also answers to its bare name, so border_style
-and appearance.border_style are the same path.
+and appearance.border_style are the same path. A path or a value that the
+option does not take is refused, and nothing changes.
+
+With a client attached, the client applies the value and writes it to
+config.toml. With no client attached, the daemon keeps the value for this
+session and does not write the file. The client applies it when it attaches.
+The command then says so on stderr, and --json reports "applied": false with
+the reason.
+
+agents.enabled is the person's switch. A process in a pane cannot set it.
 
   tuios set-config appearance.border_style rounded
   tuios set-config appearance.dockbar_position top`,
@@ -1074,10 +857,11 @@ and appearance.border_style are the same path.
   tuios set-config hide_window_buttons true`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return runSetConfig(setConfigSession, args[0], args[1])
+			return runSetConfig(setConfigSession, args[0], args[1], setConfigJSON)
 		},
 	}
 	setConfigCmd.Flags().StringVarP(&setConfigSession, "session", "s", "", "Target session (default: most recently active)")
+	setConfigCmd.Flags().BoolVar(&setConfigJSON, "json", false, "Output result as JSON, with applied and the reason when it is false")
 	_ = setConfigCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
 	var getConfigSession string
@@ -1089,9 +873,12 @@ and appearance.border_style are the same path.
 recorded in daemon-owned state, so this works whether or not a TUI client is
 attached.
 
-An option with no session override reads as its default, so a path that exists
+An option with no session override reads as the value in config.toml. An
+option that config.toml does not set reads as its default. A path that exists
 always reads. --json also reports where the value came from: "session" for an
-override set here, "default" for the built-in.
+override set here, "config" for a value the daemon read from config.toml, and
+"default" for the built-in. agents.enabled is the daemon's switch, so it reads
+as the value in effect for every session.
 
 Run 'tuios list-options' to see every path.`,
 		Example: `  # Read the border style
@@ -1117,7 +904,7 @@ Run 'tuios list-options' to see every path.`,
 		Long: `Report the semantic state of an agent running in a pane so the daemon can
 surface which panes need attention. State is one of: none, working, needs_input,
 idle, done, errored, unknown. A pane reports its own state by running this
-against the daemon socket; tuios agent-hook, which the installed harness
+against the daemon socket. tuios agent-hook, which the installed harness
 integrations run, does exactly that.
 
 Without --window, run in a pane, the report is about that pane. Run outside
@@ -1143,7 +930,7 @@ every pane, it is about the focused pane.`,
 				setAgentStateMessage, setAgentStateSource, setAgentStateHarness, setAgentStateExtra)
 		},
 	}
-	setAgentStateCmd.Flags().StringVar(&setAgentStateExtra.kind, "kind", "", "What a needs_input state waits for: approval or question")
+	setAgentStateCmd.Flags().StringVar(&setAgentStateExtra.kind, "kind", "", "What a needs_input state waits for: approval, question or auth")
 	setAgentStateCmd.Flags().StringVar(&setAgentStateExtra.sessionID, "agent-session-id", "", "The harness's own conversation id, stored on the pane for a later resume")
 	setAgentStateCmd.Flags().StringVar(&setAgentStateExtra.transcriptPath, "transcript-path", "", "The transcript file the harness writes, joined exactly instead of searched for")
 	setAgentStateCmd.Flags().StringVar(&setAgentStateExtra.ifState, "if-state", "", "Apply only when the pane is in one of these comma-separated states")
@@ -1320,6 +1107,7 @@ a bundled one.`,
 
 	var sendTextSession string
 	var sendTextWindow string
+	var sendTextJSON bool
 	sendTextCmd := &cobra.Command{
 		Use:   "send-text <text>",
 		Short: "Write text verbatim to a pane",
@@ -1338,11 +1126,12 @@ as typed. End the text with a newline to run it as a command.`,
   tuios send-text -w build 'partial input'`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return runSendText(sendTextSession, sendTextWindow, args[0])
+			return runSendText(sendTextSession, sendTextWindow, args[0], sendTextJSON)
 		},
 	}
 	sendTextCmd.Flags().StringVarP(&sendTextSession, "session", "s", "", "Target session (default: most recently active)")
 	sendTextCmd.Flags().StringVarP(&sendTextWindow, "window", "w", "", "Target window by name or ID (default: focused)")
+	sendTextCmd.Flags().BoolVar(&sendTextJSON, "json", false, "Output result as JSON")
 	_ = sendTextCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
 	var newWindowSession string
@@ -1353,6 +1142,9 @@ as typed. End the text with a newline to run it as a command.`,
 	var newWindowGrants []string
 	var newWindowJSON bool
 	var newWindowPrintID bool
+	var newWindowKind, newWindowURI string
+	var newWindowKeepOpen, newWindowWait bool
+	var newWindowTimeout int
 	newWindowCmd := &cobra.Command{
 		Use:   "new-window [name] [command...]",
 		Short: "Open a new window in a session",
@@ -1364,25 +1156,37 @@ on to the id.
 
 Arguments after the name are an argv the window runs as its own process instead
 of a shell. Nothing re-parses them, so nothing needs quoting. The window closes
-when the program exits. Put -- before a command that has flags of its own, or
+when the program exits, unless you add --keep-open. Put -- before a command that has flags of its own, or
 tuios reads them as its own flags: tuios new-window log -- git log --oneline.
 
 --workspace picks the workspace, --cwd sets the starting directory, and
 --no-focus leaves the focus where it is.
+
+--keep-open keeps the window after its program exits. The window shows a line
+with the exit status under the last output. Close the window to remove it.
+
+--wait waits for the program to exit, prints nothing, and exits with the
+program's status. A program that a signal stopped gives 128 plus the signal
+number. --timeout sets a limit in milliseconds. Use --wait with --keep-open to
+read the output after the exit with capture-pane.
 
 The output is the short id and the name, "d6b97fe4  build". Either one is a
 window target for -w. --print-id prints the full id alone, for a script:
 id=$(tuios new-window build --print-id).
 
 --host runs the window's process on another machine from the [hosts] table. The
-window still belongs to this session and is drawn and sized here; only the
+window still belongs to this session and is drawn and sized here. Only the
 process is over there. There is no special mode to turn on: a session holding
 one is an ordinary session with a window that happens to be elsewhere, so it
 lists, scripts and restores like any other.
 
 --grants says what the window's process may do through tuios: read, write,
 fan, respond, admin, or none. Without it the window holds the default of
-[agents.permissions]. See 'tuios pane-grants'.`,
+[agents.permissions]. See 'tuios pane-grants'.
+
+--kind makes a window that a native renderer (tuios-gpui) draws itself: view,
+web or app, with --uri naming what it shows. A terminal client shows such a
+window as one line with its uri.`,
 		Example: `  # Open an unnamed window
   tuios new-window
 
@@ -1404,6 +1208,10 @@ fan, respond, admin, or none. Without it the window holds the default of
   id=$(tuios new-window docs --cwd ~/src/docs --no-focus --print-id)
   tuios new-window --json | jq -r .window_id
 
+  # Run the tests beside you, wait, and read the output if they fail
+  tuios new-window tests --no-focus --keep-open --wait -- go test ./... ||
+    tuios capture-pane -w tests --scrollback
+
   # Open a window whose shell runs on another machine
   tuios new-window deploy --host build`,
 		Args: cobra.ArbitraryArgs,
@@ -1414,8 +1222,12 @@ fan, respond, admin, or none. Without it the window holds the default of
 				name = args[0]
 				command = args[1:]
 			}
-			return runNewWindow(newWindowSession, name, newWindowWorkspace, newWindowCwd,
-				!newWindowNoFocus, command, newWindowHost, newWindowGrants, newWindowJSON, newWindowPrintID)
+			return runNewWindow(newWindowOptions{
+				session: newWindowSession, name: name, workspace: newWindowWorkspace, cwd: newWindowCwd,
+				focus: !newWindowNoFocus, command: command, host: newWindowHost, grants: newWindowGrants,
+				kind: newWindowKind, uri: newWindowURI, jsonOut: newWindowJSON, printID: newWindowPrintID,
+				keepOpen: newWindowKeepOpen, wait: newWindowWait, timeout: newWindowTimeout,
+			})
 		},
 	}
 	newWindowCmd.Flags().StringVarP(&newWindowSession, "session", "s", "", "Target session (default: most recently active)")
@@ -1423,10 +1235,16 @@ fan, respond, admin, or none. Without it the window holds the default of
 	newWindowCmd.Flags().StringVar(&newWindowCwd, "cwd", "", "Directory to start the shell in (default: the daemon's)")
 	newWindowCmd.Flags().BoolVar(&newWindowNoFocus, "no-focus", false, "Leave the focus where it is")
 	newWindowCmd.Flags().StringVar(&newWindowHost, "host", "", "Run the window's process on this machine from the [hosts] table (default: this machine)")
-	newWindowCmd.Flags().StringSliceVar(&newWindowGrants, "grants", nil, "What the window's process may do through tuios, comma separated: read, write, fan, respond, admin, or none (default: [agents.permissions])")
+	newWindowCmd.Flags().StringSliceVar(&newWindowGrants, "grants", nil, "What the window's process may do through tuios, comma separated: read, write, fan, files, respond, admin, or none (default: [agents.permissions])")
 	newWindowCmd.Flags().BoolVar(&newWindowJSON, "json", false, "Output result as JSON")
 	newWindowCmd.Flags().BoolVar(&newWindowPrintID, "print-id", false, "Print only the new window's full id, for id=$(...)")
+	newWindowCmd.Flags().StringVar(&newWindowKind, "kind", "", "What draws the window: terminal, or view, web or app for a native renderer (default: terminal)")
+	newWindowCmd.Flags().StringVar(&newWindowURI, "uri", "", "What a view, web or app window shows, such as tuios://review/<pane>")
+	newWindowCmd.Flags().BoolVar(&newWindowKeepOpen, "keep-open", false, "Keep the window after its program exits, with a line that shows the exit status")
+	newWindowCmd.Flags().BoolVar(&newWindowWait, "wait", false, "Wait for the program to exit, and exit with its status")
+	newWindowCmd.Flags().IntVar(&newWindowTimeout, "timeout", 0, "With --wait: milliseconds to wait before failing (default: no limit)")
 	newWindowCmd.MarkFlagsMutuallyExclusive("json", "print-id")
+	newWindowCmd.MarkFlagsMutuallyExclusive("wait", "print-id")
 	_ = newWindowCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 	_ = newWindowCmd.RegisterFlagCompletionFunc("host", completeHostNames)
 	_ = newWindowCmd.RegisterFlagCompletionFunc("grants", completeGrantNames)
@@ -1434,6 +1252,7 @@ fan, respond, admin, or none. Without it the window holds the default of
 	var popupSession string
 	var popupWidth string
 	var popupHeight string
+	var popupDim int
 	var popupName string
 	var popupCwd string
 	var popupWorkspace int
@@ -1461,7 +1280,10 @@ command prints. Not on Windows.
 
 --width and --height take cells or a percentage of the pane region. A size
 larger than the region is cut down to the region. Neither has a short form: -w
-selects a window everywhere else, and -h is help.`,
+selects a window everywhere else, and -h is help.
+
+--dim takes a percent from 0 to 90 and overrides appearance.popup_dim for this
+popup. Omit it to follow the config (default: 0); --dim 0 disables dimming.`,
 		Example: `  # Pick a file in a centred popup and use the answer
   file=$(tuios popup --capture-stdout -- fzf)
 
@@ -1480,11 +1302,19 @@ selects a window everywhere else, and -h is help.`,
   # Watch something, then press q to close it
   tuios popup --width 90% --height 80% -- htop
 
+  # Dim the background while choosing
+  tuios popup --dim 30 -- gum choose one two three
+
   # Capture the popup's id for scripting
   tuios popup --json -- fzf | jq -r .window_id`,
 		Args: cobra.ArbitraryArgs,
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var dim *config.PopupDim
+			if cmd.Flags().Changed("dim") {
+				dim = &config.PopupDim{Percent: popupDim}
+			}
 			return runPopup(popupOptions{
+				dim:       dim,
 				session:   popupSession,
 				name:      popupName,
 				cwd:       popupCwd,
@@ -1508,6 +1338,7 @@ selects a window everywhere else, and -h is help.`,
 	// would reach for already mean something else here.
 	popupCmd.Flags().StringVar(&popupWidth, "width", "", "Popup width in cells or percent (default: 80%)")
 	popupCmd.Flags().StringVar(&popupHeight, "height", "", "Popup height in cells or percent (default: 60%)")
+	popupCmd.Flags().IntVar(&popupDim, "dim", 0, "Dim the background by 0 to 90 percent (default: appearance.popup_dim; 0 disables)")
 	popupCmd.Flags().StringVar(&popupName, "name", "", "Name for the popup")
 	popupCmd.Flags().StringVar(&popupCwd, "cwd", "", "Directory to run the command in (default: the daemon's)")
 	popupCmd.Flags().IntVar(&popupWorkspace, "workspace", 0, "Workspace to open the popup on (default: the current one)")
@@ -1519,9 +1350,12 @@ selects a window everywhere else, and -h is help.`,
 	var splitWindowName string
 	var splitWindowJSON bool
 	splitWindowCmd := &cobra.Command{
-		Use:   "split-window <horizontal|vertical>",
+		Use:   "split-window <horizontal|vertical|left|right|up|down>",
 		Short: "Divide a pane and open a new one beside it",
 		Long: `Split a pane along an axis and print the id of the new pane.
+
+horizontal and vertical put the new pane below or to the right. left, right,
+up and down name the side of the pane the new pane takes.
 
 Needs an attached client and tiling on. The split goes through the renderer's
 own path, so the new pane lands in the layout exactly as one opened from the
@@ -1529,13 +1363,16 @@ keyboard does.`,
 		Example: `  # Split the focused pane left/right
   tuios split-window vertical
 
+  # Put the new pane to the left of the focused one
+  tuios split-window left
+
   # Split a named pane and name what comes out of it
   tuios split-window horizontal -w build --name logs
 
   # Capture the new pane's id for scripting
   tuios split-window vertical --json | jq -r .window_id`,
 		Args:      cobra.ExactArgs(1),
-		ValidArgs: []string{"horizontal", "vertical"},
+		ValidArgs: []string{"horizontal", "vertical", "left", "right", "up", "down"},
 		RunE: func(_ *cobra.Command, args []string) error {
 			return runSplitWindow(splitWindowSession, splitWindowWindow, args[0],
 				splitWindowName, splitWindowJSON)
@@ -1590,35 +1427,57 @@ other two forms work on a detached session.`,
 
 	var moveWindowSession string
 	var moveWindowWindow string
+	var moveWindowToSession string
 	var moveWindowFollow bool
 	var moveWindowJSON bool
 	moveWindowCmd := &cobra.Command{
-		Use:   "move-window <workspace>",
-		Short: "Move a window to another workspace",
+		Use:   "move-window [workspace]",
+		Short: "Move a window to another workspace or session",
 		Long: `Move a window to another workspace and report where it came from.
 
 Works on a detached session. Pass --follow to switch to that workspace after
-the move instead of staying put.`,
+the move instead of staying put.
+
+With --to-session, the window moves to another session. The program in it
+keeps running, and the window keeps its id and its scrollback. The workspace
+is optional then: without it, the window goes to the workspace that session
+shows. A popup, a scratch pane, a TML pane and a pane on another machine
+cannot move.`,
 		Example: `  # Move the focused window to workspace 3
   tuios move-window 3
 
   # Move a named window and go with it
-  tuios move-window 2 -w build --follow`,
-		Args: cobra.ExactArgs(1),
+  tuios move-window 2 -w build --follow
+
+  # Move a window to the session "review"
+  tuios move-window -s work -w build --to-session review
+
+  # Move it to workspace 2 of "review" and focus it there
+  tuios move-window 2 -w build --to-session review --follow`,
+		Args: cobra.RangeArgs(0, 1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			workspace, err := strconv.Atoi(args[0])
-			if err != nil {
-				return fmt.Errorf("workspace must be a number, got %q", args[0])
+			workspace := 0
+			if len(args) == 1 {
+				n, err := strconv.Atoi(args[0])
+				if err != nil || n < 1 {
+					return fmt.Errorf("workspace must be a number from 1, got %q", args[0])
+				}
+				workspace = n
 			}
-			return runMoveWindow(moveWindowSession, moveWindowWindow, workspace,
+			if workspace == 0 && moveWindowToSession == "" {
+				return errors.New("give the workspace to move the window to, or a session with --to-session")
+			}
+			return runMoveWindow(moveWindowSession, moveWindowWindow, moveWindowToSession, workspace,
 				moveWindowFollow, moveWindowJSON)
 		},
 	}
 	moveWindowCmd.Flags().StringVarP(&moveWindowSession, "session", "s", "", "Target session (default: most recently active)")
 	moveWindowCmd.Flags().StringVarP(&moveWindowWindow, "window", "w", "", "Window to move by name or ID (default: focused)")
+	moveWindowCmd.Flags().StringVar(&moveWindowToSession, "to-session", "", "Session to move the window to")
 	moveWindowCmd.Flags().BoolVar(&moveWindowFollow, "follow", false, "Switch to that workspace after moving")
 	moveWindowCmd.Flags().BoolVar(&moveWindowJSON, "json", false, "Output result as JSON")
 	_ = moveWindowCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
+	_ = moveWindowCmd.RegisterFlagCompletionFunc("to-session", completeSessionNames)
 
 	var setWindowSession string
 	var setWindowWindow string
@@ -1732,6 +1591,10 @@ is showing.`,
 		Long: `Turn tiling on or off, even out the split ratios, and flip the axis of the
 split holding the focused pane.
 
+--equalize resets the splits of the layout on screen. In the BSP layout every
+split goes back to half. In the master-stack layout the master ratio goes back
+to its configured value, and the other panes share the rest evenly.
+
 --master-position and --masters shape the master-stack layout of the current
 workspace. The workspace keeps them until you change them again.
 
@@ -1770,7 +1633,7 @@ only mean something while the panes are tiled.`,
 	}
 	setLayoutCmd.Flags().StringVarP(&setLayoutSession, "session", "s", "", "Target session (default: most recently active)")
 	setLayoutCmd.Flags().StringVar(&setLayoutTiling, "tiling", "", "Tile the panes automatically: true or false")
-	setLayoutCmd.Flags().BoolVar(&setLayoutEqualize, "equalize", false, "Reset every split ratio so the panes share the space evenly")
+	setLayoutCmd.Flags().BoolVar(&setLayoutEqualize, "equalize", false, "Reset the splits: every split to half in BSP, the configured master ratio in master-stack")
 	setLayoutCmd.Flags().BoolVar(&setLayoutRotate, "rotate", false, "Flip the axis of the split holding the focused pane")
 	setLayoutCmd.Flags().StringVar(&setLayoutMasterPosition, "master-position", "", "Side the master panes take: left, right, top, bottom or center")
 	setLayoutCmd.Flags().IntVar(&setLayoutMasters, "masters", 0, "How many panes are master panes, 1 to 9")
@@ -1880,7 +1743,7 @@ dropped back to the default with nothing on screen to say so, because the
 alternative is a window control the pointer no longer lands on. The second
 column is what draws.
 
-Writing <id>.json in the glyphs directory registers that set; the directory is
+Writing <id>.json in the glyphs directory registers that set. The directory is
 re-read on every call, so a set authored a moment ago can be selected without a
 restart. Give it "inherits" to start from a built-in and change one mark.`,
 		Example: `  # What sets are there, and what roles can a set name
@@ -2031,6 +1894,85 @@ straight away without a restart.`,
 	importThemeCmd.Flags().StringVar(&importThemeName, "name", "", "Theme id to write it under (default: the file's name)")
 	importThemeCmd.Flags().BoolVar(&importThemeJSON, "json", false, "Output as JSON")
 
+	themeCmd := &cobra.Command{
+		Use:   "theme",
+		Short: "Work with theme files",
+	}
+	var themeReloadJSON bool
+	themeReloadCmd := &cobra.Command{
+		Use:   "reload",
+		Short: "Read the theme and glyph files again in every client",
+		Long: `Read the theme and glyph files again in every tuios client on this machine,
+ask each terminal for its colours again, and repaint. A client also does this
+by itself when a file in the themes or glyphs directory changes.
+
+Run it from a wallpaper tool that writes a theme file: pywal with wal -o, or
+matugen with a post_hook.`,
+		Example: `  tuios theme reload
+  wal -i ~/wall.png -o "tuios theme reload"`,
+		Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runThemeReload(themeReloadJSON)
+		},
+	}
+	themeReloadCmd.Flags().BoolVar(&themeReloadJSON, "json", false, "Output as JSON")
+	themeCmd.AddCommand(themeReloadCmd)
+
+	completeThemeID := func(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		theme.ReloadCustomThemes()
+		return theme.AvailableThemes(), cobra.ShellCompDirectiveNoFileComp
+	}
+	var themeExportFormat string
+	var themeExportFull bool
+	themeExportCmd := &cobra.Command{
+		Use:   "export <theme>",
+		Short: "Print a theme as a theme file",
+		Long: `Print a theme as a theme file on standard output.
+
+A theme from your themes directory is written against the built-in theme it
+starts from, with only the colours that are different. A built-in theme is
+written with all its colours. --full writes all the colours of any theme, with
+no base.
+
+--format base16 writes a base16 scheme in YAML for other programs.`,
+		Example: `  tuios theme export mine > mine.json
+  tuios theme export dracula --format base16`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeThemeID,
+		RunE: func(_ *cobra.Command, args []string) error {
+			return runThemeExport(args[0], themeExportFormat, themeExportFull)
+		},
+	}
+	themeExportCmd.Flags().StringVar(&themeExportFormat, "format", "tuios", "Output format: tuios or base16")
+	themeExportCmd.Flags().BoolVar(&themeExportFull, "full", false, "Write every colour, with no base")
+	_ = themeExportCmd.RegisterFlagCompletionFunc("format", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+		return []string{"tuios", "base16"}, cobra.ShellCompDirectiveNoFileComp
+	})
+	themeCmd.AddCommand(themeExportCmd)
+
+	themeShareCmd := &cobra.Command{
+		Use:   "share <theme>",
+		Short: "Print a theme as one line to paste in a message",
+		Long: `Print a theme as one line that starts with tuios-theme:v1:. The line holds
+the same file that tuios theme export writes, so a theme from your themes
+directory holds only the colours that are different from its base.`,
+		Example:           `  tuios theme share mine`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeThemeID,
+		RunE: func(_ *cobra.Command, args []string) error {
+			line, err := theme.ShareString(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Println(line)
+			return nil
+		},
+	}
+	themeCmd.AddCommand(themeShareCmd)
+
 	var waitForSession string
 	var waitForWindow string
 	var waitForPattern string
@@ -2051,14 +1993,16 @@ straight away without a restart.`,
 Conditions:
   session-exists  the named session is present
   window-output   the window printed something matching --pattern
-  window-exit     the window's shell exited
+  window-exit     the window's program exited. The output shows its exit
+                  status, and --json gives it in exit_code. The command
+                  still exits 0. Use new-window --wait to exit with it
   window-idle     the window printed nothing for --idle milliseconds
-  agent-state     an agent reached one of the --until states; without --window,
+  agent-state     an agent reached one of the --until states. Without --window,
                   any agent pane in the session matches, with --any-session,
                   any agent pane in any session, and with --select, any pane
                   the selector matches (every one of them with --every)
   agent-message   mail arrived. With --window it matches unread mail for that
-                  inbox, including mail queued before the wait started; without
+                  inbox, including mail queued before the wait started. Without
                   one, anything said in the session after it started. --thread
                   narrows either shape to one conversation
   command-finished  a shell that marks its commands with OSC 133 finished
@@ -2111,7 +2055,7 @@ non-zero with the timeout error.`,
 	waitForCmd.Flags().StringVar(&waitForSelect, "select", "", "For agent-state: watch the agent panes a selector matches, in every session. Takes no --session, --window or --any-session")
 	waitForCmd.Flags().BoolVar(&waitForEvery, "every", false, "With --select: wait until every matched pane is in one of the --until states, not only the first")
 	waitForCmd.Flags().StringVarP(&waitForSession, "session", "s", "", "Target session (default: most recently active)")
-	waitForCmd.Flags().StringVarP(&waitForWindow, "window", "w", "", "Target window by name or ID (default: focused; agent-state: any window)")
+	waitForCmd.Flags().StringVarP(&waitForWindow, "window", "w", "", "Target window by name or ID (default: focused, and for agent-state any window)")
 	waitForCmd.Flags().StringVar(&waitForPattern, "pattern", "", "Regular expression to match, required by window-output")
 	waitForCmd.Flags().StringVar(&waitForUntil, "until", "", "Agent state(s) to wait for, comma-separated, required by agent-state")
 	waitForCmd.Flags().IntVar(&waitForIdle, "idle", 0, "Milliseconds of silence that count as idle, for window-idle (default: 500)")
@@ -2204,6 +2148,37 @@ survives a reattach. Pass no accent to clear it.`,
 	setSessionAccentCmd.Flags().StringVarP(&setSessionAccentSession, "session", "s", "", "Target session (default: most recently active)")
 	_ = setSessionAccentCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
+	var setSessionSpaceSession string
+	setSessionSpaceCmd := &cobra.Command{
+		Use:   "set-session-space [space]",
+		Short: "File a session under a space",
+		Long: `File a session under a space, a named group of related sessions that
+'tuios ls' and the sidebar list together, under the space's name. A space
+exists while at least one session is in it. Pass no space to take the session
+out of any.
+
+A space name follows the session name rules and is at most 64 bytes. A
+global session cannot be in a space.`,
+		Example: `  # File the current session under the space payments
+  tuios set-session-space payments
+
+  # File a specific session
+  tuios set-session-space -s work payments
+
+  # Take the session out of any space
+  tuios set-session-space`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			space := ""
+			if len(args) > 0 {
+				space = args[0]
+			}
+			return runSetSessionSpace(setSessionSpaceSession, space)
+		},
+	}
+	setSessionSpaceCmd.Flags().StringVarP(&setSessionSpaceSession, "session", "s", "", "Target session (default: most recently active)")
+	_ = setSessionSpaceCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
+
 	var setWorkspaceNameSession string
 	setWorkspaceNameCmd := &cobra.Command{
 		Use:   "set-workspace-name <workspace> [name]",
@@ -2254,10 +2229,16 @@ number. The number stays the workspace's identity. Pass no name to clear it.`,
 	}
 
 	var tapeExecSession string
+	var tapeExecTimeout time.Duration
 	tapeExecCmd := &cobra.Command{
 		Use:   "exec <file.tape>",
 		Short: "Execute a tape file in a running session",
 		Long: `Execute a tape file in a running TUIOS session.
+
+The session needs an attached client, which plays the tape. The command
+returns when the tape ends. It exits non-zero when the tape has an error or
+a command fails, such as a WaitFor that times out or an Expect that does not
+hold. The message gives the file and line.
 
 For single tape commands, use: tuios run-command <Command> [args...]`,
 		Example: `  # Execute a tape file
@@ -2268,10 +2249,11 @@ For single tape commands, use: tuios run-command <Command> [args...]`,
   tuios tape exec --session mysession demo.tape`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return runTapeExec(tapeExecSession, args[0])
+			return runTapeExec(tapeExecSession, args[0], tapeExecTimeout)
 		},
 	}
 	tapeExecCmd.Flags().StringVarP(&tapeExecSession, "session", "s", "", "Target session (default: most recently active)")
+	tapeExecCmd.Flags().DurationVar(&tapeExecTimeout, "timeout", 30*time.Minute, "How long to wait for the tape to end")
 	_ = tapeExecCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
 	// Add exec to tape command group
@@ -2324,6 +2306,8 @@ titles and paths.`,
 	// Inspection commands for scripting and hackability
 	var listWindowsSession string
 	var listWindowsJSON bool
+	var listWindowsAll, listWindowsAllHosts bool
+	var listWindowsText int
 	listWindowsCmd := &cobra.Command{
 		Use:   "list-windows",
 		Short: "List all windows in the session",
@@ -2338,13 +2322,25 @@ Use --json for machine-readable output that can be used for scripting.`,
   tuios list-windows --json
 
   # Use with jq to get focused window ID
-  tuios list-windows --json | jq '.focused_window_id'`,
+  tuios list-windows --json | jq '.focused_window_id'
+
+  # Every pane of every session, with the last 20 lines of each screen
+  tuios list-windows --all --text 20 --json
+
+  # Every pane on this machine and on each host
+  tuios list-windows --all --all-hosts`,
 		RunE: func(_ *cobra.Command, _ []string) error {
+			if listWindowsAll || listWindowsAllHosts || listWindowsText > 0 {
+				return runListAllWindows(listWindowsSession, listWindowsAll, listWindowsAllHosts, listWindowsText, listWindowsJSON)
+			}
 			return queryWindows(listWindowsSession, listWindowsJSON)
 		},
 	}
 	listWindowsCmd.Flags().StringVarP(&listWindowsSession, "session", "s", "", "Target session (default: most recently active)")
 	listWindowsCmd.Flags().BoolVar(&listWindowsJSON, "json", false, "Output as JSON")
+	listWindowsCmd.Flags().BoolVar(&listWindowsAll, "all", false, "List the panes of every session on this machine, one row each")
+	listWindowsCmd.Flags().BoolVar(&listWindowsAllHosts, "all-hosts", false, "Also list the panes of every session on each host in [hosts]")
+	listWindowsCmd.Flags().IntVar(&listWindowsText, "text", 0, fmt.Sprintf("Add the last N lines of each pane's screen, up to %d. capture-pane's grants apply", maxListText))
 	_ = listWindowsCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
 	var getWindowSession string
@@ -2443,15 +2439,36 @@ Name a verb to describe only that verb.`,
 	layoutCmd := &cobra.Command{
 		Use:   "layout",
 		Short: "Manage layout templates",
-		Long:  `Save, load, list, and delete window layout templates`,
+		Long: `List, delete and export the saved window layout templates.
+
+Save and load a layout in a running session, with the layout prefix keys or
+the command palette. With no layout saved, 'tuios layout list' says which keys
+save one.`,
 	}
+	var layoutListJSON bool
 	layoutListCmd := &cobra.Command{
 		Use:   "list",
 		Short: "List saved layout templates",
+		Long: `List the saved layout templates: the name, how many windows each holds,
+whether it is tiled, and when it was saved. 'tuios layout dir' prints the
+directory that holds them.`,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			templates, err := app.LoadLayoutTemplates()
 			if err != nil {
 				return err
+			}
+			if layoutListJSON {
+				type layoutRow struct {
+					Name      string    `json:"name"`
+					Windows   int       `json:"windows"`
+					Tiled     bool      `json:"tiled"`
+					CreatedAt time.Time `json:"created_at"`
+				}
+				rows := make([]layoutRow, 0, len(templates))
+				for _, t := range templates {
+					rows = append(rows, layoutRow{Name: t.Name, Windows: len(t.Windows), Tiled: t.AutoTiling, CreatedAt: t.CreatedAt})
+				}
+				return printJSON(rows)
 			}
 			if len(templates) == 0 {
 				fmt.Println(layoutSaveHint(loadKeybindConfig()))
@@ -2469,10 +2486,14 @@ Name a verb to describe only that verb.`,
 		},
 	}
 	layoutDeleteCmd := &cobra.Command{
-		Use:   "delete [name]",
+		Use:   "delete <name>",
 		Short: "Delete a layout template",
+		Long:  `Delete a saved layout template by its name. 'tuios layout list' shows the names.`,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
+			if _, err := findLayoutTemplate(args[0]); err != nil {
+				return err
+			}
 			if err := app.DeleteLayoutTemplate(args[0]); err != nil {
 				return err
 			}
@@ -2483,12 +2504,13 @@ Name a verb to describe only that verb.`,
 	layoutDirCmd := &cobra.Command{
 		Use:   "dir",
 		Short: "Print layout templates directory path",
+		Long:  `Print the path of the directory that holds the layout templates. Each template is a JSON file there.`,
 		Run: func(_ *cobra.Command, _ []string) {
 			fmt.Println(app.GetTemplatesDir())
 		},
 	}
 	layoutExportCmd := &cobra.Command{
-		Use:   "export [name]",
+		Use:   "export <name>",
 		Short: "Export a layout template as a tape script",
 		Long: `Print a saved layout template as a tape script on stdout. Run the script
 with 'tuios tape play', or with 'tuios tape exec' against a running session.
@@ -2498,19 +2520,15 @@ The template itself is a JSON file in the directory 'tuios layout dir' prints.`,
   tuios tape play dev-layout.tape`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			templates, err := app.LoadLayoutTemplates()
+			t, err := findLayoutTemplate(args[0])
 			if err != nil {
 				return err
 			}
-			for _, t := range templates {
-				if t.Name == args[0] {
-					fmt.Print(app.GenerateTapeScript(t))
-					return nil
-				}
-			}
-			return fmt.Errorf("layout '%s' not found", args[0])
+			fmt.Print(app.GenerateTapeScript(t))
+			return nil
 		},
 	}
+	layoutListCmd.Flags().BoolVar(&layoutListJSON, "json", false, "Output as JSON")
 	layoutCmd.AddCommand(layoutListCmd, layoutDeleteCmd, layoutDirCmd, layoutExportCmd)
 
 	// The interface flags ride only the commands that draw the interface. They
@@ -2591,7 +2609,7 @@ would accept a question right now.`,
 		Use:   "send-agent-message <text>",
 		Short: "Leave a message for another agent, or post a notice to the session",
 		Long: `Queue a message in the session's agent ring. With -w it goes to one pane's
-inbox; without, it is a notice everyone in the session can read.
+inbox. Without -w, it is a notice everyone in the session can read.
 
 It does not touch the recipient's keyboard, which is the point: a message can be
 left for an agent that is mid-turn, and it is there when that agent next reads
@@ -2660,7 +2678,7 @@ list-agents printed for the same selector.`,
 	sendAgentMessageCmd.Flags().StringVar(&sendMsgFrom, "from", "", "The sending window, normally \"$TUIOS_PANE_ID\"")
 	sendAgentMessageCmd.Flags().StringVar(&sendMsgSubject, "subject", "", "One-line summary, at most 120 characters")
 	sendAgentMessageCmd.Flags().Uint64Var(&sendMsgReplyTo, "reply-to", 0, "Answer this message id. The reply joins that message's thread")
-	sendAgentMessageCmd.Flags().StringArrayVar(&sendMsgAttach, "attach", nil, "Absolute path to a file to reference; repeatable, at most 8")
+	sendAgentMessageCmd.Flags().StringArrayVar(&sendMsgAttach, "attach", nil, "Absolute path to a file to reference. Repeatable, at most 8")
 	sendAgentMessageCmd.Flags().BoolVar(&sendMsgJSON, "json", false, "Output result as JSON")
 	_ = sendAgentMessageCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
@@ -2676,7 +2694,7 @@ list-agents printed for the same selector.`,
 		Use:   "read-agent-messages",
 		Short: "Read the messages agents have left in this session",
 		Long: `Read the session's agent ring. With -w it reads that pane's inbox and marks
-what it returns as read; without, it reads everything and marks nothing, so
+what it returns as read. Without -w, it reads everything and marks nothing, so
 looking around never empties someone else's mailbox.
 
 --thread reads one conversation. Pass any message id in the thread, not only the
@@ -2735,12 +2753,12 @@ between.
 
 This is the difference between typing at a pane and asking an agent a question.
 The honest signal that a message landed is the target's state returning to rest,
-so that is what is waited on; a pane that reports no state falls back to going
+so that is what is waited on. A pane that reports no state falls back to going
 quiet for --settle. The answer says which of the two ended the wait.
 
 Three things it will not do. It will not type at an agent on needs_input: such
 an agent is waiting on a prompt, most often a permission menu, and the question
-would be read as the answer. That fails with agent_blocked and nothing is typed;
+would be read as the answer. That fails with agent_blocked and nothing is typed.
 read the prompt with capture-pane and answer it yourself or ask the person.
 --allow-blocked overrides it, for a prompt you have read that takes free text.
 It will not type at an agent that is working, which is what --force overrides
@@ -2790,15 +2808,15 @@ others still answer.`,
 	askAgentCmd.Flags().BoolVar(&askYes, "yes", false, "With --select: ask the set without asking you first")
 	askAgentCmd.Flags().StringVar(&askConfirm, "confirm", "", "With --select: the token list-agents printed, which asks exactly the panes it listed")
 	askAgentCmd.Flags().StringVarP(&askSession, "session", "s", "", "Target session (default: most recently active)")
-	askAgentCmd.Flags().StringVarP(&askWindow, "window", "w", "", "The agent to ask, by name or ID; list-agents finds it")
-	askAgentCmd.Flags().StringVar(&askFrom, "from", "", "The asking window, normally \"$TUIOS_PANE_ID\"; omitting it gives up loop detection")
+	askAgentCmd.Flags().StringVarP(&askWindow, "window", "w", "", "The agent to ask, by name or ID. list-agents finds it")
+	askAgentCmd.Flags().StringVar(&askFrom, "from", "", "The asking window, normally \"$TUIOS_PANE_ID\". Without it there is no loop detection")
 	askAgentCmd.Flags().IntVar(&askReadyTimeout, "ready-timeout", 0, "Milliseconds to wait for the target to stop working (default 30000)")
 	askAgentCmd.Flags().IntVar(&askSettle, "settle", 0, "Milliseconds of silence that count as finished, for a pane that reports no state (default 2000)")
 	askAgentCmd.Flags().IntVar(&askTimeout, "timeout", 0, "Milliseconds to wait for the answer overall (default 300000)")
 	askAgentCmd.Flags().IntVar(&askLines, "lines", 0, "Cap the reply to this many lines (default 200)")
 	askAgentCmd.Flags().IntVar(&askStallTimeout, "stall-timeout", 0, "Milliseconds after Enter for the target to show it took the question before prompt_stalled (default 5000)")
 	askAgentCmd.Flags().BoolVar(&askForce, "force", false, "Send without waiting for the target to be ready (a target on needs_input is still refused)")
-	askAgentCmd.Flags().BoolVar(&askAllowBlocked, "allow-blocked", false, "Type at a target on needs_input; the text answers its prompt, so read it with capture-pane first")
+	askAgentCmd.Flags().BoolVar(&askAllowBlocked, "allow-blocked", false, "Type at a target on needs_input. The text answers its prompt, so read it with capture-pane first")
 	askAgentCmd.Flags().BoolVar(&askJSON, "json", false, "Output result as JSON")
 	_ = askAgentCmd.RegisterFlagCompletionFunc("session", completeSessionNames)
 
@@ -2881,6 +2899,9 @@ Statuses:
   incompatible  The remote daemon speaks a control protocol this build does not
                 serve. Upgrade tuios on one of the two machines.
   connecting    The first attempt has not finished yet.
+  sign in       Tailscale SSH needs you to sign in before tuios can reach the
+                host. Run 'tuios hosts signin NAME' to open the sign-in page.
+                The JSON status is tailscale_check.
 
 Add a machine with 'tuios hosts add', remove one with 'tuios hosts remove', and
 dial one with 'tuios hosts test'. Each writes or reads the config file, and a
@@ -2931,27 +2952,37 @@ command in authorized_keys to make the policy a boundary:
 	}
 	stdioProxyCmd.Flags().StringVar(&stdioProxyAs, "as", "", "Name of the machine the link comes from, for its link policy. Overrides the name that machine gives")
 
-	rootCmd.AddCommand(sshCmd, configCmd, keybindsCmd, tapeCmd, layoutCmd, updateCmd)
-	rootCmd.AddCommand(attachCmd, newCmd, lsCmd, killSessionCmd, resurrectCmd)
-	rootCmd.AddCommand(startDaemonCmd, daemonCmd, killDaemonCmd)
+	rootCmd.AddCommand(sshCmd, configCmd, newLookCommand(), keybindsCmd, tapeCmd, layoutCmd, updateCmd)
+	rootCmd.AddCommand(attachCmd, newCmd, lsCmd, listClientsCmd, killSessionCmd, resurrectCmd)
+	rootCmd.AddCommand(newSwitchSessionCmd())
+	rootCmd.AddCommand(newDetachClientCmd())
+	rootCmd.AddCommand(newSSHAgentPathCmd())
+	rootCmd.AddCommand(newDisplayEnvCmd())
+	rootCmd.AddCommand(startDaemonCmd, daemonCmd, killDaemonCmd, newRestartServerCommand())
 	rootCmd.AddCommand(sendKeysCmd, runCommandCmd, setConfigCmd, getConfigCmd, logsCmd, capturePaneCmd, screenshotCmd)
 	rootCmd.AddCommand(setAgentStateCmd, setAgentMetaCmd, setAgentSessionCmd, newResumeAgentCommand(), getAgentStateCmd, explainAgentDetectCmd, explainAgentScreenCmd)
 	rootCmd.AddCommand(listAgentsCmd, sendAgentMessageCmd, readAgentMessagesCmd, askAgentCmd, newListAttentionCommand(),
-		newPeekPromptCommand(), newRespondCommand(), newQueueCommand(), newReviewCommand())
+		newPeekPromptCommand(), newRespondCommand(), newQueueCommand(), newReviewCommand(), newCheckpointCommand(), newShipCommand())
 	rootCmd.AddCommand(sendTextCmd, newWindowCmd, waitForCmd, newSubscribeCommand(), newRunCommand(), newAskHumanCommand())
-	rootCmd.AddCommand(renameSessionCmd, setSessionNameCmd, setSessionAccentCmd, setWorkspaceNameCmd)
-	rootCmd.AddCommand(splitWindowCmd, popupCmd, focusWindowCmd, moveWindowCmd, setWindowCmd, newPiPCommand())
+	rootCmd.AddCommand(renameSessionCmd, setSessionNameCmd, setSessionAccentCmd, setSessionSpaceCmd, setWorkspaceNameCmd)
+	rootCmd.AddCommand(splitWindowCmd, popupCmd, focusWindowCmd, moveWindowCmd, setWindowCmd, newPiPCommand(), newCallCommand(), newPaneViewCommand())
 	rootCmd.AddCommand(selectWorkspaceCmd, listWorkspacesCmd, setLayoutCmd)
-	rootCmd.AddCommand(listWindowsCmd, getWindowCmd, sessionInfoCmd, listVerbsCmd, listOptionsCmd, listThemesCmd, listGlyphsCmd, importThemeCmd)
+	rootCmd.AddCommand(listWindowsCmd, getWindowCmd, sessionInfoCmd, listVerbsCmd, listOptionsCmd, listThemesCmd, listGlyphsCmd, importThemeCmd, themeCmd)
 	rootCmd.AddCommand(listDockComponentsCmd, refreshDockCmd, listHooksCmd)
-	rootCmd.AddCommand(hostsCmd, stdioProxyCmd)
+	rootCmd.AddCommand(hostsCmd, stdioProxyCmd, newGUIBridgeCommand())
 	rootCmd.AddCommand(newStashCommand(), newPaneGrantsCommand(), newSetPaneGrantsCommand())
-	rootCmd.AddCommand(newWorktreeCommand(), newFanCommand(), newStartAgentCommand(), newXpanesCommand(), newCloseWorkspaceCommand())
+	rootCmd.AddCommand(newBufferCommands()...)
+	rootCmd.AddCommand(newWorktreeCommand(), newFanCommand(), newStartAgentCommand(), newXpanesCommand(), newCloseWorkspaceCommand(), newCloseWindowCommand())
 	rootCmd.AddCommand(newAgentHookCommand(), newAgentStatusLineCommand(), newIntegrationCommand(), newDoctorCommand(), newMCPCommand())
 	rootCmd.AddCommand(newTmuxCommand(), newTmuxShimCommand(), newTmuxPaneCommand())
-	rootCmd.AddCommand(newAgentProtoCommand(), newAgentLogCommand())
+	rootCmd.AddCommand(newAgentProtoCommand(), newAgentLogCommand(), newNotifyCommand(), newStatusCommand(), newPairCommand())
 	rootCmd.AddCommand(newHerdrGroupCommand("pane"), newHerdrGroupCommand("notification"))
+	rootCmd.AddCommand(newPluginsCommand())
+	rootCmd.AddCommand(newCpCommand(), newTransfersCommand())
+	rootCmd.AddCommand(newMermaidCommand())
+	rootCmd.AddCommand(newTMLCommand())
 
+	addExplorers(rootCmd)
 	return rootCmd
 }
 
@@ -2965,4 +2996,18 @@ func registerInterfaceFlags(cmds ...*cobra.Command) {
 	for _, cmd := range cmds {
 		interfaceFlags.Register(cmd.Flags())
 	}
+}
+
+// findLayoutTemplate returns the saved layout template called name.
+func findLayoutTemplate(name string) (app.LayoutTemplate, error) {
+	templates, err := app.LoadLayoutTemplates()
+	if err != nil {
+		return app.LayoutTemplate{}, err
+	}
+	for _, t := range templates {
+		if t.Name == name {
+			return t, nil
+		}
+	}
+	return app.LayoutTemplate{}, fmt.Errorf("no layout named %q. Run 'tuios layout list' to see the saved layouts", name)
 }

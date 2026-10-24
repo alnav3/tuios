@@ -199,16 +199,11 @@ func localCwdPath(raw string) (string, bool) {
 	return path, true
 }
 
-// isLocalHost reports whether an OSC 7 host refers to this machine.
+// isLocalHost reports whether an OSC 7 host refers to this machine. It is the
+// daemon's rule, so the client and the daemon agree about which reports are
+// local.
 func isLocalHost(host string) bool {
-	host = strings.ToLower(host)
-	if host == "localhost" {
-		return true
-	}
-	if h, err := os.Hostname(); err == nil && strings.EqualFold(h, host) {
-		return true
-	}
-	return false
+	return session.IsLocalHostName(host)
 }
 
 // evaluateTapeDir checks whether dir carries a .tuios.tape and, if so, updates
@@ -293,6 +288,12 @@ func (m *OS) evaluateTapeDir(dir string) {
 	m.ShowNotification(message, notifType, tapeBannerDuration)
 }
 
+// tapeStatusShown reports whether a playing tape draws its status pill and
+// its start message ([tape] show_status, on by default).
+func (m *OS) tapeStatusShown() bool {
+	return m.UserConfig == nil || m.UserConfig.Tape.TapeStatusShown()
+}
+
 // tapeAutoReviewEnabled reports whether the user opted into auto-opening the
 // review dialog on detection ([tape] auto_review = true).
 func (m *OS) tapeAutoReviewEnabled() bool {
@@ -375,13 +376,3 @@ const (
 	tapeGlyphUntrusted  = "?" // untrusted, reviewable in a later stage
 	tapeGlyphIneligible = "!" // ineligible, cannot be trusted
 )
-
-// tapeIndicatorStatus exposes the current indicator status for tests and
-// callers that need to assert what the passive surface is showing. The bool is
-// false when no indicator is active.
-func (m *OS) tapeIndicatorStatus() (trust.Status, bool) {
-	if !m.tapeDetect.indicator.active {
-		return trust.StatusUntrusted, false
-	}
-	return m.tapeDetect.indicator.status, true
-}

@@ -104,12 +104,27 @@ func scratchNameOf(w *terminal.Window) string {
 // answers.
 const scratchPendingMax = 10 * time.Second
 
+// scratchPendingHostMax is scratchPendingMax in a session on another machine.
+// The call there can take the link's 30 seconds to open, plus the create's
+// own wait, and a second press inside that time must not ask again.
+const scratchPendingHostMax = 45 * time.Second
+
+// scratchPendingLimit is the backstop in force for this session.
+func (m *OS) scratchPendingLimit() time.Duration {
+	if m.AttachedHost != "" {
+		return scratchPendingHostMax
+	}
+	return scratchPendingMax
+}
+
 // ScratchOpenedMsg reports the outcome of the call that creates the scratch
 // terminal in a daemon session.
 type ScratchOpenedMsg struct {
 	// Label names the scratch in a message.
 	Label string
-	Err   error
+	// Name is the scratch group the create was for.
+	Name string
+	Err  error
 }
 
 // scratchStoppedWait is how long the create waits to see whether the command
@@ -144,11 +159,6 @@ func (m *OS) scratchConfig() config.ScratchConfig {
 // daemon's, so a pane the user opened with the same name is not one.
 func isScratch(w *terminal.Window) bool {
 	return w != nil && w.IsScratch
-}
-
-// scratchIndex is the index of a pane of the built-in scratch group, or -1.
-func (m *OS) scratchIndex() int {
-	return m.scratchIndexNamed(scratchName)
 }
 
 // scratchIndexNamed is the index of a pane of the group kept under name, or
@@ -208,7 +218,6 @@ const (
 	scratchCreate
 	scratchShow
 	scratchHide
-	scratchRefuse
 )
 
 // scratchPlan is what one press of the toggle does. It is worked out apart
@@ -217,8 +226,6 @@ type scratchPlan struct {
 	action scratchAction
 	// index is a pane of the group, for show and hide.
 	index int
-	// refuse is the warning to show instead of acting.
-	refuse string
 }
 
 // planScratch decides what the toggle does now.
@@ -232,14 +239,8 @@ func (m *OS) planScratch(name string) scratchPlan {
 		}
 		return scratchPlan{action: scratchShow, index: i}
 	}
-	if m.scratchPending == name && time.Since(m.scratchPendingAt) < scratchPendingMax {
+	if m.scratchPending == name && time.Since(m.scratchPendingAt) < m.scratchPendingLimit() {
 		return scratchPlan{action: scratchNothing, index: -1}
-	}
-	if m.IsDaemonSession && m.DaemonClient != nil && m.AttachedHost != "" {
-		// The create goes to the daemon on this machine, and the session is
-		// on another one.
-		return scratchPlan{action: scratchRefuse, index: -1,
-			refuse: "The scratch terminal works only in a session on this machine."}
 	}
 	return scratchPlan{action: scratchCreate, index: -1}
 }
@@ -258,8 +259,6 @@ func (m *OS) toggleScratch(spec scratchSpec) tea.Cmd {
 	}
 	plan := m.planScratch(spec.Name)
 	switch plan.action {
-	case scratchRefuse:
-		m.ShowNotification(plan.refuse, "warning", m.Settings.NotificationDuration)
 	case scratchHide:
 		m.leaveScratchView()
 	case scratchShow:
@@ -309,10 +308,7 @@ func (m *OS) leaveScratchView() {
 	if !m.InScratchView() {
 		return
 	}
-	base := m.scratchBase
-	if base < 1 {
-		base = 1
-	}
+	base := max(m.scratchBase, 1)
 	back := -1
 	for j, o := range m.Windows {
 		if m.scratchReturnID != "" && o.ID == m.scratchReturnID && o.Workspace == base && !o.Minimized {
@@ -469,14 +465,20 @@ func (m *OS) PaneHeight() int {
 // scratchDir is the folder the scratch shell starts in: the focused pane's,
 // when it is a folder on this machine, else the home folder.
 func (m *OS) scratchDir() string {
+	raw := ""
 	if w := m.GetFocusedWindow(); w != nil && w.Host == "" {
-		dir := ""
-		if w.Cwd != "" {
-			dir, _ = localCwdPath(w.Cwd)
-		} else {
-			dir = w.CWD()
-		}
-		if info, err := os.Stat(dir); dir != "" && err == nil && info.IsDir() {
+		raw = paneDir(w)
+	}
+	return localFolder(raw)
+}
+
+// localFolder is the folder a command started for a pane on this machine
+// runs in. raw is where the pane says it is, an OSC 7 report or a path; the
+// answer is that folder when it is one here, and the home folder otherwise.
+// It stats the folder, which can block on a network filesystem.
+func localFolder(raw string) string {
+	if dir, _ := localCwdPath(raw); dir != "" {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
 			return dir
 		}
 	}
@@ -490,10 +492,18 @@ func (m *OS) scratchDir() string {
 // createScratch makes the scratch terminal: through the daemon in a daemon
 // session, here otherwise.
 func (m *OS) createScratch(spec scratchSpec) tea.Cmd {
-	dir := m.scratchDir()
 	if !m.IsDaemonSession || m.DaemonClient == nil {
-		m.createLocalScratch(dir, spec)
+		m.createLocalScratch(m.scratchDir(), spec)
 		return nil
+	}
+	var dir string
+	if m.AttachedHost != "" {
+		// The pane starts on the session's machine, so the folder is the
+		// focused pane's path there. Empty lets that daemon pick its own.
+		// scratchDir is not asked: it stats a folder here.
+		dir = m.remotePaneDir()
+	} else {
+		dir = m.scratchDir()
 	}
 	m.scratchPending = spec.Name
 	m.scratchPendingAt = time.Now()
@@ -506,10 +516,12 @@ func (m *OS) createScratch(spec scratchSpec) tea.Cmd {
 		Width:     spec.Width,
 		Height:    spec.Height,
 		Workspace: m.CurrentWorkspace,
+		Host:      m.AttachedHost,
+		Build:     m.DaemonClient.ClientVersion(),
 	}
-	label := spec.Title
+	label, name := spec.Title, spec.Name
 	return func() tea.Msg {
-		return ScratchOpenedMsg{Label: label, Err: scratchOpener(req)}
+		return ScratchOpenedMsg{Label: label, Name: name, Err: scratchOpener(req)}
 	}
 }
 
@@ -575,12 +587,15 @@ type scratchRequest struct {
 	Dir           string
 	Width, Height string
 	Workspace     int
+	// Host is the machine the session is on, "" for this one. Build is this
+	// client's version, for the handshake through the link.
+	Host, Build string
 }
 
-// openScratchPopup asks the daemon for the scratch terminal. It runs as a
-// command, never from Update, for the reason labelVerbCmd gives.
+// openScratchPopup asks the session's daemon for the scratch terminal. It
+// runs as a command, never from Update, for the reason labelVerbCmd gives.
 func openScratchPopup(req scratchRequest) error {
-	c, err := session.DialVerbClient()
+	c, err := dialSessionDaemon(req.Host, req.Build)
 	if err != nil {
 		return err
 	}
@@ -634,6 +649,16 @@ func (m *OS) handleScratchOpened(msg ScratchOpenedMsg) {
 		return
 	}
 	m.scratchPending = ""
+	if scratchExists(msg.Err) && msg.Name != "" {
+		// The daemon has the pane already: a press that raced an earlier
+		// create, or a create whose answer was lost on the link. Show it.
+		// When this client does not hold it yet, the push brings it, and
+		// the create stays on its way until then.
+		m.scratchPending = msg.Name
+		m.scratchPendingAt = time.Now()
+		m.maybeFocusScratch()
+		return
+	}
 	if stopped, ok := errors.AsType[ScratchStoppedError](msg.Err); ok {
 		// The daemon closed the pane, but the push that removes it can come
 		// after this answer, on the client's own connection. Until then a
@@ -648,7 +673,19 @@ func (m *OS) handleScratchOpened(msg ScratchOpenedMsg) {
 		m.ShowNotification(fmt.Sprintf("The command %s stopped with exit code %d.", msg.Label, stopped.Code), "error", m.Settings.NotificationDuration)
 		return
 	}
-	m.ShowNotification("The scratch terminal did not open: "+msg.Err.Error(), "error", m.Settings.NotificationDuration)
+	why := m.sessionCallFailure(msg.Err)
+	if why == "" {
+		why = plainCause(msg.Err)
+	}
+	m.ShowNotification("The scratch terminal did not open. "+why, "error", m.Settings.NotificationDuration*2)
+}
+
+// scratchExists reports the daemon's refusal of a second scratch pane of a
+// name, which means the pane is there to show.
+func scratchExists(err error) bool {
+	callErr, ok := errors.AsType[*session.VerbCallError](err)
+	return ok && callErr.Code == session.ErrVerbInvalidParams && callErr.Hint != nil &&
+		callErr.Hint.Param == "scratch" && callErr.Message == session.ErrScratchExists.Error()
 }
 
 // maybeFocusScratch ends the create on its way once its pane arrives, and
@@ -657,7 +694,7 @@ func (m *OS) maybeFocusScratch() {
 	if m.scratchPending == "" {
 		return
 	}
-	if time.Since(m.scratchPendingAt) >= scratchPendingMax {
+	if time.Since(m.scratchPendingAt) >= m.scratchPendingLimit() {
 		m.scratchPending = ""
 		return
 	}
@@ -686,6 +723,46 @@ func (m *OS) windowCountForNotice() int {
 		}
 	}
 	return n
+}
+
+// windowLabelsForNotice is the label of every window the created and closed
+// notices count, by window id.
+func (m *OS) windowLabelsForNotice() map[string]string {
+	labels := make(map[string]string, len(m.Windows))
+	for _, w := range m.Windows {
+		if !isScratch(w) {
+			labels[w.ID] = windowRowTitle(w)
+		}
+	}
+	return labels
+}
+
+// windowMoveNotice is the notice for a push in which a window moved to or
+// from another session, with before the windows shown before the push. It
+// reports false when no window that left or arrived in the push moved, and
+// the created and closed notices apply.
+func (m *OS) windowMoveNotice(state *session.SessionState, before map[string]string) (string, bool) {
+	if state == nil || len(state.WindowMoves) == 0 {
+		return "", false
+	}
+	after := m.windowLabelsForNotice()
+	for id, label := range before {
+		if _, ok := after[id]; ok {
+			continue
+		}
+		if mv, ok := state.LastWindowMove(id); ok && mv.Away {
+			return fmt.Sprintf("Moved %s to the session %s.", label, mv.Other), true
+		}
+	}
+	for id, label := range after {
+		if _, ok := before[id]; ok {
+			continue
+		}
+		if mv, ok := state.LastWindowMove(id); ok && !mv.Away {
+			return fmt.Sprintf("Moved %s here from the session %s.", label, mv.Other), true
+		}
+	}
+	return "", false
 }
 
 // HideShownScratch hides the scratch group when it is on the screen, and

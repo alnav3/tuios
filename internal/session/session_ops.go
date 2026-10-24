@@ -4,9 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
+	"sync"
 
+	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 	"github.com/google/uuid"
 )
@@ -232,6 +233,8 @@ type NewWindowOptions struct {
 	// See WindowState.PopupWidth. They mean nothing unless Popup is set.
 	PopupWidth  string
 	PopupHeight string
+	// PopupDim is the optional daemon-owned dim override, including zero.
+	PopupDim *config.PopupDim
 	// Scratch marks the popup as the session's scratch terminal. See
 	// WindowState.Scratch. It means nothing unless Popup is set.
 	Scratch bool
@@ -244,16 +247,58 @@ type NewWindowOptions struct {
 	// up. It is unexported: only verify-fan's status pipe sets it, and only
 	// for a local process on a platform that passes them (not Windows).
 	extraFiles []*os.File
+	// keepOpen keeps the window after its process exits and writes a line
+	// with the exit status under the last output. See keep_open.go. It is
+	// unexported: only new-window sets it, and the caller's onExit must not
+	// close the window for it to mean anything.
+	keepOpen bool
+	// closeOnExit is new-window's close_on_exit: the daemon closes the
+	// window when its process exits. It is unexported, like keepOpen: the
+	// caller's onExit does the closing, and this only tells the PTY that its
+	// exit is not a person's close (see PTY.ownShell).
+	closeOnExit bool
 	// Env is KEY=VALUE pairs the process gets on top of the daemon's own
 	// environment, from a caller that passed its own (fan, start-agent). The
 	// TUIOS_ variables are set after it, so it cannot change them. It is not
 	// saved: a window a restore brings back starts with the daemon's
 	// environment. A window on another machine ignores it.
 	Env []string
+	// FocusIfShown focuses the window only when its workspace is the one the
+	// session shows, never changes the current workspace, and does not count
+	// as a focus move. See ExecuteCommandPayload.FocusIfShown. It means
+	// nothing with Focus set.
+	FocusIfShown bool
+	// TabKey names the workspace by its tab key, which follows it through a
+	// renumber, when the caller read the workspace's number before one it
+	// may not have seen. Zero names it by Workspace alone. See
+	// ExecuteCommandPayload.TabKey.
+	TabKey int
 	// Grants is what the window's process may do through tuios, nil for the
 	// default of [agents.permissions]. It is in force before the process
 	// starts, and it is saved with the window. See pane_grants.go.
 	Grants *Grants
+	// Bounded says a pane without admin asked for the window, and Bound is
+	// the folder that pane's files grant reaches ("" for none). The new
+	// window starts inside Bound: a folder it inherits from the focused pane
+	// that is outside it is replaced by Bound, and with no Bound the window
+	// gets no start folder, so its files grant reaches nothing. A caller
+	// checks an explicit Cwd against Bound first (Daemon.childWindowBound).
+	Bounded bool
+	Bound   string
+	// Kind and URI make a window a renderer draws natively. See
+	// WindowState.Kind. With no Command, its program is the placeholder.
+	Kind string
+	URI  string
+}
+
+// WindowKinds are the kinds a window can be. Empty is "terminal".
+var WindowKinds = []string{"terminal", "view", "web", "app"}
+
+// PlaceholderCommand is the program of a window a renderer draws natively:
+// it prints one line that says what the window shows, for a terminal
+// client, and then waits without echoing what is typed.
+func PlaceholderCommand(kind, uri string) []string {
+	return []string{"/bin/sh", "-c", `stty -echo 2>/dev/null; printf '\033[2m%s pane\033[0m  %s\n' "$1" "$2"; exec sleep 2147483647`, "tuios-" + kind, kind, uri}
 }
 
 // AddDaemonWindowWith creates a daemon-owned window with explicit placement.
@@ -262,6 +307,12 @@ type NewWindowOptions struct {
 // window created on the current workspace and moved is visible on the wrong
 // workspace for as long as the two calls take, which an attached client renders.
 func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID string)) (WindowState, error) {
+	if opts.Kind == "terminal" {
+		opts.Kind = ""
+	}
+	if opts.Kind != "" && len(opts.Command) == 0 {
+		opts.Command = PlaceholderCommand(opts.Kind, opts.URI)
+	}
 	// A scratch pane is an ordinary tiled window on its group's workspace, not
 	// a popup. See scratch_workspace.go. While a client too old for that is
 	// attached it is a popup on the current workspace, as that client
@@ -322,14 +373,64 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 	if cwd == "" && opts.Host == "" {
 		cwd = s.inheritedCwd()
 	}
+	// With nothing to inherit, the session's own start directory: the one
+	// tuios new --cwd named. A local path, so a window with a host skips it
+	// for the reason above.
+	if cwd == "" && opts.Host == "" {
+		cwd = s.StartDir()
+	}
+	// A pane without admin cannot start a window whose folder is wider than
+	// its own, by cd before the call or by the focused pane's folder.
+	noStartDir := false
+	if opts.Bounded && opts.Host == "" {
+		switch {
+		case opts.Bound == "":
+			noStartDir = true
+		case cwd == "" || !pathUnder(realPath(cwd), opts.Bound):
+			cwd = opts.Bound
+		default:
+			// The process starts in the resolved folder, and that is the
+			// folder recorded for it: a link repointed after this check
+			// moves neither.
+			cwd = realPath(cwd)
+		}
+	}
+
+	// A command can exit before its window is in the state: one that fails
+	// at once does. onExit finds the window by its PTY (close_on_exit and
+	// plugin panes close it that way), so it waits until the window is
+	// added or refused. Without the wait it found nothing, and the window
+	// stayed open around a dead process.
+	added := make(chan struct{})
+	var addedOnce sync.Once
+	markAdded := func() { addedOnce.Do(func() { close(added) }) }
+	defer markAdded()
+	if onExit != nil {
+		exit := onExit
+		onExit = func(ptyID string) {
+			<-added
+			exit(ptyID)
+		}
+	}
 
 	pty, err := s.createPTY(ptyWidth, ptyHeight, ptySpawn{
 		windowID: windowID, cwd: cwd, command: opts.Command, env: opts.Env, host: opts.Host,
-		onExit: onExit, stdout: opts.stdout, extraFiles: opts.extraFiles, grants: opts.Grants,
-		workspace: opts.Workspace,
+		onExit: onExit, stdout: opts.stdout, extraFiles: opts.extraFiles, grants: opts.Grants, keepOpen: opts.keepOpen,
+		workspace: opts.Workspace, noStartDir: noStartDir, closeOnExit: opts.closeOnExit,
 	})
 	if err != nil {
 		return WindowState{}, err
+	}
+	// A client that creates a pane gives it the session's cell itself (see
+	// handleCreatePTY). A pane asked for any other way, by a verb or for a
+	// session nobody is attached to, gets it here.
+	if s.config != nil && s.config.CellSize != nil {
+		if w, h, ok := s.config.CellSize(s.ID); ok {
+			_ = pty.UpdatePixelDimensions(w, h)
+		}
+	}
+	if windowSpawnedHook != nil {
+		windowSpawnedHook(pty)
 	}
 
 	// The session's directory is its first window's, so the first window is
@@ -386,6 +487,18 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 		if opts.Workspace != 0 {
 			workspace = opts.Workspace
 		}
+		if opts.TabKey > 0 {
+			if at := state.WorkspaceForTabKey(opts.TabKey); at > 0 {
+				workspace = at
+			}
+		}
+		// The pane a switch to an empty workspace asks for is one per
+		// workspace, whatever asked: a second client that switched too, or a
+		// request sent again after the first one was slow. Checked under the
+		// state lock, so two that race cannot both add one.
+		if opts.FocusIfShown && !scratch && hasPanes(state, workspace) {
+			return ErrWorkspaceHasPane
+		}
 
 		win = WindowState{
 			ID:         windowID,
@@ -416,8 +529,11 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 			IsFloating:  opts.Popup,
 			PopupWidth:  opts.PopupWidth,
 			PopupHeight: opts.PopupHeight,
+			PopupDim:    opts.PopupDim,
 			Scratch:     scratch,
 			ScratchName: scratchName,
+			Kind:        opts.Kind,
+			URI:         opts.URI,
 		}
 		// A window on another machine holds what that machine gives it.
 		if opts.Host == "" {
@@ -438,9 +554,16 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 				state.CurrentWorkspace = workspace
 			}
 			state.FocusHistory = RecordFocus(state.FocusHistory, workspace, windowID)
+		} else if opts.FocusIfShown {
+			if workspace == state.CurrentWorkspace {
+				state.FocusedWindowID = windowID
+				state.FocusHistory = RecordFocus(state.FocusHistory, workspace, windowID)
+			}
+			s.focusNeutral = true
 		}
 		return nil
 	})
+	markAdded()
 	if err != nil {
 		// The shell started for a window that was refused has no owner.
 		_ = s.ClosePTY(pty.ID)
@@ -448,6 +571,15 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 	}
 	return win, nil
 }
+
+// windowSpawnedHook, when set, runs after AddDaemonWindowWith has spawned the
+// window's process and before it adds the window to the state. Test-only.
+var windowSpawnedHook func(*PTY)
+
+// ErrWorkspaceHasPane is the refusal of a FocusIfShown window on a workspace
+// that has a pane already. The caller treats it as a success that did
+// nothing. See ExecuteCommandPayload.FocusIfShown.
+var ErrWorkspaceHasPane = errors.New("the workspace has a pane already")
 
 // ErrScratchExists is the refusal of a second scratch terminal in a session.
 var ErrScratchExists = errors.New("this session already has a scratch terminal of this name. Press its key to show it")
@@ -472,32 +604,13 @@ func (s *Session) CloseDaemonWindow(target string) (string, error) {
 			return err
 		}
 
-		closed = state.Windows[idx]
-		workspace := closed.Workspace
-		state.Windows = append(state.Windows[:idx], state.Windows[idx+1:]...)
-		state.FocusHistory = RemoveFocus(state.FocusHistory, closed.ID)
+		closed = s.removeWindowLocked(state, idx)
 		// The window is gone, so nothing owns its agent state any more. The
 		// detector sweeps stale claims on its own tick too, but only when it is
 		// running, and a claim can now come from a source that is not the detector.
 		delete(s.agentClaims, closed.ID)
 		delete(s.agentHarnessPIDs, closed.ID)
-
-		// Repair focus if we removed the focused window.
-		if state.FocusedWindowID == closed.ID {
-			state.FocusedWindowID = focusAfterClose(state, workspace, closed.ID)
-		}
-		if state.WorkspaceFocus != nil && state.WorkspaceFocus[workspace] == closed.ID {
-			delete(state.WorkspaceFocus, workspace)
-			if state.FocusedWindowID != "" {
-				// Only re-point the workspace focus at a window that is actually on it.
-				for i := range state.Windows {
-					if state.Windows[i].ID == state.FocusedWindowID && state.Windows[i].Workspace == workspace {
-						state.WorkspaceFocus[workspace] = state.FocusedWindowID
-						break
-					}
-				}
-			}
-		}
+		delete(s.agentSharedGuards, closed.ID)
 		return nil
 	})
 	if err != nil {
@@ -509,6 +622,38 @@ func (s *Session) CloseDaemonWindow(target string) (string, error) {
 		_ = s.ClosePTY(closed.PTYID)
 	}
 	return closed.ID, nil
+}
+
+// removeWindowLocked takes the window at idx out of the window set, repairs
+// the focus it held, and returns it. The caller holds stateMu, inside a
+// mutation. Closing a window and moving it to another session both leave
+// through here.
+func (s *Session) removeWindowLocked(state *SessionState, idx int) WindowState {
+	gone := state.Windows[idx]
+	workspace := gone.Workspace
+	state.Windows = append(state.Windows[:idx], state.Windows[idx+1:]...)
+	state.FocusHistory = RemoveFocus(state.FocusHistory, gone.ID)
+
+	// Repair focus if we removed the focused window.
+	if state.FocusedWindowID == gone.ID {
+		state.FocusedWindowID = focusAfterClose(state, workspace, gone.ID)
+	}
+	if state.WorkspaceFocus != nil && state.WorkspaceFocus[workspace] == gone.ID {
+		delete(state.WorkspaceFocus, workspace)
+		if state.FocusedWindowID != "" {
+			// Only re-point the workspace focus at a window that is actually on it.
+			for i := range state.Windows {
+				if state.Windows[i].ID == state.FocusedWindowID && state.Windows[i].Workspace == workspace {
+					state.WorkspaceFocus[workspace] = state.FocusedWindowID
+					break
+				}
+			}
+		}
+	}
+	// The last pane on the workspace on screen takes the person back
+	// to where they came from. See empty_workspace.go.
+	s.returnFromEmptyLocked(state, workspace)
+	return gone
 }
 
 // FocusDaemonWindow makes the window matching target the focused window,
@@ -593,6 +738,42 @@ func (s *Session) CycleDaemonFocus(delta int) error {
 	})
 }
 
+// setStartedBy records ref as the pane that started window.
+func (s *Session) setStartedBy(window string, ref *PaneRef) {
+	_ = s.mutateState(func(state *SessionState) error {
+		idx, err := findWindowStateIndex(state.Windows, window)
+		if err != nil {
+			return err
+		}
+		state.Windows[idx].StartedBy = ref
+		return nil
+	})
+}
+
+// renameStartedBy follows a session rename in the started_by of this
+// session's panes. It changes nothing, and publishes nothing, when no pane
+// names the old session.
+func (s *Session) renameStartedBy(old, name string) {
+	hit := false
+	for _, w := range s.GetState().Windows {
+		if w.StartedBy != nil && w.StartedBy.Session == old {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		return
+	}
+	_ = s.mutateState(func(state *SessionState) error {
+		for i := range state.Windows {
+			if ref := state.Windows[i].StartedBy; ref != nil && ref.Session == old {
+				state.Windows[i].StartedBy = &PaneRef{Session: name, Window: ref.Window}
+			}
+		}
+		return nil
+	})
+}
+
 // RenameDaemonWindow sets the CustomName of the window matching target.
 func (s *Session) RenameDaemonWindow(target, name string) error {
 	return s.mutateState(func(state *SessionState) error {
@@ -652,42 +833,6 @@ func (s *Session) SetDaemonWorkspaceName(ws int, name string) error {
 	})
 }
 
-// SetDaemonWorkspaceOrder records the order the workspaces are shown in. It
-// moves no workspace: every number keeps everything it owns, and the windows,
-// the focus map, the trees and the verbs all go on addressing by number.
-//
-// The order is sanitised rather than trusted, because it arrives from a drag
-// that reads a list the client rendered and the daemon's own list may since
-// have changed: an entry outside the session's range or naming a workspace
-// already placed cannot mean anything, so it is dropped instead of stored.
-//
-// An ascending order is stored as nil. That is the arrangement a session with
-// no order already has, so recording it would leave a trace in serialized state
-// that says nothing, the way an empty name would.
-func (s *Session) SetDaemonWorkspaceOrder(order []int) error {
-	return s.mutateState(func(state *SessionState) error {
-		bound := state.workspaceBound()
-		clean := make([]int, 0, len(order))
-		seen := make(map[int]bool, len(order))
-		for _, ws := range order {
-			if ws < 1 || ws > bound || seen[ws] {
-				continue
-			}
-			seen[ws] = true
-			clean = append(clean, ws)
-		}
-		if len(clean) == 0 && len(order) > 0 {
-			return fmt.Errorf("no workspace in the order is in range (1-%d)", bound)
-		}
-		if slices.IsSorted(clean) {
-			state.WorkspaceOrder = nil
-			return nil
-		}
-		state.WorkspaceOrder = clean
-		return nil
-	})
-}
-
 // SwitchDaemonWorkspace sets the current workspace, restoring that workspace's
 // last-focused window when one is recorded.
 func (s *Session) SwitchDaemonWorkspace(ws int) error {
@@ -726,6 +871,21 @@ func (s *Session) markRestoredScratch(panes map[string]scratchPane) {
 			// A hidden group holds no focus, or the first client would show it.
 			if state.FocusedWindowID == w.ID {
 				state.FocusedWindowID = ""
+			}
+		}
+		return nil
+	})
+}
+
+// markRestoredViews puts back the kind and uri of restored windows a renderer
+// draws natively. They are daemon-owned like the scratch mark, so UpdateState
+// keeps only what canonical state already has, and a new session has none.
+func (s *Session) markRestoredViews(views map[string][2]string) {
+	_ = s.mutateState(func(state *SessionState) error {
+		for i := range state.Windows {
+			w := &state.Windows[i]
+			if v, ok := views[w.ID]; ok {
+				w.Kind, w.URI = v[0], v[1]
 			}
 		}
 		return nil

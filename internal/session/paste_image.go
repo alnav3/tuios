@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 )
 
 // Pasting an image into a pane.
@@ -62,6 +64,17 @@ const PasteImageMaxBytes = pasteImageMaxBytes
 // later. An hour covers a prompt that is written slowly and still keeps the
 // directory from growing for the life of the daemon.
 const pasteFileTTL = time.Hour
+
+// pasteReplyPrefix starts the name of a file a queued reply carries: a long
+// paste or an image the person attached to it. It starts with pasteFilePrefix,
+// so every sweep and cap that knows pasted files knows these too.
+const pasteReplyPrefix = pasteFilePrefix + "reply-"
+
+// pasteReplyTTL is how long a file a queued reply carries stays on disk. It is
+// written when the reply is typed, and the agent can read it again at any
+// point of the work that follows, so it is kept for a day, as dropped files
+// are.
+const pasteReplyTTL = 24 * time.Hour
 
 // pasteMaxFiles and pasteMaxDirBytes bound the paste directory. It is under
 // the runtime directory, which is often a small tmpfs, and a run of pastes
@@ -128,6 +141,8 @@ type pasteStore struct {
 	dir func() (string, error)
 	now func() time.Time
 	ttl time.Duration
+	// replyTTL is pasteReplyTTL. Only tests change it.
+	replyTTL time.Duration
 	// maxFiles and maxBytes cap the directory. Zero means the defaults.
 	maxFiles int
 	maxBytes int64
@@ -137,6 +152,8 @@ type pasteStore struct {
 	written map[string]bool
 	// timer runs the next TTL sweep, nil when nothing is waiting for one.
 	timer *time.Timer
+	// seq numbers the files this store writes, in order. See write.
+	seq uint64
 }
 
 // errPasteDirLink is a paste directory that is a symbolic link. Following it
@@ -153,9 +170,10 @@ func newPasteStore(socketPath func() string) *pasteStore {
 			}
 			return filepath.Join(filepath.Dir(sock), "paste"), nil
 		},
-		now:     time.Now,
-		ttl:     pasteFileTTL,
-		written: map[string]bool{},
+		now:      time.Now,
+		ttl:      pasteFileTTL,
+		replyTTL: pasteReplyTTL,
+		written:  map[string]bool{},
 	}
 }
 
@@ -171,6 +189,41 @@ func (s *pasteStore) save(data []byte) (string, error) {
 	if ext == "" {
 		return "", errPasteNotImage
 	}
+	return s.write(data, pasteFilePrefix, ext, nil)
+}
+
+// saveReply writes one part of a queued reply, a long paste or an image, and
+// returns its absolute path. It is kept for pasteReplyTTL, since the agent
+// can read it again later in its turn. ext must be one this package chose:
+// ".txt", or one sniffImage returned.
+//
+// held is the set of files the same message has written so far, and the new
+// path is added to it. The directory cap never deletes a file in held: a
+// message may hold more parts (queueMaxParts) than the directory keeps files
+// (pasteMaxFiles), and without it a long message would delete its own first
+// files before the agent read them. nil holds nothing back.
+func (s *pasteStore) saveReply(data []byte, ext string, held map[string]bool) (string, error) {
+	if s == nil {
+		return "", errors.New("this daemon has no store for pasted files")
+	}
+	return s.write(data, pasteReplyPrefix, ext, held)
+}
+
+// write puts data in a new file named prefix, the time, a sequence number,
+// random letters and ext, in the paste directory, and returns its absolute
+// path. The path is added to held when held is not nil, and the cap deletes
+// no file in held.
+//
+// The sequence number orders the files one store writes in the same second,
+// which the time in the name cannot. The cap goes by it when two files have
+// the same modification time, which a coarse file system clock makes common.
+//
+// Nothing is written through a link. The directory is refused when it is a
+// link, and the file is opened through an os.Root at the directory that was
+// checked, so a link swapped in for the directory, or planted inside it, cannot
+// carry the write anywhere else. The file is created with O_EXCL, so a name
+// that exists, a link included, is refused rather than written through.
+func (s *pasteStore) write(data []byte, prefix, ext string, held map[string]bool) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dir, err := s.dir()
@@ -184,46 +237,62 @@ func (s *pasteStore) save(data []byte) (string, error) {
 		return "", err
 	}
 	// A link planted where the directory goes is refused, not followed.
-	if info, err := os.Lstat(dir); err != nil {
+	info, err := os.Lstat(dir)
+	if err != nil {
 		return "", err
-	} else if !info.IsDir() {
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s: %w", dir, errPasteDirLink)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	// The root must be the directory that was checked, not one swapped in
+	// for it since.
+	if opened, err := root.Stat("."); err != nil || !os.SameFile(opened, info) {
 		return "", fmt.Errorf("%s: %w", dir, errPasteDirLink)
 	}
 	// Mkdir leaves an existing directory's mode alone. This one is ours, so
 	// it is put back to the owner's alone.
-	_ = os.Chmod(dir, pasteDirPerm)
+	_ = root.Chmod(".", pasteDirPerm)
 	s.sweepLocked(dir)
 
 	var rnd [6]byte
 	if _, err := rand.Read(rnd[:]); err != nil {
 		return "", err
 	}
-	name := pasteFilePrefix + s.now().Format("20060102-150405") + "-" + hex.EncodeToString(rnd[:]) + ext
-	path := filepath.Join(dir, name)
-	// O_EXCL, so a name that somehow exists, or a link planted under it, is
-	// refused rather than written through.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, pasteFilePerm)
+	s.seq++
+	name := prefix + s.now().Format("20060102-150405") + "-" + fmt.Sprintf("%010d", s.seq) + "-" + hex.EncodeToString(rnd[:]) + ext
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, pasteFilePerm)
 	if err != nil {
 		return "", err
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		_ = os.Remove(path)
+		_ = root.Remove(name)
 		return "", err
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
+		_ = root.Remove(name)
 		return "", err
 	}
+	path := filepath.Join(dir, name)
 	s.written[path] = true
-	s.capLocked(dir, path)
+	if held != nil {
+		held[path] = true
+	}
+	s.capLocked(dir, path, held)
 	s.armLocked(dir)
 	return path, nil
 }
 
 // capLocked deletes the oldest pasted files until the directory is within
-// its caps. keep, the file just written, is never deleted.
-func (s *pasteStore) capLocked(dir, keep string) {
+// its caps. keep, the file just written, and the files in held are never
+// deleted, so the directory can stay over its caps while one message is
+// written. The next write after it brings the directory back.
+func (s *pasteStore) capLocked(dir, keep string, held map[string]bool) {
 	maxFiles, maxBytes := s.maxFiles, s.maxBytes
 	if maxFiles <= 0 {
 		maxFiles = pasteMaxFiles
@@ -233,6 +302,7 @@ func (s *pasteStore) capLocked(dir, keep string) {
 	}
 	type file struct {
 		path string
+		key  string
 		mod  time.Time
 		size int64
 	}
@@ -243,24 +313,39 @@ func (s *pasteStore) capLocked(dir, keep string) {
 		if err != nil {
 			continue
 		}
-		files = append(files, file{filepath.Join(dir, e.Name()), info.ModTime(), info.Size()})
+		files = append(files, file{filepath.Join(dir, e.Name()), pasteNameKey(e.Name()), info.ModTime(), info.Size()})
 		total += info.Size()
 	}
-	slices.SortFunc(files, func(a, b file) int {
+	sortx.SortFunc(files, func(a, b file) int {
 		if c := a.mod.Compare(b.mod); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.key, b.key); c != 0 {
 			return c
 		}
 		return strings.Compare(a.path, b.path)
 	})
-	for i := 0; i < len(files) && (len(files)-i > maxFiles || total > maxBytes); i++ {
-		if files[i].path == keep {
+	count := len(files)
+	for i := 0; i < len(files) && (count > maxFiles || total > maxBytes); i++ {
+		if files[i].path == keep || held[files[i].path] {
 			continue
 		}
 		if err := os.Remove(files[i].path); err == nil || os.IsNotExist(err) {
 			delete(s.written, files[i].path)
 			total -= files[i].size
+			count--
 		}
 	}
+}
+
+// pasteNameKey is the part of a pasted file's name after its prefix: the
+// time, then the sequence number. It sorts in the order one store wrote its
+// files, whichever prefix each has.
+func pasteNameKey(name string) string {
+	if rest, ok := strings.CutPrefix(name, pasteReplyPrefix); ok {
+		return rest
+	}
+	return strings.TrimPrefix(name, pasteFilePrefix)
 }
 
 // pastedEntries lists the pasted files in dir.
@@ -274,27 +359,39 @@ func (s *pasteStore) pastedEntries(dir string) []os.DirEntry {
 	})
 }
 
-// armLocked sets the timer for the next TTL sweep: when the oldest pasted
+// ttlFor is how long the pasted file called name is kept.
+func (s *pasteStore) ttlFor(name string) time.Duration {
+	if strings.HasPrefix(name, pasteReplyPrefix) && s.replyTTL > 0 {
+		return s.replyTTL
+	}
+	return s.ttl
+}
+
+// armLocked sets the timer for the next TTL sweep: when the first pasted
 // file in dir expires. With no pasted file left it sets none.
 func (s *pasteStore) armLocked(dir string) {
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
 	}
-	var oldest time.Time
+	var first time.Time
 	for _, e := range s.pastedEntries(dir) {
-		if info, err := e.Info(); err == nil && (oldest.IsZero() || info.ModTime().Before(oldest)) {
-			oldest = info.ModTime()
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if expiry := info.ModTime().Add(s.ttlFor(e.Name())); first.IsZero() || expiry.Before(first) {
+			first = expiry
 		}
 	}
-	if oldest.IsZero() {
+	if first.IsZero() {
 		return
 	}
-	wait := max(oldest.Add(s.ttl).Sub(s.now())+10*time.Millisecond, 10*time.Millisecond)
+	wait := max(first.Sub(s.now())+10*time.Millisecond, 10*time.Millisecond)
 	s.timer = time.AfterFunc(wait, s.sweep)
 }
 
-// sweep deletes the pasted files older than the TTL.
+// sweep deletes the pasted files older than their TTL.
 func (s *pasteStore) sweep() {
 	if s == nil {
 		return
@@ -314,10 +411,10 @@ func (s *pasteStore) sweep() {
 
 // sweepLocked is sweep with s.mu held.
 func (s *pasteStore) sweepLocked(dir string) {
-	cutoff := s.now().Add(-s.ttl)
+	now := s.now()
 	for _, e := range s.pastedEntries(dir) {
 		info, err := e.Info()
-		if err != nil || info.ModTime().After(cutoff) {
+		if err != nil || info.ModTime().After(now.Add(-s.ttlFor(e.Name()))) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
@@ -414,7 +511,7 @@ func (d *Daemon) verbPasteImage(cs *connState, params json.RawMessage) (any, *ve
 	if verr != nil {
 		return nil, verr
 	}
-	if p.HumanNonce == "" || !d.matchHumanNonce(p.HumanNonce, sess.ID, cs) {
+	if p.HumanNonce == "" || !d.verifyHumanNonce(p.HumanNonce, sess.ID, cs) {
 		return nil, hintedVerbError(ErrVerbNotHuman, "paste-image is the person's act, and human_nonce does not belong to a client attached to this session right now", &VerbHint{
 			Param:  "human_nonce",
 			Detail: "Nothing was written. Only the person's attached client pastes an image, and a process inside a pane cannot.",
@@ -434,11 +531,41 @@ func (d *Daemon) verbPasteImage(cs *connState, params json.RawMessage) (any, *ve
 		defer cancel()
 		path, err := rp.pasteImage(ctx, data)
 		if err != nil {
+			// A refusal by the far machine's link policy is passed on as it
+			// is, so the client can say which capability to add and where.
+			if far, ok := errors.AsType[*verbError](err); ok && far.Code == ErrVerbForbidden {
+				return nil, hintedVerbError(ErrVerbForbidden, "paste-image: "+rp.host+" refused the image: "+far.Message, refusedOn(far.Hint, rp.host))
+			}
 			return nil, hintedVerbError(ErrVerbHostUnreachable, "paste-image: the image did not reach "+rp.host+": "+err.Error(), &VerbHint{
 				Detail: "Nothing was pasted. Check that the link to " + rp.host + " is up and that its tuios is current.",
 			})
 		}
 		return map[string]any{"type": "pasted_image", "session": sess.Name(), "window": w.ID, "host": rp.host, "path": path, "bytes": len(data)}, nil
+	}
+
+	// A pane whose shell is on another machine (ssh in the pane) gets the
+	// file on that machine. See paste_image_ssh.go.
+	host, elsewhere, err := d.paneRemoteHost(pty)
+	if refusal, ok := errors.AsType[pasteRefusal](err); ok {
+		hint := &VerbHint{Detail: refusal.detail}
+		if refusal.noLink {
+			hint.Command = "tuios hosts add <name> <addr>"
+		}
+		return nil, hintedVerbError(ErrVerbUnknownHost, "paste-image: "+refusal.detail, hint)
+	}
+	if elsewhere {
+		ctx, cancel := context.WithTimeout(context.Background(), pasteHostedBudget)
+		defer cancel()
+		path, err := d.pasteToHost(ctx, host, data)
+		if err != nil {
+			if far, ok := errors.AsType[*VerbCallError](err); ok && far.Code == ErrVerbForbidden {
+				return nil, hintedVerbError(ErrVerbForbidden, "paste-image: "+host+" refused the image: "+far.Message, refusedOn(far.Hint, host))
+			}
+			return nil, hintedVerbError(ErrVerbHostUnreachable, "paste-image: the image did not reach "+host+": "+err.Error(), &VerbHint{
+				Detail: "Nothing was pasted. Check that the link to " + host + " is up and that its tuios is current.",
+			})
+		}
+		return map[string]any{"type": "pasted_image", "session": sess.Name(), "window": w.ID, "host": host, "path": path, "bytes": len(data)}, nil
 	}
 
 	path, err := d.pastes.save(data)
@@ -553,4 +680,16 @@ func (p *remotePane) pasteImage(ctx context.Context, data []byte) (string, error
 		return "", errors.New("the reply named no path")
 	}
 	return resp.Result.Path, nil
+}
+
+// refusedOn is a copy of the far machine's hint with the host that refused,
+// as this machine names it.
+func refusedOn(h *VerbHint, host string) *VerbHint {
+	out := &VerbHint{}
+	if h != nil {
+		c := *h
+		out = &c
+	}
+	out.Host = host
+	return out
 }

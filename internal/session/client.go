@@ -109,27 +109,30 @@ func (c *Client) ListSessions() ([]SessionInfo, error) {
 	return payload.Sessions, nil
 }
 
-// CreateDetachedSession asks the daemon to create a headless session (with an
-// initial window) and no attached client. name may be empty to let the daemon
-// generate one. It returns an error if the name is already taken.
-func (c *Client) CreateDetachedSession(name string, width, height int) error {
-	return c.createSession(name, width, height, false)
+// CreateDetachedSessionIn asks the daemon to create a headless session (with
+// an initial window) and no attached client. name may be empty to let the
+// daemon generate one. It returns an error if the name is already taken. The
+// session's first window starts in cwd, and so does any later window with no
+// directory to inherit. See NewPayload.Cwd.
+func (c *Client) CreateDetachedSessionIn(name string, width, height int, cwd string) error {
+	return c.createSession(name, width, height, false, cwd)
 }
 
 // CreateGlobalSession creates a session meant to hold panes from more than one
 // machine. It is created with no windows, because its first pane is the one
 // the user picks a machine for. See NewPayload.Global.
 func (c *Client) CreateGlobalSession(name string, width, height int) error {
-	return c.createSession(name, width, height, true)
+	return c.createSession(name, width, height, true, "")
 }
 
-func (c *Client) createSession(name string, width, height int, global bool) error {
+func (c *Client) createSession(name string, width, height int, global bool, cwd string) error {
 	msg, err := NewMessage(MsgNew, &NewPayload{
 		SessionName: name,
 		Width:       width,
 		Height:      height,
 		Detach:      true,
 		Global:      global,
+		Cwd:         cwd,
 	})
 	if err != nil {
 		return err
@@ -195,6 +198,22 @@ func (c *Client) ResurrectSession(name string) error {
 	}
 }
 
+// helloTerm is the TERM and COLORTERM a hello names for this process: what
+// guestenv.DetectTerm finds, except for a command with no terminal on stdout
+// (a script, a service, CI, an agent). That detects NoTTY and answers dumb,
+// and a session it creates would keep TERM=dumb in every pane for its life,
+// although the panes are drawn by tuios and not by this stdout. It names no
+// TERM instead, so the daemon gives its xterm-256color and truecolor. A real
+// terminal that answers dumb keeps its answer, as it does for a standalone
+// window. Both hellos use it: the binary protocol's and the verb client's.
+func helloTerm() (termType, colorTerm string) {
+	termType, colorTerm = guestenv.DetectTerm()
+	if termType == "dumb" && !term.IsTerminal(int(os.Stdout.Fd())) {
+		return "", ""
+	}
+	return termType, colorTerm
+}
+
 func (c *Client) sendHello() error {
 	// The same TERM detection the standalone window path uses. The hello names
 	// no shell: the daemon resolves it from its appearance.preferred_shell,
@@ -202,17 +221,7 @@ func (c *Client) sendHello() error {
 	// default. This client runs behind every control command and shell
 	// completion, so it must not load the config, write a default one, or print
 	// config warnings.
-	termType, colorTerm := guestenv.DetectTerm()
-	// A command with no terminal on stdout (a script, a service, CI, an agent)
-	// detects NoTTY and answers dumb, and a session it creates would keep
-	// TERM=dumb in every pane for its life, although the panes are drawn by
-	// tuios and not by this stdout. It names no TERM instead, so the daemon
-	// gives the xterm-256color and truecolor an attached client's session and
-	// the new-session verb already get. A real terminal that answers dumb
-	// keeps its answer, as it does for a standalone window.
-	if termType == "dumb" && !term.IsTerminal(int(os.Stdout.Fd())) {
-		termType, colorTerm = "", ""
-	}
+	termType, colorTerm := helloTerm()
 
 	msg, err := NewMessage(MsgHello, &HelloPayload{
 		Version:        c.version,
@@ -240,6 +249,9 @@ func (c *Client) sendHello() error {
 	if resp.Type == MsgError {
 		var errPayload ErrorPayload
 		_ = resp.ParsePayload(&errPayload)
+		if errPayload.Code == ErrCodeBusy {
+			return ErrTooManyConnections
+		}
 		return fmt.Errorf("the daemon refused this client: %s", errPayload.Message)
 	}
 	if resp.Type != MsgWelcome {
@@ -282,6 +294,23 @@ func (c *Client) getTerminalSize() (width, height int) {
 		return 80, 24 // Default
 	}
 	return width, height
+}
+
+// SendControlMessageWait is SendControlMessage with a read deadline of wait
+// instead of thirty seconds, for a request whose answer comes when the work
+// is done: a tape answers when it ends.
+func (c *Client) SendControlMessageWait(msg *Message, wait time.Duration) (*Message, error) {
+	if err := c.send(msg); err != nil {
+		return nil, fmt.Errorf("failed to send message: %w", err)
+	}
+	c.recvMu.Lock()
+	defer c.recvMu.Unlock()
+	_ = c.conn.SetReadDeadline(time.Now().Add(wait))
+	resp, err := ReadMessage(c.conn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to receive response: %w", err)
+	}
+	return resp, nil
 }
 
 // SendControlMessage sends a control message to the daemon and waits for a response.

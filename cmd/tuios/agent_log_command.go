@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 )
 
@@ -39,6 +40,10 @@ type agentLogEntry struct {
 	OK     *bool    `json:"ok"`
 	Exit   *int     `json:"exit"`
 	Text   string   `json:"text"`
+	// Outcome, DurationMS and Tools say how a stopped subagent ended.
+	Outcome    string `json:"outcome"`
+	DurationMS int64  `json:"duration_ms"`
+	Tools      int    `json:"tools"`
 }
 
 // agentLogRecap is the recap of the agent-activity result.
@@ -199,10 +204,12 @@ func agentLogLabel(e agentLogEntry) string {
 func agentLogDetail(e agentLogEntry) string {
 	switch e.Kind {
 	case session.ActivitySubagentStart, session.ActivitySubagentStop:
-		// "Explore started": the subagent's type, then what it did.
+		// "Research tmux (general-purpose) started": the subagent, then
+		// what it did. A stop says how it ended, "done after 3m, 14 tools",
+		// and from a daemon before outcomes just "stopped".
 		did := "started"
 		if e.Kind == session.ActivitySubagentStop {
-			did = "stopped"
+			did = subagentEnd(e)
 		}
 		if e.Text == "" {
 			return did
@@ -218,7 +225,9 @@ func agentLogDetail(e agentLogEntry) string {
 	var b strings.Builder
 	switch {
 	case e.Tool != "" && e.Target != "":
-		b.WriteString(plainLine(e.Tool) + ": " + plainLine(e.Target))
+		b.WriteString(plainLine(e.Tool))
+		b.WriteString(": ")
+		b.WriteString(plainLine(e.Target))
 	case e.Tool != "":
 		b.WriteString(plainLine(e.Tool))
 	case e.Target != "":
@@ -237,6 +246,44 @@ func agentLogDetail(e agentLogEntry) string {
 		fmt.Fprintf(&b, "  (wrote %s)", listFiles(e.Files, len(e.Files), 3))
 	}
 	return b.String()
+}
+
+// subagentEnd is how a subagent_stop entry says its subagent ended.
+func subagentEnd(e agentLogEntry) string {
+	did := "stopped"
+	switch e.Outcome {
+	case session.SubagentDone, session.SubagentFailed:
+		did = e.Outcome
+	}
+	var parts []string
+	if e.DurationMS > 0 {
+		parts = append(parts, "after "+shortSpan(time.Duration(e.DurationMS)*time.Millisecond))
+	}
+	switch {
+	case e.Tools == 1:
+		parts = append(parts, "1 tool")
+	case e.Tools > 1:
+		parts = append(parts, strconv.Itoa(e.Tools)+" tools")
+	}
+	if len(parts) == 0 {
+		return did
+	}
+	return did + " " + strings.Join(parts, ", ")
+}
+
+// shortSpan is a length of time in its largest unit: 4s, 3m, 2h10m.
+func shortSpan(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return strconv.Itoa(max(int(d/time.Second), 1)) + "s"
+	case d < time.Hour:
+		return strconv.Itoa(int(d/time.Minute)) + "m"
+	}
+	h, m := int(d/time.Hour), int(d%time.Hour/time.Minute)
+	if m == 0 {
+		return strconv.Itoa(h) + "h"
+	}
+	return strconv.Itoa(h) + "h" + strconv.Itoa(m) + "m"
 }
 
 // listFiles names up to show of files, and how many more of total there are.
@@ -278,12 +325,12 @@ func printAgentRecap(w io.Writer, raw json.RawMessage, now time.Time) error {
 	} else {
 		fmt.Fprintln(w, "No activity recorded for this pane.")
 	}
-	line := plural(int(rc.Turns), "turn", "turns") + "."
+	line := plural.CountAs(int(rc.Turns), "turn", "turns") + "."
 	if rc.FilesTotal > 0 {
-		line += " " + plural(rc.FilesTotal, "file", "files") + ": " + listFiles(rc.Files, rc.FilesTotal, 3)
+		line += " " + plural.CountAs(rc.FilesTotal, "file", "files") + ": " + listFiles(rc.Files, rc.FilesTotal, 3)
 	}
 	fmt.Fprintln(w, line)
-	line = plural(rc.Commands, "command", "commands") + "."
+	line = plural.CountAs(rc.Commands, "command", "commands") + "."
 	if rc.Tests != nil {
 		ago := waitedFor(rc.Tests.At, now)
 		switch {
@@ -301,12 +348,4 @@ func printAgentRecap(w io.Writer, raw json.RawMessage, now time.Time) error {
 	}
 	fmt.Fprintf(w, "Now: %s\n", plainLine(rc.State))
 	return nil
-}
-
-// plural is n and the word for it: 1 turn, 3 turns.
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return "1 " + one
-	}
-	return strconv.Itoa(n) + " " + many
 }

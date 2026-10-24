@@ -1,7 +1,6 @@
 package app
 
 import (
-	"fmt"
 	"os"
 	"runtime"
 	"slices"
@@ -22,6 +21,9 @@ import (
 // daemon this client can see, or through an agent integration installed on
 // this machine.
 func (m *OS) agentsSeen() bool {
+	if !m.agentsOn() {
+		return false
+	}
 	return m.SidebarAgentsSeen || m.agentIntegrationInstalled || m.agentsPresent()
 }
 
@@ -62,43 +64,40 @@ func (m *OS) noteAgentsSeen() {
 }
 
 // prefixMenuGroups is the which-key menu after the prefix key, in its
-// sections. The Inbox's lines wait until an agent has been seen, and a section
+// sections. The Copies line waits until a copy exists. The Inbox's lines wait
+// until an agent has been seen, and a section
 // they leave empty goes with them; the keys work either way. The review line
 // is left out on a daemon that cannot review, where the key does what an
 // unbound key does.
 func (m *OS) prefixMenuGroups() []config.KeybindingGroup {
-	groups := config.GetPrefixKeybindingGroups("", m.IsDaemonSession)
-	seen, review := m.agentsSeen(), m.reviewSupported()
-	// With multifocus on, the copy-mode key enters multi copy mode, and the
-	// menu says so: this is where a multifocus user finds out it exists.
 	multi, multiOK := m.MultiCopyEligible()
+	if !multiOK {
+		multi = 0
+	}
+	groups := config.PrefixMenuGroups(m.KeybindRegistry, "", config.MenuState{
+		Daemon:    m.IsDaemonSession,
+		MultiCopy: multi,
+		Spotlight: m.spotlight.on,
+		Minimized: -1,
+	})
+	seen, review, agentsTab := m.agentsSeen(), m.reviewSupported(), m.agentsPageAvailable()
 	out := groups[:0]
 	for _, g := range groups {
-		if multiOK {
-			for i := range g.Bindings {
-				if g.Bindings[i].Key == config.WhichKeyCopyPasteKey {
-					g.Bindings[i].Description = fmt.Sprintf("Multi copy (%d)/paste image", multi)
-				}
-			}
-		}
 		if !seen {
 			g.Bindings = slices.DeleteFunc(g.Bindings, config.IsAgentPrefixKeybinding)
 		}
 		if !review {
 			g.Bindings = slices.DeleteFunc(g.Bindings, config.IsReviewPrefixKeybinding)
 		}
+		if !agentsTab {
+			g.Bindings = slices.DeleteFunc(g.Bindings, config.IsAgentsSettingsPrefixKeybinding)
+		}
+		if len(m.transfers.rows) == 0 {
+			g.Bindings = slices.DeleteFunc(g.Bindings, config.IsTransfersPrefixKeybinding)
+		}
 		if len(g.Bindings) > 0 {
 			out = append(out, g)
 		}
-	}
-	return out
-}
-
-// prefixMenuBindings is prefixMenuGroups as one list.
-func (m *OS) prefixMenuBindings() []config.Keybinding {
-	var out []config.Keybinding
-	for _, g := range m.prefixMenuGroups() {
-		out = append(out, g.Bindings...)
 	}
 	return out
 }

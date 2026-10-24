@@ -26,7 +26,7 @@ const (
 	MsgKill                                    // Kill/terminate a session
 	MsgInput                                   // Keyboard/mouse input bytes
 	MsgResize                                  // Terminal resize event
-	MsgPing                                    // Reserved: keepalive ping (no sender; numbering is wire format)
+	MsgPing                                    // Asks for a MsgPong; a client sends it after a large input as a barrier (paste_retry.go)
 	MsgCreatePTY                               // Create new PTY in session
 	MsgClosePTY                                // Close a PTY
 	MsgListPTYs                                // Reserved: list PTYs (no sender)
@@ -48,7 +48,7 @@ const (
 	MsgSessionList   // List of sessions
 	MsgOutput        // Reserved: never sent
 	MsgError         // Error message
-	MsgPong          // Reserved: response to MsgPing
+	MsgPong          // Response to MsgPing
 	MsgSessionEnded  // Session terminated
 	MsgWindowChanged // Reserved: never sent
 	MsgPTYList       // Reserved: response to MsgListPTYs
@@ -106,9 +106,9 @@ const (
 	// directory did not exist. The daemon that owns the pane owns the
 	// filesystem the pane is on, so the listing is asked for rather than taken.
 	//
-	// It carries no new authority over a link. Attaching a session on a host
-	// already gives a shell on it, and reading the names in a directory is
-	// strictly less than that.
+	// Over a link it keeps to the read rules file-list keeps to
+	// (verb_files_confine.go). A machine that may list panes is not thereby
+	// one that may list ~/.ssh or /proc.
 	MsgReadDir
 	MsgDirListing
 	// MsgClientFocus reports whether the host terminal of a TUI client has
@@ -156,6 +156,37 @@ const (
 	// as an op the daemon applies and versions. A client sends it only to a
 	// daemon whose welcome set SidebarOps. See sidebar_visibility.go.
 	MsgSidebarVisibility
+	// MsgSessionUsed says the person used the client's session: a key, a
+	// paste, a click, a drag or a wheel turn from the terminal the client
+	// runs in. Keys a script sends through the client (send-keys, a tape)
+	// are not reported. A bare attach picks the session used last. A client
+	// sends it only to a daemon whose welcome set SessionUsed. See
+	// session_used.go.
+	MsgSessionUsed
+	// MsgSessionsChanged tells a client that the session listing changed: a
+	// session, a window, a title, a folder or an agent state it shows. It has
+	// no payload. The client asks for the listing again. The daemon sends it
+	// only to a client whose hello set ListingPush. See
+	// daemon_listing_push.go.
+	MsgSessionsChanged
+	// MsgPaneMark tells a client that a pane it does not stream rang the
+	// bell or printed, once until the client subscribes to the pane or drops
+	// it. The daemon sends it only to a client whose hello set PaneMarks.
+	// See pane_marks.go.
+	MsgPaneMark
+	// MsgGoodbye is the daemon's last message to a client before it stops:
+	// why it stops. The daemon sends it only to a client whose hello set
+	// Goodbye. See daemon_goodbye.go.
+	MsgGoodbye
+	// MsgTMLSurface is one TML surface as the daemon holds it: the tree, the
+	// state and the version, or a mark that it closed. The daemon sends it
+	// only to a client whose hello set TMLSurfaces. See tml_surface.go.
+	MsgTMLSurface
+	// MsgPluginApprovals lists the native plugins that wait for the
+	// person's approval on this machine (PluginApprovalsPayload). An empty
+	// list closes the client's dialog. The daemon sends it only to a client
+	// whose hello set PluginApprovals. See plugin_approval.go.
+	MsgPluginApprovals
 )
 
 // WatchDirPayload is the body of MsgWatchDir. WindowID is the pane the folder
@@ -185,11 +216,19 @@ type HostsChangedPayload struct {
 
 // Message is the base protocol message structure.
 // Wire format (v2): [4 bytes length][1 byte type][1 byte codec][payload]
-// The codec byte is always 0 (gob). The value 1 once meant JSON and stays
-// reserved; readers ignore the byte.
+// The codec byte is 0 (gob) or 2 (gob after an 8-byte request id, see
+// wireCodecGobTagged). The value 1 once meant JSON and stays reserved.
 type Message struct {
 	Type    MessageType
 	Payload []byte
+	// ReqID ties a reply to the request it answers. A client sets it on a
+	// request it waits for, and the daemon copies it onto every message it
+	// sends in answer, MsgError included. Zero is a message that answers
+	// nothing in particular: a broadcast, a push, or anything to or from a
+	// peer that does not read request ids. It travels in the frame header
+	// (wireCodecGobTagged), outside the payload, so a reply is matched to its
+	// request without decoding it.
+	ReqID uint64
 }
 
 // HelloPayload is sent by client on initial connection.
@@ -213,6 +252,10 @@ type HelloPayload struct {
 	// a=a, a=c). Without it the daemon refuses those commands itself, in
 	// order with its other answers. See Session.SetKittyAnimation.
 	KittyAnimation bool `json:"kitty_animation,omitempty"`
+	// SymbolImages says the client draws a pane's sixel image as block
+	// glyphs when its terminal has neither sixel nor kitty graphics. Such a
+	// client shows the image, so the panes are told they can draw sixel.
+	SymbolImages bool `json:"symbol_images,omitempty"`
 	// Protocol is the wire protocol version the client speaks. Zero means a
 	// client that predates the field, which is read as LegacyProtocolVersion:
 	// gob ignores a field the peer does not know, so silence here is age, not
@@ -235,6 +278,51 @@ type HelloPayload struct {
 	// session takes the smallest client's size whatever window_size says,
 	// which is what that client expects. See window_size.go.
 	WindowSize bool `json:"window_size,omitzero"`
+	// SSHAuthSock is the client's SSH_AUTH_SOCK. With [daemon] ssh_agent =
+	// "follow", the session's agent link points at it while this client is
+	// the newest to attach or use the session. Only the tuios attach and new
+	// commands send it. See ssh_agent_follow.go.
+	SSHAuthSock string `json:"ssh_auth_sock,omitempty"`
+	// Display is the client's WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY and
+	// XAUTHORITY. With [daemon] display = "follow" and a daemon that has no
+	// display of its own, new panes of the session get them while this
+	// client is the newest to attach or use the session. Only the tuios
+	// attach and new commands send it. gob drops it on a daemon that
+	// predates it, and a client that predates it sends none. See
+	// display_follow.go.
+	Display ClientDisplay `json:"display,omitzero"`
+	// Machine is the short host name of the machine the client runs on. A
+	// larger client names it in the hint over the space a smaller session
+	// leaves. It is a label and nothing else: no check reads it. The daemon
+	// keeps it only when it is a valid link peer name.
+	Machine string `json:"machine,omitempty"`
+	// ClientKind says what serves the client when it is not a terminal on
+	// Machine: "ssh" for the SSH server, "web" for tuios-web. The hint names
+	// such a client by its kind, since Machine is the server's.
+	ClientKind string `json:"client_kind,omitempty"`
+	// ViewChrome says the client draws a session of another size, or one
+	// whose agreed reserve is less than its own chrome, as a view inside its
+	// own chrome. Under latest the daemon leaves the chrome of such a client
+	// out of the agreed reserve when it is not the session's size. A client
+	// without it lays the panes out around its own chrome whatever the
+	// session says, so its chrome always counts. See calculateSessionReserve.
+	ViewChrome bool `json:"view_chrome,omitzero"`
+	// ListingPush says the client reads MsgSessionsChanged. The daemon sends
+	// it to no other client. See daemon_listing_push.go.
+	ListingPush bool `json:"listing_push,omitzero"`
+	// PaneMarks says the client reads MsgPaneMark. The daemon sends it to no
+	// other client. See pane_marks.go.
+	PaneMarks bool `json:"pane_marks,omitzero"`
+	// Goodbye says the client reads MsgGoodbye. See daemon_goodbye.go.
+	Goodbye bool `json:"goodbye,omitzero"`
+	// TMLSurfaces says the client draws TML surfaces: it reads
+	// MsgTMLSurface. The daemon sends it to no other client. See
+	// tml_surface.go.
+	TMLSurfaces bool `json:"tml_surfaces,omitzero"`
+	// PluginApprovals says the client asks the person about native plugins
+	// that wait for approval: it reads MsgPluginApprovals. The daemon sends
+	// it to no other client. See plugin_approval.go.
+	PluginApprovals bool `json:"plugin_approvals,omitzero"`
 }
 
 // WelcomePayload is sent by server in response to Hello.
@@ -276,6 +364,32 @@ type WelcomePayload struct {
 	// the rail is shown as session state. A client that does not see it keeps
 	// its rail to itself, as every client did before.
 	SidebarOps bool `json:"sidebar_ops,omitzero"`
+	// RequestIDs says the daemon reads tagged frames and tags its answer to a
+	// tagged request with the same id (see Message.ReqID). A client that does
+	// not see it matches replies by message type, as every client did before.
+	RequestIDs bool `json:"request_ids,omitzero"`
+	// EmptyWorkspacePanes says the daemon reads ExecuteCommandPayload's
+	// Workspace, CwdFrom and FocusIfShown on a NewWindow. A client that does
+	// not see it opens no pane on a switch to an empty workspace: an older
+	// daemon would open it on the workspace the person left, or move the
+	// session to it.
+	EmptyWorkspacePanes bool `json:"empty_workspace_panes,omitzero"`
+	// SessionUsed says the daemon reads MsgSessionUsed. A client that does
+	// not see it sends none, and an older daemon picks a bare attach by
+	// activity alone.
+	SessionUsed bool `json:"session_used,omitzero"`
+	// DetachOthers says the daemon reads AttachPayload.DetachOthers. A client
+	// asked for tuios attach -d warns when it does not see it: an older
+	// daemon attaches and detaches nobody.
+	DetachOthers bool `json:"detach_others,omitzero"`
+	// ListingPush says the daemon sends MsgSessionsChanged to a client whose
+	// hello set ListingPush. Such a client stops polling the listing. A
+	// client that does not see it (a daemon that predates it) keeps polling.
+	ListingPush bool `json:"listing_push,omitzero"`
+	// PaneMarks says the daemon sends MsgPaneMark to a client whose hello set
+	// PaneMarks. A client that does not see it (a daemon that predates it)
+	// marks no tab for a pane it does not stream.
+	PaneMarks bool `json:"pane_marks,omitzero"`
 }
 
 // AttachPayload requests attachment to a session.
@@ -303,6 +417,22 @@ type AttachPayload struct {
 	// window_size policies it does not count toward the session's size;
 	// under smallest it counts like any client. An older daemon ignores it.
 	ViewOnly bool `json:"view_only,omitzero"`
+	// Passive displays and accepts input for a pane but does not implement
+	// renderer commands (for example a session shown in a sidebar rail).
+	// Command routing skips it; its viewport does not size the shared session.
+	Passive bool `json:"passive,omitempty"`
+	// Cwd is the start directory of a session this attach creates (CreateNew
+	// and no session by that name). See NewPayload.Cwd. An attach to a
+	// session that exists ignores it.
+	Cwd string `json:"cwd,omitempty"`
+	// DetachOthers takes every other client off the session as this one
+	// attaches, as tuios attach -d asks. See detach_client.go. An older
+	// daemon ignores it.
+	DetachOthers bool `json:"detach_others,omitzero"`
+	// Reconnect marks the attach a client makes on its own to get back a
+	// session it lost, through a host link that dropped. It is not the
+	// person attaching, so single_client does not detach anybody for it.
+	Reconnect bool `json:"reconnect,omitzero"`
 }
 
 // LayoutReserve is the rows and columns a client keeps for its own chrome (the
@@ -363,6 +493,20 @@ type AttachedPayload struct {
 	// sent to the client it answers, so the reply has to say it. Empty from
 	// an older daemon, which leaves the client reporting all input.
 	Policy string `json:"policy,omitempty"`
+	// SizedBy names the machine of the client whose size the session took,
+	// for the hint a larger client shows. Empty when it is not known.
+	SizedBy string `json:"sized_by,omitempty"`
+	// SizedByClient is the connection ID of that client, and ClientID is
+	// this client's own. Together they tell a client whether it sets the
+	// size. Under latest a client that does not lays the panes out around
+	// the agreed reserve alone. Empty from an older daemon.
+	SizedByClient string `json:"sized_by_client,omitempty"`
+	ClientID      string `json:"client_id,omitempty"`
+	// SizedByKind is that client's ClientKind. See HelloPayload.ClientKind.
+	SizedByKind string `json:"sized_by_kind,omitempty"`
+	// ClientCount is how many TUI clients the session has with this one. A
+	// client alone in its session draws no leftover.
+	ClientCount int `json:"client_count,omitempty"`
 }
 
 // NewPayload requests creation of a new session.
@@ -384,6 +528,10 @@ type NewPayload struct {
 	// a window spawned here would be a local pane nobody asked for, in the one
 	// session whose whole point is that the machine is chosen.
 	Global bool `json:"global,omitempty"`
+	// Cwd is the directory the session's windows start in when nothing else
+	// names one, the first window included. See Session.startDir. An older
+	// daemon ignores it, and the windows start in the daemon's directory.
+	Cwd string `json:"cwd,omitempty"`
 }
 
 // WindowSummary is a lightweight per-window entry in a session listing: enough
@@ -430,6 +578,15 @@ type WindowSummary struct {
 	// watching another session can say so. Additive and omitted when zero,
 	// which is what an older peer sends.
 	Subagents int `json:"agent_subagents,omitzero"`
+	// SubagentList is the subagents themselves
+	// (WindowState.AgentSubagentList), so a rail watching another session
+	// can draw a row for each. Additive and omitted when empty, which is what
+	// an older peer sends.
+	SubagentList []SubagentInfo `json:"agent_subagent_list,omitempty"`
+	// ProgramStatus is the pane's OSC 7501 records (WindowState.ProgramStatus),
+	// so a rail watching another session can show them. Additive and omitted
+	// when empty, which is what an older peer sends.
+	ProgramStatus []ProgramStatusRecord `json:"program_status,omitempty"`
 	// ForegroundCmd is what the pane is running, for a row that would otherwise
 	// repeat the title its siblings carry. Empty for a shell and for a pane the
 	// user has named, whose name is already the answer. Additive and omitted
@@ -444,6 +601,13 @@ type WindowSummary struct {
 	// leaves the row out, as the attached client does. Additive and omitted
 	// when false.
 	Scratch bool `json:"scratch,omitempty"`
+}
+
+// ClientInfo describes one daemon connection for listing.
+type ClientInfo struct {
+	ClientID string `json:"client_id"` // Daemon-assigned connection ID
+	PID      int    `json:"pid"`       // Kernel peer process ID
+	Session  string `json:"session"`   // Current session name, empty while detached
 }
 
 // SessionInfo describes a single session for listing.
@@ -488,6 +652,10 @@ type SessionInfo struct {
 	// SessionState.Global. Omitted when false, which is what an older daemon
 	// sends and what every client reads as an ordinary session.
 	Global bool `json:"global,omitempty"`
+	// Space is the space the session is filed under. See SessionState.Space.
+	// Omitted when the session is in none, which is also what an older daemon
+	// sends.
+	Space string `json:"space,omitempty"`
 	// Worktree is set for a session whose directory is a git worktree: which
 	// repository, which branch, and whether the directory still exists. It is
 	// what the rail groups by. Omitted for every other session, which is also
@@ -521,6 +689,11 @@ type SessionEndedPayload struct {
 	// it, because its output turned out to reach a pane of the session it
 	// shows. Reason is the refusal. See nested_attach.go.
 	Nested bool `json:"nested,omitempty"`
+	// Detached says the session did not end: the daemon took this client off
+	// it because another client attached with -d, single_client is on, or
+	// detach-client named it. Reason is what the client shows. See
+	// detach_client.go.
+	Detached bool `json:"detached,omitzero"`
 }
 
 // ResizePayload notifies of terminal resize.
@@ -611,11 +784,15 @@ type PTYResizedPayload struct {
 // A push carries either a stored message or a read receipt, never both. The
 // receipt lists the ids a read just marked read, so the count a client draws
 // beside a pane's inbox follows the agent actually reading rather than the
-// client's guess.
+// client's guess. A seen receipt lists the ids a peek just marked seen, in
+// SeenIDs. A client that does not know the field sees an empty push and
+// ignores it, and keeps counting the message unread, which it still is.
 type AgentMailPayload struct {
 	Message AgentMessage `json:"message"`
 	ReadIDs []uint64     `json:"read_ids,omitempty"`
 	ReadAt  int64        `json:"read_at,omitempty"`
+	SeenIDs []uint64     `json:"seen_ids,omitempty"`
+	SeenAt  int64        `json:"seen_at,omitempty"`
 }
 
 // UnsubscribePTYPayload requests unsubscribing from PTY output.
@@ -667,6 +844,36 @@ type ExecuteCommandPayload struct {
 	// current one. A client in a scratch group sends the group's workspace,
 	// which is never the session's current one. An older daemon ignores it.
 	Workspace int `json:"workspace,omitempty"`
+	// SSHFrom names the window a NewWindow follows into ssh. When that
+	// window's pane runs an ssh or mosh client, the new window runs the same
+	// client to the same destination instead of a shell. When it does not,
+	// or the NewWindow names its own command, the field changes nothing. An
+	// older daemon ignores it and opens a shell.
+	SSHFrom string `json:"ssh_from,omitempty"`
+	// CwdFrom names the window whose directory a NewWindow starts in, when
+	// Cwd is empty. The daemon reads the directory from that pane's process,
+	// because the client may not know it. A window that is gone, is on
+	// another machine, or has no directory gives the session's start
+	// directory. A client opening a window on the empty workspace it just
+	// switched to sends the pane focused on the workspace it came from. An
+	// older daemon ignores it and the window starts where it would have
+	// before.
+	CwdFrom string `json:"cwd_from,omitempty"`
+	// FocusIfShown asks for a NewWindow that changes nothing about what the
+	// person sees. The new window takes the focus only when its workspace is
+	// the one the session shows when the daemon adds it. It never changes the
+	// session's current workspace, and it does not count as a focus move, so
+	// a push the client sends after a later switch still wins. A client
+	// sends it for the pane it opens on an empty workspace, and only to a
+	// daemon whose welcome set EmptyWorkspacePanes.
+	FocusIfShown bool `json:"focus_if_shown,omitempty"`
+	// TabKey is the herdr tab key of Workspace as the client last saw it
+	// (see SessionState.WorkspaceTabKey). The pane a client opens on an empty
+	// workspace is asked for right after the switch that shows it, and the
+	// switch can leave a workspace below it empty, which renumbers it before
+	// the request lands. The key still names it. An older daemon ignores it
+	// and reads Workspace.
+	TabKey int `json:"tab_key,omitempty"`
 }
 
 // CommandResultPayload contains the result of a remote command execution.
@@ -751,6 +958,14 @@ type SessionResizePayload struct {
 	// Policy is the window_size policy the size was settled under:
 	// smallest, largest or latest. Empty from a daemon that predates it.
 	Policy string `json:"policy,omitempty"`
+	// SizedBy names the machine of the client whose size the session took.
+	// See AttachedPayload.SizedBy.
+	SizedBy string `json:"sized_by,omitempty"`
+	// SizedByClient is the connection ID of that client. See
+	// AttachedPayload.SizedByClient.
+	SizedByClient string `json:"sized_by_client,omitempty"`
+	// SizedByKind is that client's ClientKind.
+	SizedByKind string `json:"sized_by_kind,omitempty"`
 }
 
 // Error codes
@@ -767,6 +982,11 @@ const (
 	// ErrCodeForbidden refuses a message a machine linked to this one may not
 	// send under its link policy. Nothing was done. See link_policy.go.
 	ErrCodeForbidden = 10
+	// ErrCodeBusy refuses a message the daemon has no room for now: other
+	// large messages hold its read budget, the pane has not read the last
+	// large input, or the daemon has too many connections. Nothing was done,
+	// and the sender may try again. See frame_budget.go.
+	ErrCodeBusy = 11
 )
 
 // WriteMessage writes one framed message.
@@ -783,17 +1003,25 @@ const (
 // 1.3us instead of 2.2us and a 4 KiB frame 1.65us instead of 2.2us. At 64 KiB
 // and above the copy into the socket dominates and the two are within noise of each other.
 func WriteMessage(w io.Writer, msg *Message) error {
-	var hdr [6]byte
-	// Length counts the type and codec bytes plus the payload.
+	var hdr [6 + reqIDLen]byte
+	head := hdr[:6]
+	// Length counts the type and codec bytes plus the payload, and the
+	// request id when there is one.
 	binary.BigEndian.PutUint32(hdr[:4], uint32(2+len(msg.Payload)))
 	hdr[4], hdr[5] = byte(msg.Type), wireCodecGob
+	if msg.ReqID != 0 {
+		binary.BigEndian.PutUint32(hdr[:4], uint32(2+reqIDLen+len(msg.Payload)))
+		hdr[5] = wireCodecGobTagged
+		binary.BigEndian.PutUint64(hdr[6:], msg.ReqID)
+		head = hdr[:]
+	}
 
 	if len(msg.Payload) == 0 {
-		if _, err := w.Write(hdr[:]); err != nil {
+		if _, err := w.Write(head); err != nil {
 			return fmt.Errorf("failed to write message header: %w", err)
 		}
 	} else {
-		bufs := net.Buffers{hdr[:], msg.Payload}
+		bufs := net.Buffers{head, msg.Payload}
 		if _, err := bufs.WriteTo(w); err != nil {
 			return fmt.Errorf("failed to write message: %w", err)
 		}
@@ -826,27 +1054,29 @@ func ReadMessage(r io.Reader) (*Message, error) {
 // part: at the boundary, the read then waits for the next frame with no
 // wakeup at all.
 //
-// Both read loops go through here. The daemon wraps each accepted connection
-// in a bufio.Reader to peek the first byte for JSON-versus-binary detection,
-// and the client wraps its connection so a frame is one read rather than
-// three; neither may read conn directly once the reader holds bytes.
+// The client's read loop goes through here. The daemon reads with
+// Daemon.readClientFrame, which checks a frame's type and charges its memory
+// before it reads the body. Neither may read conn directly once the reader
+// holds bytes.
 func ReadMessageBuffered(conn net.Conn, r io.Reader, boundaryTimeout, bodyTimeout time.Duration) (*Message, error) {
-	return readMessageBufferedLimit(conn, r, boundaryTimeout, bodyTimeout, nil)
+	totalLen, err := readFrameLength(conn, r, boundaryTimeout, bodyTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return readMessageBody(r, totalLen, nil)
 }
 
-// readMessageBufferedLimit is ReadMessageBuffered with a frame limit per
-// message type. A frame over its type's limit is skipped unread and reported
-// as a *FrameTooLargeError, after which the stream is still in step. A nil
-// limit allows every type the 16 MB any frame may have.
-func readMessageBufferedLimit(conn net.Conn, r io.Reader, boundaryTimeout, bodyTimeout time.Duration, limit func(MessageType) uint32) (*Message, error) {
+// readFrameLength reads the length prefix of the next frame with
+// boundaryTimeout, then arms bodyTimeout for the rest of the frame.
+func readFrameLength(conn net.Conn, r io.Reader, boundaryTimeout, bodyTimeout time.Duration) (uint32, error) {
 	setBoundaryDeadline(conn, boundaryTimeout)
 
 	var totalLen uint32
 	if err := binary.Read(r, binary.BigEndian, &totalLen); err != nil {
 		if err == io.EOF {
-			return nil, err
+			return 0, err
 		}
-		return nil, fmt.Errorf("failed to read message length: %w", err)
+		return 0, fmt.Errorf("failed to read message length: %w", err)
 	}
 
 	if bodyTimeout > 0 {
@@ -854,8 +1084,7 @@ func readMessageBufferedLimit(conn net.Conn, r io.Reader, boundaryTimeout, bodyT
 	} else {
 		_ = conn.SetReadDeadline(time.Time{})
 	}
-
-	return readMessageBody(r, totalLen, limit)
+	return totalLen, nil
 }
 
 // setBoundaryDeadline arms the deadline for the wait between frames, or
@@ -874,59 +1103,145 @@ func setBoundaryDeadline(conn net.Conn, timeout time.Duration) {
 	_ = conn.SetReadDeadline(time.Time{})
 }
 
-// readMessageBody reads the header and payload after the length prefix has
-// already been consumed from r. limit, when not nil, is the largest frame
-// accepted for each message type; see readMessageBufferedLimit.
-func readMessageBody(r io.Reader, totalLen uint32, limit func(MessageType) uint32) (*Message, error) {
+// frameHeader is what precedes a frame's payload: its type, the request id
+// it carries (0 when it carries none) and the length of the payload.
+type frameHeader struct {
+	Type       MessageType
+	ReqID      uint64
+	PayloadLen uint32
+	TotalLen   uint32
+}
+
+// readFrameHeader reads the type, codec and request id that follow the
+// length prefix, and checks the length against them.
+func readFrameHeader(r io.Reader, totalLen uint32) (frameHeader, error) {
 	// Sanity check length (max 16MB). A frame past this is not skipped: a
 	// length that large is more likely a stream out of step than a frame.
 	if totalLen > maxFrameBytes {
-		return nil, fmt.Errorf("message too large: %d bytes (raw: 0x%08x)", totalLen, totalLen)
+		return frameHeader{}, fmt.Errorf("message too large: %d bytes (raw: 0x%08x)", totalLen, totalLen)
 	}
 
 	if totalLen < 2 {
-		return nil, fmt.Errorf("message too small: %d bytes", totalLen)
+		return frameHeader{}, fmt.Errorf("message too small: %d bytes", totalLen)
 	}
 
-	// Read type and codec. The codec byte is always gob and is ignored.
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, fmt.Errorf("failed to read message header (after len=%d): %w", totalLen, err)
+	// Read type and codec. The codec byte is gob, with or without a request
+	// id in front of the payload.
+	var header [2]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return frameHeader{}, fmt.Errorf("failed to read message header (after len=%d): %w", totalLen, err)
 	}
 
-	msgType := MessageType(header[0])
+	h := frameHeader{Type: MessageType(header[0]), PayloadLen: totalLen - 2, TotalLen: totalLen}
+	tagged := header[1] == wireCodecGobTagged
+	if tagged && h.PayloadLen < reqIDLen {
+		// Too short to hold the id it says it carries, which no sender writes:
+		// the same fault as a frame too small for its header.
+		return frameHeader{}, fmt.Errorf("tagged message too small: %d bytes", totalLen)
+	}
 
-	// Read payload
-	payloadLen := totalLen - 2
+	if tagged {
+		var id [reqIDLen]byte
+		if _, err := io.ReadFull(r, id[:]); err != nil {
+			return frameHeader{}, fmt.Errorf("failed to read request id (len=%d, type=%d): %w", h.PayloadLen, h.Type, err)
+		}
+		h.ReqID = binary.BigEndian.Uint64(id[:])
+		if h.ReqID == 0 {
+			// Zero is the id of a message that answers nothing, and that
+			// message goes out untagged. A tagged zero would read as the
+			// same Message as an untagged frame, so the frame a relay writes
+			// back would not be the one it read. No sender writes one.
+			return frameHeader{}, fmt.Errorf("tagged message with request id 0 (type=%d)", h.Type)
+		}
+		h.PayloadLen -= reqIDLen
+	}
+	return h, nil
+}
+
+// skipPayload reads the payload of a refused frame and drops it, so the
+// stream stays in step.
+func skipPayload(r io.Reader, h frameHeader) error {
+	if _, err := io.CopyN(io.Discard, r, int64(h.PayloadLen)); err != nil {
+		return fmt.Errorf("failed to skip a refused message payload (len=%d, type=%d): %w", h.PayloadLen, h.Type, err)
+	}
+	return nil
+}
+
+// readMessageBody reads the header and payload after the length prefix has
+// already been consumed from r. limit, when not nil, is the largest frame
+// accepted for each message type. A frame over its type's limit is skipped
+// unread and reported as a *FrameTooLargeError, after which the stream is
+// still in step. A nil limit allows every type the 16 MB any frame may have.
+func readMessageBody(r io.Reader, totalLen uint32, limit func(MessageType) uint32) (*Message, error) {
+	h, err := readFrameHeader(r, totalLen)
+	if err != nil {
+		return nil, err
+	}
 
 	// A frame over its own type's limit is skipped before any of it is
-	// decoded, which is the point of the limit: see wire_bounds.go.
+	// decoded, which is the point of the limit: see wire_bounds.go. The
+	// request id was read first so the refusal can answer the request.
 	if limit != nil {
-		if typeMax := limit(msgType); totalLen > typeMax {
-			if _, err := io.CopyN(io.Discard, r, int64(payloadLen)); err != nil {
-				return nil, fmt.Errorf("failed to skip oversized message payload (len=%d, type=%d): %w", payloadLen, msgType, err)
+		if typeMax := limit(h.Type); totalLen > typeMax {
+			if err := skipPayload(r, h); err != nil {
+				return nil, err
 			}
-			return nil, &FrameTooLargeError{Type: msgType, Size: totalLen, Limit: typeMax}
+			return nil, &FrameTooLargeError{Type: h.Type, Size: totalLen, Limit: typeMax, ReqID: h.ReqID}
 		}
 	}
+	return readFramePayloadOf(r, h)
+}
 
-	var payload []byte
-	if payloadLen > 0 {
-		payload = make([]byte, payloadLen)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil, fmt.Errorf("failed to read message payload (len=%d, type=%d): %w", payloadLen, msgType, err)
-		}
+// readFramePayloadOf reads the payload h announces and builds the message.
+func readFramePayloadOf(r io.Reader, h frameHeader) (*Message, error) {
+	payload, err := readFramePayload(r, int(h.PayloadLen))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read message payload (len=%d, type=%d): %w", h.PayloadLen, h.Type, err)
 	}
 
 	msg := &Message{
-		Type:    msgType,
+		Type:    h.Type,
 		Payload: payload,
+		ReqID:   h.ReqID,
 	}
 
 	// Debug logging
 	LogMessage("RECV", msg)
 
 	return msg, nil
+}
+
+// readFramePayload reads n payload bytes into memory that grows as they
+// arrive: it starts at firstFrameChunk, or twice what a buffered reader
+// already holds, and doubles, by frameGrowStep at most, up to n. A sender that
+// announces more than it sends costs at most twice what it sent, not what it
+// announced.
+func readFramePayload(r io.Reader, n int) ([]byte, error) {
+	if n == 0 {
+		return nil, nil
+	}
+	first := firstFrameChunk
+	// Bytes a buffered reader already holds have arrived. Starting at twice
+	// them costs no more than the doublings would after them, and takes most
+	// frames in one buffer.
+	if b, ok := r.(interface{ Buffered() int }); ok {
+		first = max(first, 2*b.Buffered())
+	}
+	payload := make([]byte, 0, min(n, first))
+	for len(payload) < n {
+		if len(payload) == cap(payload) {
+			want := min(n, cap(payload)+min(cap(payload), frameGrowStep))
+			next := make([]byte, len(payload), want)
+			copy(next, payload)
+			payload = next
+		}
+		k, err := io.ReadFull(r, payload[len(payload):cap(payload)])
+		payload = payload[:len(payload)+k]
+		if err != nil {
+			return nil, err
+		}
+	}
+	return payload, nil
 }
 
 // NewMessage creates a message with a gob-encoded payload. A nil payload

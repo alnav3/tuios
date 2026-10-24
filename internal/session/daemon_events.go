@@ -39,7 +39,13 @@ const (
 	// EventWorkspaceRenamed: a workspace's name was set, changed or cleared.
 	// Workspace is the workspace, and Title its new name, absent when cleared.
 	EventWorkspaceRenamed = "workspace-renamed"
-	EventAgentState       = "agent-state" // a window's agent state changed
+	// EventLayoutChanged: the panes on a workspace now sit differently. A
+	// pane opened, closed, moved, was minimized, zoomed or resized, or the
+	// session changed size. Workspace names it. It carries no rectangles: a
+	// client that mirrors the layout reads list-windows again. It is opt-in
+	// and not kept for replay, since a dragged split raises one per step.
+	EventLayoutChanged = "layout-changed"
+	EventAgentState    = "agent-state" // a window's agent state changed
 	// EventAgentMessage is one agent leaving a message for another. Window is
 	// the recipient's window id, or empty for a session-wide notice. It carries
 	// nothing else on purpose: a subscriber reads the message back from the ring
@@ -54,6 +60,8 @@ const (
 	EventSessionCreated = "session-created" // a session was created
 	EventSessionClosed  = "session-closed"  // a session was terminated
 	EventGap            = "gap"             // slow-subscriber marker: N events were dropped
+	// EventClientSessionChanged reports a client attaching, detaching or switching.
+	EventClientSessionChanged = "client-session-changed"
 	// EventAttention is a change to the Inbox, the daemon's attention queue:
 	// an item opened, updated or closed. Action says which, and Attention
 	// carries the item. See attention.go.
@@ -77,7 +85,31 @@ const (
 	// reported them. It is chatty, so it reaches only a subscriber that names
 	// it in types. See agent_activity.go.
 	EventAgentActivity = "agent-activity"
-	EventSubscribed    = "subscribed" // subscribe ack result type
+	// EventTranscript says the transcript a pane is joined to grew, so a
+	// reader of agent-transcript can read again. Cursor is the cursor a read
+	// to the end returns now. It carries nothing of the file, and it reaches
+	// only a subscriber that names it in types. See verb_agent_transcript.go.
+	EventTranscript = "transcript"
+	// EventTransfer is a change of a copy the daemon runs (transfer.go):
+	// Action is created, state, ended or removed, and Transfer is the job's
+	// row as transfer-list gives it. A copy's state is said once per change.
+	// removed says a copy that ended left the list, by transfer-clear or 30
+	// minutes after it ended, and carries the last row it had.
+	EventTransfer = "transfer"
+	// EventTransferProgress is a copy's row while its bytes move, at most
+	// four times a second per copy. It reaches only a subscriber that names
+	// it in types, and it is not kept for replay: the next one replaces it.
+	EventTransferProgress = "transfer-progress"
+	// EventTransferFile is one file of a copy: Action and File.State are
+	// done, same, skipped, conflict or failed. It reaches only a subscriber
+	// that names it in types, and it is not kept for replay.
+	EventTransferFile = "transfer-file"
+	// EventTML is what a person did on a TML surface that its owner hears:
+	// an emit action, or the close. TML carries the surface, the name and
+	// the value. It reaches only a subscriber that names it in types, and a
+	// tml-open with events. See tml_surface.go.
+	EventTML        = "tml-event"
+	EventSubscribed = "subscribed" // subscribe ack result type
 )
 
 // defaultEventQueue bounds a subscriber's per-connection event queue. When it is
@@ -116,6 +148,12 @@ type streamEvent struct {
 	Window  string `json:"window,omitempty"`
 	PTYID   string `json:"pty_id,omitempty"`
 	Title   string `json:"title,omitempty"`
+	// ClientID identifies the daemon connection whose session changed.
+	ClientID string `json:"client_id,omitempty"`
+	// PID is the kernel peer process of the daemon connection.
+	PID int `json:"pid,omitempty"`
+	// Attached says whether the client entered or left Session.
+	Attached *bool `json:"attached,omitempty"`
 	// Body is a notification event's text. Title carries its title, which
 	// OSC 9 never sets.
 	Body    string `json:"body,omitempty"`
@@ -159,6 +197,14 @@ type streamEvent struct {
 	CommandSeq uint64 `json:"command_seq,omitempty"`
 	// Entry is an agent-activity event's entry of the pane's activity ring.
 	Entry *AgentActivityEntry `json:"entry,omitempty"`
+	// Cursor is a transcript event's agent-transcript cursor.
+	Cursor string `json:"cursor,omitempty"`
+	// Transfer is a transfer or transfer-progress event's copy.
+	Transfer *TransferRow `json:"transfer,omitempty"`
+	// File is a transfer-file event's file.
+	File *TransferFile `json:"file,omitempty"`
+	// TML is a tml-event's surface, name and value.
+	TML *TMLEvent `json:"tml,omitempty"`
 
 	// relayed marks an event copied from a linked host's own stream. It is
 	// delivered only to a subscriber that asked for other machines' events,
@@ -187,6 +233,8 @@ type SessionEvent struct {
 	ExitCode   *int
 	DurationMS int64
 	CommandSeq uint64
+	// Cursor is a transcript event's cursor. See streamEvent.
+	Cursor string
 
 	// The fields below carry everything the hook dispatcher needs, so it can
 	// build a hook's environment from the event alone. That is not a
@@ -203,6 +251,10 @@ type SessionEvent struct {
 	hookPrevWorkspace int
 	hookHarness       string
 	hookMessage       string
+	// hookProgram says the window's state comes from OSC 7501 records. The
+	// Inbox then names the pane by its id as well as its title, since the
+	// program can set the title.
+	hookProgram bool
 
 	// These feed the attention queue, and like the hook fields they never reach
 	// the wire. hookKind is the blocked_by of a needs_input window.
@@ -213,10 +265,15 @@ type SessionEvent struct {
 	hookKind          string
 	completionSeq     uint64
 	prevCompletionSeq uint64
-	// hookRoot is the window's worktree root, else its working directory:
-	// where the risk rules measure "outside the worktree" from, carried so the
-	// queue never reads session state under its own lock.
-	hookRoot string
+	// hookWorktree and hookAgentSession are what the approval root is made
+	// from beside the window's start folder (windowApprovalRoot). hookRoot
+	// is that root and hookRunDir the pane's folder now, both filled by the
+	// daemon's sink before the queue reads them, so the queue never reads
+	// session state under its own lock. Neither is the pane's reported
+	// folder alone, which the pane sets.
+	hookWorktree, hookAgentSession string
+	hookRoot                       string
+	hookRunDir                     string
 }
 
 // eventCompletionSeen is raised when an attached client's state push shows it
@@ -240,6 +297,12 @@ const eventAttentionDetail = "attention-detail"
 // harness shows its own prompt to the person now looking at it.
 const eventPaneFocused = "pane-focused"
 
+// eventProgramStatus is raised when a pane's OSC 7501 records changed. It is
+// internal: the daemon's sink copies the records into the window state and
+// sets the pane's agent state from them, and never publishes it. The agent
+// state change that follows is published and raises its hooks as usual.
+const eventProgramStatus = "program-status"
+
 // eventFilter selects which events a subscriber receives. A zero value matches
 // everything. An empty types set matches all event types.
 type eventFilter struct {
@@ -260,6 +323,9 @@ type eventFilter struct {
 	// mirrored from a host, or host-changed), because every other subscriber
 	// reads session and window as names on this machine.
 	hosts bool
+	// surface admits only the tml-event events of one TML surface: the
+	// stream a tml-open with events holds on its connection.
+	surface string
 }
 
 func (f eventFilter) match(ev streamEvent) bool {
@@ -268,11 +334,15 @@ func (f eventFilter) match(ev streamEvent) bool {
 			return false
 		}
 	}
+	// A filter that names a window or a pane follows it to another session:
+	// window and PTY ids are unique on this machine, and a pane moved with
+	// move-window's to_session goes on running there.
+	follows := ev.Host == "" && ((f.window != "" && ev.Window == f.window) || (f.ptyID != "" && ev.PTYID == f.ptyID))
 	if f.sess != nil {
-		if ev.Session != f.sess.Name() {
+		if ev.Session != f.sess.Name() && !follows {
 			return false
 		}
-	} else if f.session != "" && ev.Session != f.session {
+	} else if f.session != "" && ev.Session != f.session && !follows {
 		return false
 	}
 	if f.window != "" && ev.Window != f.window {
@@ -282,6 +352,9 @@ func (f eventFilter) match(ev streamEvent) bool {
 		return false
 	}
 	if len(f.types) > 0 && !f.types[ev.Type] {
+		return false
+	}
+	if f.surface != "" && (ev.TML == nil || ev.TML.Surface != f.surface) {
 		return false
 	}
 	// An opt-in type reaches only a filter that names it, so a subscriber
@@ -295,7 +368,7 @@ func (f eventFilter) match(ev streamEvent) bool {
 // optInEventTypes are the event types a subscription receives only when its
 // types filter names them. They arrive at the speed an agent works rather
 // than the speed a person does.
-var optInEventTypes = map[string]bool{EventAgentActivity: true}
+var optInEventTypes = map[string]bool{EventLayoutChanged: true, EventAgentActivity: true, EventTranscript: true, EventTransferProgress: true, EventTransferFile: true, EventTML: true}
 
 // admitsOutput reports whether the filter lets output events through, which
 // decides whether a resume can be exact: output events are not kept for replay.
@@ -346,6 +419,20 @@ type eventHub struct {
 	evictedSeq      uint64
 	lastOutputSeq   uint64
 	lastActivitySeq uint64
+	// lastTranscriptSeq is the same for transcript events, which a reader
+	// replaces with one agent-transcript call from its cursor.
+	lastTranscriptSeq uint64
+	// lastProgressSeq is the same for transfer-progress events, which the
+	// next one replaces.
+	lastProgressSeq uint64
+	// lastFileSeq is the same for transfer-file events.
+	lastFileSeq uint64
+	// lastLayoutSeq is the same for layout-changed events.
+	lastLayoutSeq uint64
+	// lastTMLSeq is the same for tml-event events, whose values can be
+	// large and are the person's input: they go live to the owner and to
+	// subscribers, and are not kept for a later reader.
+	lastTMLSeq uint64
 }
 
 func newEventHub() *eventHub {
@@ -444,7 +531,12 @@ func (h *eventHub) replayLocked(filter eventFilter, from resumePoint) []streamEv
 	case from.afterSeq < h.evictedSeq:
 		out = append(out, gap(GapEvicted))
 	case filter.admitsOutput() && h.lastOutputSeq > from.afterSeq,
-		filter.types[EventAgentActivity] && h.lastActivitySeq > from.afterSeq:
+		filter.types[EventAgentActivity] && h.lastActivitySeq > from.afterSeq,
+		filter.types[EventTranscript] && h.lastTranscriptSeq > from.afterSeq,
+		filter.types[EventTransferProgress] && h.lastProgressSeq > from.afterSeq,
+		filter.types[EventTransferFile] && h.lastFileSeq > from.afterSeq,
+		filter.types[EventLayoutChanged] && h.lastLayoutSeq > from.afterSeq,
+		filter.types[EventTML] && h.lastTMLSeq > from.afterSeq:
 		out = append(out, gap(GapNotRetained))
 	}
 	for i := range h.ringLen {
@@ -461,7 +553,8 @@ func (h *eventHub) replayLocked(filter eventFilter, from resumePoint) []streamEv
 // agent and lifecycle events a reconnecting subscriber actually needs out of a
 // bounded ring within seconds. Agent-activity events are counted the same way:
 // one fires on every tool call of every agent, and a subscriber that missed
-// some reads the pane's ring with agent-activity instead.
+// some reads the pane's ring with agent-activity instead. Transcript events
+// are counted too: a reader that missed some reads from its cursor.
 func (h *eventHub) retain(ev streamEvent) {
 	switch ev.Type {
 	case EventOutput:
@@ -469,6 +562,24 @@ func (h *eventHub) retain(ev streamEvent) {
 		return
 	case EventAgentActivity:
 		h.lastActivitySeq = ev.Seq
+		return
+	case EventTranscript:
+		h.lastTranscriptSeq = ev.Seq
+		return
+	case EventTransferProgress:
+		h.lastProgressSeq = ev.Seq
+		return
+	case EventTransferFile:
+		h.lastFileSeq = ev.Seq
+		return
+	case EventLayoutChanged:
+		// One fires on every step of a dragged split. A subscriber that
+		// missed some reads list-windows, which is the layout they described.
+		// Counted, so a resume over one is marked with a gap.
+		h.lastLayoutSeq = ev.Seq
+		return
+	case EventTML:
+		h.lastTMLSeq = ev.Seq
 		return
 	}
 	if h.ringLen == len(h.ring) {

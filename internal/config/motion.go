@@ -86,6 +86,12 @@ const (
 	// ModalDimMax caps it for the reason DimUnfocusedMax does: past this the
 	// screen behind is gone rather than dimmed.
 	ModalDimMax = 90
+
+	// PopupDimDefault is how far the screen behind a popup is darkened when
+	// nothing sets it. Zero leaves the screen unchanged.
+	PopupDimDefault = 0
+	// PopupDimMax caps it for the same reason as ModalDimMax.
+	PopupDimMax = 90
 )
 
 // migrateAnimationsEnabled folds the old on/off appearance.animations_enabled
@@ -103,4 +109,55 @@ func migrateAnimationsEnabled(a *AppearanceConfig) {
 		a.Motion = MotionNone
 	}
 	a.AnimationsEnabled = nil
+}
+
+// Theme transitions. appearance.theme_transition takes one of these.
+const (
+	// ThemeTransitionNone swaps the colours in one frame. It is the default.
+	ThemeTransitionNone = "none"
+	// ThemeTransitionFade crosses the whole screen from the old theme to the
+	// new one.
+	ThemeTransitionFade = "fade"
+	// ThemeTransitionCircle grows the new theme from the middle of the screen
+	// as a circle over the old one.
+	ThemeTransitionCircle = "circle"
+)
+
+// ThemeTransitions is what appearance.theme_transition accepts.
+var ThemeTransitions = []string{ThemeTransitionNone, ThemeTransitionCircle, ThemeTransitionFade}
+
+// ThemeTransitionMsDefault, Min and Max bound
+// appearance.theme_transition_duration, in milliseconds.
+const (
+	ThemeTransitionMsDefault = 450
+	ThemeTransitionMsMin     = 100
+	ThemeTransitionMsMax     = 2000
+)
+
+// ThemeTransitionStyle is the transition a theme change made now is shown
+// with. It is none whenever motion is: appearance.motion = "none", the
+// --no-animations flag, and a tape or remote command that suppressed
+// animations all turn it off. It counts as basic motion, since a person who
+// set it asked for it by name.
+func (s *Settings) ThemeTransitionStyle() string {
+	if !s.MotionAllows(MotionBasic) {
+		return ThemeTransitionNone
+	}
+	switch s.ThemeTransition {
+	case ThemeTransitionFade, ThemeTransitionCircle:
+		return s.ThemeTransition
+	}
+	return ThemeTransitionNone
+}
+
+// ThemeTransitionDuration is how long a theme transition runs, scaled by
+// appearance.animation_speed. Zero, which a Settings built by hand carries,
+// reads as the default.
+func (s *Settings) ThemeTransitionDuration() time.Duration {
+	ms := s.ThemeTransitionMs
+	if ms == 0 {
+		ms = ThemeTransitionMsDefault
+	}
+	ms = min(max(ms, ThemeTransitionMsMin), ThemeTransitionMsMax)
+	return s.scaleAnimation(time.Duration(ms) * time.Millisecond)
 }

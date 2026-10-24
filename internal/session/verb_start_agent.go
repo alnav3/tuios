@@ -128,6 +128,11 @@ func (d *Daemon) verbStartAgent(cs *connState, params json.RawMessage) (any, *ve
 
 	// The session: the named one, made when it does not exist, or the most
 	// recently active one, made when there is none at all.
+	// Checked before a session is made for it: a pane without admin starts
+	// an agent only inside its own folder.
+	if _, _, verr := d.childWindowBound(cs, "start-agent", cwd); verr != nil {
+		return nil, verr
+	}
 	sess := d.findTargetSession(name)
 	created := false
 	if sess == nil {
@@ -135,7 +140,7 @@ func (d *Daemon) verbStartAgent(cs *connState, params json.RawMessage) (any, *ve
 			name = startAgentSessionName(launch)
 		}
 		var err error
-		sess, err = d.manager.CreateSession(name, &SessionConfig{}, defaultVerbSessionWidth, defaultVerbSessionHeight)
+		sess, err = d.manager.CreateSession(name, callerSessionConfig(cs), defaultVerbSessionWidth, defaultVerbSessionHeight)
 		if err != nil {
 			return nil, hintedVerbError(ErrVerbSessionExists, err.Error(), &VerbHint{
 				Param:     "session",
@@ -163,7 +168,7 @@ func (d *Daemon) verbStartAgent(cs *connState, params json.RawMessage) (any, *ve
 		}
 		markMu.Unlock()
 	}
-	win, err := sess.AddDaemonWindowWith(NewWindowOptions{
+	win, bverr, err := d.addWindowFor(cs, "start-agent", sess, NewWindowOptions{
 		Title:     p.Name,
 		Name:      p.Name,
 		Cwd:       cwd,
@@ -175,9 +180,13 @@ func (d *Daemon) verbStartAgent(cs *connState, params json.RawMessage) (any, *ve
 		Env:     env,
 		Grants:  grants,
 	}, onExit)
+	if bverr != nil {
+		return nil, bverr
+	}
 	if err != nil {
 		return nil, newWindowErr(err, sess, p.Workspace)
 	}
+	d.noteStartedBy(cs, win.ID)
 	if p.Protocol != "" {
 		markMu.Lock()
 		if !exited {

@@ -31,7 +31,7 @@ func handleSessionSwitcherInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cm
 		return o, nil
 	}
 
-	if listKey(keyStr, false, listPage, o.SessionSwitcherMove) {
+	if listKey(o, keyStr, false, listPage, o.SessionSwitcherMove) {
 		return o, nil
 	}
 
@@ -51,20 +51,21 @@ func handleSessionSwitcherInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cm
 				// The switch is made by the node, which knows the machine
 				// and the name: Title is a label and may be a display name
 				// that addresses nothing, and the ID of a row under another
-				// machine is a rail identity that no daemon holds (#196).
+				// machine is a rail identity that no daemon holds.
 				o.OpenSessionNode(selected)
 			}
 		} else if o.SessionSwitcherQuery != "" {
-			// No matching session: create new one with the typed name
-			if err := o.SwitchToSession(o.SessionSwitcherQuery); err != nil {
-				o.ShowNotification("Create failed: "+err.Error(), "error", o.Settings.NotificationDuration*2)
-			}
+			// No matching session: create one with the typed name. It goes
+			// through the same switch the rows use, which applies [startup]
+			// to the new session. A bare SwitchToSession left it floating.
+			o.OpenOrCreateSession(o.SessionSwitcherQuery)
 		}
 		o.ShowSessionSwitcher = false
 		o.SessionSwitcherQuery = ""
 		o.SessionSwitcherSelected = 0
 		o.SessionSwitcherScroll = 0
-		return o, nil
+		// A session on another machine opens off the Update goroutine.
+		return o, o.TakeSidebarCmd()
 
 	case "backspace":
 		if o.SessionSwitcherQuery != "" {

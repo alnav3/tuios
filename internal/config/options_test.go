@@ -16,17 +16,37 @@ var optionWalkSkips = map[string]string{
 	"hooks":                        "a free-form map of event to command",
 	"daemon.agent_binaries":        "a list, which a value arriving as one string cannot spell",
 	"daemon.respond_from_shell":    "a grant to act as the person, which set-option, a verb any pane can call, must not be able to switch",
+	"daemon.single_client":         "detaches the person's other clients on every attach, which set-option, a verb any pane can call, must not be able to switch; detach-client needs admin for the same reason",
+	"daemon.display":               "gives every new pane the display of the person's client, which set-option, a verb any pane can call, must not be able to switch",
+	"daemon.ssh_agent":             "points every new pane's SSH_AUTH_SOCK at a link the daemon keeps, which set-option, a verb any pane can call, must not be able to switch",
 	"notifications.agent.sounds":   "file paths, which no accepted set or range can check",
 	"dock.left":                    "an ordered list of component names, not a scalar path",
 	"dock.center":                  "an ordered list of component names, not a scalar path",
 	"dock.right":                   "an ordered list of component names, not a scalar path",
 	"dock.custom":                  "a free-form map of component name to its command and refresh",
+	"dock.tabs":                    "the workspace strip's look, a table edited in the file beside [dock.custom]; number_glyphs is a list a value arriving as one string cannot spell",
+	"dock.session":                 "the session cell's format and look, a table edited in the file beside [dock.custom]",
 	"hosts":                        "a map of host name to its address, which no single settable path can spell",
+	"notify":                       "where the Inbox's text goes and with which credentials, which a pane must not change over the control protocol",
+	"plugins":                      "which plugins run outside every pane with the person's rights, which set-option, a verb any pane can call, must not be able to change",
 	"tailscale":                    "file-plane config for what the hosts table suggests, read from the file by the two callers that use it, like [hosts] above",
 	"appearance.sidebar.agent_row": "a table of tokens, each with a look and an ordered rule list, which no single settable path can spell",
+	"appearance.sidebar.custom":    "the rail section's command, which runs outside every pane on every refresh, as dock commands and hooks do; set-option, a verb any pane can call in the default open mode, must not be able to set it, the way daemon.respond_from_shell is kept out above",
+	"appearance.sidebar.left":      "the second rail's file-only configuration includes a command that runs outside panes; do not expose its table through set-option until safe scalar controls have separate registry entries",
+	"appearance.sidebar.right":     "the second rail's file-only configuration includes a command that runs outside panes; do not expose its table through set-option until safe scalar controls have separate registry entries",
 	"hints.patterns":               "a list of regular expressions, which a value arriving as one string cannot spell",
 	"scratch.session":              "no longer used: read only so a config from the first scratch design loads and validation can say to remove it",
-	"agents":                       "file-plane config the daemon reads from the file, like [hosts]: which harnesses hold their prompts for the Inbox is not for a pane to change over the control protocol",
+	// [agents] is file-plane config the daemon reads from the file, like
+	// [hosts], apart from agents.enabled, which is a plain switch.
+	"agents.approvals":      "which harnesses hold their prompts for the Inbox is not for a pane to change over the control protocol",
+	"agents.permissions":    "what a pane may do through tuios is not for a pane to change over the control protocol",
+	"agents.recap":          "file-plane config the daemon reads from the file, like [hosts]",
+	"agents.queue":          "file-plane config the daemon reads from the file, like [hosts]",
+	"agents.checkpoints":    "file-plane config the daemon reads from the file, like [hosts]",
+	"agents.mail":           "whether tuios types into an agent's pane is not for a pane to change over the control protocol",
+	"agents.herdr_protocol": "file-plane config the daemon reads from the file, like [hosts]",
+	// Read by a client when it starts, which is when it asks its terminal.
+	"agents.host_program_status": "file-plane config a client reads from the file when it starts, like [hosts]",
 }
 
 // TestOptionRegistryCoversEveryScalarField is the guard that keeps the
@@ -65,8 +85,7 @@ func walkScalarPaths(t *testing.T, structType reflect.Type, prefix string) []str
 	t.Helper()
 
 	var paths []string
-	for i := range structType.NumField() {
-		field := structType.Field(i)
+	for field := range structType.Fields() {
 		name := tomlFieldName(field)
 		if name == "" || name == "-" { // "-" is a field toml never reads or writes
 			continue
@@ -103,6 +122,7 @@ func TestSetOptionValueRejectsBadInput(t *testing.T) {
 		{"non-numeric int", "appearance.scroll_lines", "several"},
 		{"out-of-range int", "appearance.scroll_lines", "9999"},
 		{"unparseable bool", "appearance.hide_window_buttons", "maybe"},
+		{"the rail section's command", "appearance.sidebar.custom.command", "echo"},
 	}
 
 	for _, tc := range cases {
@@ -175,7 +195,8 @@ func TestOptionSpecsAreWellFormed(t *testing.T) {
 	sections := []string{
 		"appearance", "sidebar", "dock", "scrollbar", "selection",
 		"startup", "daemon", "notifications", "tape", "debug",
-		"screenshot", "screensaver", "spotlight", "hints", "scratch", "pip", "launcher",
+		"screenshot", "screensaver", "spotlight", "hints", "panes", "scratch", "pip", "mermaid", "launcher",
+		"agents", "workspaces",
 	}
 	for _, opt := range optionSpecs {
 		if opt.Description == "" {

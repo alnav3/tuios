@@ -30,6 +30,7 @@ const (
 	sidebarActReorderDown = "reorder_down"
 	sidebarActReorderUp   = "reorder_up"
 	sidebarActSection     = "section"
+	sidebarActSwitchEdge  = "switch_edge"
 	sidebarActAgentFilter = "agents_filter"
 	sidebarActAgentSort   = "agents_sort"
 	sidebarActMail        = "mail"
@@ -64,6 +65,11 @@ const (
 	// hardcoded key hint waiting to go stale.
 	sidebarActFileOpen = "file_open"
 	sidebarActFileEdit = "file_edit"
+	// file_copy_path copies the row's path whatever the row is. file_open
+	// copies a file's path too, but on a folder it opens the folder.
+	sidebarActFileCopyPath = "file_copy_path"
+	// sidebarActFileSend sends the row's file or folder to another machine.
+	sidebarActFileSend = "file_send"
 	// jump_1..jump_9 are matched by prefix; see HandleSidebarKey.
 	sidebarActJumpPrefix = "jump_"
 )
@@ -86,6 +92,7 @@ func NewActionDispatcher() *ActionDispatcher {
 func (d *ActionDispatcher) registerHandlers() {
 	// Window Management actions
 	d.Register("new_window", handleNewWindow)
+	d.Register("new_window_ssh", handleNewWindowSSH)
 	d.Register("close_window", handleCloseWindow)
 	d.Register("rename_window", handleRenameWindow)
 	d.Register("set_accent", handleSetAccent)
@@ -94,6 +101,7 @@ func (d *ActionDispatcher) registerHandlers() {
 	d.Register("restore_all", handleRestoreAll)
 	d.Register("next_window", handleNextWindow)
 	d.Register("prev_window", handlePrevWindow)
+	d.Register("last_pane", handleLastPane)
 
 	// Window selection (1-9)
 	for i := 1; i <= 9; i++ {
@@ -105,9 +113,9 @@ func (d *ActionDispatcher) registerHandlers() {
 	for i := 1; i <= 9; i++ {
 		d.Register("switch_workspace_"+string(rune('0'+i)), makeSwitchWorkspaceHandler(i))
 		d.Register("move_and_follow_"+string(rune('0'+i)), makeMoveAndFollowHandler(i))
-		d.Register("next_workspace", handleNextWorkspace)
-		d.Register("prev_workspace", handlePrevWorkspace)
 	}
+	d.Register("next_workspace", handleNextWorkspace)
+	d.Register("prev_workspace", handlePrevWorkspace)
 
 	// Layout actions
 	d.Register("snap_left", handleSnapLeft)
@@ -168,6 +176,8 @@ func (d *ActionDispatcher) registerHandlers() {
 	d.Register("smart_split", handleSmartSplit)
 	d.Register("split_horizontal", handleSplitHorizontal)
 	d.Register("split_vertical", handleSplitVertical)
+	d.Register("split_ssh_horizontal", handleSplitSSHHorizontal)
+	d.Register("split_ssh_vertical", handleSplitSSHVertical)
 	d.Register("rotate_split", handleRotateSplit)
 	d.Register("equalize_splits", handleEqualizeSplits)
 	d.Register("cycle_tiling_scheme", handleCycleTilingScheme)
@@ -192,6 +202,10 @@ func (d *ActionDispatcher) registerHandlers() {
 	d.Register("enter_window_mode", handleEnterWindowMode)
 	d.Register("toggle_help", handleToggleHelp)
 	d.Register("open_settings", handleOpenSettings)
+	d.Register("open_keybind_presets", func(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+		o.OpenKeybindPresets()
+		return o, nil
+	})
 	d.Register("quit", handleQuit)
 
 	// Enter the sidebar rail's keyboard scope (window mode "s"). The exit and the
@@ -210,19 +224,40 @@ func (d *ActionDispatcher) registerHandlers() {
 	d.Register("next_session", handleNextSession)
 	d.Register("prev_session", handlePrevSession)
 
+	// Session switching (1-9), by the rail's own order
+	for i := 1; i <= 9; i++ {
+		d.Register("switch_session_"+string(rune('0'+i)), makeSwitchSessionHandler(i))
+	}
+
 	// Clipboard actions
 	d.Register("copy_selection", handleCopySelection)
 	d.Register("paste_clipboard", handlePasteClipboard)
 	d.Register("paste_image", handlePasteImage)
+	d.Register("paste_buffer", handlePasteBuffer)
+	d.Register("choose_buffer", handleChooseBuffer)
 	d.Register("clear_selection", handleClearSelection)
 
 	// Session lifecycle actions (context menu rows; the quit menu's kill rows
 	// route through the same OS methods, so the two cannot drift apart)
 	d.Register("settings_sidebar", handleSettingsSidebar)
 	d.Register("rename_session", handleRenameSession)
+	d.Register("rename_workspace", handleRenameWorkspace)
 	d.Register("kill_session", handleKillSession)
 	d.Register("kill_session_next", handleKillSessionNext)
 	d.Register("kill_session_quit", handleKillSessionQuit)
+	// The palette row, the rail's menu for this machine, or a key the
+	// person bound. See app/daemon_restart.go.
+	d.Register("restart_daemon", func(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+		o.OpenDaemonRestart()
+		return o, nil
+	})
+
+	// The worktree dialog's two entry points. A session row's menu names a
+	// session and a repository header's menu names a repository, so they are
+	// two actions with two carries rather than one action guessing which.
+	// Both open the same dialog; see worktree_prompt.go for the verb behind it.
+	d.Register("session_new_worktree", handleSessionNewWorktree)
+	d.Register("repo_new_worktree", handleRepoNewWorktree)
 
 	// The rail's file actions. They are dispatched by key from HandleSidebarKey,
 	// which reads its own scope, and they are registered here because the files
@@ -236,6 +271,7 @@ func (d *ActionDispatcher) registerHandlers() {
 		sidebarActFileCreate, sidebarActFileRename, sidebarActFileDelete,
 		sidebarActFileDeleteAll, sidebarActFileCopy, sidebarActFileCut,
 		sidebarActFilePaste, sidebarActFileOpen, sidebarActFileEdit,
+		sidebarActFileCopyPath, sidebarActFileSend,
 	} {
 		d.Register(action, makeSidebarFileHandler(action))
 	}
@@ -256,6 +292,7 @@ func (d *ActionDispatcher) registerHandlers() {
 	d.Register("toggle_logs", handleToggleLogs)
 	d.Register("toggle_cache_stats", handleToggleCacheStats)
 	d.Register("toggle_spotlight", handleToggleSpotlight)
+	d.Register("prefix_toggle_spotlight", handleToggleSpotlight)
 	d.Register("toggle_pip", handleTogglePiP)
 
 	// Multifocus actions (see multifocus_actions.go)
@@ -287,6 +324,10 @@ func (d *ActionDispatcher) Dispatch(action string, msg tea.KeyPressMsg, o *app.O
 	if !ok && strings.HasPrefix(action, config.CommandActionPrefix) {
 		handler, ok = handleCommandBinding(action), true
 	}
+	// open_menu:NAME opens a declared menu, named in the action the same way.
+	if !ok && strings.HasPrefix(action, config.OpenMenuPrefix) {
+		handler, ok = handleOpenMenu(action), true
+	}
 	if ok {
 		// Record the action if tape recording is active
 		if o.TapeRecorder != nil && o.TapeRecorder.IsRecording() {
@@ -317,7 +358,7 @@ func (d *ActionDispatcher) Dispatch(action string, msg tea.KeyPressMsg, o *app.O
 // HasAction checks if an action is registered
 func (d *ActionDispatcher) HasAction(action string) bool {
 	_, ok := d.handlers[action]
-	return ok || strings.HasPrefix(action, config.CommandActionPrefix)
+	return ok || strings.HasPrefix(action, config.CommandActionPrefix) || strings.HasPrefix(action, config.OpenMenuPrefix)
 }
 
 // handleCommandBinding runs the [[keybindings.command]] entry behind action.
@@ -340,7 +381,26 @@ func GetDispatcher() *ActionDispatcher {
 // ============================================================================
 
 func handleNewWindow(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarSessionFocused() {
+		o.NewSidebarSessionWindow()
+		return o, nil
+	}
+	if o.FollowSSHOnNewWindow() {
+		o.NewWindowSSH()
+		return o, nil
+	}
 	o.NewWindowHere()
+	return o, nil
+}
+
+// handleNewWindowSSH opens a window that runs the focused pane's ssh, or an
+// ordinary one when that pane runs none.
+func handleNewWindowSSH(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarSessionFocused() {
+		o.NewSidebarSessionWindow()
+		return o, nil
+	}
+	o.NewWindowSSH()
 	return o, nil
 }
 
@@ -354,6 +414,13 @@ func handleCloseWindow(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.FireHook(hooks.AfterCloseWindow, w.ID, w.Title())
 		o.DeleteWindow(o.FocusedWindow)
 	}
+	return o, nil
+}
+
+// handleRenameWorkspace opens the rename editor on the workspace the session
+// is showing now.
+func handleRenameWorkspace(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.BeginRenameWorkspace(o.CurrentWorkspace)
 	return o, nil
 }
 
@@ -429,6 +496,15 @@ func handlePrevWindow(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	return afterFocusCommand(o, prev, focusEnterCycle)
 }
 
+func handleLastPane(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	prev := o.FocusedWindow
+	if !o.LastPane() {
+		o.ShowNotification("No pane to go back to", "info", o.Settings.NotificationDuration)
+		return o, nil
+	}
+	return afterFocusCommand(o, prev, focusEnterTargeted)
+}
+
 // makeSelectWindowHandler creates a handler for selecting a window by index.
 // The index comes from the action name, so the binding can be any key.
 func makeSelectWindowHandler(idx int) ActionHandler {
@@ -450,6 +526,13 @@ func makeSwitchWorkspaceHandler(workspace int) ActionHandler {
 	}
 }
 
+func makeSwitchSessionHandler(n int) ActionHandler {
+	return func(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+		o.SwitchToSessionByIndex(n - 1)
+		return o, nil
+	}
+}
+
 func makeMoveAndFollowHandler(workspace int) ActionHandler {
 	return func(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		if o.FocusedWindow >= 0 && o.FocusedWindow < len(o.Windows) {
@@ -459,35 +542,16 @@ func makeMoveAndFollowHandler(workspace int) ActionHandler {
 	}
 }
 
-// next/prev workspace cycle only through workspaces that hold at least one
-// window, wrapping at the ends. With no other populated workspace they do
-// nothing, so a stray chord cannot land the person on an empty grid.
+// next_workspace and prev_workspace cycle through the workspaces that hold
+// a pane. See OS.NextWorkspace.
 
 func handleNextWorkspace(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
-	for i := 1; i <= o.NumWorkspaces; i++ {
-		next := o.CurrentWorkspace + i
-		if next > o.NumWorkspaces {
-			next -= o.NumWorkspaces
-		}
-		if o.GetWorkspaceWindowCount(next) > 0 {
-			o.SwitchToWorkspace(next)
-			break
-		}
-	}
+	o.NextWorkspace()
 	return o, nil
 }
 
 func handlePrevWorkspace(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
-	for i := 1; i <= o.NumWorkspaces; i++ {
-		prev := o.CurrentWorkspace - i
-		if prev < 1 {
-			prev += o.NumWorkspaces
-		}
-		if o.GetWorkspaceWindowCount(prev) > 0 {
-			o.SwitchToWorkspace(prev)
-			break
-		}
-	}
+	o.PrevWorkspace()
 	return o, nil
 }
 
@@ -710,7 +774,7 @@ func handleToggleZoom(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if fw != nil && fw.Zoomed {
 		o.ShowNotification("ZOOM", "info", o.Settings.NotificationDuration)
 	} else {
-		o.ShowNotification("", "info", 0) // clear
+		o.ClearNotification("ZOOM")
 	}
 	return o, nil
 }
@@ -724,6 +788,13 @@ func handleSmartSplit(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 }
 
 func handleSplitHorizontal(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarSessionFocused() {
+		o.NewSidebarSessionWindow() // rail panes always stack top to bottom
+		return o, nil
+	}
+	if o.FollowSSHOnNewWindow() {
+		return handleSplitSSHHorizontal(tea.KeyPressMsg{}, o)
+	}
 	if o.AutoTiling {
 		o.SplitFocusedHorizontal()
 		o.ShowNotification("Split horizontal", "info", o.Settings.NotificationDuration)
@@ -732,8 +803,35 @@ func handleSplitHorizontal(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 }
 
 func handleSplitVertical(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarSessionFocused() {
+		o.NewSidebarSessionWindow() // no horizontal subdivision of a narrow rail
+		return o, nil
+	}
+	if o.FollowSSHOnNewWindow() {
+		return handleSplitSSHVertical(tea.KeyPressMsg{}, o)
+	}
 	if o.AutoTiling {
 		o.SplitFocusedVertical()
+		o.ShowNotification("Split vertical", "info", o.Settings.NotificationDuration)
+	}
+	return o, nil
+}
+
+// handleSplitSSHHorizontal splits top/bottom and runs the focused pane's ssh
+// in the new pane, or a shell when that pane runs no ssh.
+func handleSplitSSHHorizontal(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.AutoTiling {
+		o.SplitFocusedHorizontalSSH()
+		o.ShowNotification("Split horizontal", "info", o.Settings.NotificationDuration)
+	}
+	return o, nil
+}
+
+// handleSplitSSHVertical splits left/right and runs the focused pane's ssh in
+// the new pane, or a shell when that pane runs no ssh.
+func handleSplitSSHVertical(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.AutoTiling {
+		o.SplitFocusedVerticalSSH()
 		o.ShowNotification("Split vertical", "info", o.Settings.NotificationDuration)
 	}
 	return o, nil
@@ -960,13 +1058,13 @@ func handleQuit(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // System Action Handlers
 // ============================================================================
 
-// handleToggleSpotlight turns the beam on the focused pane's cursor on and off.
-//
-// One key in window mode rather than a chord: it is switched on while somebody
-// is watching the screen, and three keystrokes is the wrong shape for that.
+// handleToggleSpotlight turns the beam on and off. It is B in window mode and
+// leader, B in either mode; the chord is the way out of the beam in terminal
+// mode, where esc belongs to the program in the pane. See
+// internal/app/spotlight_exit.go.
 func handleToggleSpotlight(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	save := o.ToggleSpotlight()
-	toggleNotify(o, "Spotlight", o.SpotlightOn())
+	o.AnnounceSpotlight()
 	return o, save
 }
 
@@ -1013,7 +1111,8 @@ func handleCopySelection(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if focusedWindow == nil {
 		return o, nil
 	}
-	return o, o.CopyToClipboard(selectionText(focusedWindow))
+	text := selectionText(focusedWindow)
+	return o, tea.Batch(o.CopyToClipboard(text), o.SaveToPasteBuffers(text))
 }
 
 func handlePasteClipboard(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
@@ -1082,8 +1181,7 @@ func handleSettingsSidebar(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // The other two kill rows say what becomes of this client and so can only mean
 // the session it is in; this one is the row every other session's menu carries.
 func handleKillSession(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
-	o.OpenSessionCloseFor(o.TakeMenuSession())
-	return o, nil
+	return o, o.OpenSessionCloseFor(o.TakeMenuSession())
 }
 
 // handleRenameSession opens the rename editor on the session whose row the menu
@@ -1102,6 +1200,20 @@ func handleRenameSession(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // to the next one, in that order (see OS.KillSessionGoNext for why).
 func handleKillSessionNext(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	return o, o.KillSessionGoNext(o.NextSessionName())
+}
+
+// handleSessionNewWorktree opens the worktree dialog on the session whose row
+// the menu was opened on, the same carry the rename and accent rows use.
+func handleSessionNewWorktree(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.BeginWorktreePromptForSession(o.TakeMenuSession())
+	return o, nil
+}
+
+// handleRepoNewWorktree opens the worktree dialog on the repository whose
+// group header the menu was opened on.
+func handleRepoNewWorktree(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.BeginWorktreePromptForRepo(o.TakeMenuRepo())
+	return o, nil
 }
 
 // handleKillSessionQuit kills the current session and quits this client, the

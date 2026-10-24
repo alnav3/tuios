@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 )
 
 // This file detects the one failure that has no good error message anywhere
@@ -58,6 +60,8 @@ type DaemonHandshake struct {
 	// takes a pane's token with pane-grants. False for a daemon from before
 	// pane grants.
 	PaneGrants bool `json:"pane_grants"`
+	// OS is the daemon's GOOS. Empty for a daemon from before it was sent.
+	OS string `json:"os"`
 }
 
 // ProtocolMismatchError reports that the running daemon cannot speak the control
@@ -109,7 +113,7 @@ func (e *ProtocolMismatchError) Error() string {
 		b.WriteString("\nFix: run 'tuios kill-server', then run this command again.")
 	}
 	if e.Sessions > 0 {
-		fmt.Fprintf(&b, "\nNote: the daemon is holding %d session(s). They are saved and restored when it restarts (see 'tuios resurrect').", e.Sessions)
+		fmt.Fprintf(&b, "\nNote: the daemon is holding %s. %s saved and restored when it restarts (see 'tuios resurrect').", plural.Count(e.Sessions, "session"), plural.Word(e.Sessions, "It is", "They are"))
 	}
 	if e.DaemonPID > 0 {
 		fmt.Fprintf(&b, "\nDaemon PID: %d.", e.DaemonPID)
@@ -127,11 +131,27 @@ func (e *ProtocolMismatchError) Unwrap() error { return e.Cause }
 // and no error: refusing to talk to it would break the compatibility the verb
 // protocol promises.
 func (c *VerbClient) handshake(clientVersion string) (*DaemonHandshake, error) {
-	raw, err := c.Call("hello", map[string]any{
-		"client":   "tuios",
-		"version":  clientVersion,
-		"protocol": VerbProtocolVersion,
-	})
+	// The caller's terminal, as the binary protocol's hello sends it, so a
+	// session this connection creates (new-session, switch-session's create)
+	// gets it rather than the daemon's fallback.
+	termType, colorTerm := helloTerm()
+	params := map[string]any{
+		"client":     "tuios",
+		"version":    clientVersion,
+		"protocol":   VerbProtocolVersion,
+		"term":       termType,
+		"color_term": colorTerm,
+	}
+	raw, err := c.Call("hello", params)
+	// A daemon from before term and color_term refuses a parameter it does
+	// not know. Asked again without them it answers, and its sessions get its
+	// fallback terminal, as they always did. Any other refusal stands.
+	if callErr, ok := errors.AsType[*VerbCallError](err); ok && callErr.Code == ErrVerbInvalidParams &&
+		callErr.Hint != nil && (callErr.Hint.Param == "term" || callErr.Hint.Param == "color_term") {
+		delete(params, "term")
+		delete(params, "color_term")
+		raw, err = c.Call("hello", params)
+	}
 	if err == nil {
 		var hs DaemonHandshake
 		if uerr := json.Unmarshal(raw, &hs); uerr != nil {

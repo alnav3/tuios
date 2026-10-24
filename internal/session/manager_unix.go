@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/Gaurav-Gosain/tuios/internal/sockpath"
 )
 
 // GetSocketPath returns the path to the daemon socket. It refuses when
@@ -23,25 +25,26 @@ func GetSocketPath() (string, error) {
 	return path, nil
 }
 
-// defaultSocketPath is the daemon socket the environment's directories name.
+// defaultSocketPath is the daemon socket this user reaches: the one in
+// sockpath.Dir, unless only a daemon in the other folder answers. See
+// pickLiveSocket.
 func defaultSocketPath() (string, error) {
-	// Use XDG_RUNTIME_DIR if available (preferred for sockets)
-	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runtimeDir != "" {
-		socketDir := filepath.Join(runtimeDir, "tuios")
-		if err := ensureSocketDir(socketDir); err != nil {
+	// $XDG_RUNTIME_DIR/tuios when there is a runtime directory (found at
+	// /run/user/$UID when the variable is unset), and /tmp/tuios-$UID
+	// otherwise. A named server's folder is inside that one,
+	// <that folder>/servers/<name>, and each folder down to it is checked:
+	// whoever controls a parent can replace the child.
+	socketDir := sockpath.Dir()
+	dirs := []string{socketDir}
+	if base := sockpath.BaseDir(); base != socketDir {
+		dirs = []string{base, filepath.Dir(socketDir), socketDir}
+	}
+	for _, dir := range dirs {
+		if err := ensureSocketDir(dir); err != nil {
 			return "", err
 		}
-		return filepath.Join(socketDir, "tuios.sock"), nil
 	}
-
-	// Fallback to /tmp/tuios-$UID/
-	uid := os.Getuid()
-	socketDir := filepath.Join("/tmp", fmt.Sprintf("tuios-%d", uid))
-	if err := ensureSocketDir(socketDir); err != nil {
-		return "", err
-	}
-	return filepath.Join(socketDir, "tuios.sock"), nil
+	return pickLiveSocket(filepath.Join(socketDir, "tuios.sock")), nil
 }
 
 // GetPidFilePath returns the path to the daemon PID file.

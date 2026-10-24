@@ -17,6 +17,12 @@ var verbLineSeeds = []string{
 	`{"verb":"new-session","params":{"name":"work"}}`,
 	`{"id":"str-id","verb":"list-windows","params":{"session":"work"}}`,
 	`{"id":null,"verb":"kill-session","params":{"session":"gone"}}`,
+	// A subagent's news, by its id and by the call that launched it, with an
+	// outcome and a tool count the daemon bounds.
+	`{"id":1,"verb":"report-agent-activity","params":{"session":"work","window":"build","harness":"claude-code","agent_session_id":"5f1c","activity":{"event":"subagent_update","agent_id":"ab34da07d2d63ee3c","tool":"Bash","target":"go test ./...","ok":true,"tools":3}}}`,
+	`{"id":1,"verb":"report-agent-activity","params":{"session":"work","activity":{"event":"subagent_update","call_id":"toolu_018oJpQiuuCwCqSvc1N1wGYd","outcome":"failed","text":"boom"}}}`,
+	`{"id":1,"verb":"report-agent-activity","params":{"activity":{"event":"subagent_update","agent_id":"a1","spawn":true,"agent_type":"Explore","target":"map the api","call_id":"x","outcome":"nope","tools":-1}}}`,
+	`{"id":1,"verb":"set-agent-state","params":{"state":"working","activity":{"event":"tool","tool":"Agent","target":"Research tmux","spawn":true,"agent_type":"general-purpose","call_id":"toolu_01"}}}`,
 	// Missing and empty fields.
 	`{}`,
 	`{"verb":""}`,
@@ -88,7 +94,7 @@ func FuzzClosestMatch(f *testing.F) {
 				t.Fatalf("closestMatch(%q) suggested its own input", target)
 			}
 			if got != "" {
-				if _, ok := verbRegistry[got]; !ok {
+				if _, ok := verbRegistry()[got]; !ok {
 					t.Fatalf("closestMatch(%q) suggested unregistered verb %q", target, got)
 				}
 			}
@@ -139,6 +145,14 @@ func FuzzReadMessageFraming(f *testing.F) {
 	// the one a writer sends.
 	f.Add(append(frame(2+36+2, byte(MsgInput), wireCodecGob), append(make([]byte, 36), 'h', 'i')...))
 	f.Add(frame(3, byte(MsgResize), 1, 'x'))
+	// Tagged frames: an id and a payload, an id alone, and the id 0 that no
+	// sender writes.
+	f.Add(frame(2+8+2, byte(MsgList), wireCodecGobTagged, 0, 0, 0, 0, 0, 0, 0, 42, 'h', 'i'))
+	f.Add(frame(2+8, byte(MsgList), wireCodecGobTagged, 0, 0, 0, 0, 0, 0, 0, 42))
+	f.Add(frame(2+8, byte(MsgList), wireCodecGobTagged, 0, 0, 0, 0, 0, 0, 0, 0))
+	// The reserved codec byte 1 with a payload long enough to hold an id. It
+	// is plain gob, so the reader must not take the first 8 bytes as one.
+	f.Add(frame(2+10, byte(MsgList), 1, 0, 0, 0, 0, 0, 0, 0, 42, 'h', 'i'))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 1<<20 {
@@ -157,12 +171,16 @@ func FuzzReadMessageFraming(f *testing.F) {
 			if msg == nil {
 				t.Fatalf("ReadMessage returned a nil message and no error")
 			}
-			// The writer must put back exactly the frame the reader took,
-			// apart from the codec byte, which the reader ignores and the
-			// writer always sends as gob. A frame that re-encodes to other
-			// bytes is one a relaying daemon forwards changed.
+			// The writer must put back exactly the frame the reader took. The
+			// one byte it may change is a codec byte other than the tagged
+			// one: the reader takes any such value as plain gob, and the
+			// writer sends plain gob as 0. The tagged value is not ignored,
+			// so it must come back with its id. A frame that re-encodes to
+			// other bytes is one a relaying daemon forwards changed.
 			consumed := append([]byte(nil), data[off:len(data)-r.Len()]...)
-			consumed[5] = wireCodecGob
+			if consumed[5] != wireCodecGobTagged {
+				consumed[5] = wireCodecGob
+			}
 			var back bytes.Buffer
 			if err := WriteMessage(&back, msg); err != nil {
 				t.Fatalf("WriteMessage of a frame ReadMessage accepted: %v", err)
@@ -182,8 +200,9 @@ func FuzzReadMessageFraming(f *testing.F) {
 					len(msg.Payload), len(data))
 			}
 			// PTY frames are parsed further, with the ID taken from a fixed
-			// 36-byte prefix.
-			if msg.Type == MsgPTYOutput || msg.Type == MsgInput {
+			// 36-byte prefix. The PTY writer never tags a frame, so only an
+			// untagged one can come back from it unchanged.
+			if (msg.Type == MsgPTYOutput || msg.Type == MsgInput) && msg.ReqID == 0 {
 				ptyID, payload, perr := ParseBinaryPTYMessage(msg.Payload)
 				if perr == nil {
 					if len(ptyID) > 36 {

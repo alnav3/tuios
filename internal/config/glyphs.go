@@ -6,6 +6,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
+	"github.com/lrstanley/go-nf/glyphs/fa"
 )
 
 // BorderStyleGlyphs is the appearance.border_style value meaning "take the
@@ -130,6 +131,69 @@ func (s *Settings) GetRailFoldShutGlyph() string {
 // restyles one has said what it wants the other to be.
 func (s *Settings) GetRailRuleGlyph() string { return s.GetWindowSeparatorChar() }
 
+// GetRailHeaderCase is how the rail's section headers read. A nil settings
+// keeps the quiet lowercase look, the same contract sidebarHeaderRow keeps for
+// its callers outside the rail.
+func (s *Settings) GetRailHeaderCase() string {
+	if s == nil {
+		return RailHeaderLowercase
+	}
+	return s.RailHeaderCase
+}
+
+// GetRailRowStyle is how the rail marks the row you are on. A nil or unset
+// settings reads as bar, the mark the rail has always drawn.
+func (s *Settings) GetRailRowStyle() string {
+	if s == nil || s.RailRowStyle == "" {
+		return RailRowBar
+	}
+	return s.RailRowStyle
+}
+
+// GetRailHeaderStyle is how a rail section header is drawn. A nil or unset
+// settings reads as auto, the rail's drawing before the option.
+func (s *Settings) GetRailHeaderStyle() string {
+	if s == nil || s.RailHeaderStyle == "" {
+		return RailHeaderAuto
+	}
+	return s.RailHeaderStyle
+}
+
+// GetRailSectionIcon is the icon in front of a rail section's header under
+// the icon header style: the glyph set's, else a Nerd Font icon. Empty, so the
+// header is plain, for a section with no icon and where Nerd Fonts are off
+// and the set names none.
+func (s *Settings) GetRailSectionIcon(section string) string {
+	var role func(*theme.GlyphSet) string
+	var nerd string
+	switch section {
+	case "sessions":
+		role, nerd = func(g *theme.GlyphSet) string { return g.SectionSessions }, fa.LayerGroup.String()
+	case "terminals":
+		role, nerd = func(g *theme.GlyphSet) string { return g.SectionTerminals }, fa.Terminal.String()
+	case "agents":
+		role, nerd = func(g *theme.GlyphSet) string { return g.SectionAgents }, fa.Robot.String()
+	case "files":
+		role, nerd = func(g *theme.GlyphSet) string { return g.SectionFiles }, fa.Folder.String()
+	case "git":
+		role, nerd = func(g *theme.GlyphSet) string { return g.SectionGit }, fa.CodeBranch.String()
+	default:
+		return ""
+	}
+	if g := role(theme.Glyphs()); g != "" && (!s.UseASCIIOnly || overlay.IsASCII(g)) {
+		return g
+	}
+	if s.NerdFontsOff() {
+		return ""
+	}
+	return nerd
+}
+
+// GetRailMarker is the gutter glyph of the marker row style.
+func (s *Settings) GetRailMarker() string {
+	return s.glyphOr(func(g *theme.GlyphSet) string { return g.Marker }, "›", ">")
+}
+
 // GetRailCollapseGlyph is the arrow that folds the rail down to its strip.
 //
 // Two cells in ASCII, where "«" has no one-cell stand-in: a lone "<" in the
@@ -143,6 +207,24 @@ func (s *Settings) GetRailCollapseGlyph() string {
 // GetRailExpandGlyph is the arrow that opens it again.
 func (s *Settings) GetRailExpandGlyph() string {
 	return s.glyphOr(func(g *theme.GlyphSet) string { return g.Expand }, "»", ">>")
+}
+
+// GetRailScrollThumb is the thumb of an overflowing rail section's scroll bar,
+// from the set's scrollbar_thumb role. The pane bar's own getter is not used:
+// its default style draws a full block, which is too heavy beside a list.
+func (s *Settings) GetRailScrollThumb() string {
+	return s.glyphOr(func(g *theme.GlyphSet) string { return g.ScrollbarThumb }, "┃", "#")
+}
+
+// GetRailScrollThumbBeside is GetRailScrollThumb for a thumb drawn in place of
+// the rail's edge rule, whose glyph is rule. A thumb that is the same glyph as
+// the rule (a heavy border style draws its rule as ┃) would not show, so a full
+// block takes its place.
+func (s *Settings) GetRailScrollThumbBeside(rule string) string {
+	if thumb := s.GetRailScrollThumb(); thumb != rule {
+		return thumb
+	}
+	return s.glyphOr(func(*theme.GlyphSet) string { return "" }, "█", "#")
 }
 
 // ResolvedGlyphs reports what is actually drawn for every role: the active

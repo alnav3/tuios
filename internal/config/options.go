@@ -10,6 +10,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/hints"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
 
@@ -69,9 +70,26 @@ type Option struct {
 	// Such an option takes the empty string as a value, which clears it, so
 	// it can go back to following once it has been set.
 	Follows string `json:"follows,omitempty"`
+	// DefaultClears marks a string option whose Default is a word rather than
+	// a value. Writing that word clears the field back to unset, and an unset
+	// field reads back as it. It is for an option where the empty string is a
+	// value of its own: an empty mode icon hides the icon, so the empty string
+	// cannot also be the way back to the built-in.
+	DefaultClears bool `json:"default_clears,omitempty"`
+	// Icon marks a string option whose value is drawn in the dock as an icon.
+	// A value with a control character, or wider than DockModeIconMaxWidth
+	// cells, is refused, because it would break the dock row's layout.
+	Icon bool `json:"icon,omitempty"`
 	// BoxSize marks a string option whose value is a size in cells (60) or
 	// percent (80%), read by ParseBoxSize. An empty value means the default.
 	BoxSize bool `json:"box_size,omitempty"`
+	// Auto marks an int option that also takes the word "auto". Its config
+	// field is a string type, such as FPSLimit, that can hold either.
+	Auto bool `json:"auto,omitempty"`
+	// Check rejects a value of an open string option that does not parse,
+	// such as a duration or a field list, at set time rather than as a
+	// warning on the next load. Nil checks nothing beyond the rest.
+	Check func(string) error `json:"-"`
 }
 
 // UnsetText is how a reader is told an option is unset and what it follows,
@@ -98,7 +116,17 @@ var (
 	SidebarPositions     = []string{"left", "right", "hidden"}
 	WhichKeyPositions    = []string{"bottom-right", "bottom-left", "top-right", "top-left", "center"}
 	WindowTitlePositions = []string{"bottom", "top", "hidden"}
-	daemonLogLevels      = []string{"off", "errors", "basic", "messages", "verbose", "trace"}
+	// DockPrefixIndicators are where an armed leader shows: on the dock's
+	// mode pill, or on the floating badge it had before the pill could.
+	DockPrefixIndicators = []string{"pill", "badge"}
+	// WindowTitleStyles are the shapes of a pane's title: pill has rounded
+	// caps on a fill, tab is the fill alone, plain is the text on the line.
+	WindowTitleStyles = []string{"pill", "tab", "plain"}
+	// WindowTitleAligns are where the title sits on its row. auto is the end
+	// away from the window buttons on the top row, and the middle on the
+	// bottom row.
+	WindowTitleAligns = []string{"auto", "left", "center", "right"}
+	daemonLogLevels   = []string{"off", "errors", "basic", "messages", "verbose", "trace"}
 )
 
 // The shipped edges for the dock, the rail and the window title. Named because
@@ -109,6 +137,12 @@ const (
 	DefaultDockbarPosition     = "top"
 	DefaultSidebarPosition     = "right"
 	DefaultWindowTitlePosition = "top"
+	DefaultDockPrefixIndicator = "pill"
+	// DefaultBorderGradientAngle runs the gradient from the top left corner
+	// to the bottom right one.
+	DefaultBorderGradientAngle = 45
+	DefaultWindowTitleStyle    = "pill"
+	DefaultWindowTitleAlign    = "auto"
 )
 
 // optionSpecs is the registry, hand-written so each entry can say what the
@@ -129,6 +163,11 @@ var optionSpecs = []Option{
 		Accepted:    BorderStyles, Default: "rounded",
 	},
 	{
+		Path: "appearance.frame_panels", Type: OptionBool, Section: "appearance",
+		Description: "Frame the larger overlay panels, such as the command palette, in the border style",
+		Default:     "false",
+	},
+	{
 		Path: "appearance.zen_mode", Type: OptionString, Section: "appearance",
 		Description: "When window borders are hidden: never, always, or while the mouse is idle",
 		Accepted:    ZenModeModes, Default: ZenModeDisabled,
@@ -137,6 +176,31 @@ var optionSpecs = []Option{
 		Path: "appearance.links", Type: OptionString, Section: "appearance",
 		Description: "Links the pointer picks up: off, only marked links, or plain URLs too",
 		Accepted:    LinkModes, Default: LinksAll,
+	},
+	{
+		Path: "appearance.link_click", Type: OptionString, Section: "appearance",
+		Description: "The click that opens a link: ctrl or shift, ctrl only, shift only, or none",
+		Accepted:    LinkClickModes, Default: LinkClickBoth,
+	},
+	{
+		Path: "appearance.link_hover", Type: OptionString, Section: "appearance",
+		Description: "The hover highlight: safe skips a pane whose guest tracks the mouse, always draws it everywhere",
+		Accepted:    LinkHoverModes, Default: LinkHoverSafe,
+	},
+	{
+		Path: "appearance.drop_preview", Type: OptionString, Section: "appearance",
+		Description: "What a BSP drag shows where the pane would land: a frame with a tint inside, the frame only, or nothing",
+		Accepted:    DropPreviewModes, Default: DropPreviewFill,
+	},
+	{
+		Path: "appearance.drop_preview_delay", Type: OptionString, Section: "appearance",
+		Description: "How long the pointer rests on a drop zone before it shows: a duration such as 120ms, or 0 for at once",
+		Default:     DefaultDropPreviewDelay.String(), Check: checkDropPreviewDelay,
+	},
+	{
+		Path: "appearance.link_opener", Type: OptionString, Section: "appearance",
+		Description: "The command that opens a web link. If this is empty, tuios uses $BROWSER, then the system opener.",
+		Default:     "",
 	},
 	{
 		Path: "appearance.hide_window_buttons", Type: OptionBool, Section: "appearance",
@@ -184,6 +248,11 @@ var optionSpecs = []Option{
 		Default:     "false",
 	},
 	{
+		Path: "appearance.focus_follows_mouse_pause", Type: OptionString, Section: "appearance",
+		Description: "Hold this key to keep the focus on the current pane as the mouse moves: off, ctrl, alt",
+		Accepted:    FocusFollowsMousePauseKeys, Default: FocusFollowsMousePauseOff,
+	},
+	{
 		Path: "appearance.alt_drag", Type: OptionBool, Section: "appearance",
 		Description: "Alt plus left-drag moves a pane",
 		Default:     "true",
@@ -199,9 +268,19 @@ var optionSpecs = []Option{
 		Accepted:    KittyPlaceholderModes, Default: KittyPlaceholdersAuto,
 	},
 	{
+		Path: "appearance.image_symbols", Type: OptionString, Section: "appearance",
+		Description: "Draw pane images as block glyphs when the terminal has no graphics: auto, octant, sextant, quadrant, half, off",
+		Accepted:    ImageSymbolModes, Default: ImageSymbolsAuto,
+	},
+	{
 		Path: "appearance.new_window_inherit_cwd", Type: OptionBool, Section: "appearance",
 		Description: "A new window starts in the focused pane's working directory",
 		Default:     "true",
+	},
+	{
+		Path: "appearance.new_window_follow_ssh", Type: OptionBool, Section: "appearance",
+		Description: "A split or new window of a pane that runs ssh runs the same ssh",
+		Default:     "false",
 	},
 	{
 		Path: "appearance.click_to_type", Type: OptionString, Section: "appearance",
@@ -232,6 +311,12 @@ var optionSpecs = []Option{
 		Path: "appearance.modal_dim", Type: OptionInt, Section: "appearance",
 		Description: "How much the screen behind a modal panel is darkened, as a percent. 0 is off.",
 		Default:     strconv.Itoa(ModalDimDefault), Min: 0, Max: ModalDimMax,
+		Percent: true,
+	},
+	{
+		Path: "appearance.popup_dim", Type: OptionInt, Section: "appearance",
+		Description: "How much the screen behind a focused plain popup is darkened, as a percent. 0 is off; popup --dim overrides it.",
+		Default:     strconv.Itoa(PopupDimDefault), Min: 0, Max: PopupDimMax,
 		Percent: true,
 	},
 	{
@@ -266,23 +351,48 @@ var optionSpecs = []Option{
 		Accepted:    WindowTitlePositions, Default: DefaultWindowTitlePosition,
 	},
 	{
+		Path: "appearance.window_title_style", Type: OptionString, Section: "appearance",
+		Description: "Shape of a pane's title: pill has rounded caps, tab is a plain fill, plain is the text on the border",
+		Accepted:    WindowTitleStyles, Default: DefaultWindowTitleStyle,
+	},
+	{
+		Path: "appearance.window_title_align", Type: OptionString, Section: "appearance",
+		Description: "Where a pane's title sits on its row. auto keeps it away from the window buttons",
+		Accepted:    WindowTitleAligns, Default: DefaultWindowTitleAlign,
+	},
+	{
 		Path: "appearance.theme", Type: OptionString, Section: "appearance",
-		Description: "Colour theme name. Empty keeps your terminal's own colours.",
+		Description: "Colour theme name. Empty follows Omarchy when it is installed, else keeps your terminal's colours. none always keeps them.",
+		Default:     "", Theme: true,
+	},
+	{
+		Path: "appearance.theme_light", Type: OptionString, Section: "appearance",
+		Description: "Theme to use while the terminal is light. Empty uses theme for both. theme is then the dark theme",
 		Default:     "", Theme: true,
 	},
 	{
 		Path: "appearance.shared_borders", Type: OptionBool, Section: "appearance",
-		Description: "Share one border between adjacent tiled panes",
+		Description: "Draw one border between neighbouring tiled panes, in every layout",
 		Default:     "false",
 	},
 	{
 		Path: "appearance.border_focused_color", Type: OptionString, Section: "appearance",
-		Description: "Hex colour overriding the focused pane's border, e.g. #89b4fa",
+		Description: "Colour overriding the focused pane's border: #89b4fa, a slot name such as bright_cyan, or a role such as accent",
 		Default:     "", Color: true,
 	},
 	{
+		Path: "appearance.border_focused_gradient", Type: OptionString, Section: "appearance",
+		Description: "Two or more colours, separated by spaces, that the focused pane's border steps through. Empty draws one colour",
+		Default:     "",
+	},
+	{
+		Path: "appearance.border_gradient_angle", Type: OptionInt, Section: "appearance",
+		Description: "Direction of the focused border's gradient in degrees: 0 runs left to right, 90 top to bottom",
+		Default:     "45", Min: 0, Max: 359,
+	},
+	{
 		Path: "appearance.border_unfocused_color", Type: OptionString, Section: "appearance",
-		Description: "Hex colour overriding an unfocused pane's border, e.g. #585b70",
+		Description: "Colour overriding an unfocused pane's border: #585b70, a slot name such as bright_black, or a role such as muted",
 		Default:     "", Color: true,
 	},
 	{
@@ -302,9 +412,11 @@ var optionSpecs = []Option{
 	},
 	{
 		Path: "appearance.max_fps", Type: OptionInt, Section: "appearance",
-		Description: fmt.Sprintf("Highest frame rate tuios draws at. 0 uses 60. The range is %d to %d.",
-			MinConfiguredFPS, MaxFPSCap),
-		Default: "0", Min: 0, Max: MaxFPSCap,
+		Description: fmt.Sprintf("Highest frame rate tuios draws at. Your terminal and monitor can show fewer frames. "+
+			"A value above what they can show does not make tuios smoother. "+
+			"0 uses %d. auto uses the refresh rate of your display. The range is %d to %d.",
+			DefaultFPS, MinConfiguredFPS, MaxFPSCap),
+		Default: "0", Min: 0, Max: MaxFPSCap, Auto: true,
 	},
 	{
 		Path: "appearance.session_colors", Type: OptionBool, Section: "appearance",
@@ -396,9 +508,32 @@ var optionSpecs = []Option{
 		Default:     "true",
 	},
 	{
+		Path: "appearance.zoom_borderless", Type: OptionBool, Section: "appearance",
+		Description: "Show a zoomed pane on the whole pane region with no border or title bar. Zoom size and zoom max width do not apply.",
+		Default:     "false",
+	},
+	{
 		Path: "appearance.zoom_animation", Type: OptionBool, Section: "appearance",
 		Description: "Slide a pane between its tile and the zoom box instead of swapping the two in one frame",
 		Default:     "true",
+	},
+	{
+		Path: "appearance.animation_speed", Type: OptionInt, Section: "appearance",
+		Description: "Percent window animations run at: 100 as shipped, 200 twice as fast, 50 half as fast",
+		Default:     strconv.Itoa(AnimationSpeedDefault),
+		Min:         AnimationSpeedMin, Max: AnimationSpeedMax,
+		Percent: true,
+	},
+	{
+		Path: "appearance.theme_transition", Type: OptionString, Section: "appearance",
+		Description: "How tuios shows a theme change: none, circle (the new theme grows from the middle of the screen) or fade",
+		Accepted:    ThemeTransitions, Default: ThemeTransitionNone,
+	},
+	{
+		Path: "appearance.theme_transition_duration", Type: OptionInt, Section: "appearance",
+		Description: "Milliseconds a theme transition takes at animation speed 100",
+		Default:     strconv.Itoa(ThemeTransitionMsDefault),
+		Min:         ThemeTransitionMsMin, Max: ThemeTransitionMsMax,
 	},
 	{
 		Path: "appearance.scroll_column_max", Type: OptionInt, Section: "appearance",
@@ -430,6 +565,11 @@ var optionSpecs = []Option{
 		Percent: true,
 	},
 	{
+		Path: "appearance.dim_foreground", Type: OptionBool, Section: "appearance",
+		Description: "Let dim_unfocused dim a pane's text too, not only its background",
+		Default:     "true",
+	},
+	{
 		Path: "appearance.dim_multifocus", Type: OptionBool, Section: "appearance",
 		Description: "Dim the panes in the multifocus set like other panes you are not in",
 		Default:     "false",
@@ -439,27 +579,27 @@ var optionSpecs = []Option{
 	// ResolveBackground.
 	{
 		Path: "appearance.background", Type: OptionString, Section: "appearance",
-		Description: "Background painted on every surface not set on its own (panes, desktop, window chrome, dock, rail): off (your terminal shows through), theme, or a #RRGGBB literal",
+		Description: "Background painted on every surface not set on its own (panes, desktop, window chrome, dock, rail): off (your terminal shows through), theme, or a colour (#rrggbb, 0-255, a slot name or a role name)",
 		Accepted:    Backgrounds, Default: BackgroundOff, Color: true,
 	},
 	{
 		Path: "appearance.pane_background", Type: OptionString, Section: "appearance",
-		Description: "Background behind pane content: off, theme, or a #RRGGBB literal; empty follows appearance.background",
+		Description: "Background behind pane content: off, theme, or a colour (#rrggbb, 0-255, a slot name or a role name); empty follows appearance.background",
 		Accepted:    Backgrounds, Default: "", Color: true,
 	},
 	{
 		Path: "appearance.desktop_background", Type: OptionString, Section: "appearance",
-		Description: "Background behind and between panes, including gaps and an empty workspace: off, theme, or a #RRGGBB literal; empty follows appearance.background",
+		Description: "Background behind and between panes, including gaps and an empty workspace: off, theme, or a colour (#rrggbb, 0-255, a slot name or a role name); empty follows appearance.background",
 		Accepted:    Backgrounds, Default: "", Color: true,
 	},
 	{
 		Path: "appearance.window_chrome_background", Type: OptionString, Section: "appearance",
-		Description: "Background under pane borders, title bars and the lines between shared-border panes: off, theme, or a #RRGGBB literal; empty follows appearance.background",
+		Description: "Background under pane borders, title bars and the lines between shared-border panes: off, theme, or a colour (#rrggbb, 0-255, a slot name or a role name); empty follows appearance.background",
 		Accepted:    Backgrounds, Default: "", Color: true,
 	},
 	{
 		Path: "appearance.dock_background", Type: OptionString, Section: "dock",
-		Description: "Background under the dock: off, theme, or a #RRGGBB literal; empty follows appearance.background",
+		Description: "Background under the dock: off, theme, or a colour (#rrggbb, 0-255, a slot name or a role name); empty follows appearance.background",
 		Accepted:    Backgrounds, Default: "", Color: true,
 	},
 	{
@@ -521,17 +661,52 @@ var optionSpecs = []Option{
 	},
 	{
 		Path: "appearance.dock_workspace_tab_format", Type: OptionString, Section: "dock",
-		Description: "Workspace tab template accepting {index} and {name} (empty: {name})",
+		Description: "Workspace tab template accepting {index}, {name}, {icon} and {zoom} (empty: {name})",
 		Default:     "",
 	},
 	{
 		Path: "appearance.dock_workspace_tooltip", Type: OptionBool, Section: "dock",
-		Description: "Pop a truncated workspace name in full on hover",
+		Description: "Show the workspace name on hover when the pill cuts the name or does not show it",
 		Default:     "true",
 	},
 	{
+		Path: "appearance.dock_workspace_label_max", Type: OptionInt, Section: "dock",
+		Description: "Cells a workspace pill's label may span before the pill cuts it (0 draws the whole name and scrolls the strip instead)",
+		Default:     "12", Min: 0, Max: 200,
+	},
+	{
 		Path: "appearance.dock_pill_caps", Type: OptionBool, Section: "dock",
-		Description: "Draw powerline caps on the dock's pills instead of flat ends",
+		Description: "Draw rounded caps on every dock pill: the mode chip, the workspace tabs and the minimized windows. Off draws flat pills",
+		Default:     "true",
+	},
+	{
+		Path: "appearance.dock_prefix_indicator", Type: OptionString, Section: "dock",
+		Description: "Where the dock shows an armed leader key: pill colours the mode pill, badge draws a separate badge",
+		Accepted:    DockPrefixIndicators, Default: DefaultDockPrefixIndicator,
+	},
+	{
+		Path: "appearance.dock_mode_icon_window", Type: OptionString, Section: "dock",
+		Description: "Icon in the mode pill in window mode. An empty value shows no icon. default uses the icon of the glyph set",
+		Default:     DockModeIconDefault, DefaultClears: true, Icon: true,
+	},
+	{
+		Path: "appearance.dock_mode_icon_terminal", Type: OptionString, Section: "dock",
+		Description: "Icon in the mode pill in terminal mode. An empty value shows no icon. default uses the icon of the glyph set",
+		Default:     DockModeIconDefault, DefaultClears: true, Icon: true,
+	},
+	{
+		Path: "appearance.dock_mode_icon_tiling", Type: OptionString, Section: "dock",
+		Description: "Icon in the mode pill while tiling is on. An empty value shows no icon. default uses the icon of the glyph set",
+		Default:     DockModeIconDefault, DefaultClears: true, Icon: true,
+	},
+	{
+		Path: "appearance.dock_mode_split_letter", Type: OptionBool, Section: "dock",
+		Description: "Show V or H after the tiling icon in the mode pill. The letter is the direction of the next split",
+		Default:     "true",
+	},
+	{
+		Path: "appearance.dock_compact", Type: OptionBool, Section: "dock",
+		Description: "Draw the dock as one row with no rule. The panes get one more row",
 		Default:     "false",
 	},
 	{
@@ -575,7 +750,7 @@ var optionSpecs = []Option{
 	},
 	{
 		Path: "appearance.scrollbar.tint", Type: OptionString, Section: "scrollbar",
-		Description: "Bar colour: quiet, border, muted, or a #RRGGBB literal",
+		Description: "Bar colour: quiet, border, muted, or a colour (#rrggbb, 0-255, a slot name or a role name)",
 		Accepted:    ScrollbarTints, Default: ScrollbarTintQuiet, Color: true,
 	},
 
@@ -704,6 +879,11 @@ var optionSpecs = []Option{
 		Default:     "true",
 	},
 	{
+		Path: "appearance.sidebar.show_numbers", Type: OptionBool, Section: "sidebar",
+		Description: "Show the switch number ahead of each session name",
+		Default:     "false",
+	},
+	{
 		Path: "appearance.sidebar.show_agents", Type: OptionBool, Section: "sidebar",
 		Description: "Show the agents section at the rail's bottom",
 		Default:     "true",
@@ -721,7 +901,7 @@ var optionSpecs = []Option{
 	},
 	{
 		Path: "appearance.sidebar.background", Type: OptionString, Section: "sidebar",
-		Description: "Background under the rail: off, theme, or a #RRGGBB literal; empty follows appearance.background",
+		Description: "Background under the rail: off, theme, or a colour (#rrggbb, 0-255, a slot name or a role name); empty follows appearance.background",
 		Accepted:    Backgrounds, Default: "", Color: true,
 	},
 	{
@@ -745,6 +925,26 @@ var optionSpecs = []Option{
 		Accepted:    SidebarFolderClicks, Default: SidebarFolderClickNavigate,
 	},
 	{
+		Path: "appearance.sidebar.header_case", Type: OptionString, Section: "sidebar",
+		Description: "How the rail's section headers read: lowercase keeps the quiet furniture look, uppercase draws them as headings",
+		Accepted:    RailHeaderCases, Default: RailHeaderLowercase,
+	},
+	{
+		Path: "appearance.sidebar.row_style", Type: OptionString, Section: "sidebar",
+		Description: "How the rail marks the row you are on: bar in the gutter, marker glyph, underline, or pill",
+		Accepted:    RailRowStyles, Default: RailRowBar,
+	},
+	{
+		Path: "appearance.sidebar.header_style", Type: OptionString, Section: "sidebar",
+		Description: "How a rail section header is drawn: auto, plain, rule, pill, or icon with the section's icon",
+		Accepted:    RailHeaderStyles, Default: RailHeaderAuto,
+	},
+	{
+		Path: "appearance.sidebar.density", Type: OptionString, Section: "sidebar",
+		Description: "Space between the rail's sections: normal, or roomy for a blank row in front of each section after the first",
+		Accepted:    RailDensities, Default: RailDensityNormal,
+	},
+	{
 		Path: "appearance.sidebar.editor", Type: OptionString, Section: "sidebar",
 		Description: "The terminal editor that opens a text file. If this is empty, tuios uses $EDITOR, then $VISUAL, then vi.",
 		Default:     "",
@@ -762,7 +962,32 @@ var optionSpecs = []Option{
 	{
 		Path: "appearance.sidebar.agent_rest_fold", Type: OptionString, Section: "sidebar",
 		Description: "How long an agent row rests (idle, unknown, or done and seen) before the rail folds it into one line: a duration such as 1h, or off",
-		Default:     "1h",
+		Default:     "1h", Check: checkAgentRestFold,
+	},
+	{
+		Path: "appearance.sidebar.subagent_rows", Type: OptionString, Section: "sidebar",
+		Description: "How an agent row shows its subagents: a row for each under it, the rows on tree lines, or the count alone",
+		Accepted:    SidebarSubagentRowsValues, Default: SidebarSubagentRowsRows,
+	},
+	{
+		Path: "appearance.sidebar.subagent_collapse", Type: OptionString, Section: "sidebar",
+		Description: "A heading line over each agent's subagents that opens and shuts their rows: off, or on and expanded or collapsed at the start",
+		Accepted:    SidebarSubagentCollapseValues, Default: SidebarSubagentCollapseOff,
+	},
+	{
+		Path: "appearance.sidebar.subagent_fields", Type: OptionString, Section: "sidebar",
+		Description: "What each subagent row shows, a comma list of mark, name, type, time and note",
+		Default:     DefaultSubagentFields, Check: CheckSubagentFields,
+	},
+	{
+		Path: "appearance.sidebar.subagent_max_rows", Type: OptionInt, Section: "sidebar",
+		Description: "The most lines one agent's subagents take, the +N more line included. 0 is no limit.",
+		Default:     "0", Min: 0, Max: SidebarSubagentMaxRowsMax,
+	},
+	{
+		Path: "appearance.sidebar.subagent_hide_finished", Type: OptionString, Section: "sidebar",
+		Description: "How long a finished subagent's row stays after it ends: a duration such as 30s, or off to keep it until the daemon drops it",
+		Default:     SubagentHideOff, Check: CheckSubagentHide,
 	},
 	{
 		Path: "appearance.sidebar.workspaces", Type: OptionString, Section: "sidebar",
@@ -779,7 +1004,7 @@ var optionSpecs = []Option{
 	},
 	{
 		Path: "startup.tiled", Type: OptionBool, Section: "startup",
-		Description: "Start a new session tiled instead of floating",
+		Description: "Start a new session tiled instead of floating. False when the config file has no [startup] table.",
 		Default:     "true",
 	},
 	{
@@ -794,7 +1019,15 @@ var optionSpecs = []Option{
 	},
 	{
 		Path: "startup.daemon", Type: OptionBool, Section: "startup",
-		Description: "Make a bare \"tuios\" attach to a daemon-backed session instead of running standalone. TUIOS_NO_DAEMON=1 or --standalone overrides it",
+		Description: "Make a bare \"tuios\" attach to a daemon-backed session instead of running standalone. TUIOS_NO_DAEMON=1 or --standalone overrides it. False when the config file has no [startup] table.",
+		Default:     "true",
+	},
+
+	// [agents]. Only enabled is a scalar; the rest of the table is lists and
+	// tables, which stay in the file.
+	{
+		Path: "agents.enabled", Type: OptionBool, Section: "agents",
+		Description: "Agents, the Inbox, mail and approvals. Turn off to keep only the multiplexer.",
 		Default:     "true",
 	},
 
@@ -809,8 +1042,8 @@ var optionSpecs = []Option{
 	},
 	{
 		Path: "daemon.window_size", Type: OptionString, Section: "daemon",
-		Description: "The size of a session with more than one client: the smallest client, the largest client, or the client that last had input",
-		Accepted:    WindowSizeModes, Default: WindowSizeSmallest,
+		Description: "The size of a session with more than one client: the client that last had input, the smallest client, or the largest client",
+		Accepted:    WindowSizeModes, Default: WindowSizeLatest,
 	},
 	{
 		Path: "daemon.agent_autodetect", Type: OptionBool, Section: "daemon",
@@ -983,6 +1216,11 @@ var optionSpecs = []Option{
 		Path: "tape.auto_review", Type: OptionBool, Section: "tape",
 		Description: "Open the review dialog on detection instead of only badging it",
 		Default:     "false",
+	},
+	{
+		Path: "tape.show_status", Type: OptionBool, Section: "tape",
+		Description: "Show the RUNNING pill and a message while a tape plays",
+		Default:     "true",
 	},
 
 	// [dock]
@@ -1169,6 +1407,13 @@ var optionSpecs = []Option{
 		Accepted:    PiPCorners, Default: PiPCornerBottomRight,
 	},
 
+	// [mermaid]. Read each time tuios mermaid runs.
+	{
+		Path: "mermaid.theme", Type: OptionString, Section: "mermaid",
+		Description: "Colours of tuios mermaid: tuios for the colours of your theme, or a named theme such as flexoki, nord or rose-pine",
+		Default:     "tuios",
+	},
+
 	// [hints]. Read each time hints mode opens. hints.patterns is a list and
 	// is set in the file only, like [keybindings].
 	{
@@ -1198,6 +1443,19 @@ var optionSpecs = []Option{
 		Default:     "false",
 	},
 
+	// [panes]. Read each time display_panes opens.
+	{
+		Path: "panes.label_keys", Type: OptionString, Section: "panes",
+		Description: "Keys the pane labels are made of, first pane first. Letters a to z and digits",
+		Default:     PanesDefaultLabelKeys,
+	},
+	{
+		Path: "panes.navigator_layout", Type: OptionString, Section: "panes",
+		Description: "How the pane navigator lists the panes when it opens",
+		Accepted:    NavigatorLayouts,
+		Default:     NavigatorLayoutTree,
+	},
+
 	// [scratch]. Read each time toggle_scratch creates or shows the scratch
 	// terminal. A show resizes the popup to the size in force.
 	{
@@ -1216,6 +1474,31 @@ var optionSpecs = []Option{
 		Description: "Command that starts a graphical desktop entry instead of a pane. The entry's argv is added to it. Use a command that takes an argv, such as \"tuios-wayland launch --\" or \"niri msg action spawn --\". Do not use one that joins its arguments into a shell line, such as \"swaymsg exec --\" or \"hyprctl dispatch exec\".",
 		Default:     "",
 	},
+	// [workspaces]. The daemon reads it when it starts and when the file
+	// changes.
+	{
+		Path: "workspaces.return_when_empty", Type: OptionBool, Section: "workspaces",
+		Description: "When the last pane on the workspace on screen closes, show the workspace you came from. Off shows the splash screen",
+		Default:     "true",
+	},
+	// [paste_buffers]. The daemon reads it when it starts and when the file
+	// changes, and so does a client with no daemon.
+	{
+		Path: "paste_buffers.limit", Type: OptionInt, Section: "selection",
+		Description: "How many yanks to keep to paste again. When it is full, the oldest goes. 0 keeps none.",
+		Default:     "20", Min: 0, Max: 1000,
+	},
+	{
+		Path: "paste_buffers.max_kb", Type: OptionInt, Section: "selection",
+		Description: "Most KiB all paste buffers hold together, at most 262144 (256 MiB). When it is full, the oldest go. 0 uses 16384.",
+		Default:     "16384", Min: 0, Max: 262144,
+	},
+	// Read by the client on each switch, so a change applies at once.
+	{
+		Path: "workspaces.new_window_when_empty", Type: OptionBool, Section: "workspaces",
+		Description: "When you switch to a workspace with no panes, open a new pane there. It starts in the folder of the pane you came from",
+		Default:     "false",
+	},
 }
 
 // optionsByPath indexes the registry for lookup. Built once at init so a caller
@@ -1231,7 +1514,7 @@ var optionsByPath = func() map[string]Option {
 // Options returns every settable option, sorted by path.
 func Options() []Option {
 	out := slices.Clone(optionSpecs)
-	slices.SortFunc(out, func(a, b Option) int { return strings.Compare(a.Path, b.Path) })
+	sortx.SortFunc(out, func(a, b Option) int { return strings.Compare(a.Path, b.Path) })
 	return out
 }
 
@@ -1254,24 +1537,19 @@ func OptionPaths() []string {
 // checkValue rejects a value the option cannot hold, before any of it reaches
 // the config struct.
 //
-// A colour option is why this is no longer just the Accepted membership test.
-// The two border colours take any literal and so carry no Accepted set, which
-// meant nothing checked them at all: set-option appearance.border_focused_color
-// notacolour was accepted, written, and turned up later as a border drawn in
-// nothing. The tint has a keyword set and a literal form at once, which a closed
+// A colour option is why this is more than the Accepted membership test. The
+// two border colours take any literal and so carry no Accepted set: unchecked,
+// set-option appearance.border_focused_color notacolour would be accepted,
+// written, and turn up later as a border drawn in nothing. The tint has a keyword set and a literal form at once, which a closed
 // set on its own cannot say.
 func (o Option) checkValue(value string) error {
 	if o.Color {
 		// Empty is how a colour option says unset: the border falls back to the
 		// theme's, the tint to its own default. Clearing has to stay reachable.
-		if value == "" || slices.Contains(o.Accepted, value) || IsHexColor(value) {
+		if value == "" || slices.Contains(o.Accepted, value) || theme.IsColor(value) {
 			return nil
 		}
-		if len(o.Accepted) > 0 {
-			return fmt.Errorf("%s: %q is not a colour; expected #RRGGBB, one of %s, or empty",
-				o.Path, value, strings.Join(o.Accepted, ", "))
-		}
-		return fmt.Errorf("%s: %q is not a colour; expected #RRGGBB or empty", o.Path, value)
+		return fmt.Errorf("%s: %s. Use an empty value to unset it", o.Path, ColourProblem(value, o.Accepted...))
 	}
 	if o.Theme && !theme.Exists(value) {
 		// Exists re-reads the custom themes directory before it says no, so a
@@ -1287,6 +1565,10 @@ func (o Option) checkValue(value string) error {
 		return fmt.Errorf("%s: no glyph set named %q; call list-glyphs for the ones there are, "+
 			"or write %s.json in the glyphs directory first", o.Path, value, value)
 	}
+	if o.Icon && value != o.Default && !DockModeIconUsable(value) {
+		return fmt.Errorf("%s: %q is not a usable icon; use at most %d cells and no control characters",
+			o.Path, value, DockModeIconMaxWidth)
+	}
 	if o.BoxSize && strings.TrimSpace(value) != "" {
 		if _, _, err := ParseBoxSize(value); err != nil {
 			return fmt.Errorf("%s: %w", o.Path, err)
@@ -1294,6 +1576,11 @@ func (o Option) checkValue(value string) error {
 	}
 	if len(o.Accepted) > 0 && !slices.Contains(o.Accepted, value) {
 		return fmt.Errorf("%s: %q is not one of %s", o.Path, value, strings.Join(o.Accepted, ", "))
+	}
+	if o.Check != nil {
+		if err := o.Check(value); err != nil {
+			return fmt.Errorf("%s: %w", o.Path, err)
+		}
 	}
 	return nil
 }
@@ -1322,6 +1609,12 @@ func SetOptionValue(cfg *UserConfig, path, value string) error {
 		return nil
 	}
 
+	// An option whose default is a word clears on that word, back to unset.
+	if opt.DefaultClears && strings.TrimSpace(value) == opt.Default && field.Kind() == reflect.Pointer {
+		field.SetZero()
+		return nil
+	}
+
 	switch opt.Type {
 	case OptionBool:
 		parsed, err := parseOptionBool(value)
@@ -1333,12 +1626,31 @@ func SetOptionValue(cfg *UserConfig, path, value string) error {
 		}
 		optionTarget(field).SetBool(parsed)
 	case OptionInt:
+		if opt.Auto && strings.EqualFold(strings.TrimSpace(value), FPSAuto) {
+			if optionKind(field) != reflect.String {
+				return fmt.Errorf("%s: registry says int or auto, config field is %s", path, optionKind(field))
+			}
+			optionTarget(field).SetString(FPSAuto)
+			return nil
+		}
 		parsed, err := strconv.Atoi(strings.TrimSpace(value))
 		if err != nil {
+			if opt.Auto {
+				return fmt.Errorf("%s: %q is not a whole number or auto", path, value)
+			}
 			return fmt.Errorf("%s: %q is not a whole number", path, value)
 		}
 		if opt.Max > 0 && (parsed < opt.Min || parsed > opt.Max) {
 			return fmt.Errorf("%s: %d is outside %d..%d", path, parsed, opt.Min, opt.Max)
+		}
+		if opt.Auto && optionKind(field) == reflect.String {
+			// 0 is stored as the empty value, the one spelling a reload gives.
+			stored := ""
+			if parsed != 0 {
+				stored = strconv.Itoa(parsed)
+			}
+			optionTarget(field).SetString(stored)
+			return nil
 		}
 		if optionKind(field) != reflect.Int {
 			return fmt.Errorf("%s: registry says int, config field is %s", path, optionKind(field))
@@ -1380,6 +1692,17 @@ func GetOptionValue(cfg *UserConfig, path string) (string, bool) {
 	case reflect.Int:
 		return strconv.FormatInt(field.Int(), 10), true
 	case reflect.String:
+		if opt.Auto {
+			// An auto-or-int option reads back as the int or "auto", never
+			// as the empty string an unset field holds.
+			if v := strings.TrimSpace(field.String()); v != "" {
+				if strings.EqualFold(v, FPSAuto) {
+					return FPSAuto, true
+				}
+				return v, true
+			}
+			return opt.Default, true
+		}
 		return field.String(), true
 	default:
 		return "", false

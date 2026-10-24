@@ -7,9 +7,9 @@ import (
 )
 
 // An agent ricing a session cannot see the screen. It can set a palette and
-// read the option back, and until this existed that was the whole of the
-// feedback: the value it had just sent, echoed. Whether the green it chose is
-// legible on the background it chose was not answerable from outside the
+// read the option back, and without Describe that is the whole of the
+// feedback: the value it has just sent, echoed. Whether the green it chose is
+// legible on the background it chose is not answerable from outside the
 // process, and a theme whose colours sit on top of each other looks exactly
 // like a theme that failed to apply.
 //
@@ -66,6 +66,9 @@ var ansiNames = [16]string{
 func Describe(id string) (Palette, bool) {
 	if id == "" || !Exists(id) {
 		return Palette{}, false
+	}
+	if id == OmarchyID {
+		_, _ = refreshOmarchy()
 	}
 	t, ok := tint.GetTint(id)
 	if !ok || t == nil {
@@ -124,6 +127,11 @@ func Describe(id string) (Palette, bool) {
 func Colors(id string) (palette [16]color.Color, fg, bg, cursor color.Color, ok bool) {
 	if id == "" || !Exists(id) {
 		return palette, nil, nil, nil, false
+	}
+	if id == OmarchyID {
+		// The daemon follows nothing, so it reads the applied theme when
+		// asked. An unchanged one costs a file read and registers nothing.
+		_, _ = refreshOmarchy()
 	}
 	t, found := tint.GetTint(id)
 	if !found || t == nil {

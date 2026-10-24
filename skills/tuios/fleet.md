@@ -72,7 +72,10 @@ The session is named `<repo>-<branch>` with slashes turned into hyphens.
 `--agent` names an agent CLI the way you type it and starts it instead of a
 shell. `worktree ls` (the `list-worktrees` verb) reports each session's rolled-up
 `state` and `gone` when the directory was removed; the verb with
-`"changes": true` also counts uncommitted changes and commits ahead of the base.
+`"changes": true` also counts uncommitted changes and commits ahead of the base,
+and reports `merged`: true when the branch has commits of its own and its base,
+or the upstream of the base, already holds them. `merged_into` names that ref.
+A merge commit, a fast-forward, a rebase and a squash all count. No fetch runs.
 
 ## Fan-out
 
@@ -125,6 +128,14 @@ are quoted one by one; one word is a shell line, for `&&` and pipes. The
 window holds no grants. It closes on a pass and stays open on a failure so the
 output can be read, until the next check closes it. The counts run from where
 each attempt left the base, so they hold still when main moves on.
+
+A judge reports its pick with `tuios fan verdict SESSION --pick ATTEMPT
+--summary TEXT`, with `--reason TEXT` and `--note ATTEMPT=TEXT` as often as
+needed (`set-fan-verdict`). Only the judge pane `judge-fan` started, or a
+call from outside every pane, records a verdict: a pane of an attempt is
+refused. The judge can read the attempts and nothing more. The person keeps
+an attempt from the agents view or with `tuios fan keep`, which deletes the
+files git ignores in the other worktrees.
 `fan verify` waits and exits 1 when any failed; `--no-wait` returns at once and
 `fan compare` shows the results. From a pane, `verify-fan` needs the `fan`
 grant and `compare-fan` needs `read`, and both reach only your own fan group.
@@ -160,6 +171,18 @@ The person reviews the same diff and the same notes in the client (`ctrl+b v`,
 or `v` in the Inbox), and compares a fan's attempts there. Notes they leave or
 send there arrive as "from the person"; the notes you left show under their
 lines, labelled as your pane's.
+
+### Undo a turn, and ship the one you keep
+
+Each finished turn of an agent in a git work tree leaves a checkpoint you can
+diff and restore (`tuios --skill checkpoints`). `tuios ship` commits, merges,
+pushes and opens a pull request for an attempt (`tuios --skill ship`):
+
+```sh
+tuios checkpoint list -s api-fan-add-retry-backoff-http-2
+tuios ship commit -s api-fan-add-retry-backoff-http-2 -m 'Add a retry with backoff'
+tuios fan keep api-fan-add-retry-backoff-http-2 --merge --squash
+```
 
 ## One agent beside you: start-agent
 

@@ -19,6 +19,14 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// says the user has moved on. See CancelCopyFlash.
 	o.CancelCopyFlash()
 
+	// A press of any button while a pane is held by the pointer cancels the
+	// move: the pane goes back where it came from and the press does nothing
+	// else. The left button is still down, and its release then finds no
+	// gesture to finish. See app.OS.CancelWindowDrag.
+	if o.CancelWindowDrag() {
+		return o, nil
+	}
+
 	// An open context menu is modal to the mouse: it either runs the row that
 	// was clicked or, for a click anywhere else, closes without running
 	// anything. Either way the click stops here, so it cannot also focus a pane
@@ -52,6 +60,53 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if o.OverlayActive() {
 		if handled, cmd := o.OverlayMouseClick(X, Y, msg.Button == tea.MouseRight); handled {
 			return o, cmd
+		}
+	}
+
+	// Rail panes keep their ordinary title bars. A title click focuses that
+	// exact pane; its controls must never fall through to the center session.
+	if edge, w := o.SidebarSessionTitlePaneAt(X, Y); w != nil {
+		if msg.Button == tea.MouseRight {
+			o.OpenSettingsAt("Sidebar")
+			return o, nil
+		}
+		if msg.Button == tea.MouseLeft {
+			if action, ok := o.WindowButtonIn(w.ID, X, Y); ok {
+				switch action {
+				case app.WindowButtonClose:
+					o.FocusSidebarSession(edge)
+					o.SidebarSessionIntent("CloseWindow", w.ID)
+				case app.WindowButtonMinimize:
+					o.FocusSidebarSession(edge)
+					o.SidebarSessionIntent("MinimizeWindow", w.ID)
+				case app.WindowButtonZoom:
+					o.FocusSidebarSession(edge)
+					o.FocusSidebarSessionPane(w)
+					o.ToggleSidebarSessionZoom(edge, w)
+				}
+				return o, nil
+			}
+			o.FocusSidebarSession(edge)
+			o.FocusSidebarSessionPane(w)
+			return o, nil
+		}
+	}
+
+	// The pane displayed in a rail gets normal terminal mouse input when its
+	// guest asked for tracking. A click also gives it keyboard focus without
+	// switching the center client's daemon session.
+	if msg.Button != tea.MouseRight {
+		if edge, ok := o.SidebarSessionAt(X, Y); ok {
+			o.FocusSidebarSession(edge)
+			if w := o.SidebarSessionPaneAt(X, Y); w != nil {
+				o.FocusSidebarSessionPane(w)
+				if w.Terminal != nil && w.Terminal.HasMouseMode() {
+					if tx, ty, inside := w.ScreenToTerminal(X, Y); inside {
+						sendMouseToWindow(o, w, uv.MouseClickEvent{X: tx, Y: ty, Button: uv.MouseButton(mouse.Button), Mod: uv.KeyMod(mouse.Mod)})
+					}
+				}
+			}
+			return o, nil
 		}
 	}
 
@@ -102,8 +157,7 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			}
 			return o, nil
 		case app.DockSessionClose:
-			o.OpenSessionClose()
-			return o, nil
+			return o, o.OpenSessionClose()
 		case app.DockSessionNew:
 			o.OpenNewSessionPicker()
 			return o, nil
@@ -114,11 +168,24 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		if o.NotificationClick(X, Y) {
 			return o, nil
 		}
+		// The spotlight chip turns the beam off. It is the way out a person
+		// who does not know the key can see.
+		if msg.Button == tea.MouseLeft && o.SpotlightChipAt(X, Y) {
+			save, _ := o.TurnOffSpotlight()
+			return o, save
+		}
 		// A custom component's cell runs its on-click command, the way a hook
 		// runs. It is tested here, after the blocks that own their columns
 		// unconditionally and before the ones whose columns move with the
 		// layout, because a component sits between them on the bar.
 		if name := o.DockCustomComponentAt(X, Y); name != "" {
+			// The copies' cell opens the Copies panel.
+			if name == config.DockComponentTransfers {
+				if msg.Button == tea.MouseLeft {
+					return o, o.OpenTransfers()
+				}
+				return o, nil
+			}
 			if o.RunDockComponentClick(name, int(msg.Button)) {
 				return o, nil
 			}
@@ -166,12 +233,6 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		return o, nil
 	}
 
-	// A committed ctrl-drag ends on the next mouse event without ctrl held, so a
-	// click arriving mid-drag drops the window where it sits.
-	if o.CtrlDragging && msg.Mod&tea.ModCtrl == 0 {
-		return finalizeCtrlDrag(o, X, Y)
-	}
-
 	// Fast hit testing: find which window was clicked without expensive canvas generation
 	clickedWindowIndex := findClickedWindow(X, Y, o)
 
@@ -195,6 +256,14 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		return o, nil
 	}
 
+	// A middle press over pane content can be a terminal-mode binding. It is
+	// looked up before guest mouse forwarding, so the shipped paste gesture also
+	// works over a program that tracks the mouse; removing or changing the
+	// binding hands the press back to that program.
+	if next, cmd, handled := handleTerminalMouseBinding(msg, o, clickedWindowIndex); handled {
+		return next, cmd
+	}
+
 	// Ctrl + left press on a window: multi-select on a click, or grab the pane
 	// for moving on a drag. On the content it arms the click-vs-drag decision
 	// (committed past the threshold in handleMouseMotion, then moved through the
@@ -216,6 +285,15 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			o.CtrlDragPending = true
 			o.CtrlDragIndex = clickedWindowIndex
 			o.DragStartX, o.DragStartY = X, Y
+			// A press on a link may be a ctrl+click that opens it. The
+			// release decides: below the drag threshold it opens the link,
+			// past it the pane moves. See linkClickAllows.
+			o.CtrlClickLink = ""
+			if linkClickAllows(o, tea.ModCtrl) {
+				if link, ok := o.LinkAt(X, Y); ok {
+					o.CtrlClickLink = link.URL
+				}
+			}
 			return o, nil
 		}
 		o.FocusWindowFromClick(clickedWindowIndex, X, Y)
@@ -286,17 +364,19 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 
 	// Shift and the left button on a link acts on it.
 	//
-	// Shift is the terminal's own "this click is mine, not the program's"
-	// modifier, which xterm has meant by it for decades, so it is the one
-	// modifier a user already expects to reach past a program that is tracking
-	// the mouse. That is also why this sits above the forwarding below rather
-	// than under it: holding shift is the user saying the click is tuios's.
+	// Shift is the xterm "this click is the terminal's" modifier, so most
+	// outer terminals keep shift+click for their own selection while tuios
+	// tracks the mouse, and the click never arrives here. Ctrl+click (the
+	// ctrl branch above, on release) is the gesture that reaches tuios in
+	// most terminals. Shift+click stays for the terminals that pass it on.
+	// It sits above the forwarding below because holding a modifier is the
+	// user saying the click is tuios's, not the program's.
 	//
 	// A plain click is deliberately not this. A left press on a pane is already
 	// how you focus it, start typing in it, and select text in it, and a browser
 	// opening on top of any of those three would be a gesture nobody asked for
 	// landing on text that merely looks like an address.
-	if msg.Button == tea.MouseLeft && msg.Mod == tea.ModShift {
+	if msg.Button == tea.MouseLeft && msg.Mod == tea.ModShift && linkClickAllows(o, tea.ModShift) {
 		if link, ok := o.LinkAt(X, Y); ok {
 			if clickedWindowIndex != -1 {
 				o.FocusWindowFromClick(clickedWindowIndex, X, Y)
@@ -308,6 +388,13 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// Forward mouse events to terminal if in terminal mode and window has mouse tracking
 	if clickedWindowIndex != -1 && o.Mode == app.TerminalMode {
 		clickedWindow := o.Windows[clickedWindowIndex]
+		// The first click on a TML window that does not have the focus
+		// only focuses it. A popup a pane opened under the pointer must not
+		// take the click the person meant for what was there before.
+		if o.DrawsTML(clickedWindow) && o.FocusedWindow != clickedWindowIndex {
+			o.FocusWindowFromClick(clickedWindowIndex, X, Y)
+			return o, nil
+		}
 		// Forward mouse only when app explicitly requested mouse tracking (DECSET 1000-1003)
 		if clickedWindow.Terminal != nil && clickedWindow.Terminal.HasMouseMode() {
 			// Convert to terminal-relative coordinates (0-based)
@@ -582,6 +669,7 @@ func beginWindowDrag(o *app.OS, idx, x, y int) {
 	o.DragOffsetX = x - win.X
 	o.DragOffsetY = y - win.Y
 	win.IsBeingManipulated = true
+	o.ClearDropZone()
 	// In tiling mode, complete pending animations to avoid state conflicts,
 	// then record the slot for the swap-on-release. The scrolling strip
 	// included: its pane follows the pointer like any other tiled pane now, and
@@ -623,4 +711,18 @@ func untilePaneForDrag(win *terminal.Window) {
 func finalizeCtrlDrag(o *app.OS, x, y int) (*app.OS, tea.Cmd) {
 	o.CtrlDragging = false
 	return handleMouseRelease(tea.MouseReleaseMsg{X: x, Y: y, Button: tea.MouseLeft}, o)
+}
+
+// linkClickAllows reports whether appearance.link_click lets a left click
+// with this modifier open a link.
+func linkClickAllows(o *app.OS, mod tea.KeyMod) bool {
+	switch o.Settings.LinkClick {
+	case config.LinkClickOff:
+		return false
+	case config.LinkClickCtrl:
+		return mod == tea.ModCtrl
+	case config.LinkClickShift:
+		return mod == tea.ModShift
+	}
+	return mod == tea.ModCtrl || mod == tea.ModShift
 }

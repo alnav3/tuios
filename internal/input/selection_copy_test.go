@@ -9,7 +9,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/app"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // These tests drive the mouse and then check the selection through its
@@ -85,7 +85,9 @@ func TestMenuReadsTheSelectionOfThePaneItWasOpenedOn(t *testing.T) {
 		t.Error("copy is dimmed on the pane the menu was opened on, which holds a selection")
 	}
 	o.CloseContextMenu()
-	if got, want := copySelection(t, o), "delta echo"; got != want {
+	// The drag ends on the space after "echo", and a copy keeps a printed
+	// space (#516).
+	if got, want := copySelection(t, o), "delta echo "; got != want {
 		t.Errorf("copy produced %q, want the targeted pane's selection %q", got, want)
 	}
 

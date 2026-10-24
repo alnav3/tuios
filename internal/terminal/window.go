@@ -4,6 +4,7 @@ package terminal
 import (
 	"context"
 	"fmt"
+	"image/color"
 	"log"
 	"os"
 	"os/exec"
@@ -21,7 +22,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/debuglog"
 	"github.com/Gaurav-Gosain/tuios/internal/ptyspawn"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // ioMu guards the emulator cell buffer: the PTY reader and the daemon output
@@ -149,6 +150,12 @@ type Window struct {
 	PositionDirty bool
 	CachedContent string
 	CachedLayer   *lipgloss.Layer
+	// CachedLayerBorder is the border colour CachedLayer was drawn with. The
+	// border colour depends on things outside the pane (focus, the input mode,
+	// the session tint), so the renderer reuses the layer only while the colour
+	// it wants matches this one. Issue #642: entering terminal mode on an idle
+	// pane kept the window mode border until the guest drew something.
+	CachedLayerBorder color.Color
 	// reportKey names the OSC 10 and 11 answer the emulator was last given.
 	// Written on the UI goroutine only. See SetReportColors.
 	reportKey string
@@ -174,15 +181,17 @@ type Window struct {
 	// any business setting it, and setting it wrong serves a stale frame.
 	cachedContentDim int
 	// CachedCursor is what this window's cursor was the last time the render
-	// loop could read it: where it is, whether it is hidden, and the shape the
-	// guest asked for. Reading the live one needs the I/O lock, which a pane
-	// flooding output holds in a near-continuous burst, and the frame that
-	// would block on it is the same frame carrying the user's keystroke echo.
-	// Serving a cursor one frame old costs nothing anyone can see.
+	// loop could read it outside a synchronized update: where it is, whether it
+	// is hidden, and the shape the guest asked for. Reading the live one needs
+	// the I/O lock, which output bursts can hold almost continuously. Reusing
+	// this sample keeps those panes from delaying the user's keystroke echo.
 	CachedCursor       uv.Position
 	CachedCursorHidden bool
 	CachedCursorStyle  vt.CursorStyle
 	CachedCursorSteady bool
+	// CachedCursorColor is the cursor colour the guest set with OSC 12, nil
+	// when it set none, so the host keeps its own.
+	CachedCursorColor color.Color
 	// SyncHoldContent is the last frame this window rendered from a guest that
 	// was not mid-update, kept solely so the synchronized-output hold (DEC 2026)
 	// has something complete to present. Every other cache here is invalidated
@@ -317,11 +326,24 @@ type Window struct {
 	// group's own workspace. It is the session's, like IsPopup. See
 	// session.WindowState.Scratch.
 	IsScratch bool
+	// Stack names the stack the pane is in, empty when it is in none, and
+	// StackIndex is its place in that stack. The stack's members share one
+	// tile: the one that is not minimized has it, and every other shows as a
+	// title row. See app/stack.go.
+	Stack      string
+	StackIndex int
+	// Kind and URI say what draws the pane and what it shows: empty for a
+	// terminal, or "view", "web" or "app" for a pane a native renderer draws
+	// itself. The daemon sets them. See session.WindowState.Kind.
+	Kind string
+	URI  string
 	// ScratchName keys a scratch pane: "scratch" (or empty, from before
 	// names) for the built-in one, the entry's name for a command entry.
 	ScratchName string
 	PopupWidth  string
 	PopupHeight string
+	// PopupDim is nil to inherit the popup or modal dim, or an explicit override.
+	PopupDim *config.PopupDim
 	// Cell dimensions in pixels (for TIOCGWINSZ pixel reporting to child processes)
 	CellPixelWidth  int
 	CellPixelHeight int
@@ -358,6 +380,15 @@ type Window struct {
 	// HasNewOutput is set when new data is written to the terminal.
 	// Used by MarkTerminalsWithNewContent to avoid unconditional dirty-marking.
 	HasNewOutput atomic.Bool
+	// HasGraphicsOutput is set instead of HasNewOutput for a write that was
+	// only kitty graphics commands leaving every cell as it was, while the
+	// cursor is hidden: a frame of a guest that streams images. See
+	// graphicsOnly.
+	HasGraphicsOutput atomic.Bool
+
+	// frameInterval is the coalescer's floor in nanoseconds, 0 for the
+	// default. See SetFrameInterval.
+	frameInterval atomic.Int64
 
 	// coalesceSignal is the renderCoalescer's own render-trigger flag.
 	// outputWriter (daemon panes) or the PTY reader (local panes) sets it after
@@ -425,6 +456,10 @@ type Window struct {
 	// AgentHarness is the harness id the reporting source named, empty when the
 	// state came from something that named none. Alert sinks pass it on.
 	AgentHarness string
+	// StartedBySession and StartedByWindow name the pane whose call created
+	// this one, as the daemon recorded it. Both are empty when no pane did.
+	StartedBySession string
+	StartedByWindow  string
 	// AgentMeta is what the pane reported about its agent through
 	// set-agent-meta, as the daemon synced it. The rail draws it. Replaced
 	// whole on every sync and never edited in place.
@@ -435,6 +470,13 @@ type Window struct {
 	// AgentSubagents is how many subagents the pane's agent is running, as the
 	// daemon synced it. Zero for none, and from a daemon that counts none.
 	AgentSubagents int
+	// AgentSubagentList is the subagents themselves, as the daemon synced
+	// them, in start order. Nil from a daemon that sends only the count.
+	// Replaced whole on every sync and never edited in place.
+	AgentSubagentList []sessiontree.Subagent
+	// ProgramStatus is the pane's OSC 7501 records, as the daemon synced them,
+	// the root first. Replaced whole on every sync and never edited in place.
+	ProgramStatus []sessiontree.ProgramRecord
 	// AgentStateAt is when the pane entered AgentState (Unix nanoseconds), as
 	// the daemon stamped it. The rail shows the elapsed time so a pane waiting
 	// on input reads differently from one that just started working.
@@ -470,6 +512,10 @@ type Window struct {
 	// when that is not the machine the pane runs on: the pane is running ssh.
 	// Empty otherwise. Only the daemon reports it.
 	CwdHost string
+	// CwdElsewhereDir is the folder that report from CwdHost named. An ssh
+	// split starts the new pane there. Only a client that runs the pane
+	// itself sets it.
+	CwdElsewhereDir string
 
 	// Host is the machine the pane's process runs on, empty for this one.
 	//
@@ -529,6 +575,17 @@ type SearchCache struct {
 	Matches   []SearchMatch
 	CacheTime time.Time
 	Valid     bool
+
+	// What the search was made over, so the next one can tell whether it
+	// may search only the lines this one matched. See narrowedLines in
+	// internal/input. CaseSensitive is the setting it ran with. Capped is
+	// set when it stopped at MaxSearchMatches, so Matches may not be all
+	// of them. HistoryGen and HistoryLen are the history's generation and
+	// length.
+	CaseSensitive bool
+	Capped        bool
+	HistoryGen    uint64
+	HistoryLen    int
 }
 
 // CopyMode holds all state for vim-style copy/scrollback mode
@@ -649,10 +706,6 @@ func newWindowBase(id, title string, x, y, width, height, z int, ptyDataChan cha
 	// sessions and they need not agree about it.
 	terminal := vt.NewWithScrollback(terminalWidth, terminalHeight, scrollbackLines)
 
-	// Set cell size for XTWINOPS terminal size reporting
-	// Using 10x20 pixels as reasonable defaults for a typical monospace font
-	terminal.SetCellSize(10, 20)
-
 	window := &Window{
 		Width:         width,
 		Height:        height,
@@ -717,15 +770,19 @@ func newWindowBase(id, title string, x, y, width, height, z int, ptyDataChan cha
 				window.CwdFunc(cwd)
 			}
 		},
-		TuiosNavigation: func(direction string) {
-			if window.NvimNavFunc != nil {
-				window.NvimNavFunc(direction)
+		PrivateOSC: func(cmd int, data []byte) {
+			if cmd != nvimNavigatorOSC {
+				return
 			}
-		},
-		NvimNavigatorState: func(active bool) {
-			if window.NvimNavStateFunc != nil {
-				window.NvimNavStateFunc(active)
-			}
+			handleNvimNavigatorOSC(data, func(direction string) {
+				if window.NvimNavFunc != nil {
+					window.NvimNavFunc(direction)
+				}
+			}, func(active bool) {
+				if window.NvimNavStateFunc != nil {
+					window.NvimNavStateFunc(active)
+				}
+			})
 		},
 	})
 
@@ -911,14 +968,15 @@ func NewDaemonWindow(id, title string, x, y, width, height, z int, ptyID string,
 }
 
 // GuestCursor reads the guest's cursor: its position and whether it is
-// hidden. It also refreshes the Cached* cursor fields, the style included, so
-// a caller that needs the shape reads it there after this call.
+// hidden. It also refreshes the Cached* cursor fields, the style and colour
+// included, so a caller that needs them reads them there after this call.
 //
 // The I/O lock is taken only if it is free. A pane in an output burst holds
 // the exclusive side almost continuously, and the frame that would wait for
 // it carries the user's keystroke echo. When the lock is busy the cursor the
-// last read saw is returned, which is at most a frame stale. ok is false when
-// the window has no terminal.
+// last read saw is returned. During a synchronized update the same cache holds
+// the cursor with the last complete content, rather than exposing the guest's
+// intermediate drawing positions or styles. ok is false without a terminal.
 func (w *Window) GuestCursor() (pos uv.Position, hidden, ok bool) {
 	if w.Terminal == nil {
 		return pos, false, false
@@ -929,9 +987,12 @@ func (w *Window) GuestCursor() (pos uv.Position, hidden, ok bool) {
 			w.RUnlockIO()
 			return pos, false, false
 		}
-		w.CachedCursor = w.Terminal.CursorPosition()
-		w.CachedCursorHidden = w.Terminal.IsCursorHidden()
-		w.CachedCursorStyle, w.CachedCursorSteady = w.Terminal.CursorStyle()
+		if !w.Terminal.IsSyncActive() {
+			w.CachedCursor = w.Terminal.CursorPosition()
+			w.CachedCursorHidden = w.Terminal.IsCursorHidden()
+			w.CachedCursorStyle, w.CachedCursorSteady = w.Terminal.CursorStyle()
+			w.CachedCursorColor = w.Terminal.GuestCursorColor()
+		}
 		w.RUnlockIO()
 	}
 	return w.CachedCursor, w.CachedCursorHidden, true

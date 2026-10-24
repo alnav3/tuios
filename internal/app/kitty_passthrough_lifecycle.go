@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 func (kp *KittyPassthrough) OnWindowMove(windowID string, newX, newY, contentOffsetX, contentOffsetY int, scrollbackLen, scrollOffset, viewportHeight int) {
@@ -63,15 +63,14 @@ func (kp *KittyPassthrough) OnWindowClose(windowID string) {
 		return
 	}
 
-	placements := kp.placements[windowID]
-	for _, p := range placements {
-		kp.deleteOnePlacement(p)
-	}
-	delete(kp.placements, windowID)
+	kp.deleteWindowImages(windowID, false)
+	kp.dropWindowPlacements(windowID)
 	for _, hostID := range kp.imageIDMap[windowID] {
 		kp.releaseHostID(windowID, hostID)
 	}
 	delete(kp.imageIDMap, windowID)
+	kp.forgetKept(windowID, 0)
+	delete(kp.rawChunks, windowID)
 	kp.forgetImagePixels(windowID, 0)
 	kp.forgetFrameHashes(windowID)
 	kp.deleteRemoteVideoImages(windowID)
@@ -94,6 +93,7 @@ func (kp *KittyPassthrough) deleteVirtualImages(windowID string) {
 		// d=I frees the image data as well as the placements: the window is
 		// gone and no cell will name this image again.
 		fmt.Fprintf(&buf, "\x1b_Ga=d,d=I,i=%d,q=2\x1b\\", hostID)
+		kp.forgetKept(windowID, hostID)
 	}
 	kp.pendingOutput = append(kp.pendingOutput, buf.Bytes()...)
 	delete(kp.virtualImages, windowID)
@@ -136,7 +136,7 @@ func (kp *KittyPassthrough) ClearWindow(windowID string) {
 	for _, p := range placements {
 		kp.deleteOnePlacement(p)
 	}
-	kp.placements[windowID] = nil
+	kp.dropWindowPlacements(windowID)
 	kp.deleteRemoteVideoImages(windowID)
 	// A screen clear takes the placeholder cells with it, so nothing names
 	// these images any more and their data would sit in the host until the

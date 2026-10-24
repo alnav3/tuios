@@ -14,8 +14,8 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/pool"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
 	uv "github.com/charmbracelet/ultraviolet"
+	"tuios.dev/vt"
 )
 
 func (m *OS) GetCanvas(render bool) *frameCanvas {
@@ -24,7 +24,7 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 	// already composed, so a client launched with ascii_only painted its first
 	// frame with unicode glyphs in the rail and only corrected itself on the
 	// next redraw.
-	syncOverlayASCII(&m.Settings)
+	syncOverlaySettings(&m.Settings)
 
 	// Reuse the canvas across frames. Allocating a fresh one each frame was the
 	// single largest source of allocations (a full-screen cell buffer per frame).
@@ -66,6 +66,10 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 	// window composed from its cached layer is not redrawn and still has them on
 	// screen. What has to go is a closed window's.
 	m.pruneWindowButtonRects()
+	// The focused border's gradient is marked again by whichever path draws
+	// that border on this frame. See border_gradient.go.
+	m.gradient.on = false
+	gradient := m.gradientOn()
 
 	topMargin := m.GetTopMargin()
 	viewportHeight := m.GetUsableHeight()
@@ -126,6 +130,11 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 	// While a scratch group is on the screen, the workspace it is shown over
 	// is drawn under it, below every layer of the group. See scratch.go.
 	inScratch := m.InScratchView()
+	// The group's own panes are cut to the inside of the scratch box, not to
+	// the content region. A zoom under 100 percent is a camera over a layout
+	// larger than the box, and the panes it runs off the edges were drawn over
+	// the frame and the backdrop outside it.
+	_, scratchInner, _ := m.scratchRegion()
 	for i := range m.Windows {
 		window := m.Windows[i]
 
@@ -165,10 +174,24 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 			margin = 20
 		}
 
+		// The box this pane is drawn inside: the content region, or the inside
+		// of the scratch box for a pane of the group on the screen.
+		clipL, clipT, clipR, clipB := leftMargin, topMargin, rightClip, viewportHeight+topMargin
+		inBox := inScratch && !backdrop
+		if inBox {
+			clipL, clipT = scratchInner.X, scratchInner.Y
+			clipR, clipB = scratchInner.X+scratchInner.W, scratchInner.Y+scratchInner.H
+		}
+
 		isVisible := window.X+window.Width >= cullLeft-margin &&
 			window.X <= cullRight+margin &&
 			window.Y+window.Height >= cullTop-margin &&
 			window.Y <= cullBottom+margin
+		if inBox {
+			// A pane the camera has moved wholly out of the box draws nothing.
+			isVisible = isVisible && window.X+window.Width > clipL && window.X < clipR &&
+				window.Y+window.Height > clipT && window.Y < clipB
+		}
 
 		if !isVisible {
 			continue
@@ -181,15 +204,29 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 			m.paneContentRects[window.ID] = paneContentRect(window)
 		}
 
-		isFullyVisible := window.X >= leftMargin && window.Y >= topMargin &&
-			window.X+window.Width <= rightClip &&
-			window.Y+window.Height <= viewportHeight+topMargin
+		isFullyVisible := window.X >= clipL && window.Y >= clipT &&
+			window.X+window.Width <= clipR &&
+			window.Y+window.Height <= clipB
+		// A scratch pane the box cuts has its bar in a column the box may not
+		// show, so it gets none.
+		barClip := rightClip
+		if inBox && !isFullyVisible {
+			barClip = -1
+		}
 
 		isFocused := m.FocusedWindow == i && m.FocusedWindow >= 0 && m.FocusedWindow < len(m.Windows)
 		isMultifocused := len(m.MultifocusSet) > 0 && m.MultifocusSet[window.ID]
 		var borderColorObj color.Color
 		tint, quietTint, tinted := m.sessionBorderTint()
+		var stateColor color.Color
+		if isFocused {
+			stateColor = m.focusedStateBorder(window)
+		}
 		switch {
+		case stateColor != nil:
+			// Copy mode or an agent that waits, in a colour the theme names
+			// for it, outranks the mode and the session.
+			borderColorObj = stateColor
 		case isFocused && m.Mode == TerminalMode:
 			// The mode colour outranks the session's. This border says the keys
 			// are going into the guest, which is the more urgent fact and the
@@ -212,6 +249,9 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 		default:
 			borderColorObj = theme.BorderUnfocusedOn(m.host.bg)
 		}
+		if gradient && isFocused && stateColor == nil && !rendersBorderless(window) && !m.zenBordersHidden(true) {
+			m.markGradient(window.ID, image.Rect(window.X, window.Y, window.X+window.Width, window.Y+window.Height), borderColorObj)
+		}
 
 		// Effective z-index, computed once so the cached and freshly-rendered
 		// paths place the window and its scrollbar at the same depth. Computing
@@ -222,7 +262,14 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 			zIndex += scratchBackdropZ
 		}
 
-		if window.CachedLayer != nil && !window.Dirty && !window.ContentDirty && !window.PositionDirty {
+		// A layer drawn with another border colour is stale whatever the dirty
+		// flags say: a mode switch, a focus change or a session tint recolours
+		// the border without touching the pane. Keying the layer on the colour
+		// covers every path that changes one of those, so none of them has to
+		// remember to invalidate the cache (#642).
+		borderStale := window.CachedLayer != nil && !sameColor(window.CachedLayerBorder, borderColorObj)
+
+		if window.CachedLayer != nil && !borderStale && !window.Dirty && !window.ContentDirty && !window.PositionDirty {
 			if renderTraceEnabled {
 				traceLayerHold(window, isFocused, "clean")
 			}
@@ -231,7 +278,7 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 			// vim) have no scrollback, so drawing a scrollback thumb over them
 			// only flickers as their content redraws.
 			if windowNeedsScrollbar(window, &m.Settings) {
-				if sbLayer := m.renderScrollbarLayer(window, rightClip, zIndex+1, isFocused); sbLayer != nil {
+				if sbLayer := m.renderScrollbarLayer(window, barClip, zIndex+1, isFocused); sbLayer != nil {
 					layers = append(layers, sbLayer)
 				}
 			}
@@ -245,7 +292,7 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 		// arrives when the guest closes sync renders the finished screen. Only
 		// hold when nothing but content changed (position/z match the cache).
 		if window.Terminal != nil && window.Terminal.IsSyncActive() &&
-			window.CachedLayer != nil &&
+			window.CachedLayer != nil && !borderStale &&
 			window.CachedLayer.GetX() == window.X &&
 			window.CachedLayer.GetY() == window.Y &&
 			window.CachedLayer.GetZ() == zIndex {
@@ -254,14 +301,14 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 			}
 			layers = append(layers, window.CachedLayer)
 			if windowNeedsScrollbar(window, &m.Settings) {
-				if sbLayer := m.renderScrollbarLayer(window, rightClip, zIndex+1, isFocused); sbLayer != nil {
+				if sbLayer := m.renderScrollbarLayer(window, barClip, zIndex+1, isFocused); sbLayer != nil {
 					layers = append(layers, sbLayer)
 				}
 			}
 			continue
 		}
 
-		needsRedraw := window.CachedLayer == nil ||
+		needsRedraw := window.CachedLayer == nil || borderStale ||
 			window.Dirty || window.ContentDirty || window.PositionDirty ||
 			window.CachedLayer.GetX() != window.X ||
 			window.CachedLayer.GetY() != window.Y ||
@@ -287,24 +334,38 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 		// was. TestFullyVisibleWindowBoxFitsItsRectangle holds the box to that.
 		clippedContent, finalX, finalY := boxContent, window.X, window.Y
 		if !isFullyVisible {
-			clippedContent, finalX, finalY = clipWindowContent(
-				boxContent,
-				window.X, window.Y,
-				rightClip, viewportHeight+topMargin,
-			)
+			if inBox {
+				// clipWindowContent cuts at column and row 0 on the near
+				// sides, so the pane is moved into the box's own frame of
+				// reference for the cut and back after it.
+				clippedContent, finalX, finalY = clipWindowContent(
+					boxContent,
+					window.X-clipL, window.Y-clipT,
+					clipR-clipL, clipB-clipT,
+				)
+				finalX += clipL
+				finalY += clipT
+			} else {
+				clippedContent, finalX, finalY = clipWindowContent(
+					boxContent,
+					window.X, window.Y,
+					rightClip, viewportHeight+topMargin,
+				)
+			}
 		}
 
 		if renderTraceEnabled {
 			traceLayerBuild(window, isFocused, boxContent, clippedContent,
-				window.X, window.Y, finalX, finalY, zIndex, rightClip, viewportHeight+topMargin)
+				window.X, window.Y, finalX, finalY, zIndex, clipR, clipB)
 		}
 
 		window.CachedLayer = lipgloss.NewLayer(clippedContent).X(finalX).Y(finalY).Z(zIndex).ID(window.ID)
+		window.CachedLayerBorder = borderColorObj
 		layers = append(layers, window.CachedLayer)
 
 		// Scrollbar layer (always fresh, not cached). See the alt-screen note above.
 		if windowNeedsScrollbar(window, &m.Settings) {
-			if sbLayer := m.renderScrollbarLayer(window, rightClip, zIndex+1, isFocused); sbLayer != nil {
+			if sbLayer := m.renderScrollbarLayer(window, barClip, zIndex+1, isFocused); sbLayer != nil {
 				layers = append(layers, sbLayer)
 			}
 		}
@@ -321,8 +382,9 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 	if frame := m.renderScratchFrame(); frame != nil {
 		layers = append(layers, frame)
 	}
+	layers = append(layers, m.renderStackRows()...)
 
-	// Add shared border separator overlay when active (not in scrolling mode)
+	// Add the shared-border dividers when the panes have given up their own borders
 	if m.panesBorderless() {
 		if sepLayers := m.renderSeparatorOverlay(); len(sepLayers) > 0 {
 			layers = append(layers, sepLayers...)
@@ -339,6 +401,9 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 		// reserved-region layer rather than an overlay panel. Compose it before
 		// the overlays so a palette or settings panel still draws on top of it.
 		if sidebarLayer := m.renderSidebar(); sidebarLayer != nil {
+			layers = append(layers, sidebarLayer)
+		}
+		if sidebarLayer := m.renderSecondarySidebar(); sidebarLayer != nil {
 			layers = append(layers, sidebarLayer)
 		}
 		// The picture-in-picture view, above the tiles and below every popup
@@ -375,6 +440,9 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 		if mark := m.renderViewMark(); mark != nil {
 			layers = append(layers, mark)
 		}
+
+		// The part of this client's pane area a smaller session leaves.
+		layers = m.renderLeftover(layers)
 	} else {
 		// Off the render path (e.g. state snapshots) nothing draws the sidebar,
 		// so last frame's hit geometry must not linger and mis-route a click.
@@ -514,6 +582,10 @@ func rendersBorderless(window *terminal.Window) bool {
 // path so both produce identical output.
 func (m *OS) renderWindowBox(window *terminal.Window, index int, isFocused bool, borderColorObj color.Color) string {
 	content := m.renderTerminal(window, isFocused, m.Mode == TerminalMode)
+	if m.isTMLPopup(window) {
+		// A TML popup is a dialog, with a frame of its own. See tml_chrome.go.
+		return m.renderTMLDialogBox(window, fitToContentBox(content, window.ContentWidth(), window.ContentHeight()))
+	}
 	preShaped := !preShapedDisabled &&
 		window.RenderedCols == window.ContentWidth() &&
 		window.RenderedRows == window.ContentHeight()
@@ -675,10 +747,18 @@ func (m *OS) safeComposeFrame() (frame string, ok bool) {
 // composeFrame renders the full frame, using the fullscreen fast path when it is
 // eligible and falling back to the compositor otherwise.
 func (m *OS) composeFrame() string {
+	frame := m.composeFrameOnce()
+	// The frame a theme transition starts from. See theme_transition.go.
+	m.themeFx.lastFrame = frame
+	return frame
+}
+
+func (m *OS) composeFrameOnce() string {
 	// The ground a pane's program is told it is on, kept in step with the one
 	// it is drawn on. First, because every path below draws the panes. See
 	// background.go.
 	m.syncReportColors()
+	m.noteThemeChange()
 
 	// The screen saver is the frame, not a layer over one.
 	//
@@ -694,6 +774,12 @@ func (m *OS) composeFrame() string {
 	// The panes are still there and still running; what is skipped is drawing
 	// them. The saver's own capture was taken when it started, so it has the
 	// screen it is animating and needs nothing further from the compositor.
+	if m.themeFx.pending {
+		// Before anything below draws: the canvas still holds the frame in
+		// the old theme. See theme_transition.go.
+		m.keepThemeFrame()
+	}
+	m.canvasIsFrame = false
 	if m.screensaver.active && m.screensaver.frame != "" {
 		m.OverlayHits = m.OverlayHits[:0]
 		m.SixelPassthrough.SetFrame(nil, 0, 0, 0, 0)
@@ -704,6 +790,7 @@ func (m *OS) composeFrame() string {
 	// is drawn, so a pane that is not drawn would otherwise hold hints open,
 	// and the fast path off, for good.
 	m.closeStaleHints()
+	m.PaneLabelsOpen()
 	if window, ok := m.fullscreenFastWindow(); ok && !fastPathDisabled {
 		// The fast path draws no rail, so no working row is on screen and the
 		// shimmer's clock must not go on asking for frames.
@@ -722,6 +809,9 @@ func (m *OS) composeFrame() string {
 		}
 	}
 	canvas := m.GetCanvas(true)
+	// Image glyphs before the spotlight, so the beam shades them like text.
+	// A frame with a modal had them drawn before its scrim (compose.go).
+	m.drawImageSymbols(canvas)
 	// The spotlight goes here and nowhere else: after every pane's cached layer
 	// has been consumed, before the canvas becomes a string. The saver owns the
 	// whole screen while it runs, so the two never draw in one frame.
@@ -732,6 +822,11 @@ func (m *OS) composeFrame() string {
 	if m.celebration.active() {
 		m.celebration.draw(canvas)
 	}
+	// The old theme outside the circle, over everything drawn in the new
+	// one.
+	if m.themeFx.running() {
+		m.applyThemeTransition(canvas, time.Now())
+	}
 	// Last, so the images are cut by everything drawn over the panes.
 	m.scanSixelFrame(canvas)
 	// The frame goes out as the canvas wrote it. The bubbletea renderer
@@ -740,6 +835,7 @@ func (m *OS) composeFrame() string {
 	// wish or sip sets per connection. Passing it through lipgloss.Sprint as
 	// well copied the whole frame twice on a truecolor terminal and stripped
 	// every colour when this process's stdout was not a TTY.
+	m.canvasIsFrame = true
 	return canvas.Render()
 }
 
@@ -748,7 +844,12 @@ func (m *OS) composeFrame() string {
 // visible windows, any overlay, separators, graphics, or active manipulation or
 // animation. Pure: it does not mutate render state.
 func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
-	if len(m.Animations) > 0 || m.Renaming() || m.FilePromptOpen() {
+	if len(m.Animations) > 0 || m.Renaming() {
+		return nil, false
+	}
+	// A gradient border is a pass over the canvas, which this path does not
+	// build. Only when one is configured.
+	if m.Settings.BorderFocusedGradient != "" && m.gradientOn() {
 		return nil, false
 	}
 	// The screen saver is a compositor overlay, and the fast path skips
@@ -757,11 +858,12 @@ func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
 	if m.screensaver.active {
 		return nil, false
 	}
-	if m.ShowHelp || m.ShowCommandPalette || m.ShowLauncher || m.ShowSessionSwitcher || m.ShowAgentMail || m.ShowInbox || m.ShowWorkspaceSwitcher || m.ShowLayoutPicker || m.ShowHostPicker ||
-		m.ShowQuitMenu || m.ShowScrollbackBrowser || m.ShowLogs || m.msgView.open || m.ShowCacheStats ||
-		m.ShowAggregateView || m.ShowTapeManager || m.ShowTapeReview || m.ShowSettings || m.ShowThemePicker || m.ShowEffectPicker ||
-		m.ShowKeybindManager || m.ShowAccentPicker || m.PrefixActive || m.ContextMenu != nil ||
-		m.Capture.Active || m.ShotPreview.Open || m.review.open {
+	// Every panel is drawn by renderOverlays, which the fast path skips. The
+	// panels are asked through eachOverlayGate, the list mouse routing reads,
+	// so a panel added there cannot open over a lone pane unseen while it
+	// takes every key. The rest are the surfaces that list does not carry.
+	if m.AnyOverlayOpen() || m.ShowScrollbackBrowser || m.ShowCacheStats || m.ShowTapeManager || m.ShowTapeReview ||
+		m.PrefixActive || m.ContextMenu != nil || m.Capture.Active || m.review.open {
 		return nil, false
 	}
 	if m.TapeRecorder != nil && m.TapeRecorder.IsRecording() {
@@ -789,9 +891,18 @@ func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
 	if m.hints != nil {
 		return nil, false
 	}
+	// So are the pane labels (pane_labels_render.go).
+	if m.paneLabels != nil {
+		return nil, false
+	}
 	// The celebration is a pass over the canvas too, for the second or so it
 	// is on screen.
 	if m.celebration.active() {
+		return nil, false
+	}
+	// And the theme transition, which keeps the old frame's cells outside
+	// its circle.
+	if m.themeFx.running() {
 		return nil, false
 	}
 	// A hover label is a layer the fast path does not compose. The dock's
@@ -803,9 +914,10 @@ func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
 	if m.panesBorderless() {
 		return nil, false
 	}
-	// A view of a larger session is the compositor's: the fast path draws the
-	// pane at the origin of the screen, unshifted.
-	if m.ViewCropped() {
+	// A view of a larger or smaller session is the compositor's: the fast
+	// path draws the pane at the origin of the screen, unshifted, and draws
+	// no leftover.
+	if m.viewShifted() {
 		return nil, false
 	}
 	// The picture-in-picture view is a layer over the pane. The fast path
@@ -819,7 +931,7 @@ func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
 	// it reserves any columns a lone window no longer fills the screen, so fall
 	// back to the compositor (which draws the sidebar and clips the pane to the
 	// content region). Cheapest correct v1; can be optimised later.
-	if m.GetSidebarWidth() > 0 {
+	if m.GetSidebarWidth() > 0 || m.secondarySidebarWidth() > 0 {
 		return nil, false
 	}
 	if m.KittyPassthrough != nil && m.KittyPassthrough.HasPlacements() {
@@ -831,6 +943,10 @@ func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
 		return nil, false
 	}
 	window := visible[0]
+	// A fullscreen popup still dims the dock. That pass needs the canvas.
+	if _, dim := m.popupScrimTarget(); dim > 0 {
+		return nil, false
+	}
 	if window.IsBeingManipulated {
 		return nil, false
 	}
@@ -844,6 +960,14 @@ func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
 	// does not silently lose it. At the live tail there is no thumb, so a deep
 	// scrollback no longer costs the fast path.
 	if windowNeedsScrollbar(window, &m.Settings) {
+		return nil, false
+	}
+	// The fast path stacks the box and this client's dock with nothing
+	// between them. When another client on the session reserves more rows
+	// than this one draws (a full dock beside a compact one, or any dock
+	// beside a hidden one), the layout leaves a blank band this frame would
+	// not have, and every row under it would be drawn one or more rows off.
+	if own := m.OwnLayoutReserve(); m.GetTopMargin() != own.Top || m.GetBottomMargin() != own.Bottom {
 		return nil, false
 	}
 	rw, topMargin, usableH := m.GetRenderWidth(), m.GetTopMargin(), m.GetUsableHeight()
@@ -868,6 +992,25 @@ func (m *OS) fastPathPaints() bool {
 		(m.surfaceGround(surfaceDock).on() && m.Settings.DockbarPosition != "hidden")
 }
 
+// focusedStateBorder is the focused pane's border for a state the theme
+// names a colour for: border.copy in copy mode, status.attention while the
+// pane's agent waits for input. Nil when the pane is in neither state, or
+// the theme names no colour for it, and the mode's colour is drawn.
+func (m *OS) focusedStateBorder(w *terminal.Window) color.Color {
+	if w == nil {
+		return nil
+	}
+	if w.CopyModeVisible() {
+		if c := theme.BorderFocusedCopy(); c != nil {
+			return c
+		}
+	}
+	if c := theme.BorderFocusedAttention(); c != nil && m.windowMarkState(w) == "needs_input" {
+		return c
+	}
+	return nil
+}
+
 // buildFullscreenFrame renders the window box and stacks it with the dock,
 // skipping the compositor. Mutates render state (renders the window, clears its
 // dirty flags), so it must only be called after eligibility is confirmed.
@@ -879,7 +1022,13 @@ func (m *OS) buildFullscreenFrame(window *terminal.Window) string {
 
 	isFocused := m.FocusedWindow >= 0 && m.FocusedWindow < len(m.Windows) && m.Windows[m.FocusedWindow] == window
 	var borderColorObj color.Color
+	var stateColor color.Color
+	if isFocused {
+		stateColor = m.focusedStateBorder(window)
+	}
 	switch {
+	case stateColor != nil:
+		borderColorObj = stateColor
 	case isFocused && m.Mode == TerminalMode:
 		borderColorObj = theme.BorderFocusedTerminalOn(m.host.bg)
 	case isFocused:
@@ -948,7 +1097,13 @@ func (m *OS) chargeRenderCost(d time.Duration) {
 }
 
 func (m *OS) View() tea.View {
+	if renderTraceEnabled {
+		m.traceFrame()
+	}
 	var view tea.View
+	// composed is set when this call composed a frame that differs from the
+	// last one.
+	var composed bool
 
 	// The last frame of a remote client that lost its session or its daemon.
 	// It leaves the alternate screen so the reason stays on the user's terminal
@@ -978,11 +1133,7 @@ func (m *OS) View() tea.View {
 		return m.crashView()
 	}
 
-	// Fast path: return cached content when frame-skip determined nothing changed.
-	// This avoids the expensive GetCanvas → ultraviolet render pipeline on idle ticks.
-	if m.renderSkipped && m.cachedViewContent != "" {
-		view.SetContent(m.cachedViewContent)
-	} else {
+	compose := func() bool {
 		// A resize drag applies the new geometry to the windows immediately but
 		// defers the matching BSP ratio sync, because the sync is whole-tree
 		// work and motion events outnumber frames. The separator overlay reads
@@ -1003,16 +1154,50 @@ func (m *OS) View() tea.View {
 			// the next one: the panic is in the compositor, so the next frame
 			// would fail the same way and the user would sit in front of a
 			// screen that never changed.
-			return m.crashView()
+			return false
+		}
+		// A frame to flush: the frame ticker runs at the frame rate again.
+		// It goes out now rather than at its next tick, unless it equals the
+		// last one; see below.
+		//
+		// A frame equal to the last one leaves the ticker where it is. It has
+		// nothing to write, and the cursor, the one thing it can still move,
+		// goes out through kickFlush. The git section's reading every 2 s
+		// composes such a frame, and waking the ticker for it kept an idle
+		// client with that section at about 110 context switches a second.
+		if content != m.cachedViewContent {
+			composed = true
 		}
 		m.cachedViewContent = content
-		// This frame carries the beam at the pointer's newest position, so the
-		// skipped move it was waiting for has been drawn. Cleared here rather
-		// than on the motion path so a frame composed for any other reason (a
-		// keystroke, pane output) counts too.
-		m.spotlightMotionPending = false
+		if composed && !m.quietFrame {
+			m.noteFrame()
+			// The panes may have reflowed or used the alternate screen
+			// for this frame. See releaseEmulatorScratch.
+			m.emulatorReleasePending = true
+		}
+		// This frame carries the hover and the beam at the pointer's newest
+		// position, so the skipped move it was waiting for has been drawn.
+		// Cleared here rather than on the motion path so a frame composed for
+		// any other reason (a keystroke, pane output) counts too, and it starts
+		// the motion frame budget over for the same reason.
+		m.pointerMotionPending = false
+		m.lastInteractionRender = composeStart
 		m.zenHidden = m.zenBordersHidden(false)
 		view.SetContent(content)
+		return true
+	}
+
+	// Fast path: return cached content when frame-skip determined nothing changed.
+	// This avoids the expensive GetCanvas → ultraviolet render pipeline on idle ticks.
+	//
+	// The cursor is read fresh on every frame, the skipped ones too, so a
+	// cached frame can carry a picture-in-picture box placed for where the
+	// cursor was. Such a frame is composed again rather than reused: the box
+	// must never cover the cursor the same frame shows.
+	if cur, _ := m.viewCursor(); m.renderSkipped && m.cachedViewContent != "" && !m.pipCoversCursor(cur) {
+		view.SetContent(m.cachedViewContent)
+	} else if !compose() {
+		return m.crashView()
 	}
 
 	view.AltScreen = true
@@ -1030,12 +1215,41 @@ func (m *OS) View() tea.View {
 	// app that asked for less than 1003 still sees only what it asked for (#78);
 	// see guestWantsMotion.
 	view.MouseMode = tea.MouseModeAllMotion
+	if m.MouseOff {
+		view.MouseMode = tea.MouseModeNone
+	}
 
 	view.ReportFocus = true
 	m.notePaneFocus()
 	view.DisableBracketedPasteMode = false
 	view.KeyboardEnhancements = m.keyboardEnhancements()
-	view.Cursor = m.getRealCursor()
+	// With no cursor shown, the cursor is parked hidden at the caret, so an
+	// input method opens its window there. See cursor_park.go.
+	var cursorShown bool
+	view.Cursor, cursorShown = m.viewCursor()
+	// The emulator's cursor can move between the read the composed frame
+	// placed the picture-in-picture box by and the read above, since pane
+	// output is written on another goroutine. When the move took it under the
+	// box, the frame is composed once more, around the cursor it will show.
+	if m.pipCoversCursor(view.Cursor) {
+		if !compose() {
+			return m.crashView()
+		}
+		view.Cursor, cursorShown = m.viewCursor()
+	}
+	m.cursorPark.set(view.Cursor, cursorShown)
+	// The title of the terminal tuios runs in, when a tool set one through
+	// herdr's client.window_title.set. Empty leaves the title alone.
+	view.WindowTitle = m.ClientTitle
+
+	// A composed frame goes out now rather than at the next tick. One equal
+	// to the last, with the cursor where it was, has nothing to write: that
+	// is every frame a pane streaming kitty graphics composes, and asking
+	// for it cost a timer and a wakeup each.
+	if cur := cursorState(view.Cursor); composed || cur != m.frameRate.lastCursor {
+		m.frameRate.lastCursor = cur
+		m.kickFlush()
+	}
 
 	// Flush graphics AFTER setting view content. bubbletea will render the
 	// text first, then we write graphics. This keeps them in the same frame
@@ -1098,9 +1312,9 @@ func (m *OS) flushGraphicsForView() {
 	// of the drag. Hiding keeps the image data resident, so the gesture ending
 	// puts it back with no round trip to whatever drew it.
 	hideImages := m.Resizing || m.ShowHelp || m.ShowCommandPalette || m.ShowLauncher || m.ShowSessionSwitcher || m.ShowAgentMail || m.ShowInbox ||
-		m.ShowWorkspaceSwitcher || m.ShowLayoutPicker || m.ShowHostPicker || m.ShowQuitMenu || m.ShowScrollbackBrowser ||
+		m.ShowWorkspaceSwitcher || m.gotoPicker.open || m.buffers.open || m.navigator.open || m.ShowLayoutPicker || m.ShowHostPicker || m.ShowQuitMenu || m.DaemonRestartOpen() || m.ShowScrollbackBrowser ||
 		m.ShowLogs || m.msgView.open || m.ShowCacheStats || m.ShowAggregateView ||
-		m.ShowSettings || m.ShowThemePicker || m.ShowKeybindManager || m.ShowAccentPicker || m.ShowTapeManager || m.ShowTapeReview ||
+		m.ShowSettings || m.ShowThemePicker || m.themeEditor.open || m.presetPicker.open || m.ShowKeybindManager || m.ShowAccentPicker || m.ShowTapeManager || m.ShowTapeReview ||
 		m.ShotPreview.Open || m.review.open
 	if m.KittyPassthrough != nil {
 		// Self-placed remote video images are hidden/dropped here, not by
@@ -1121,6 +1335,9 @@ func (m *OS) flushGraphicsForView() {
 	} else {
 		m.clearLauncherIcons()
 	}
+	// The reply's image previews belong to the Inbox, the same way. A nil
+	// check when no reply has shown a picture.
+	m.flushReplyPreviewForFrame()
 	// The preview's picture belongs to the panel that is doing the hiding, the
 	// same as the launcher's icons, so it runs past hideImages rather than
 	// through it.
@@ -1264,4 +1481,15 @@ func (m *OS) GetKittyGraphicsCmd() tea.Cmd {
 	kittyPassthroughLog("GetKittyGraphicsCmd: flushing %d bytes, preview=%q", len(data), preview)
 	m.KittyPassthrough.WriteToHost(data)
 	return nil
+}
+
+// sameColor reports whether a and b are the same colour. Two nil colours are
+// the same, and a nil colour differs from every other one.
+func sameColor(a, b color.Color) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	ar, ag, ab, aa := a.RGBA()
+	br, bg, bb, ba := b.RGBA()
+	return ar == br && ag == bg && ab == bb && aa == ba
 }

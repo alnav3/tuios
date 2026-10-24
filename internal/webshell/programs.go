@@ -9,68 +9,172 @@ import (
 	"unicode/utf8"
 )
 
-var logo = []string{
-	`████████╗██╗   ██╗██╗ ██████╗ ███████╗`,
-	`╚══██╔══╝██║   ██║██║██╔═══██╗██╔════╝`,
-	`   ██║   ██║   ██║██║██║   ██║███████╗`,
-	`   ██║   ██║   ██║██║██║   ██║╚════██║`,
-	`   ██║   ╚██████╔╝██║╚██████╔╝███████║`,
-	`   ╚═╝    ╚═════╝ ╚═╝ ╚═════╝ ╚══════╝`,
-}
+// logo is the full fastfetch logo. smallLogo stands in for it in a pane too
+// narrow for the full one beside the info.
+var (
+	logo = []string{
+		`████████╗██╗   ██╗██╗ ██████╗ ███████╗`,
+		`╚══██╔══╝██║   ██║██║██╔═══██╗██╔════╝`,
+		`   ██║   ██║   ██║██║██║   ██║███████╗`,
+		`   ██║   ██║   ██║██║██║   ██║╚════██║`,
+		`   ██║   ╚██████╔╝██║╚██████╔╝███████║`,
+		`   ╚═╝    ╚═════╝ ╚═╝ ╚═════╝ ╚══════╝`,
+	}
+	smallLogo = []string{
+		`▀█▀ █ █ █ █▀█ █▀▀`,
+		` █  █▄█ █ █▄█ ▄▄█`,
+	}
+	logoPalette = []string{"\x1b[38;5;213m", "\x1b[38;5;177m", "\x1b[38;5;141m", "\x1b[38;5;105m", "\x1b[38;5;69m", "\x1b[38;5;39m"}
+)
 
 var started = time.Now()
 
-func cmdNeofetch(t *TTY, _ []string) int {
-	cols, _ := t.Size()
-	palette := []string{"\x1b[38;5;213m", "\x1b[38;5;177m", "\x1b[38;5;141m", "\x1b[38;5;105m", "\x1b[38;5;69m", "\x1b[38;5;39m"}
-	info := []string{
-		bold + "guest" + reset + "@" + bold + "tuios" + reset,
-		dim + "───────────" + reset,
-		cyan + "OS" + reset + "      your browser",
-		cyan + "Kernel" + reset + "  WebAssembly",
-		cyan + "Uptime" + reset + "  " + time.Since(started).Round(time.Second).String(),
-		cyan + "Shell" + reset + "   webshell",
-		cyan + "WM" + reset + "      tuios",
-	}
-	wide := cols >= 64
-	for i := 0; i < max(len(logo), len(info)); i++ {
-		if i < len(logo) && wide {
-			t.Print(palette[i%len(palette)] + logo[i] + reset + "  ")
-		} else if wide {
-			t.Print(strings.Repeat(" ", 40))
-		}
-		if i < len(info) {
-			t.Print(info[i])
-		}
-		t.Print("\r\n")
-	}
-	if !wide {
-		t.Print(dim + "(widen the window to see the logo)" + reset + "\r\n")
-	}
-	var sw strings.Builder
-	for c := range 8 {
-		fmt.Fprintf(&sw, "\x1b[4%dm   ", c)
-	}
-	t.Print(sw.String() + reset + "\r\n")
+func cmdFastfetch(t *TTY, _ []string) int {
+	uptime := time.Since(started).Round(time.Second).String()
+	t.Lay(func(cols int) []string { return fastfetch(cols, uptime) })
 	return 0
 }
 
+// fastfetch lays the output out for a pane cols cells wide. It tries, in
+// order, the full logo beside the info, the small logo beside the info, a
+// logo above the info, and the info alone. No line is wider than cols: a
+// value too long for its column ends in an ellipsis instead of wrapping,
+// because a wrapped line breaks mid-word and pushes everything below it.
+func fastfetch(cols int, uptime string) []string {
+	cols = max(cols, 1)
+	info := [][2]string{
+		{"OS", "your browser"},
+		{"Kernel", "WebAssembly"},
+		{"Uptime", uptime},
+		{"Shell", "webshell"},
+		{"WM", "tuios"},
+	}
+	const user, label = "guest@tuios", 8
+	infoW := len(user)
+	for _, kv := range info {
+		infoW = max(infoW, label+utf8.RuneCountInString(kv[1]))
+	}
+	// infoLines renders the info column w cells wide.
+	infoLines := func(w int) []string {
+		lines := []string{
+			bold + "guest" + reset + "@" + bold + "tuios" + reset,
+			dim + strings.Repeat("─", len(user)) + reset,
+		}
+		if w < len(user) {
+			lines = []string{bold + ellipsize(user, w) + reset, dim + strings.Repeat("─", w) + reset}
+		}
+		for _, kv := range info {
+			plain := ellipsize(kv[0]+strings.Repeat(" ", label-len(kv[0]))+kv[1], w)
+			n := min(len(kv[0]), utf8.RuneCountInString(plain))
+			key := string([]rune(plain)[:n])
+			lines = append(lines, cyan+key+reset+string([]rune(plain)[n:]))
+		}
+		return lines
+	}
+	paint := func(art []string, i int) string { return logoPalette[i%len(logoPalette)] + art[i] + reset }
+
+	var out []string
+	switch {
+	case cols >= logoWidth(logo)+2+infoW, cols >= logoWidth(smallLogo)+2+infoW:
+		art := logo
+		if cols < logoWidth(logo)+2+infoW {
+			art = smallLogo
+		}
+		lines := infoLines(cols - logoWidth(art) - 2)
+		for i := range max(len(art), len(lines)) {
+			var row string
+			if i < len(art) {
+				row = paint(art, i) + "  "
+			} else {
+				row = strings.Repeat(" ", logoWidth(art)+2)
+			}
+			if i < len(lines) {
+				row += lines[i]
+			}
+			out = append(out, row)
+		}
+	case cols >= logoWidth(smallLogo):
+		art := smallLogo
+		if cols >= logoWidth(logo) {
+			art = logo
+		}
+		for i := range art {
+			out = append(out, paint(art, i))
+		}
+		out = append(out, "")
+		out = append(out, infoLines(cols)...)
+	default:
+		out = infoLines(cols)
+	}
+
+	// Eight swatches, three cells each when they fit.
+	sw := max(min(cols/8, 3), 1)
+	var b strings.Builder
+	for c := range min(8, cols/sw) {
+		fmt.Fprintf(&b, "\x1b[4%dm%s", c, strings.Repeat(" ", sw))
+	}
+	return append(out, b.String()+reset)
+}
+
+func logoWidth(art []string) int { return utf8.RuneCountInString(art[0]) }
+
+// ellipsize cuts s to at most w cells, ending in "…" when it cuts.
+func ellipsize(s string, w int) string {
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w <= 0 {
+		return ""
+	}
+	return string(r[:w-1]) + "…"
+}
+
 func cmdColors(t *TTY, _ []string) int {
+	t.Lay(colors)
+	return 0
+}
+
+// colors lays the palette out for a pane cols cells wide.
+func colors(cols int) []string {
+	var lines []string
+	var b strings.Builder
+	endLine := func() {
+		lines = append(lines, b.String()+reset)
+		b.Reset()
+	}
+	// Each of the 16 swatches is four cells, eight to a row when they fit,
+	// else four or two, so the rows come out even.
+	perRow := 1
+	for _, n := range []int{8, 4, 2} {
+		if n*4 <= cols {
+			perRow = n
+			break
+		}
+	}
 	for row := range 2 {
 		for c := range 8 {
 			bg := 40 + c
 			if row == 1 {
 				bg = 100 + c
 			}
-			t.Printf("\x1b[%d;97m %2d ", bg, c+8*row)
+			fmt.Fprintf(&b, "\x1b[%d;97m %2d ", bg, c+8*row)
+			if (c+1)%perRow == 0 && c < 7 {
+				endLine()
+			}
 		}
-		t.Print(reset + "\r\n")
+		endLine()
 	}
+	// The cube strip is 36 swatches of two cells, as many to a row as fit.
+	perRow = max(cols/2, 1)
 	for i := range 36 {
-		t.Printf("\x1b[48;5;%dm  ", 16+i*6)
+		if i > 0 && i%perRow == 0 {
+			endLine()
+		}
+		fmt.Fprintf(&b, "\x1b[48;5;%dm  ", 16+i*6)
 	}
-	t.Print(reset + "\r\n")
-	return 0
+	endLine()
+	return lines
 }
 
 // fullscreen runs a program on the alternate screen with the cursor hidden
@@ -125,7 +229,15 @@ func cmdTop(t *TTY, _ []string) int {
 	return fullscreen(t, func(cols, rows, tick int) string {
 		var b strings.Builder
 		up := time.Since(started).Round(time.Second)
-		b.WriteString(bold + "top" + reset + dim + " - up " + up.String() + ", 1 user, load average: 0.42 0.37 0.31" + reset + "\x1b[K\r\n")
+		b.WriteString(bold)
+		b.WriteString("top")
+		b.WriteString(reset)
+		b.WriteString(dim)
+		b.WriteString(" - up ")
+		b.WriteString(up.String())
+		b.WriteString(", 1 user, load average: 0.42 0.37 0.31")
+		b.WriteString(reset)
+		b.WriteString("\x1b[K\r\n")
 		// Each bar is its width plus 13 cells of label, brackets and percent,
 		// and two sit on a row with a two-cell gap.
 		barW := max((cols-28)/2, 4)
@@ -140,8 +252,12 @@ func cmdTop(t *TTY, _ []string) int {
 			b.WriteString("\x1b[K\r\n")
 		}
 		mem := 42 + 6*math.Sin(float64(tick)/11)
-		b.WriteString(bar("Mem", mem, barW*2+15) + "\x1b[K\r\n\x1b[K\r\n")
-		b.WriteString("\x1b[30;42m" + padRight("  PID USER      CPU%  MEM%  COMMAND", cols) + reset + "\r\n")
+		b.WriteString(bar("Mem", mem, barW*2+15))
+		b.WriteString("\x1b[K\r\n\x1b[K\r\n")
+		b.WriteString("\x1b[30;42m")
+		b.WriteString(padRight("  PID USER      CPU%  MEM%  COMMAND", cols))
+		b.WriteString(reset)
+		b.WriteString("\r\n")
 		for i := range procs {
 			procs[i].cpu = max(0, procs[i].cpu+(rand.Float64()-0.5)*4)
 		}
@@ -159,7 +275,13 @@ func cmdTop(t *TTY, _ []string) int {
 		}
 		b.WriteString("\x1b[J")
 		fmt.Fprintf(&b, "\x1b[%d;1H%s q to quit %s", rows, "\x1b[7m", reset)
-		return b.String()
+		// A line wider than the screen wraps and pushes every row below it
+		// down, so cut each one to the width.
+		frame := strings.Split(b.String(), "\r\n")
+		for i, l := range frame {
+			frame[i] = fit(l, cols)
+		}
+		return strings.Join(frame, "\r\n")
 	}, 500*time.Millisecond, false)
 }
 
@@ -238,7 +360,8 @@ var fortunes = []string{
 }
 
 func cmdFortune(t *TTY, _ []string) int {
-	t.Print(fortunes[rand.IntN(len(fortunes))] + "\r\n")
+	fortune := fortunes[rand.IntN(len(fortunes))]
+	t.Lay(func(cols int) []string { return wrapWords(fortune, cols) })
 	return 0
 }
 
@@ -247,10 +370,36 @@ func cmdCowsay(t *TTY, args []string) int {
 	if text == "" {
 		text = "moo. try cowsay hello"
 	}
-	n := utf8.RuneCountInString(text)
-	t.Print(" " + strings.Repeat("_", n+2) + "\r\n")
-	t.Print("< " + text + " >\r\n")
-	t.Print(" " + strings.Repeat("-", n+2) + "\r\n")
+	t.Lay(func(cols int) []string { return cowsay(text, cols) })
+	return 0
+}
+
+// cowsay draws the cow for a pane cols cells wide.
+func cowsay(text string, cols int) []string {
+	// Like cowsay, wrap the text at 40 columns, or narrower when the pane
+	// is: the bubble adds four cells.
+	lines := wrapWords(text, min(40, max(cols-4, 1)))
+	n := 0
+	for _, l := range lines {
+		n = max(n, utf8.RuneCountInString(l))
+	}
+	out := []string{fit(" "+strings.Repeat("_", n+2), cols)}
+	for i, l := range lines {
+		left, right := "|", "|"
+		switch {
+		case len(lines) == 1:
+			left, right = "<", ">"
+		case i == 0:
+			left, right = "/", "\\"
+		case i == len(lines)-1:
+			left, right = "\\", "/"
+		}
+		out = append(out, fit(left+" "+l+strings.Repeat(" ", n-utf8.RuneCountInString(l))+" "+right, cols))
+	}
+	out = append(out, fit(" "+strings.Repeat("-", n+2), cols))
+	// The cow is 28 cells wide, eight of them indent. In a narrower pane it
+	// moves left before it is cut.
+	shift := min(max(28-cols, 0), 8)
 	for _, l := range []string{
 		`        \   ^__^`,
 		`         \  (oo)\_______`,
@@ -258,9 +407,9 @@ func cmdCowsay(t *TTY, args []string) int {
 		`                ||----w |`,
 		`                ||     ||`,
 	} {
-		t.Print(l + "\r\n")
+		out = append(out, fit(l[shift:], cols))
 	}
-	return 0
+	return out
 }
 
 func cmdTree(s *shell, args []string, _ string) int {
@@ -271,7 +420,7 @@ func cmdTree(s *shell, args []string, _ string) int {
 	if !isDir(root) {
 		return s.fail("tree: " + argOr(args, 1, "") + " is not a directory")
 	}
-	s.t.Print(blue + bold + prettyPath(root) + reset + "\r\n")
+	lines := []string{blue + bold + prettyPath(root) + reset}
 	dirs, nfiles := 0, 0
 	var walk func(dir, indent string)
 	walk = func(dir, indent string) {
@@ -287,7 +436,7 @@ func cmdTree(s *shell, args []string, _ string) int {
 			if i == len(shown)-1 {
 				branch, next = "└── ", "    "
 			}
-			s.t.Print(dim + indent + branch + reset + colourName(e) + "\r\n")
+			lines = append(lines, dim+indent+branch+reset+colourName(e))
 			if e.dir {
 				dirs++
 				walk(dir+"/"+e.name, indent+next)
@@ -297,7 +446,8 @@ func cmdTree(s *shell, args []string, _ string) int {
 		}
 	}
 	walk(strings.TrimSuffix(root, "/"), "")
-	s.t.Printf("\r\n%d directories, %d files\r\n", dirs, nfiles)
+	lines = append(lines, "", fmt.Sprintf("%d directories, %d files", dirs, nfiles))
+	s.t.Lay(func(cols int) []string { return fitLines(lines, cols) })
 	return 0
 }
 

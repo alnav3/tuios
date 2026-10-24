@@ -9,10 +9,12 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/ghpr"
 	"github.com/Gaurav-Gosain/tuios/internal/harness"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
+	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
 
 // An agent row is drawn from tokens: the facts the row has about its pane, each
@@ -51,13 +53,30 @@ func (m *OS) sidebarAgentTokenValue(name string, e sidebarAgentEntry, variant in
 		// A pane running an agent is usually already named after it, and a
 		// row reading "claude/claude" spends half its width saying one thing
 		// twice. The token earns its cells only when it adds a name.
-		if h := sidebarHarnessLabel(e.Harness); !strings.EqualFold(h, sidebarAgentName(e)) {
+		h := sidebarHarnessLabel(e.Harness)
+		if h == "" {
+			// A program that reports over OSC 7501 names itself with app.
+			// It is the program's word, drawn as text and never looked up as
+			// a harness.
+			if sum, ok := programSummary(e.Program); ok {
+				h = printableTitle(sum.App)
+			}
+		}
+		if !strings.EqualFold(h, sidebarAgentName(e)) {
 			tk.Text = h
 		}
 	case "name":
 		tk.Text = sidebarAgentName(e)
 	case "state":
-		tk.Text = sidebarStateWords(e.State)
+		tk.Text = sidebarStateWords(displayState(e.State, e.DoneSeen, e.Subagents))
+	case "progress":
+		// "40%": the progress of the pane's OSC 7501 summary record, while
+		// it works or waits. Its number is the percent, for gt and lt.
+		if sum, ok := programSummary(e.Program); ok {
+			if tk.Text = programProgressText(sum); tk.Text != "" {
+				tk.Number, tk.HasNumber = float64(sum.Progress), true
+			}
+		}
 	case "elapsed":
 		if variant == sidebarVariantFull {
 			tk.Text = railAgentAge(e.State, e.StateAt, now)
@@ -89,9 +108,20 @@ func (m *OS) sidebarAgentTokenValue(name string, e sidebarAgentEntry, variant in
 	case "subagents":
 		// "2 subagents" on any row, since a pane at rest with subagents at
 		// work is the case it is for. Its number is the count, for gt and lt.
-		if tk.Text = session.SubagentsText(e.Subagents); tk.Text != "" {
+		// With rows of their own under this one, "3 of 4 run" says how
+		// many of them still work.
+		if e.ChildRows > 0 {
+			tk.Text = subagentsRunText(runningSubagents(e.Children), len(e.Children))
+		} else {
+			tk.Text = session.SubagentsText(e.Subagents)
+		}
+		if tk.Text != "" {
 			tk.Number, tk.HasNumber = float64(e.Subagents), true
 		}
+	case "pr":
+		// "PR #12 open pass": the pull request of the session's branch, as
+		// the daemon last read it from gh.
+		tk.Text = printableTitle(e.PR)
 	default:
 		if key, ok := config.SidebarMetaTokenKey(name); ok {
 			tk.Text = printableTitle(sidebarAgentMetaValue(e.Meta, key))
@@ -232,11 +262,23 @@ func sidebarContextPercent(v string) (float64, bool) {
 }
 
 // sidebarTokenDefaultLook is the look a token has before its table says
-// anything: the context warning is in the warning ink, and every other token
-// starts from the rail's own style.
-func sidebarTokenDefaultLook(name string) config.SidebarTokenLook {
-	if name == "context" {
+// anything: the context warning is in the warning ink, a pull request's
+// failing checks in the error ink, pending ones in the warning ink, passing
+// ones and a merge in the success ink, and every other token starts from the
+// rail's own style.
+func sidebarTokenDefaultLook(tk sidebarAgentToken) config.SidebarTokenLook {
+	switch tk.Name {
+	case "context":
 		return config.SidebarTokenLook{Fg: "warning"}
+	case "pr":
+		switch {
+		case strings.HasSuffix(tk.Text, " "+ghpr.ChecksFail):
+			return config.SidebarTokenLook{Fg: "error"}
+		case strings.HasSuffix(tk.Text, " "+ghpr.ChecksPending):
+			return config.SidebarTokenLook{Fg: "warning"}
+		case strings.HasSuffix(tk.Text, " "+ghpr.ChecksPass), strings.HasSuffix(tk.Text, " "+ghpr.StateMerged):
+			return config.SidebarTokenLook{Fg: "success"}
+		}
 	}
 	return config.SidebarTokenLook{}
 }
@@ -270,7 +312,7 @@ func (m *OS) sidebarAgentNeedText(e sidebarAgentEntry, variant int, now time.Tim
 // name's.
 func sidebarNoteToken(name string) bool {
 	switch name {
-	case "message", "need", "now", "prompt", "context", "subagents":
+	case "message", "need", "now", "prompt", "context", "subagents", "pr":
 		return true
 	}
 	_, ok := config.SidebarMetaTokenKey(name)
@@ -319,7 +361,7 @@ func sidebarAgentNeed(state string, doneSeen bool, kind, message string) (string
 // sidebarPromptKind reports whether kind is one of the prompt kinds a need
 // word can name.
 func sidebarPromptKind(kind string) bool {
-	return kind == harness.PromptKindApproval || kind == harness.PromptKindQuestion ||
+	return kind == harness.PromptKindApproval || kind == harness.PromptKindQuestion || kind == harness.PromptKindAuth ||
 		kind == inboxWordPlan || kind == inboxWordRisky
 }
 
@@ -347,46 +389,28 @@ func sidebarAgentMetaValue(meta []sessiontree.MetaToken, key string) string {
 func (m *OS) sidebarAgentsHaveNotes(agents []sidebarAgentEntry, variant int) bool {
 	now := time.Now()
 	for _, e := range agents {
-		if len(m.sidebarAgentTokensFor(e, variant, true, now).Note) > 0 {
+		// A subagent's row has a second line, its tool or how it ended,
+		// unless appearance.sidebar.subagent_fields leaves the note out.
+		// The heading over the rows has none.
+		if (!e.Head && e.sidebarSubRow() && m.Settings.SidebarSubagents.Fields.Note) || len(m.sidebarAgentTokensFor(e, variant, true, now).Note) > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// sidebarTokenColor is the colour a configured name means, on this palette. A
-// hex literal is itself; a name the palette does not know is nil, which the
-// caller reads as "leave the rail's own colour".
+// sidebarTokenColor is the colour a configured value means, on this palette:
+// a role such as text or accent is the rail's own ink. A value that is not a
+// colour is nil, which the caller reads as "leave the rail's own colour".
 func sidebarTokenColor(name string, pal overlay.Palette) color.Color {
-	switch name {
-	case "text":
-		return pal.Fg
-	case "dim":
-		return pal.FgDim
-	case "muted":
-		return pal.FgMute
-	case "accent":
-		return pal.Accent
-	case "warning":
-		return pal.Warning
-	case "error":
-		return pal.Warn
-	case "success":
-		return pal.Success
-	case "info":
-		return pal.Info
-	}
-	if c, ok := parseHexColor(name); ok {
-		return c
-	}
-	return nil
+	return theme.ConfigColorOn(name, &pal)
 }
 
 // sidebarTokenStyle is the rail's own style for a token with the configured
 // look written over it: fg replaces the colour, bold and dim replace the
 // rail's choice when they are set at all.
 func (m *OS) sidebarTokenStyle(base lipgloss.Style, tk sidebarAgentToken, pal overlay.Palette) lipgloss.Style {
-	look := sidebarTokenDefaultLook(tk.Name).Overlay(m.Settings.SidebarAgentRow.Style(tk.Name).Resolve(tk.Text, tk.Number, tk.HasNumber))
+	look := sidebarTokenDefaultLook(tk).Overlay(m.Settings.SidebarAgentRow.Style(tk.Name).Resolve(tk.Text, tk.Number, tk.HasNumber))
 	if c := sidebarTokenColor(look.Fg, pal); c != nil {
 		base = base.Foreground(c)
 	}

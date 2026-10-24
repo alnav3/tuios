@@ -91,18 +91,34 @@ func (m *OS) RenameAppend(text string) {
 	}
 }
 
-// RenameBackspace drops the last rune of the buffer. It counts in runes because
-// a name may hold multi-byte text, and cutting one byte off é leaves the buffer
-// holding a broken sequence that renders as a replacement glyph.
+// RenameBackspace drops the last rune of the buffer.
 func (m *OS) RenameBackspace() {
 	if !m.Renaming() || m.RenameBuffer == "" {
 		return
 	}
-	_, size := utf8.DecodeLastRuneInString(m.RenameBuffer)
-	m.RenameBuffer = m.RenameBuffer[:len(m.RenameBuffer)-size]
+	m.RenameBuffer = dropLastRune(m.RenameBuffer)
 	if t := m.RenameTarget(); t != nil {
 		t.InvalidateCache()
 	}
+}
+
+// RenameClear empties the buffer, so a name can be retyped from scratch.
+func (m *OS) RenameClear() {
+	if !m.Renaming() || m.RenameBuffer == "" {
+		return
+	}
+	m.RenameBuffer = ""
+	if t := m.RenameTarget(); t != nil {
+		t.InvalidateCache()
+	}
+}
+
+// dropLastRune removes the last rune of s. It counts in runes because a name
+// may hold multi-byte text, and cutting one byte off é leaves the string
+// holding a broken sequence that renders as a replacement glyph.
+func dropLastRune(s string) string {
+	_, size := utf8.DecodeLastRuneInString(s)
+	return s[:len(s)-size]
 }
 
 // combiningOnly reports whether s is nothing but marks that attach to a
@@ -220,18 +236,22 @@ func (m *OS) EndRename() {
 	m.RenameTargetID = ""
 	m.RenameBuffer = ""
 	m.renameHit = overlay.Rect{}
+	m.renameClearHit = overlay.Rect{}
 }
 
-// RenameMouseClick routes a click while the rename dialog is up: inside is a
-// no-op (the field has no clickable parts), outside cancels. The dialog is
-// modal to the mouse either way, so a stray click can never leave an editor
-// open over a pane the user has moved on to. The mouse is never required: the
-// same keys that opened it commit or cancel it.
+// RenameMouseClick routes a click while the rename dialog is up: the clear
+// hint empties the field, the rest of the dialog is a no-op, and outside
+// cancels. The dialog is modal to the mouse either way, so a stray click can
+// never leave an editor open over a pane the user has moved on to. The mouse
+// is never required: the same keys that opened it commit or cancel it.
 func (m *OS) RenameMouseClick(x, y int) bool {
 	if !m.Renaming() {
 		return false
 	}
-	if !m.renameHit.Contains(x, y) {
+	switch {
+	case m.renameClearHit.Contains(x, y):
+		m.RenameClear()
+	case !m.renameHit.Contains(x, y):
 		m.EndRename()
 	}
 	return true

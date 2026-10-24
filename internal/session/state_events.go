@@ -43,9 +43,19 @@ type lifecycleWindow struct {
 	// needs_input window is blocked by, and how many turns it has finished.
 	agentKind     string
 	completionSeq uint64
-	// root rides along for the risk rules: the session's worktree root, else
-	// the window's working directory.
-	root string
+	// program rides along for the attention queue too: a pane whose state
+	// comes from OSC 7501 is named by its id as well as its title.
+	program bool
+	// worktree and agentSession ride along for the risk rules: the
+	// session's worktree when tuios made it, and the window's agent session
+	// id. The sink turns them into the approval root (windowApprovalRoot),
+	// off this snapshot, since that reads the file system.
+	worktree, agentSession string
+	// The rectangle and how the pane sits in it, for layout-changed only.
+	// They change while a person drags a split, so they raise no event of
+	// their own and only mark the workspace's layout as changed.
+	x, y, w, h       int
+	zoomed, floating bool
 }
 
 // lifecycleSnapshot is a copy of the lifecycle-relevant parts of a SessionState.
@@ -58,6 +68,9 @@ type lifecycleSnapshot struct {
 	workspace int
 	// wsNames is a copy of the workspace names, for workspace-renamed.
 	wsNames map[int]string
+	// width and height are the session's size in cells, the box the
+	// windows' rectangles are laid out in. For layout-changed.
+	width, height int
 }
 
 // snapshotLifecycle captures the lifecycle-relevant parts of state. The caller
@@ -69,6 +82,7 @@ func snapshotLifecycle(state *SessionState) lifecycleSnapshot {
 	}
 	snap.focused = state.FocusedWindowID
 	snap.workspace = state.CurrentWorkspace
+	snap.width, snap.height = state.Width, state.Height
 	if len(state.WorkspaceNames) > 0 {
 		snap.wsNames = maps.Clone(state.WorkspaceNames)
 		// A scratch group's workspace is not a workspace a person names or
@@ -77,16 +91,9 @@ func snapshotLifecycle(state *SessionState) lifecycleSnapshot {
 		maps.DeleteFunc(snap.wsNames, func(ws int, _ string) bool { return IsScratchWorkspace(ws) })
 	}
 	snap.windows = make([]lifecycleWindow, 0, len(state.Windows))
-	worktreeRoot := ""
-	if state.Worktree != nil {
-		worktreeRoot = state.Worktree.Path
-	}
+	worktree := managedWorktreePath(state.Worktree)
 	for i := range state.Windows {
 		w := &state.Windows[i]
-		root := worktreeRoot
-		if root == "" {
-			root = w.Cwd
-		}
 		snap.index[w.ID] = len(snap.windows)
 		snap.windows = append(snap.windows, lifecycleWindow{
 			id:            w.ID,
@@ -101,7 +108,15 @@ func snapshotLifecycle(state *SessionState) lifecycleSnapshot {
 			agentStateAt:  w.AgentStateAt,
 			agentKind:     agentBlockedBy(*w),
 			completionSeq: w.CompletionSeq,
-			root:          root,
+			program:       len(w.ProgramStatus) > 0,
+			worktree:      worktree,
+			agentSession:  w.AgentSessionID,
+			x:             w.X,
+			y:             w.Y,
+			w:             w.Width,
+			h:             w.Height,
+			zoomed:        w.Zoomed,
+			floating:      w.IsFloating,
 		})
 	}
 	return snap
@@ -200,7 +215,9 @@ func diffLifecycle(before, after lifecycleSnapshot) []SessionEvent {
 				hookMessage:   w.agentMessage,
 
 				hookKind:          w.agentKind,
-				hookRoot:          w.root,
+				hookWorktree:      w.worktree,
+				hookAgentSession:  w.agentSession,
+				hookProgram:       w.program,
 				completionSeq:     w.completionSeq,
 				prevCompletionSeq: prev.completionSeq,
 			})
@@ -220,7 +237,9 @@ func diffLifecycle(before, after lifecycleSnapshot) []SessionEvent {
 				hookMessage:   w.agentMessage,
 
 				hookKind:          w.agentKind,
-				hookRoot:          w.root,
+				hookWorktree:      w.worktree,
+				hookAgentSession:  w.agentSession,
+				hookProgram:       w.program,
 				completionSeq:     w.completionSeq,
 				prevCompletionSeq: w.completionSeq,
 			})
@@ -244,6 +263,8 @@ func diffLifecycle(before, after lifecycleSnapshot) []SessionEvent {
 	for _, ws := range renamed {
 		events = append(events, SessionEvent{Type: EventWorkspaceRenamed, Workspace: ws, Title: after.wsNames[ws]})
 	}
+
+	events = append(events, layoutChanges(before, after)...)
 
 	if after.workspace != before.workspace && after.workspace > 0 && !IsScratchWorkspace(after.workspace) {
 		events = append(events, SessionEvent{
@@ -269,6 +290,66 @@ func diffLifecycle(before, after lifecycleSnapshot) []SessionEvent {
 	return events
 }
 
+// layoutChanges returns one layout-changed event for each workspace whose
+// panes now sit differently: a pane on it opened, closed, moved in or out,
+// was minimized or restored, zoomed, floated, or changed its rectangle, or the
+// session itself changed size. A client that mirrors a session's layout reads
+// list-windows again on it. One event per workspace, however many panes moved,
+// so a split that reshapes five panes is one event and not five. Ascending by
+// workspace, so the order is stable.
+func layoutChanges(before, after lifecycleSnapshot) []SessionEvent {
+	// Allocated on the first change, so a push that moves nothing, which is
+	// most of them, costs no allocation.
+	var changed map[int]bool
+	mark := func(ws int) {
+		if ws > 0 && !IsScratchWorkspace(ws) {
+			if changed == nil {
+				changed = map[int]bool{}
+			}
+			changed[ws] = true
+		}
+	}
+	for i := range before.windows {
+		w := &before.windows[i]
+		j, ok := after.index[w.id]
+		if !ok {
+			mark(w.workspace)
+			continue
+		}
+		n := &after.windows[j]
+		if n.workspace != w.workspace {
+			mark(w.workspace)
+			mark(n.workspace)
+			continue
+		}
+		if n.x != w.x || n.y != w.y || n.w != w.w || n.h != w.h ||
+			n.zoomed != w.zoomed || n.floating != w.floating || n.minimized != w.minimized {
+			mark(n.workspace)
+		}
+	}
+	for i := range after.windows {
+		if _, ok := before.index[after.windows[i].id]; !ok {
+			mark(after.windows[i].workspace)
+		}
+	}
+	if (before.width != after.width || before.height != after.height) && after.width > 0 && after.height > 0 {
+		// Every workspace is laid out in the same box, so a new box is a new
+		// layout on each one that holds a pane.
+		for i := range after.windows {
+			mark(after.windows[i].workspace)
+		}
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+	wss := slices.Sorted(maps.Keys(changed))
+	events := make([]SessionEvent, 0, len(wss))
+	for _, ws := range wss {
+		events = append(events, SessionEvent{Type: EventLayoutChanged, Workspace: ws})
+	}
+	return events
+}
+
 // attentionDetailChanged reports whether a window that kept its agent state
 // changed something its Inbox item shows. Only needs_input and errored windows
 // have an item that follows the current report; a finished item describes the
@@ -279,7 +360,7 @@ func attentionDetailChanged(w, prev *lifecycleWindow) bool {
 	}
 	return w.agentKind != prev.agentKind || w.agentMessage != prev.agentMessage ||
 		w.agentHarness != prev.agentHarness || w.workspace != prev.workspace ||
-		w.displayTitle() != prev.displayTitle()
+		w.displayTitle() != prev.displayTitle() || w.program != prev.program
 }
 
 // displayTitle is the title reported for a window in a lifecycle event: the

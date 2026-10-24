@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // TestKittyClearOnED2 reproduces the youterm multi-thumbnail scrolling bug.
@@ -54,13 +54,12 @@ func TestKittyClearOnED2(t *testing.T) {
 		)
 	})
 
-	tmpFile, err := os.CreateTemp("", "youterm-thumb-test-")
+	tmpFile, err := os.CreateTemp(kittyTestTempDir(t), "youterm-thumb-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _ = tmpFile.Write(bytes.Repeat([]byte{0x00}, 100))
 	tmpFile.Close()
-	defer os.Remove(tmpFile.Name())
 	encodedPath := base64.StdEncoding.EncodeToString([]byte(tmpFile.Name()))
 
 	frame := func() []byte {
@@ -81,7 +80,7 @@ func TestKittyClearOnED2(t *testing.T) {
 	frame1Count := len(kp.placements[winID])
 	frame1HostIDs := make([]uint32, 0, frame1Count)
 	for hid := range kp.placements[winID] {
-		frame1HostIDs = append(frame1HostIDs, hid)
+		frame1HostIDs = append(frame1HostIDs, hid.host)
 	}
 	kp.mu.Unlock()
 	if frame1Count != 3 {
@@ -140,13 +139,12 @@ func TestKittyNoStaleAccumulation(t *testing.T) {
 
 	_, _ = emu.Write([]byte("\x1b[?1049h"))
 
-	tmpFile, err := os.CreateTemp("", "youterm-thumb-accum-test-")
+	tmpFile, err := os.CreateTemp(kittyTestTempDir(t), "youterm-thumb-accum-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _ = tmpFile.Write(bytes.Repeat([]byte{0x00}, 100))
 	tmpFile.Close()
-	defer os.Remove(tmpFile.Name())
 	encodedPath := base64.StdEncoding.EncodeToString([]byte(tmpFile.Name()))
 
 	frame := func() []byte {

@@ -81,6 +81,10 @@ const appearance = isolatedTree('TUIOS_CT_APPEARANCE_HOME');
 // a default is showing that the file never reached it. They are also all
 // readable off the terminal buffer: a box-drawing glyph, a row position, a pane
 // of text down one side, a clock.
+//
+// notify = true is the one exception. It is the default value, written out.
+// A browser cannot send desktop notifications, so a value the user wrote earns
+// a notice, and the default must not.
 export const SEEDED_CONFIG = `[appearance]
 border_style = "double"
 dockbar_position = "bottom"
@@ -98,10 +102,29 @@ open_default_window = true
 
 [keybindings]
 leader_key = "ctrl+a"
+
+# The page keeps the paste keys for the browser, so tuios's own paste key
+# never arrives from them. paste.spec.mjs presses this one to read the note
+# tuios shows instead.
+[keybindings.terminal_mode]
+terminal_paste_host = ["alt+v"]
+
+[notifications.agent]
+notify = true
 `;
 
 mkdirSync(join(cfg.env.XDG_CONFIG_HOME, 'tuios'), { recursive: true });
 writeFileSync(join(cfg.env.XDG_CONFIG_HOME, 'tuios', 'config.toml'), SEEDED_CONFIG);
+
+// The config the multi-client server is served with. The suite is about a
+// session sized to the smallest viewport, which stopped being the default when
+// window_size became latest, so it is set here.
+export const SEEDED_MULTI_CONFIG = `[daemon]
+window_size = "smallest"
+`;
+
+mkdirSync(join(multi.env.XDG_CONFIG_HOME, 'tuios'), { recursive: true });
+writeFileSync(join(multi.env.XDG_CONFIG_HOME, 'tuios', 'config.toml'), SEEDED_MULTI_CONFIG);
 
 // The config the fourth server is served with: a theme and nothing else.
 //
@@ -142,8 +165,14 @@ const chromium = {
 // Never reuse a server. The key bar is built in Go and handed to the page in
 // the HTML, so a server left over from an earlier build serves the old bar
 // while the source on disk says otherwise, and nothing reports it.
+//
+// TUIOS_WEB_BIN names a tuios-web built beforehand, which CI uses to compile
+// once instead of once per server. Whoever sets it owns rebuilding it.
+const WEB_BIN = process.env.TUIOS_WEB_BIN;
 const server = (port, url, env) => ({
-  command: `go run ./cmd/tuios-web --host 127.0.0.1 --port ${port}`,
+  command: WEB_BIN
+    ? `"${WEB_BIN}" --host 127.0.0.1 --port ${port}`
+    : `go run ./cmd/tuios-web --host 127.0.0.1 --port ${port}`,
   cwd: '..',
   url,
   env,
@@ -184,7 +213,7 @@ export default defineConfig({
       // The config tests need columns: the rail and the dock both collapse on a
       // phone, and a collapsed thing cannot be told apart from a missing one.
       name: 'desktop',
-      testMatch: /config\.spec\.mjs/,
+      testMatch: /(config|keyboard|paste)\.spec\.mjs/,
       use: {
         baseURL: CONFIG_BASE_URL,
         hasTouch: false,
@@ -225,7 +254,11 @@ export default defineConfig({
     },
   ],
   webServer: [
-    server(PORT, BASE_URL, touch.env),
+    // The touch tests type into a pane and read the shell's echo back. A
+    // narrow pane, a long prompt and an interactive rc file made readline
+    // redraw the line out of place on the CI runner, so this server runs a
+    // plain sh. The other servers do not read a shell's echo.
+    server(PORT, BASE_URL, { ...touch.env, SHELL: '/bin/sh' }),
     server(CONFIG_PORT, CONFIG_BASE_URL, cfg.env),
     server(MULTI_PORT, MULTI_BASE_URL, multi.env),
     server(APPEARANCE_PORT, APPEARANCE_BASE_URL, appearance.env),

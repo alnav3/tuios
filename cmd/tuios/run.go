@@ -30,6 +30,10 @@ func loadAndApplyConfig() *config.UserConfig {
 	if err != nil {
 		log.Printf("Warning: Failed to load config, using defaults: %v", err)
 		userConfig = config.DefaultConfig()
+		// The log line above is wiped by the first frame. LoadWarnings reach
+		// the TUI, so the person learns why none of the file applies.
+		userConfig.LoadWarnings = append(userConfig.LoadWarnings,
+			fmt.Sprintf("tuios cannot load config.toml and uses the default settings: %v", err))
 	}
 
 	// What this terminal can draw, from its locale and TERM. It only decides
@@ -41,8 +45,8 @@ func loadAndApplyConfig() *config.UserConfig {
 		log.Printf("glyphs: %s, so the chrome is drawn with %s glyphs unless a glyph set or --ascii-only is chosen", why, env)
 	}
 
-	// Appearance globals are the baseline; CLI flags win. LoadUserConfig no longer
-	// applies globals itself, so this must run before ApplyOverrides.
+	// Appearance globals are the baseline; CLI flags win. LoadUserConfig does not
+	// apply globals itself, so this must run before ApplyOverrides.
 	config.ApplyAppearanceConfig(userConfig, &config.Global)
 
 	config.ApplyOverrides(flagOverrides(), &config.Global)
@@ -156,22 +160,26 @@ func runLocal() error {
 	// The shared list, then the one option that is this transport's: the
 	// writer every frame and every graphics sequence serialize on.
 	p := tea.NewProgram(initialOS, append(app.ProgramOptions(), tea.WithOutput(prw))...)
+	initialOS.BindProgram(p)
 
 	// A quit the event loop cannot carry out still has to end the process: a
 	// force-killed ssh client leaves a pty nobody drains, and the frame write
 	// that fills it is what wedges the loop. finish runs once the cleanup
 	// below is done, so a Ctrl+C during it cannot leave the terminal raw. See
 	// armSignalQuit.
-	finish := armSignalQuit(p)
+	runReturned, finish := armSignalQuit(p)
 
 	// See withoutHardTabs: tmux drops the background under a tab.
 	restoreTabs := withoutHardTabs()
 	finalModel, err := p.Run()
+	runReturned()
 	restoreTabs()
 
 	if finalOS, ok := finalModel.(*app.OS); ok {
 		finalOS.DumpTickStats()
 		finalOS.Cleanup()
+		// The OSC 7501 records this client left on the terminal.
+		_, _ = os.Stdout.WriteString(finalOS.HostProgramStatusClear())
 	}
 
 	terminal.ResetTerminal()

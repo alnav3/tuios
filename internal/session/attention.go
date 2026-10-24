@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +13,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Gaurav-Gosain/tuios/internal/atomicfile"
+	"github.com/Gaurav-Gosain/tuios/internal/lazyre"
 	"github.com/Gaurav-Gosain/tuios/internal/risk"
 )
 
@@ -116,6 +117,9 @@ const (
 	// AttentionClosedHostRemoved: the item came from a linked host that was
 	// taken out of the [hosts] table.
 	AttentionClosedHostRemoved = "host_removed"
+	// AttentionClosedAgentsDisabled: the person turned the agent features
+	// off. A held approval goes back to its harness, which asks in its pane.
+	AttentionClosedAgentsDisabled = "agents_disabled"
 	// AttentionClosedSnoozed: the person snoozed the item. It opens again
 	// with the same id and since when the snooze ends or its fact changes.
 	// A client that predates snoozing reads it as any other close.
@@ -211,6 +215,10 @@ type AttentionItem struct {
 	// Count is how many unread messages a mail item stands for, or how many
 	// turns a finished item stands for.
 	Count int `json:"count,omitempty"`
+	// Seen is how many of a mail item's unread messages the recipient looked
+	// at with a peek and did not read. It is part of Count, never added to it,
+	// and absent while none is seen.
+	Seen int `json:"seen,omitempty"`
 	// CompletionSeq is the pane's completion_seq when a finished item last
 	// changed. Focusing the pane at that count or later closes it.
 	CompletionSeq uint64 `json:"completion_seq,omitempty"`
@@ -465,6 +473,11 @@ func (a *attentionStore) upsertLocked(next AttentionItem) {
 				a.endHoldLocked(cur.RequestID, approvalOutcome{Reason: approvalEndResolved}, false)
 			}
 		}
+		// The mark lasts as long as the prompt: while the item is open a new
+		// report may add rules to it and never take one off. The report is
+		// the pane's own, and a pane could otherwise clear the mark on a
+		// risky call before it answers. A new prompt opens a new item.
+		next.Risk = stickyRisk(cur.Risk, next.Risk)
 		if attentionSame(*cur, next) {
 			return
 		}
@@ -501,7 +514,7 @@ func (a *attentionStore) upsertLocked(next AttentionItem) {
 // so a repeated report publishes nothing.
 func attentionSame(a, b AttentionItem) bool {
 	return a.Kind == b.Kind && a.Workspace == b.Workspace && a.Harness == b.Harness &&
-		a.Name == b.Name && a.Summary == b.Summary && a.Count == b.Count &&
+		a.Name == b.Name && a.Summary == b.Summary && a.Count == b.Count && a.Seen == b.Seen &&
 		a.CompletionSeq == b.CompletionSeq && a.Window == b.Window &&
 		a.RequestID == b.RequestID && a.Expires == b.Expires && a.Stale == b.Stale &&
 		a.HeldID == b.HeldID && a.HeldFor == b.HeldFor && a.ForHost == b.ForHost &&
@@ -590,6 +603,8 @@ func (a *attentionStore) noteSessionEvent(sessionName string, ev SessionEvent) {
 		a.noteAgentState(sessionName, ev)
 	case EventWindowClosed:
 		a.closeWindow(sessionName, ev.Window)
+	case EventWindowMoved:
+		a.windowWorkspace(sessionName, ev.Window, ev.Workspace)
 	case eventCompletionSeen:
 		a.noteCompletionSeen(sessionName, ev.Window, ev.completionSeq)
 	case eventPaneFocused:
@@ -610,6 +625,9 @@ func (a *attentionStore) noteAgentState(sessionName string, ev SessionEvent) {
 		Workspace: ev.hookWorkspace,
 		Harness:   ev.hookHarness,
 		Name:      attentionText(ev.hookTitle, attentionMaxSummary),
+	}
+	if ev.hookProgram {
+		base.Name += " [" + shortWindowID(ev.Window) + "]"
 	}
 
 	if state != AgentStateNeedsInput.Name() {
@@ -641,7 +659,7 @@ func (a *attentionStore) noteAgentState(sessionName string, ev SessionEvent) {
 			it.Kind = AttentionApproval
 			// An approval nobody holds is marked from the line its pane
 			// reported. A held one keeps what its hold marked (upsertLocked).
-			it.Risk = risk.Names(a.riskOfLine(ev.hookMessage, ev.hookRoot))
+			it.Risk = risk.Names(a.riskOfLine(ev.hookMessage, ev.hookRoot, ev.hookRunDir))
 		}
 		it.Summary = attentionText(ev.hookMessage, attentionMaxSummary)
 		a.upsertLocked(it)
@@ -698,6 +716,26 @@ func (a *attentionStore) closeWindow(sessionName, window string) {
 		if it := a.items[id]; it.Kind == AttentionAsk && it.Session == sessionName && it.Window == window {
 			a.closeLocked(id, AttentionClosedWindow)
 		}
+	}
+}
+
+// windowWorkspace gives the items about a pane the workspace it moved to, which is
+// also how they follow a renumber of the workspaces.
+func (a *attentionStore) windowWorkspace(sessionName, window string, workspace int) {
+	if window == "" || workspace < 1 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, id := range a.sortedIDsLocked() {
+		it := a.items[id]
+		if it.Host != "" || it.Session != sessionName || it.Window != window || it.Workspace == workspace {
+			continue
+		}
+		a.rev++
+		it.Workspace, it.Seq = workspace, a.rev
+		a.publish(attentionEvent(AttentionUpdated, *it))
+		a.changedLocked()
 	}
 }
 
@@ -847,6 +885,7 @@ func (a *attentionStore) noteMail(msg AgentMessage) {
 	if id, ok := a.byKey[attentionKey(AttentionMail, msg.Session, "", msg.ThreadID)]; ok {
 		cur := a.items[id]
 		it.Count = cur.Count + 1
+		it.Seen = cur.Seen
 		// The newest message names the thread's latest word, but the row is
 		// still the thread the person has not read.
 		if it.Window == "" {
@@ -858,6 +897,23 @@ func (a *attentionStore) noteMail(msg AgentMessage) {
 			it.HeldID, it.HeldFor = cur.HeldID, cur.HeldFor
 		}
 	}
+	a.upsertLocked(it)
+}
+
+// noteMailSeen records how many of a thread's messages for the person have
+// been seen and not read, so the Inbox row and list-attention can say so.
+func (a *attentionStore) noteMailSeen(sessionName string, thread uint64, seen int) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id, ok := a.byKey[attentionKey(AttentionMail, sessionName, "", thread)]
+	if !ok {
+		return
+	}
+	it := *a.items[id]
+	it.Seen = min(seen, it.Count)
 	a.upsertLocked(it)
 }
 
@@ -1069,17 +1125,7 @@ func writeAttentionFile(path string, data []byte) {
 	if data == nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		LogError("Failed to create the attention directory: %v", err)
-		return
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		LogError("Failed to save the attention queue: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := atomicfile.WritePrivate(path, data, false); err != nil {
 		LogError("Failed to save the attention queue: %v", err)
 	}
 }
@@ -1187,7 +1233,7 @@ func (a *attentionStore) load(path string, live func(session, window string) boo
 // a key=value or key: value whose key names a secret, and an Authorization
 // bearer token. It is a net for the common case, not a guarantee, which is why
 // the summary is also kept short.
-var attentionSecret = regexp.MustCompile(`(?i)\b((?:[a-z0-9_]*(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?)\s*[=:]\s*|bearer\s+)("[^"]*"|'[^']*'|[^\s"']+)`)
+var attentionSecret = lazyre.New(`(?i)\b((?:[a-z0-9_]*(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?)\s*[=:]\s*|bearer\s+)("[^"]*"|'[^']*'|[^\s"']+)`)
 
 // attentionSecretWords are the words attentionSecret keys on, lower case. A
 // summary with none of them cannot match, and most summaries have none, so the
@@ -1230,7 +1276,7 @@ func attentionText(s string, limit int) string {
 	}
 	out := b.String()
 	if attentionMaySecret(out) {
-		out = attentionSecret.ReplaceAllString(out, "${1}[redacted]")
+		out = attentionSecret().ReplaceAllString(out, "${1}[redacted]")
 	}
 	if len(out) <= limit {
 		return out
@@ -1289,5 +1335,21 @@ func (a *attentionStore) renameSession(old, newName string) {
 	if moved {
 		a.rev++
 		a.changedLocked()
+	}
+}
+
+// closeAll closes every item and drops every snoozed one with reason. A hold
+// on an item ends with it, so its harness asks in its pane.
+func (a *attentionStore) closeAll(reason string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, id := range a.sortedIDsLocked() {
+		a.closeLocked(id, reason)
+	}
+	for _, id := range a.snoozedIDsLocked() {
+		a.dropSnoozedLocked(id, reason)
 	}
 }

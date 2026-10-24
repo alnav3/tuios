@@ -40,11 +40,11 @@ type notifHitZones struct {
 // walks down from the top of the queue, so repeat presses of the keyboard twin
 // go deeper as each one is dismissed.
 func (m *OS) notifTargetedIndex() int {
-	for i := len(m.Notifications) - 1; i >= 0; i-- {
+	for i, v := range slices.Backward(m.Notifications) {
 		// A clipboard ask is allowed only by a click on it. The jump key is
 		// pressed from habit, and one stray press must not hand a background
 		// pane the clipboard.
-		if t := m.Notifications[i].Target; t != nil && t.ClipboardAsk == 0 {
+		if t := v.Target; t != nil && t.ClipboardAsk == 0 {
 			return i
 		}
 	}
@@ -74,6 +74,11 @@ func (m *OS) jumpToNotifTarget(t NotifTarget) {
 	// followed.
 	if t.ClipboardAsk != 0 {
 		m.allowClipboardAsk(t.ClipboardAsk, t.ClipboardVersion)
+		return
+	}
+	// The version notice is answered with the restart dialog.
+	if t.DaemonRestart {
+		m.OpenDaemonRestart()
 		return
 	}
 	// A message about mail lands on the thread, where the reply is, rather than
@@ -148,6 +153,12 @@ func (m *OS) NotificationClick(x, y int) bool {
 		return false
 	}
 	if x >= z.DismissX0 {
+		// The one explicit dismissal: a click on the dismiss end of a message
+		// that was on screen. An integration notice dismissed this way stays
+		// dismissed across attaches. See noteNoticesDismissed.
+		if top := m.Notifications[len(m.Notifications)-1]; sameDrawnNotification(top, z.Drawn) {
+			m.noteNoticesDismissed([]Notification{top})
+		}
 		m.dismissVisibleNotification()
 		return true
 	}
@@ -177,7 +188,7 @@ func (m *OS) clickVisibleNotification() {
 		return
 	}
 	m.Notifications = m.Notifications[:n-1]
-	if m.notifHit.Cut && !isClipboardAsk(visible.Target) {
+	if m.notifHit.Cut && !isClipboardAsk(visible.Target) && !isRestartNotice(visible.Target) {
 		m.notifHoverEnd()
 		m.openMessageView(m.notificationEntry(visible))
 		return
@@ -189,6 +200,11 @@ func (m *OS) clickVisibleNotification() {
 
 // isClipboardAsk reports whether a target is a pane's clipboard ask.
 func isClipboardAsk(t *NotifTarget) bool { return t != nil && t.ClipboardAsk != 0 }
+
+// isRestartNotice reports whether a target is the version notice. A click on
+// it opens the restart dialog even when the dock cut its text: the dialog
+// says it all again.
+func isRestartNotice(t *NotifTarget) bool { return t != nil && t.DaemonRestart }
 
 // sameDrawnNotification reports whether a is the message b was drawn from,
 // with the same text and the same target.

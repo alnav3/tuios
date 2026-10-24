@@ -9,9 +9,8 @@ import (
 )
 
 // The key handlers below are shared by terminal mode and window-management
-// mode. Each mode used to carry its own copy, and the copies drifted: the help
-// overlay closed on different keys depending on which mode it had been opened
-// from. Each mode still calls them at its own point in its routing order.
+// mode, so the help overlay closes on the same keys whichever mode opened it.
+// Each mode calls them at its own point in its routing order.
 
 // routeSettingsOverlayKey sends the key to the settings overlay, or to one of
 // the pickers and editors that open over it, or to the layout or machine
@@ -25,8 +24,12 @@ func routeSettingsOverlayKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd, 
 	var out *app.OS
 	var cmd tea.Cmd
 	switch {
+	case o.ThemeEditorOpen():
+		out, cmd = handleThemeEditorInput(msg, o)
 	case o.ShowThemePicker:
 		out, cmd = handleThemePickerInput(msg, o)
+	case o.PresetPickerOpen():
+		out, cmd = handlePresetPickerInput(msg, o)
 	case o.ShowGlyphPicker:
 		out, cmd = handleGlyphPickerInput(msg, o)
 	case o.ShowEffectPicker:
@@ -129,6 +132,11 @@ func handleHelpOverlayKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 				o.HelpSearchQuery = o.HelpSearchQuery[:len(o.HelpSearchQuery)-size]
 				o.HelpScrollOffset = 0 // Reset scroll when query changes
 			}
+			return o, nil
+		}
+		if key == "ctrl+u" {
+			o.HelpSearchQuery = ""
+			o.HelpScrollOffset = 0
 			return o, nil
 		}
 

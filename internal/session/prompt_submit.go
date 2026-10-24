@@ -1,7 +1,7 @@
 package session
 
 import (
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 
 	"context"
 	"fmt"
@@ -132,15 +132,35 @@ func submitPrompt(ctx context.Context, pane promptPane, text string, in harness.
 	return submitPromptStamped(ctx, pane, text, in, promptSubmitQuiet, promptSubmitMaxWait)
 }
 
-// submitPromptTimed is submitPrompt with the waits as parameters.
-func submitPromptTimed(ctx context.Context, pane promptPane, text string, in harness.InputProfile, quiet, maxWait time.Duration) error {
-	_, err := submitPromptStamped(ctx, pane, text, in, quiet, maxWait)
-	return err
+// submitPromptStamped is submitPrompt with the waits as parameters. It also
+// returns when the submit key was sent.
+func submitPromptStamped(ctx context.Context, pane promptPane, text string, in harness.InputProfile, quiet, maxWait time.Duration) (time.Time, error) {
+	return submitPastesStamped(ctx, pane, []string{text}, in, quiet, maxWait)
 }
 
-// submitPromptStamped is submitPromptTimed that also returns when the submit
-// key was sent.
-func submitPromptStamped(ctx context.Context, pane promptPane, text string, in harness.InputProfile, quiet, maxWait time.Duration) (time.Time, error) {
+// submitPastes types each of pastes as a paste of its own, waiting after each
+// for the application to take it in, and then submits once. A queued reply
+// with an image is typed this way: the text before the image, the image's
+// path alone, the text after it, so a harness that reads a pasted path as an
+// attached image sees the path as a paste by itself.
+func submitPastes(ctx context.Context, pane promptPane, pastes []string, in harness.InputProfile) (time.Time, error) {
+	return submitPastesStamped(ctx, pane, pastes, in, promptSubmitQuiet, promptSubmitMaxWait)
+}
+
+// submitGuardKey carries a check that runs right before the submit key.
+type submitGuardKey struct{}
+
+// withSubmitGuard returns ctx with check, which submitPastesStamped runs
+// right before it writes the submit key. The wait for the paste to be taken
+// can be long, and a pane can come to a prompt in it: the Enter would then
+// answer the prompt. A check that fails stops the submit, with its error
+// wrapped. The paste stays in the pane, unsubmitted.
+func withSubmitGuard(ctx context.Context, check func() *verbError) context.Context {
+	return context.WithValue(ctx, submitGuardKey{}, check)
+}
+
+// submitPastesStamped is submitPastes with the waits as parameters.
+func submitPastesStamped(ctx context.Context, pane promptPane, pastes []string, in harness.InputProfile, quiet, maxWait time.Duration) (time.Time, error) {
 	if in.SubmitKey == "" {
 		in.SubmitKey = "\r"
 	}
@@ -149,20 +169,35 @@ func submitPromptStamped(ctx context.Context, pane promptPane, text string, in h
 			return time.Time{}, fmt.Errorf("failed to report focus: %w", err)
 		}
 	}
-	body := promptBody(text)
-	if in.BracketedPaste && pane.BracketedPasteOn() {
-		body = bracketedPasteStart + body + bracketedPasteEnd
-	}
-	// Taken before the write, so output the paste caused counts however soon
-	// it arrives.
-	pastedAt := time.Now()
-	if body != "" {
-		if _, err := pane.Write([]byte(body)); err != nil {
-			return time.Time{}, fmt.Errorf("failed to write the prompt: %w", err)
+	bracket := in.BracketedPaste && pane.BracketedPasteOn()
+	for _, text := range pastes {
+		body := promptBody(text)
+		if body == "" && len(pastes) > 1 {
+			// A message that starts or ends with an image has nothing
+			// on that side. An empty bracketed paste is what a terminal
+			// sends for a clipboard with only an image, and must not be
+			// sent for nothing.
+			continue
+		}
+		if bracket {
+			body = bracketedPasteStart + body + bracketedPasteEnd
+		}
+		// Taken before the write, so output the paste caused counts
+		// however soon it arrives.
+		pastedAt := time.Now()
+		if body != "" {
+			if _, err := pane.Write([]byte(body)); err != nil {
+				return time.Time{}, fmt.Errorf("failed to write the prompt: %w", err)
+			}
+		}
+		if err := waitPasteTaken(ctx, pane, pastedAt, quiet, maxWait); err != nil {
+			return time.Time{}, err
 		}
 	}
-	if err := waitPasteTaken(ctx, pane, pastedAt, quiet, maxWait); err != nil {
-		return time.Time{}, err
+	if check, ok := ctx.Value(submitGuardKey{}).(func() *verbError); ok && check != nil {
+		if verr := check(); verr != nil {
+			return time.Time{}, fmt.Errorf("the prompt was pasted and not submitted: %w", verr)
+		}
 	}
 	submittedAt := time.Now()
 	if _, err := pane.Write([]byte(in.SubmitKey)); err != nil {

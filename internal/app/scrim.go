@@ -1,6 +1,7 @@
 package app
 
 import (
+	"image"
 	"image/color"
 
 	uv "github.com/charmbracelet/ultraviolet"
@@ -8,7 +9,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // The scrim is the screen behind a modal overlay turned down, so the panel
@@ -70,14 +71,21 @@ var modalOverlays = [...]modalOverlay{
 	{id: "palette", open: func(m *OS) bool { return m.ShowCommandPalette }, scrim: true},
 	{id: "launcher", open: func(m *OS) bool { return m.ShowLauncher }, scrim: true},
 	{id: "session", open: func(m *OS) bool { return m.ShowSessionSwitcher }, scrim: true},
+	{id: "goto", open: func(m *OS) bool { return m.gotoPicker.open }, scrim: true},
 	{id: "agentmail", open: func(m *OS) bool { return m.ShowAgentMail }, scrim: true},
 	{id: "inbox", open: func(m *OS) bool { return m.ShowInbox }, scrim: true},
 	{id: "workspace", open: func(m *OS) bool { return m.ShowWorkspaceSwitcher }, scrim: true},
+	{id: overlayKindBuffers, open: func(m *OS) bool { return m.buffers.open }, scrim: true},
+	{id: overlayKindTransfers, open: func(m *OS) bool { return m.transfers.open }, scrim: true},
+	{id: "navigator", open: func(m *OS) bool { return m.navigator.open }, scrim: true},
 	{id: "layout", open: func(m *OS) bool { return m.ShowLayoutPicker }, scrim: true},
 	{id: "hostpicker", open: func(m *OS) bool { return m.ShowHostPicker }, scrim: true},
 	{id: "settings", open: func(m *OS) bool { return m.ShowSettings }, scrim: true},
 	{id: "keybinds", open: func(m *OS) bool { return m.ShowKeybindManager }, scrim: true},
 	{id: "themepicker", open: func(m *OS) bool { return m.ShowThemePicker }},
+	// The theme editor's preview is the whole screen, the sheet sits beside it.
+	{id: "themeeditor", open: func(m *OS) bool { return m.themeEditor.open }},
+	{id: "presetpicker", open: func(m *OS) bool { return m.presetPicker.open }, scrim: true},
 	{id: "dockeditor", open: func(m *OS) bool { return m.ShowDockEditor }},
 	{id: "sectioneditor", open: func(m *OS) bool { return m.ShowSectionEditor }},
 	{id: "glyphpicker", open: func(m *OS) bool { return m.ShowGlyphPicker }},
@@ -88,7 +96,11 @@ var modalOverlays = [...]modalOverlay{
 	{id: overlayKindShot, open: func(m *OS) bool { return m.ShotPreview.Open }, scrim: true},
 	{id: "quit", open: func(m *OS) bool { return m.ShowQuitMenu }, scrim: true},
 	{id: "sessionclose", open: func(m *OS) bool { return m.ShowSessionClose }, scrim: true},
+	{id: overlayKindRestart, open: func(m *OS) bool { return m.DaemonRestartOpen() }, scrim: true},
 	{id: "filedialog", open: func(m *OS) bool { return m.FilePromptOpen() }, scrim: true},
+	{id: "worktreeprompt", open: func(m *OS) bool { return m.WorktreePromptOpen() }, scrim: true},
+	{id: overlayKindCopyDialog, open: func(m *OS) bool { return m.CopyDialogOpen() }, scrim: true},
+	{id: overlayKindPluginApproval, open: func(m *OS) bool { return m.PluginApprovalOpen() }, scrim: true},
 	{id: "help", open: func(m *OS) bool { return m.ShowHelp }, scrim: true},
 	{id: "tape-manager", open: func(m *OS) bool { return m.ShowTapeManager }, scrim: true},
 	{id: "tape-review", open: func(m *OS) bool { return m.ShowTapeReview }, scrim: true},
@@ -127,10 +139,18 @@ func scrimBehind(id string) bool {
 	return ok && modalOverlays[i].scrim
 }
 
-// applyScrim darkens every cell on the canvas by the configured modal dim. It
-// runs once per frame at most, before the first modal layer is drawn.
-func (m *OS) applyScrim(canvas *frameCanvas) {
-	dim := m.Settings.ModalDim
+// applyScrim darkens every cell on the canvas by dim percent. It runs once
+// per frame at most, before the popup or first modal layer is drawn.
+func (m *OS) applyScrim(canvas *frameCanvas, dim int) {
+	m.applyScrimIn(canvas, canvas.Bounds(), dim)
+}
+
+// applyScrimIn is applyScrim on the cells of one rectangle of the canvas.
+func (m *OS) applyScrimIn(canvas *frameCanvas, area image.Rectangle, dim int) {
+	area = area.Intersect(canvas.Bounds())
+	if area.Empty() {
+		return
+	}
 	if dim <= 0 {
 		return
 	}
@@ -143,8 +163,8 @@ func (m *OS) applyScrim(canvas *frameCanvas) {
 		s.run.have = false
 	}
 	const level = config.SpotlightLevels - 1
-	for _, line := range canvas.Lines {
-		for x := range line {
+	for _, line := range canvas.Lines[area.Min.Y:area.Max.Y] {
+		for x := area.Min.X; x < min(area.Max.X, len(line)); x++ {
 			cell := &line[x]
 			// A zero cell is the tail of a wide glyph; styling it would draw
 			// it as a cell of its own. A kitty placeholder's foreground is the
@@ -191,4 +211,47 @@ func (m *OS) scrimToward() color.Color {
 		return m.host.bg
 	}
 	return nil
+}
+
+// scrimDialogGround dims the ground of a TML dialog to the ground of the
+// screen behind it, and leaves its text, its frame and any ground of its
+// own, such as a button's, as drawn. The dialog has no fill: the scrim on
+// the screen behind it, the frame, and its text at full strength are what
+// set it apart. Left undimmed, its ground read as a lighter box, and the
+// half of each edge cell outside the frame line as a band.
+//
+// The dialog's ground is the one its top-left corner cell is on, which is
+// frame and never a button.
+func (m *OS) scrimDialogGround(canvas *frameCanvas, r image.Rectangle, dim int) {
+	r = r.Intersect(canvas.Bounds())
+	if r.Empty() || dim <= 0 || theme.Depth() == overlay.Depth16 {
+		return
+	}
+	corner := canvas.Lines[r.Min.Y]
+	if r.Min.X >= len(corner) {
+		return
+	}
+	ground := corner[r.Min.X].Style.Bg
+	s := &m.motion.scrim
+	const level = config.SpotlightLevels - 1
+	for _, line := range canvas.Lines[r.Min.Y:r.Max.Y] {
+		for x := r.Min.X; x < min(r.Max.X, len(line)); x++ {
+			cell := &line[x]
+			if cell.Content == "" || vt.IsKittyPlaceholder(cell.Content) || !sameGround(cell.Style.Bg, ground) {
+				continue
+			}
+			fg, attrs := cell.Style.Fg, cell.Style.Attrs
+			s.dimCell(cell, level)
+			cell.Style.Fg, cell.Style.Attrs = fg, attrs
+		}
+	}
+}
+
+// sameGround is sameColor for cell grounds, which may be nil or an
+// interface holding a nil pointer.
+func sameGround(a, b color.Color) bool {
+	if isNilColor(a) || isNilColor(b) {
+		return isNilColor(a) && isNilColor(b)
+	}
+	return sameColor(a, b)
 }

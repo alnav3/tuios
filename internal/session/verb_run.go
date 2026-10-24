@@ -106,18 +106,30 @@ func addShellFacts(sess *Session, data map[string]any) {
 
 // addPaneMeta adds each window's history_rows and revision to a
 // list-windows result, the numbers capture-pane reports beside its content.
-// A window with no pane on this daemon has neither.
+// A window with no pane on this daemon has neither. A pane whose process runs
+// here also gets pid, the process the pane started, and tty, its terminal
+// device: the tmux shim reports them as pane_pid and pane_tty.
 func addPaneMeta(sess *Session, data map[string]any) {
 	windows, _ := data["windows"].([]map[string]any)
 	for _, w := range windows {
 		id, _ := w["pty_id"].(string)
-		pty := sess.GetPTY(id)
-		if pty == nil {
-			continue
+		if pty := sess.GetPTY(id); pty != nil {
+			addOnePaneMeta(pty, w)
 		}
-		m := pty.Meta()
-		w["history_rows"] = m.HistoryRows
-		w["revision"] = m.Revision
+	}
+}
+
+// addOnePaneMeta adds one pane's history_rows, revision, pid and tty to its
+// window's entry. get-window uses it too, so the two reads agree.
+func addOnePaneMeta(pty *PTY, w map[string]any) {
+	m := pty.Meta()
+	w["history_rows"] = m.HistoryRows
+	w["revision"] = m.Revision
+	if pid := pty.ShellPID(); pid > 0 {
+		w["pid"] = pid
+	}
+	if tty := pty.TTYName(); tty != "" {
+		w["tty"] = tty
 	}
 }
 
@@ -338,8 +350,9 @@ func (d *Daemon) verbRun(cs *connState, params json.RawMessage) (any, *verbError
 	defer cancel()
 	pty.shell.expect()
 	defer pty.shell.stopExpecting()
+	ctx = withSubmitGuard(ctx, func() *verbError { return d.recheckTyping(cs, "run", sess, w.ID) })
 	if _, err := submitPrompt(ctx, pty, p.Command, harness.DefaultInputProfile()); err != nil {
-		return nil, newVerbError(ErrVerbInternal, err.Error())
+		return nil, promptWriteError(err)
 	}
 	LogBasic("run: typed a command in %s of %s", shortID(w.ID), sess.Name())
 
@@ -377,7 +390,7 @@ func (d *Daemon) verbRun(cs *connState, params json.RawMessage) (any, *verbError
 				if ev.CommandSeq <= baseline {
 					continue
 				}
-				output, truncated, _ := pty.LastCommandOutput()
+				output, truncated, _ := pty.LastCommandOutput(false)
 				output = sliceCaptureLines(output, 0, 0, p.Lines)
 				res := commandFinishedData(sess.Name(), w.ID, ev)
 				res["type"] = "command_result"
@@ -393,12 +406,12 @@ func (d *Daemon) verbRun(cs *connState, params json.RawMessage) (any, *verbError
 // the plain text the pane's last finished command printed, with the facts the
 // shell reported about it. It is plain only, because the rows are read out
 // of the emulator cell by cell and carry no styling.
-func captureLastCommandOutput(pty *PTY, window string, styled bool, start, end, lines int) (any, *verbError) {
+func captureLastCommandOutput(pty *PTY, window string, styled, unwrap, trim bool, start, end, lines int) (any, *verbError) {
 	if styled {
 		return nil, invalidParam("styled", "last-command-output is plain text; drop styled, ansi and resolved")
 	}
 	facts := pty.ShellFacts()
-	output, truncated, ok := pty.LastCommandOutput()
+	output, truncated, ok := pty.LastCommandOutput(unwrap)
 	if !facts.Seen || !ok {
 		if window == "" {
 			window = "focused"
@@ -410,6 +423,9 @@ func captureLastCommandOutput(pty *PTY, window string, styled bool, start, end, 
 			})
 		}
 		return nil, noShellIntegration(window)
+	}
+	if trim {
+		output = trimCapture(output)
 	}
 	res := map[string]any{
 		"type":        "pane_content",
@@ -423,6 +439,12 @@ func captureLastCommandOutput(pty *PTY, window string, styled bool, start, end, 
 	}
 	if facts.LastExit != nil {
 		res["exit_code"] = *facts.LastExit
+	}
+	if unwrap {
+		res["unwrapped"] = true
+	}
+	if trim {
+		res["trimmed"] = true
 	}
 	return res, nil
 }

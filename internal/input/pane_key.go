@@ -4,8 +4,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/app"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
 	"github.com/charmbracelet/x/ansi"
+	"tuios.dev/vt"
 )
 
 // paneKeyBytes encodes a key press for one pane from that pane's own kitty
@@ -25,19 +25,19 @@ import (
 // Without it a compositor in the pane held the key down, and its client
 // repeated it until the next key came.
 func paneKeyBytes(host tea.KeyPressMsg, w *terminal.Window, o *app.OS, focused bool) (raw []byte, released bool) {
-	flags := 0
-	appCursorKeys := false
+	flags, modifyOtherKeys := 0, 0
 	if w.Terminal != nil {
 		flags = w.Terminal.KittyKeyboardFlags()
-		appCursorKeys = w.Terminal.ApplicationCursorKeys()
+		modifyOtherKeys = w.Terminal.ModifyOtherKeys()
 	}
 	key := vtKeyFromBubbletea(host)
-	if flags != 0 {
-		if encoded := vt.EncodeKeyCSIu(key, flags); encoded != "" {
-			raw = []byte(encoded)
-		}
+	if encoded := vt.EncodePaneKey(key, flags, modifyOtherKeys); encoded != "" {
+		raw = []byte(encoded)
 	}
 	if len(raw) == 0 {
+		// Only the legacy encoding reads the cursor key mode, and on the
+		// ghostty backend reading it takes the emulator's lock.
+		appCursorKeys := w.Terminal != nil && w.Terminal.ApplicationCursorKeys()
 		raw = getRawKeyBytesWithMode(host, appCursorKeys)
 	}
 	if len(raw) == 0 || flags&ansi.KittyReportEventTypes == 0 {

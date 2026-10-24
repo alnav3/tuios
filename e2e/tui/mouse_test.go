@@ -87,8 +87,8 @@ func findText(t *testing.T, term *tuitest.Terminal, want string) (row, col int) 
 	_, rows := s.Size()
 	for r := range rows {
 		line := s.Line(r)
-		if b := strings.Index(line, want); b >= 0 {
-			return r, len([]rune(line[:b]))
+		if before, _, ok := strings.Cut(line, want); ok {
+			return r, len([]rune(before))
 		}
 	}
 	t.Fatalf("%q is in the screen text but on no single row\n%s", want, term.Snapshot())
@@ -233,7 +233,8 @@ const (
 
 // TestWheelScrollShowsScrollbackWithoutAnnouncingAMode is the centre of the
 // change. Turning the wheel over a pane used to drop the user into copy mode
-// and put "Copy mode (hjkl, q to exit)" on the dock along with a line of vim keybindings,
+// and put "Copy mode (hjkl, q to exit)" on the dock along with a line of vim keybindings
+// (now the copy-mode legend, "y yank" among its keys),
 // which is tmux's behaviour. In kitty, WezTerm, iTerm2 or GNOME Terminal the
 // view just scrolls.
 //
@@ -255,7 +256,7 @@ func TestWheelScrollShowsScrollbackWithoutAnnouncingAMode(t *testing.T) {
 
 	// Watch for any announcement for the whole gesture, not just after it: a
 	// notification that expired before a single sample would slip through.
-	stop := watchForBanner(term, "Copy mode", "hjkl:move", "y:yank")
+	stop := watchForBanner(term, "Copy mode", "hjkl:move", "y:yank", "y yank")
 
 	wheelAt(t, term, col, row, tuitest.MouseWheelUp, 20)
 

@@ -2,15 +2,20 @@ package config
 
 import (
 	"maps"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // KeybindRegistry manages the mapping between keys and actions
 type KeybindRegistry struct {
 	keyToAction map[string]string // Maps key string to action name
-	config      *UserConfig
-	normalizer  *KeyNormalizer
+	// repeat is the set of actions that stay armed after the leader: the
+	// config's keybindings.repeat, or DefaultPrefixRepeat when it is unset.
+	repeat     map[string]bool
+	config     *UserConfig
+	normalizer *KeyNormalizer
 
 	// sections holds one resolved key->action map per config section that is
 	// looked up on its own rather than through keyToAction: every prefix, the
@@ -30,15 +35,29 @@ type KeybindRegistry struct {
 	// changed without a Reload is not seen by any lookup, which was already
 	// true of the seven flattened sections.
 	sections sectionMaps
+
+	// presses is PressesByAction's answer, kept until the next buildMappings.
+	// The help overlay asks for it four times a frame while it is open, and
+	// building it walks every binding in every scope: 2.9ms a frame, most of
+	// the overlay's cost. It goes stale exactly when the maps above do, so a
+	// rebound key shows as soon as the Reload that follows every edit runs.
+	pressesMu sync.Mutex
+	presses   map[string][]string
+	// live is each scope's keys that run, for the which-key menus, kept
+	// under pressesMu and dropped with presses. See liveScope.
+	live map[string]*liveScope
 }
 
 // sectionMaps is the resolved form of every section the registry reads on its
 // own. One field per section, so a lookup is a field read and a map access.
 type sectionMaps struct {
 	prefix, windowPrefix, minimizePrefix, workspacePrefix map[string]string
-	debugPrefix, tapePrefix, layoutPrefix                 map[string]string
+	debugPrefix, tapePrefix, layoutPrefix, tuiosPrefix    map[string]string
 	terminalMode, global, script, sidebar, sidebarFiles   map[string]string
-	sidebarAgents, inbox, inboxPeek, mail                 map[string]string
+	sidebarAgents, inbox, inboxPeek, mail, copyMode       map[string]string
+	transfers, lists                                      map[string]string
+	// menus holds each declared menu (see MenuConfig), by name.
+	menus map[string]map[string]string
 }
 
 // NewKeybindRegistry creates a new keybind registry from config
@@ -55,6 +74,18 @@ func NewKeybindRegistry(cfg *UserConfig) *KeybindRegistry {
 // buildMappings builds the reverse mapping from keys to actions
 func (r *KeybindRegistry) buildMappings() {
 	r.keyToAction = make(map[string]string)
+	list := r.config.Keybindings.Repeat
+	if list == nil {
+		list = DefaultPrefixRepeat
+	}
+	r.repeat = make(map[string]bool, len(list))
+	for _, a := range list {
+		r.repeat[a] = true
+	}
+	r.pressesMu.Lock()
+	r.presses = nil
+	r.live = nil
+	r.pressesMu.Unlock()
 
 	// Build mappings for normal mode sections
 	// Note: Prefix sections (PrefixMode, WindowPrefix, MinimizePrefix, WorkspacePrefix)
@@ -82,15 +113,23 @@ func (r *KeybindRegistry) buildMappings() {
 		debugPrefix:     r.sectionKeyMap(kb.DebugPrefix),
 		tapePrefix:      r.sectionKeyMap(kb.TapePrefix),
 		layoutPrefix:    r.sectionKeyMap(kb.LayoutPrefix),
+		tuiosPrefix:     r.sectionKeyMap(kb.TuiosPrefix),
 		terminalMode:    r.sectionKeyMap(kb.TerminalMode),
 		global:          r.withCommands(r.sectionKeyMap(kb.Global), SectionGlobal),
 		script:          r.sectionKeyMap(kb.Script),
+		lists:           r.sectionKeyMap(kb.Lists),
 		sidebar:         r.sectionKeyMap(kb.Sidebar),
 		sidebarFiles:    r.sectionKeyMap(kb.SidebarFiles),
 		sidebarAgents:   r.sectionKeyMap(kb.SidebarAgents),
 		inbox:           r.sectionKeyMap(kb.Inbox),
 		inboxPeek:       r.sectionKeyMap(kb.InboxPeek),
 		mail:            r.sectionKeyMap(kb.Mail),
+		transfers:       r.sectionKeyMap(kb.Transfers),
+		copyMode:        r.sectionKeyMap(kb.CopyMode),
+		menus:           make(map[string]map[string]string, len(kb.Menus)),
+	}
+	for _, name := range kb.MenuNames() {
+		r.sections.menus[name] = r.sectionKeyMap(kb.Menus[name].Keys)
 	}
 }
 
@@ -122,13 +161,55 @@ func (r *KeybindRegistry) sectionKeyMap(section map[string][]string) map[string]
 
 	keyMap := make(map[string]string, len(section))
 	for _, action := range actions {
-		for _, key := range r.normalizer.ExpandKeys(section[action]) {
-			if _, taken := keyMap[key]; !taken {
-				keyMap[key] = action
-			}
-		}
+		r.expandInto(keyMap, action, section[action])
 	}
 	return keyMap
+}
+
+// expandInto adds the keys of one action to keyMap: every plain spelling of
+// each key, then the spellings that hold only under an assumption about the
+// keyboard, each in its own tier (see USLayoutKey and OptionGlyphKey). A key
+// already in keyMap keeps the action that claimed it first.
+//
+// The tiers are why a binding the user writes for a key wins over a US alias
+// of another binding. On AZERTY a binding on opt+& now runs, where before the
+// alt+& alias of the default opt+shift+7 took it (issue #575).
+func (r *KeybindRegistry) expandInto(keyMap map[string]string, action string, keys []string) {
+	claim := func(key string) {
+		if _, taken := keyMap[key]; !taken {
+			keyMap[key] = action
+		}
+	}
+	plain := r.normalizer.ExpandKeys(keys)
+	for _, key := range plain {
+		claim(key)
+	}
+	kb := &r.config.Keybindings
+	if kb.KeyboardLayout == KeyboardLayoutOther {
+		return
+	}
+	for _, key := range keys {
+		for _, alias := range r.normalizer.USAliasKeys(key) {
+			claim(USLayoutKey(alias))
+		}
+	}
+	// An Option chord the terminal sent as the character a US layout composes
+	// for it is looked up by the chord. With the Alt bit it is in one tier,
+	// and with no modifier in another, which "bind" and "auto" fill: a bare
+	// character can be text on another layout (issue #746), so under "auto"
+	// lookupKey answers from it only on a US Mac layout. "type" leaves both
+	// empty, so the character goes to the pane.
+	for _, key := range plain {
+		if !strings.HasPrefix(key, "alt+") {
+			continue
+		}
+		if OptionGlyphRuns(kb.KeyboardLayout, kb.OptionGlyphs, true) {
+			claim(OptionGlyphKey(key))
+		}
+		if bareGlyphTierFilled(kb.KeyboardLayout, kb.OptionGlyphs) {
+			claim(BareOptionGlyphKey(key))
+		}
+	}
 }
 
 // withCommands adds the [[keybindings.command]] keys of one section to its
@@ -143,11 +224,7 @@ func (r *KeybindRegistry) withCommands(keyMap map[string]string, section string)
 		if c.Section() != section || kb.isLeader(c.BareKey()) {
 			continue
 		}
-		for _, key := range r.normalizer.ExpandKeys([]string{c.BareKey()}) {
-			if _, taken := keyMap[key]; !taken {
-				keyMap[key] = c.Action()
-			}
-		}
+		r.expandInto(keyMap, c.Action(), []string{c.BareKey()})
 	}
 	return keyMap
 }
@@ -155,6 +232,19 @@ func (r *KeybindRegistry) withCommands(keyMap map[string]string, section string)
 // GetAction returns the action name for a given key in normal mode
 func (r *KeybindRegistry) GetAction(key string) string {
 	return r.lookupKey(key, r.keyToAction)
+}
+
+// LeaderTwiceGoesBack reports whether the leader pressed two times goes back
+// to the last workspace rather than sending the leader. See
+// KeybindingsConfig.LeaderTwice.
+func (r *KeybindRegistry) LeaderTwiceGoesBack() bool {
+	return r.config.Keybindings.LeaderTwice == LeaderTwiceLastWorkspace
+}
+
+// PrefixRepeats reports whether action stays armed after the leader. See
+// KeybindingsConfig.Repeat.
+func (r *KeybindRegistry) PrefixRepeats(action string) bool {
+	return r.repeat[action]
 }
 
 // GetPrefixAction returns the action name for a given key in the main prefix mode (Ctrl+B)
@@ -199,6 +289,18 @@ func (r *KeybindRegistry) GetGlobalAction(key string) string {
 // playing back.
 func (r *KeybindRegistry) GetScriptAction(key string) string {
 	return r.lookupKey(key, r.sections.script)
+}
+
+// GetTuiosPrefixAction returns the action name for a given key in the tuios
+// menu (the leader, then prefix_tuios's key).
+func (r *KeybindRegistry) GetTuiosPrefixAction(key string) string {
+	return r.lookupKey(key, r.sections.tuiosPrefix)
+}
+
+// GetMenuAction returns the action name for a given key in the declared menu
+// with the given name (see MenuConfig).
+func (r *KeybindRegistry) GetMenuAction(name, key string) string {
+	return r.lookupKey(key, r.sections.menus[name])
 }
 
 // GetLayoutPrefixAction returns the action name for a given key in layout prefix
@@ -258,6 +360,17 @@ func (r *KeybindRegistry) GetMailAction(key string) string {
 	return r.lookupKey(key, r.sections.mail)
 }
 
+// GetCopyModeAction returns the action a key runs in copy mode, or "" for a
+// key the section does not bind. Copy mode reads its vim motions itself.
+func (r *KeybindRegistry) GetCopyModeAction(key string) string {
+	return r.lookupKey(key, r.sections.copyMode)
+}
+
+// GetCopyModeKeys is GetKeys for the copy_mode section, for the help overlay.
+func (r *KeybindRegistry) GetCopyModeKeys(action string) []string {
+	return r.config.Keybindings.CopyMode[action]
+}
+
 // GetInboxKeys is GetKeys for the Inbox, its peek and the mailbox, whose
 // action names are their own: the key hints of those overlays read what the
 // config binds rather than a letter written into the renderer.
@@ -269,6 +382,17 @@ func (r *KeybindRegistry) GetInboxKeys(action string) []string {
 		}
 	}
 	return nil
+}
+
+// GetTransfersAction returns the action a key runs in the Copies panel.
+func (r *KeybindRegistry) GetTransfersAction(key string) string {
+	return r.lookupKey(key, r.sections.transfers)
+}
+
+// GetTransfersKeys is GetKeys for the Copies panel, for its key hints and the
+// help overlay.
+func (r *KeybindRegistry) GetTransfersKeys(action string) []string {
+	return r.config.Keybindings.Transfers[action]
 }
 
 // GetSidebarFilesKeys is GetKeys for the files section's binds, for the help
@@ -303,9 +427,32 @@ func (r *KeybindRegistry) lookupKey(key string, keyMap map[string]string) string
 		return keyMap[strings.ToLower(key)]
 	}
 
+	// A bare composed character under option_glyphs = "auto" runs its chord
+	// only on a US Mac layout. Asked here, not when the tier is filled, so a
+	// layout switched while tuios runs is seen. The answer comes from a cache
+	// the client fills in the background (see StartMacLayoutDetection).
+	if strings.HasPrefix(key, bareGlyphTier) {
+		kb := &r.config.Keybindings
+		if !OptionGlyphRuns(kb.KeyboardLayout, kb.OptionGlyphs, false) {
+			return ""
+		}
+	}
+
 	// For everything else (compound keys), normalize to lowercase
 	normalizedKey := strings.ToLower(key)
 	return keyMap[normalizedKey]
+}
+
+// bareGlyphTierFilled reports whether the registry fills the bare
+// Option-glyph tier: for "bind", and for "auto" unless keyboard_layout is
+// "other". Whether "auto" answers from it is up to lookupKey. A value outside
+// OptionGlyphModes is "auto" here, as in OptionGlyphRuns and as the
+// validation warning says, so the bindings and the leader agree on it.
+func bareGlyphTierFilled(layout, glyphs string) bool {
+	if layout == KeyboardLayoutOther {
+		return false
+	}
+	return glyphs != OptionGlyphsAlt && glyphs != OptionGlyphsType
 }
 
 // GetKeys returns the keys bound to an action in the first section below that
@@ -329,9 +476,11 @@ func (r *KeybindRegistry) GetKeys(action string) []string {
 		r.config.Keybindings.DebugPrefix,
 		r.config.Keybindings.TapePrefix,
 		r.config.Keybindings.LayoutPrefix,
+		r.config.Keybindings.TuiosPrefix,
 		r.config.Keybindings.TerminalMode,
 		r.config.Keybindings.Global,
 		r.config.Keybindings.Script,
+		r.config.Keybindings.Lists,
 	}
 
 	for _, section := range sections {
@@ -357,8 +506,19 @@ func (r *KeybindRegistry) GetKeys(action string) []string {
 //
 // Built in one pass and returned as a map because the help overlay is on the
 // render path: asking per action would rescan every section for each of eighty
-// of them, once a frame.
+// of them, once a frame. The registry keeps the map until its next Reload, so
+// callers share it and must not change it. Each slice is clipped, so an append
+// to one copies it rather than writing into the next.
 func PressesByAction(r *KeybindRegistry) map[string][]string {
+	r.pressesMu.Lock()
+	defer r.pressesMu.Unlock()
+	if r.presses == nil {
+		r.presses = buildPressesByAction(r)
+	}
+	return r.presses
+}
+
+func buildPressesByAction(r *KeybindRegistry) map[string][]string {
 	out := map[string][]string{}
 	seen := map[string]bool{}
 	for _, b := range r.Bindings() {
@@ -384,6 +544,9 @@ func PressesByAction(r *KeybindRegistry) map[string][]string {
 		seen[id] = true
 		out[b.Action] = append(out[b.Action], b.Press)
 	}
+	for action, presses := range out {
+		out[action] = slices.Clip(presses)
+	}
 	return out
 }
 
@@ -392,7 +555,11 @@ func PressesByAction(r *KeybindRegistry) map[string][]string {
 // no chord that would say so.
 func contextOnlyScope(scope string) bool {
 	switch scope {
-	case ScopeSidebar, ScopeSidebarFiles, ScopeSidebarAgents, ScopeScript, ScopeInbox, ScopeInboxPeek, ScopeMail:
+	case ScopeSidebar, ScopeSidebarFiles, ScopeSidebarAgents, ScopeScript, ScopeLists, ScopeInbox, ScopeInboxPeek, ScopeMail, ScopeTransfers, ScopeCopyMode:
+		return true
+	case ScopeGUI:
+		// Only the GUI reads these keys. A terminal's help that listed
+		// ctrl+shift+t for new_window would name a key that does nothing there.
 		return true
 	}
 	return false
@@ -429,48 +596,84 @@ var ActionDescriptions = map[string]string{
 	"file_paste":          "Files: paste into this folder",
 	"file_open":           "Files: open this folder, or copy this file's path",
 	"file_edit":           "Files: edit this text file in a new pane",
+	"file_copy_path":      "Files: copy the path of this file or folder",
+	"file_send":           "Files: send this file or folder to a host",
+	// The Copies panel: the copies between machines.
+	"transfers_down":   "Copies: next copy",
+	"transfers_up":     "Copies: previous copy",
+	"transfers_pause":  "Copies: pause or go on with the copy",
+	"transfers_cancel": "Copies: cancel the copy, after a question",
+	"transfers_retry":  "Copies: try a failed copy again",
+	"transfers_clear":  "Copies: remove the copies that ended",
+	"transfers_answer": "Copies: answer a copy that waits for an answer",
+	"transfers_close":  "Copies: close the panel",
 
-	// The Inbox, the prompt open over it, and the mailbox. Each acts only
-	// while its overlay is up.
-	"inbox_down":         "Inbox: next item",
-	"inbox_up":           "Inbox: previous item",
-	"inbox_page_down":    "Inbox: ten items down",
-	"inbox_page_up":      "Inbox: ten items up",
-	"inbox_first":        "Inbox: first item",
-	"inbox_last":         "Inbox: last item",
-	"inbox_go":           "Inbox: go to the item's pane, or open its mail",
-	"inbox_peek":         "Inbox: read the prompt here and answer it",
-	"inbox_dismiss":      "Inbox: dismiss the item",
-	"inbox_reply":        "Inbox: reply to the mail",
-	"inbox_resume":       "Inbox: resume the conversation in its pane",
-	"inbox_pass_on":      "Inbox: pass held mail on to the agent it was for",
-	"inbox_filter":       "Inbox: show one kind, then the next",
-	"inbox_select":       "Inbox: narrow the list with a selector",
-	"inbox_mailbox":      "Inbox: open the whole mailbox",
-	"inbox_close":        "Inbox: close",
-	"inbox_review":       "Inbox: review the changes in the item's pane",
-	"inbox_snooze":       "Inbox: snooze the item, then 1 to 4 for how long",
-	"inbox_undo":         "Inbox: undo the last dismiss or snooze",
-	"inbox_show_snoozed": "Inbox: show or hide snoozed items",
-	"inbox_deny_reason":  "Inbox: deny the approval or plan with a reason",
-	"inbox_detail_down":  "Inbox: scroll the detail down",
-	"inbox_detail_up":    "Inbox: scroll the detail up",
+	"list_up":        "Lists: up one row",
+	"list_down":      "Lists: down one row",
+	"list_page_up":   "Lists: up a page",
+	"list_page_down": "Lists: down a page",
+	"list_first":     "Lists: first row",
+	"list_last":      "Lists: last row",
+
+	// The agents view, the prompt open over it, and the mailbox. Each acts
+	// only while its overlay is up. The action names keep the inbox_ prefix
+	// they had before the Inbox became the agents view, so configs keep
+	// working.
+	"inbox_down":         "Agents view: next row",
+	"inbox_up":           "Agents view: previous row",
+	"inbox_page_down":    "Agents view: ten rows down",
+	"inbox_page_up":      "Agents view: ten rows up",
+	"inbox_first":        "Agents view: first row",
+	"inbox_last":         "Agents view: last row",
+	"inbox_go":           "Agents view: go to the agent's pane and close the view, or open the mail",
+	"inbox_peek":         "Agents view: read the prompt here and answer it",
+	"inbox_dismiss":      "Agents view: dismiss what needs you on the row",
+	"inbox_reply":        "Agents view: reply to the agent or the mail, or reject the held approval",
+	"inbox_resume":       "Agents view: resume the conversation in its pane",
+	"inbox_pass_on":      "Agents view: pass held mail on to the agent it was for",
+	"inbox_filter":       "Agents view: show only what needs you, then each kind, then every agent",
+	"inbox_select":       "Agents view: search the agents, with selector terms such as harness:codex",
+	"inbox_mailbox":      "Agents view: open the whole mailbox",
+	"inbox_close":        "Agents view: close",
+	"inbox_write":        "Agents view: write a reply to the selected agent",
+	"inbox_sort":         "Agents view: step the sort",
+	"inbox_view_pane":    "Agents view: zoom the selected agent's pane, and come back with the same key",
+	"inbox_review":       "Agents view: review the changes in the agent's pane",
+	"inbox_snooze":       "Agents view: snooze what needs you on the row, then 1 to 4 for how long",
+	"inbox_undo":         "Agents view: undo the last dismiss or snooze",
+	"inbox_show_snoozed": "Agents view: show or hide the snoozed rows",
+	"inbox_deny_reason":  "Agents view: reject the approval or plan and say why",
+	"inbox_new_agent":    "Agents view: start a new agent",
+	"inbox_detail_down":  "Agents view: scroll the card down",
+	"inbox_detail_up":    "Agents view: scroll the card up",
+	"inbox_allow":        "Agents view: allow the held approval once, or approve the plan",
+	"inbox_allow_always": "Agents view: always allow the held approval",
+	"inbox_open":         "Agents view: open the focus on a narrow screen, or show every row of a long group",
+	"inbox_back":         "Agents view: go back from the focus on a narrow screen",
+	"inbox_help":         "Agents view: show every key",
+	"inbox_mark":         "Agents view: mark the agent for a bulk answer",
+	"inbox_mark_all":     "Agents view: mark every agent shown, or clear the marks",
+	"inbox_tab_prev":     "Agents view: the focus's tab to the left",
+	"inbox_tab_next":     "Agents view: the focus's tab to the right",
+	"inbox_expand":       "Agents view: show every line of every card in the thread, or fold them again",
+	"inbox_compare":      "Agents view: compare the attempts of the fan under the cursor, ask a judge, keep one",
 
 	// The rail's agent rows. They act only while the cursor is on an agent
 	// row, and a key they share with a rail binding keeps its rail meaning on
 	// every other row.
 	"agent_unread":        "Agents: mark the pane's finished turn unread",
-	"agent_snooze":        "Agents: snooze the pane's Inbox item",
+	"agent_snooze":        "Agents: snooze what needs you in the pane",
 	"agent_reply":         "Agents: reply to the agent",
 	"agent_review":        "Agents: review the pane's changes",
+	"agent_subagents":     "Agents: open or close the subagent rows",
 	"agent_cancel_queued": "Agents: drop the newest queued message",
-	"peek_approve":        "Inbox prompt: approve",
-	"peek_approve_always": "Inbox prompt: approve and do not ask again",
-	"peek_deny":           "Inbox prompt: deny",
-	"peek_type":           "Inbox prompt: type an answer",
-	"peek_read_again":     "Inbox prompt: read the prompt again",
-	"peek_go":             "Inbox prompt: go to the pane",
-	"peek_back":           "Inbox prompt: back to the list",
+	"peek_approve":        "Prompt: approve",
+	"peek_approve_always": "Prompt: approve and do not ask again",
+	"peek_deny":           "Prompt: reject",
+	"peek_type":           "Prompt: type an answer",
+	"peek_read_again":     "Prompt: read the prompt again",
+	"peek_go":             "Prompt: go to the pane",
+	"peek_back":           "Prompt: back to the agents view",
 	"mail_down":           "Mailbox: next thread",
 	"mail_up":             "Mailbox: previous thread",
 	"mail_page_down":      "Mailbox: ten threads down",
@@ -487,10 +690,11 @@ var ActionDescriptions = map[string]string{
 	"reorder_down": "Rail: move this session or machine down",
 
 	// Window Management
-	"new_window":    "New window",
-	"close_window":  "Close window",
-	"rename_window": "Rename window",
-	"set_accent":    "Accent color",
+	"new_window":     "New window",
+	"new_window_ssh": "New window that runs the focused pane's ssh",
+	"close_window":   "Close window",
+	"rename_window":  "Rename window",
+	"set_accent":     "Accent color",
 	// Reached from the rail's session row and its menu; the row carries which
 	// session, so it has no key of its own.
 	"set_session_accent": "Session color",
@@ -504,6 +708,7 @@ var ActionDescriptions = map[string]string{
 	"screenshot_screen":  "Screenshot the whole screen",
 	"next_window":        "Next window",
 	"prev_window":        "Previous window",
+	"last_pane":          "Back to the previous pane",
 	"select_window_1":    "Select window 1",
 	"select_window_2":    "Select window 2",
 	"select_window_3":    "Select window 3",
@@ -517,9 +722,11 @@ var ActionDescriptions = map[string]string{
 	// Multifocus. Neither action has a default key.
 	"toggle_multifocus_active": "Add or remove the focused pane from multifocus",
 	"toggle_multifocus_all":    "Add all panes on the workspace to multifocus, or clear it",
-	"close_workspace":          "Close every pane on the current workspace, after a confirmation",
+	"close_workspace":          "Close every pane on a workspace, after a confirmation",
 
 	// Workspaces
+	"next_workspace":     "Switch to the next workspace that has panes",
+	"prev_workspace":     "Switch to the previous workspace that has panes",
 	"switch_workspace_1": "Switch to workspace 1",
 	"switch_workspace_2": "Switch to workspace 2",
 	"switch_workspace_3": "Switch to workspace 3",
@@ -588,6 +795,8 @@ var ActionDescriptions = map[string]string{
 	// BSP Tiling
 	"split_horizontal":               "Split window horizontally (top/bottom)",
 	"split_vertical":                 "Split window vertically (left/right)",
+	"split_ssh_horizontal":           "Split top/bottom, and run the focused pane's ssh in the new pane",
+	"split_ssh_vertical":             "Split left/right, and run the focused pane's ssh in the new pane",
 	"rotate_split":                   "Rotate split",
 	"equalize_splits":                "Equalize all split ratios",
 	"preselect_left":                 "Preselect left for next window",
@@ -622,26 +831,47 @@ var ActionDescriptions = map[string]string{
 	"focus_sidebar":       "Focus sidebar",
 	"next_session":        "Next session",
 	"prev_session":        "Previous session",
+	"switch_session_1":    "Switch to session 1",
+	"switch_session_2":    "Switch to session 2",
+	"switch_session_3":    "Switch to session 3",
+	"switch_session_4":    "Switch to session 4",
+	"switch_session_5":    "Switch to session 5",
+	"switch_session_6":    "Switch to session 6",
+	"switch_session_7":    "Switch to session 7",
+	"switch_session_8":    "Switch to session 8",
+	"switch_session_9":    "Switch to session 9",
 
 	// Clipboard
 	"copy_selection":  "Copy selection to clipboard",
 	"paste_clipboard": "Paste from clipboard",
 	"paste_image":     "Paste the clipboard image as a file path",
+	"paste_buffer":    "Paste the newest paste buffer",
+	"choose_buffer":   "Choose a paste buffer to paste",
 	"clear_selection": "Clear the text selection",
 	"hints":           "Label the text on the pane to copy it",
+	"display_panes":   "Label the panes and focus one by its label",
 	"toggle_scratch":  "Show or hide the scratch terminal",
 	"hints_all_panes": "Label the text on all panes to copy it",
+
+	// The scrollback in the editor (prefix E, ctrl+g in copy mode)
+	ActionEditScrollback: "Open the scrollback in the editor",
 
 	// Copy mode search (no default keybinding)
 	ActionCopyModeSearchForward:  "Enter copy mode and search forward",
 	ActionCopyModeSearchBackward: "Enter copy mode and search backward",
+	ActionCopyModeLineStart:      "Copy mode: go to the start of the line",
+	ActionCopyModeLineEnd:        "Copy mode: go to the end of the line",
 
 	// Session lifecycle (context menu rows; no default keybinding)
 	"settings_sidebar":  "Sidebar settings",
 	"rename_session":    "Rename the session the menu was opened on",
+	"rename_workspace":  "Rename the workspace the session is showing",
 	"kill_session":      "Kill the session the menu was opened on",
 	"kill_session_next": "Kill session, go to next",
 	"kill_session_quit": "Kill session and quit",
+	// The palette, the settings, the rail's menu for this machine and the
+	// version notice; no default key.
+	"restart_daemon": "Restart the daemon with the newest tuios installed",
 
 	// System
 	"toggle_logs":        "Toggle log viewer",
@@ -681,6 +911,38 @@ var ActionDescriptions = map[string]string{
 	"prefix_fullscreen":         "Fullscreen current window",
 	"prefix_split_horizontal":   "Split window horizontally",
 	"prefix_split_vertical":     "Split window vertically",
+	"mark_pane":                 "Mark the focused pane, or clear the mark",
+	"join_marked_left":          "Join the marked pane left of this one",
+	"join_marked_right":         "Join the marked pane right of this one",
+	"join_marked_up":            "Join the marked pane above this one",
+	"join_marked_down":          "Join the marked pane below this one",
+	"resize_pane_left_5":        "Narrow the focused pane by 5",
+	"resize_pane_right_5":       "Widen the focused pane by 5",
+	"resize_pane_up_5":          "Shorten the focused pane by 5",
+	"resize_pane_down_5":        "Heighten the focused pane by 5",
+	"resize_pane_left_20":       "Narrow the focused pane by 20",
+	"resize_pane_right_20":      "Widen the focused pane by 20",
+	"resize_pane_up_20":         "Shorten the focused pane by 20",
+	"resize_pane_down_20":       "Heighten the focused pane by 20",
+	"new_workspace":             "Go to the first empty workspace",
+	"last_workspace":            "Go back to the last workspace",
+	"break_pane":                "Move the focused pane to the first empty workspace, and follow it",
+	"last_session":              "Go back to the last session",
+	"send_prefix":               "Send the leader key to the focused pane",
+	"move_workspace_left":       "Swap this workspace with the one before it",
+	"move_workspace_right":      "Swap this workspace with the one after it",
+	"send_to_workspace_1":       "Send the focused pane to workspace 1",
+	"send_to_workspace_2":       "Send the focused pane to workspace 2",
+	"send_to_workspace_3":       "Send the focused pane to workspace 3",
+	"send_to_workspace_4":       "Send the focused pane to workspace 4",
+	"send_to_workspace_5":       "Send the focused pane to workspace 5",
+	"send_to_workspace_6":       "Send the focused pane to workspace 6",
+	"send_to_workspace_7":       "Send the focused pane to workspace 7",
+	"send_to_workspace_8":       "Send the focused pane to workspace 8",
+	"send_to_workspace_9":       "Send the focused pane to workspace 9",
+	"reload_config":             "Reload the config file",
+	"toggle_mouse":              "Turn mouse capture off or on (off: the terminal selects text)",
+	"cycle_layout":              "Cycle the layout: BSP, master-stack, scrolling",
 	"prefix_rotate_split":       "Rotate split",
 	"prefix_equalize_splits":    "Equalize all splits",
 	"prefix_scrollback":         "Open the scrollback browser",
@@ -688,16 +950,22 @@ var ActionDescriptions = map[string]string{
 	"prefix_command_palette":    "Open the command palette",
 	"prefix_file_search":        "Search files below the focused pane's directory",
 	"prefix_toggle_sidebar":     "Toggle the session sidebar",
+	"prefix_toggle_other_rail":  "Toggle the opposite sidebar",
+	"prefix_toggle_spotlight":   "Toggle spotlight",
 	"prefix_explore":            "Focus/leave sidebar",
 	"prefix_jump_notif":         "Jump to newest message",
 	"prefix_last_message":       "Show the last message in full",
-	"prefix_mail":               "Open the Inbox on its mail",
-	"prefix_inbox":              "Open the Inbox",
+	"prefix_mail":               "Open the agents view on the mail for you",
+	"prefix_inbox":              "Open the agents view",
+	"prefix_transfers":          "Show the copies between machines",
 	"prefix_next_attention":     "Jump to the oldest item needing you",
 	"prefix_review":             "Review the focused pane's changes",
 	"prefix_next_finished":      "Jump to the newest unseen finished turn",
+	"prefix_agents_settings":    "Open the Agents settings",
 	"prefix_session_switcher":   "Open the session switcher",
 	"prefix_workspace_switcher": "Open the workspace switcher",
+	"choose_tree":               "Find a pane in every session and go to it",
+	"goto_picker":               "Go to an agent, session, workspace or pane",
 	"prefix_layout":             "Enter layout prefix",
 
 	// Tape Prefix
@@ -719,16 +987,18 @@ var ActionDescriptions = map[string]string{
 	"debug_prefix_cancel":     "Cancel debug prefix",
 
 	// Terminal Mode (direct keybinds, no prefix required)
-	"terminal_next_window": "Next window (terminal mode)",
-	"terminal_prev_window": "Previous window (terminal mode)",
-	"terminal_exit_mode":   "Exit terminal mode (to window mode)",
-	"terminal_focus_left":  "Focus the pane to the left",
-	"terminal_focus_right": "Focus the pane to the right",
-	"terminal_focus_up":    "Focus the pane above",
-	"terminal_focus_down":  "Focus the pane below",
-	"terminal_scroll_up":   "Scroll into the pane's scrollback",
-	"terminal_scroll_down": "Scroll back down toward live output",
-	"terminal_paste_host":  "Paste from the host clipboard",
+	"terminal_next_window":      "Next window (terminal mode)",
+	"terminal_prev_window":      "Previous window (terminal mode)",
+	"terminal_exit_mode":        "Exit terminal mode (to window mode)",
+	"terminal_focus_left":       "Focus the pane to the left",
+	"terminal_focus_right":      "Focus the pane to the right",
+	"terminal_focus_up":         "Focus the pane above",
+	"terminal_focus_down":       "Focus the pane below",
+	"terminal_scroll_up":        "Scroll into the pane's scrollback",
+	"terminal_scroll_down":      "Scroll back down toward live output",
+	"terminal_scroll_page_up":   "Scroll up one page",
+	"terminal_scroll_page_down": "Scroll down one page",
+	"terminal_paste_host":       "Paste from the host clipboard",
 
 	// Global (window mode and terminal mode alike)
 	"command_palette": "Open the command palette",
@@ -742,4 +1012,12 @@ var ActionDescriptions = map[string]string{
 	"layout_prefix_load":   "Open the layout picker",
 	"layout_prefix_save":   "Save the current layout",
 	"layout_prefix_cancel": "Cancel layout prefix",
+	"window_prefix_new":    "Create a window",
+	"window_prefix_close":  "Close the window",
+	"window_prefix_rename": "Rename the window",
+	"window_prefix_next":   "Focus the next window",
+	"window_prefix_prev":   "Focus the previous window",
+	"window_prefix_tiling": "Turn tiling on or off",
+	"prefix_tuios":         "Open the tuios menu: the tuios keys a preset moved",
+	"open_keybind_presets": "Choose the keys: tuios, tmux, screen or zellij",
 }

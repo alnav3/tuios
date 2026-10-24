@@ -79,6 +79,10 @@ func TestSettingsPanelReachesEveryOption(t *testing.T) {
 // option belongs here only when a person has a better way to reach it than a
 // row, never because writing the row was inconvenient.
 var settingsUIExcluded = map[string]string{
+	// Read only by the tuios mermaid command. The window manager draws no
+	// diagrams, so a row would change nothing a person sees in it.
+	"mermaid.theme": "read only by tuios mermaid, which takes --theme too",
+
 	// The deprecated flat spellings. Each is an alias of a nested path that has
 	// a row of its own, so a row here would be a second control for one value,
 	// disagreeing with the first whenever the file used the other spelling.
@@ -88,7 +92,7 @@ var settingsUIExcluded = map[string]string{
 	"appearance.sidebar_show_windows": "alias of appearance.sidebar.show_windows",
 	"appearance.sidebar_show_glyphs":  "alias of appearance.sidebar.show_glyphs",
 	"appearance.sidebar_show_counts":  "alias of appearance.sidebar.show_counts",
-	"appearance.sidebar.workspaces":   "replaced by appearance.dock_workspace_tabs",
+	"appearance.sidebar.workspaces":   "no longer used: panes name their own workspace, and switching lives on the dock and alt+1..9",
 	"appearance.animations_enabled":   "replaced by appearance.motion (false is none)",
 
 	// The two section switches. They fold into appearance.sidebar.sections on
@@ -102,9 +106,10 @@ var settingsUIExcluded = map[string]string{
 	"appearance.hide_clock":           "the positive spelling appearance.show_clock has the row",
 
 	// A shell command the host runs on its own, with no further gesture from
-	// anyone. The panel is reachable by every attached client and `tuios ssh`
-	// authenticates none of them, so a row here is a way for whoever connected
-	// to run a command on the machine hosting the session. It stays settable
+	// anyone. The panel is reachable by every attached client: a web client,
+	// an ssh client holding any authorized key, or anyone at all under
+	// `tuios ssh --no-auth`. A row here is a way for whoever connected to run
+	// a command on the machine hosting the session. It stays settable
 	// through the config file and through set-config, both of which are the
 	// host's own doing.
 	"notifications.agent.command": "a shell command the host runs; not for a panel any client can open",
@@ -114,7 +119,7 @@ var settingsUIExcluded = map[string]string{
 
 	// Two filesystem paths on the machine hosting the session. A row would let
 	// whoever attached point server-side writes and server-side reads at any
-	// path, and `tuios ssh` authenticates no client, which is the reason
+	// path, and any attached client can open the panel, which is the reason
 	// notifications.agent.command has no row either. Both stay settable through
 	// the config file and set-config, which are the host's own doing. A path is
 	// also the one value no accepted set can check, so a row could not validate

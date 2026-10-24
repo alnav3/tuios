@@ -1,6 +1,7 @@
 package app
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
@@ -9,29 +10,23 @@ import (
 // The rail's layout: which sections it stacks, in what order, and the share of
 // it each one may claim.
 //
-// It used to be three sections in a fixed order with the split written into
-// the rail's arithmetic. A fourth section made that untenable twice over:
-// the order stopped being obvious (does a listing belong above the panes it is
-// about, or below them?), and the split stopped being one anybody but the
-// author would agree with. Both are now read off one string.
+// With four sections neither the order (does a listing belong above the panes
+// it is about, or below them?) nor the split is one anybody but the author
+// would agree with, so both are read off one string.
 //
-// # Why the rail now has a fourth section, having refused one
+// # Why the fourth section is files
 //
-// The rail's old fixed split carried a written refusal to add a workspaces
-// section, and three of its four reasons still stand. The fourth did not: it argued that
-// three sections already cost ten lines of chrome before a row of content and
-// that a fourth would take it to thirteen. That was arithmetic about floors
-// nobody had made configurable. Shares and membership are now read off
-// appearance.sidebar.sections, so a user who does not want a fourth section
-// removes it, and a rail too short for what is left gives up lines rather than
-// its region.
+// Four sections cost thirteen lines of chrome before a row of content, but
+// shares and membership are read off appearance.sidebar.sections, so a user
+// who does not want a fourth section removes it, and a rail too short for what
+// is left gives up lines rather than its region.
 //
-// The other three reasons are why the section that arrived is files and not
-// workspaces. A workspaces section would restate what the terminals section's
-// tags already say; it would be the second per-session list, competing with
-// terminals for the same lines while saying less; and a workspace already has
-// three surfaces that cost no rail lines at all. A listing restates nothing on
-// screen, is not per-session, and has no other surface.
+// The section is files and not workspaces. A workspaces section would restate
+// what the terminals section's tags already say; it would be the second
+// per-session list, competing with terminals for the same lines while saying
+// less; and a workspace already has three surfaces that cost no rail lines at
+// all. A listing restates nothing on screen, is not per-session, and has no
+// other surface.
 //
 // # Shares are ceilings, not reservations
 //
@@ -78,11 +73,12 @@ type sidebarSectionPlan struct {
 // The spacer is not in it: it is not a section, it may appear more than once,
 // and sidebarLayoutFor turns it into a plan entry of its own.
 var sidebarSectionByName = map[string]sidebarSection{
-	"sessions":  sidebarSectionSessions,
-	"terminals": sidebarSectionTerminals,
-	"agents":    sidebarSectionAgents,
-	"files":     sidebarSectionFiles,
-	"git":       sidebarSectionGit,
+	"sessions":                  sidebarSectionSessions,
+	"terminals":                 sidebarSectionTerminals,
+	"agents":                    sidebarSectionAgents,
+	"files":                     sidebarSectionFiles,
+	"git":                       sidebarSectionGit,
+	config.SidebarSectionCustom: sidebarSectionCustom,
 }
 
 // sidebarSectionFloors is the least each section is shrunk to, in rows, before
@@ -97,6 +93,9 @@ var sidebarSectionFloors = [sidebarSectionCount]int{
 	// Two, because the section is a repository name and its branch, and one
 	// without the other says half of what it is for.
 	sidebarSectionGit: 2,
+	// Two, so a section the user put on the rail is never shrunk to only its
+	// title while another section grows.
+	sidebarSectionCustom: 2,
 }
 
 // The parsed layout, cached against the string it came from. The rail parses it
@@ -138,6 +137,23 @@ func sidebarLayoutHas(section sidebarSection, s *config.Settings) bool {
 // typed.
 func sidebarLayoutPins(plans []sidebarSectionPlan) bool {
 	return len(plans) > 1 && !plans[len(plans)-1].Spacer
+}
+
+// sidebarLayoutStacksAbove reports whether the layout stacks section above
+// higher on the rail than section below. A section the layout leaves out is
+// stacked nowhere, so the answer is false.
+func sidebarLayoutStacksAbove(plans []sidebarSectionPlan, above, below sidebarSection) bool {
+	seenAbove := false
+	for _, p := range plans {
+		switch {
+		case p.Spacer:
+		case p.Section == above:
+			seenAbove = true
+		case p.Section == below:
+			return seenAbove
+		}
+	}
+	return false
 }
 
 func sidebarLayoutFor(source string) ([]sidebarSectionPlan, [sidebarSectionCount]bool) {
@@ -349,18 +365,18 @@ func sidebarBudgetLines(avail int, plans []sidebarSectionPlan, rows, rowH []int)
 	// its own floors has no lines to spend on being empty, and a gap is the one
 	// thing on it that says nothing at all.
 	order := make([]int, 0, len(plans))
-	for i := len(plans) - 1; i >= 0; i-- {
-		if plans[i].Spacer {
+	for i, plan := range slices.Backward(plans) {
+		if plan.Spacer {
 			order = append(order, i)
 		}
 	}
-	for i := len(plans) - 1; i >= 0; i-- {
-		if !plans[i].Spacer && plans[i].Share > 0 {
+	for i, plan := range slices.Backward(plans) {
+		if !plan.Spacer && plan.Share > 0 {
 			order = append(order, i)
 		}
 	}
-	for i := len(plans) - 1; i >= 0; i-- {
-		if !plans[i].Spacer && plans[i].Share <= 0 {
+	for i, plan := range slices.Backward(plans) {
+		if !plan.Spacer && plan.Share <= 0 {
 			order = append(order, i)
 		}
 	}
@@ -396,5 +412,6 @@ func (m *OS) sidebarScrollOffsets() [sidebarSectionCount]*int {
 		sidebarSectionAgents:    &m.SidebarScrollA,
 		sidebarSectionFiles:     &m.SidebarScrollF,
 		sidebarSectionGit:       &m.SidebarScrollG,
+		sidebarSectionCustom:    &m.SidebarScrollC,
 	}
 }

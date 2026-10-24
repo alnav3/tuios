@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -57,9 +58,40 @@ func (m *OS) OpenLink(rawURL string) tea.Cmd {
 	if rawURL == "" {
 		return nil
 	}
+	// A control byte or a space has no place in an address. The emulator
+	// strips control bytes from OSC 8 already; this also covers a URL that
+	// reached here some other way, and refuses rather than repairs it.
+	if !linkTextClean(rawURL) {
+		m.ShowNotification("tuios did not open the link. Its address has control characters or spaces.",
+			"warning", m.Settings.NotificationDuration)
+		return nil
+	}
 
 	if path, ok := linkFilePath(rawURL); ok {
 		return m.openLocalPath(path, rawURL)
+	}
+
+	// A tuios:// address is an order to tuios itself, not a document for
+	// the desktop. It is handled before the scheme list, which exists to
+	// decide what may leave for the viewer's machine, and nothing about a
+	// window of this session belongs there.
+	if target, ok := parseTuiosLink(rawURL); ok {
+		return m.openWindowLink(target, rawURL)
+	}
+	if strings.HasPrefix(strings.ToLower(rawURL), "tuios:") {
+		m.ShowNotification("tuios did not understand the link. A window link is tuios://window/<id>, or tuios://window/<id>/close.",
+			"warning", m.Settings.NotificationDuration)
+		return nil
+	}
+
+	// A file:// link that linkFilePath turned down names a file on another
+	// machine (file://otherhost/path). That file is not here to open, and
+	// handing the address to the desktop would open whatever this machine
+	// has at the same path.
+	if strings.HasPrefix(strings.ToLower(rawURL), "file:") {
+		m.ShowNotification("That file link names another machine. tuios did not open it. The address is on your clipboard.",
+			"warning", m.Settings.NotificationDuration)
+		return tea.SetClipboard(rawURL)
 	}
 
 	// The scheme decides whether this is handed to the desktop at all. See
@@ -76,14 +108,149 @@ func (m *OS) OpenLink(rawURL string) tea.Cmd {
 			"info", m.Settings.NotificationDuration)
 		return tea.SetClipboard(rawURL)
 	}
-	if err := openInOSViewer(rawURL); err != nil {
-		m.LogError("Failed to open link %s: %v", rawURL, err)
-		m.ShowNotification("Could not open the link. It is on your clipboard.",
+	argv, err := linkOpenerArgv(m.Settings.LinkOpener, rawURL)
+	if errors.Is(err, errNoDesktop) {
+		m.ShowNotification("Copied the link. This machine has no desktop to open it. Use the link click of your terminal.",
+			"info", m.Settings.NotificationDuration)
+		return tea.SetClipboard(rawURL)
+	}
+	if err != nil {
+		m.LogError("Could not read the link opener: %v", err)
+		m.ShowNotification("tuios can not read the link opener command. Change appearance.link_opener.",
 			"error", m.Settings.NotificationDuration)
 		return tea.SetClipboard(rawURL)
 	}
-	m.ShowNotification("Opened the link.", "success", m.Settings.NotificationDuration)
+	watch, err := startLinkOpener(argv, rawURL)
+	if err != nil {
+		m.LogError("Failed to open link %s with %s: %v", rawURL, argv[0], err)
+		m.ShowNotification("Could not start "+sanitizeLinkText(argv[0])+". The link is on your clipboard.",
+			"error", m.Settings.NotificationDuration)
+		return tea.SetClipboard(rawURL)
+	}
+	m.ShowNotification("Opening "+linkHostLabel(rawURL)+".", "success", m.Settings.NotificationDuration)
+	return watch
+}
+
+// frameLink reports whether a link belongs in the frame tuios emits to the
+// outer terminal. A tuios:// address is an order to tuios itself, never a
+// document for the desktop, and the outer terminal has no handler for the
+// scheme: its cmd+click would open a dialog. The inner emulator still carries
+// the link, so tuios's own clicks answer it.
+//
+// This runs per cell on the render hot path, so it reads six bytes and
+// folds them rather than lowering the whole address.
+func frameLink(u string) bool {
+	const scheme = "tuios:"
+	if len(u) < len(scheme) {
+		return true
+	}
+	return !strings.EqualFold(u[:len(scheme)], scheme)
+}
+
+// tuiosLink is the parse of a tuios://window address.
+type tuiosLink struct {
+	id    string
+	close bool
+}
+
+// tuiosLinkMinID is the shortest id a window link may carry: the 8-character
+// short form list-windows prints. A shorter prefix collides too easily with
+// the wrong window, and a program printing the link chooses the id, not the
+// person clicking it.
+const tuiosLinkMinID = 8
+
+// parseTuiosLink reads the window addresses the scheme carries:
+// tuios://window/<id> focuses the window and tuios://window/<id>/close closes
+// it. The id is the window's uuid or a prefix of it at least the short form
+// list-windows prints. Any other tuios:// shape is not an address tuios
+// answers, and the caller says so.
+func parseTuiosLink(rawURL string) (tuiosLink, bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "tuios" || u.Host != "window" {
+		return tuiosLink{}, false
+	}
+	rest := strings.TrimPrefix(u.Path, "/")
+	if rest == "" {
+		return tuiosLink{}, false
+	}
+	if id, found := strings.CutSuffix(rest, "/close"); found {
+		if len(id) < tuiosLinkMinID {
+			return tuiosLink{}, false
+		}
+		return tuiosLink{id: id, close: true}, true
+	}
+	if len(rest) < tuiosLinkMinID {
+		return tuiosLink{}, false
+	}
+	return tuiosLink{id: rest}, true
+}
+
+// openWindowLink acts on a tuios://window link. The window set is the
+// client's own in every deployment, so the id resolves here: a full uuid or
+// a prefix that names exactly one window. A prefix two windows share names
+// nothing, because focusing or closing the wrong pane one time in many is
+// worse than saying the address was ambiguous.
+func (m *OS) openWindowLink(target tuiosLink, rawURL string) tea.Cmd {
+	i, found := m.resolveWindowByIDPrefix(target.id)
+	if !found {
+		m.ShowNotification("The window link names no window on this machine, or names more than one. The address is on your clipboard.",
+			"warning", m.Settings.NotificationDuration)
+		return tea.SetClipboard(rawURL)
+	}
+	if target.close {
+		// The click lands wherever a program chose to print the link, and the
+		// link's visible text named whatever that program liked. The
+		// confirmation is what names the real target to the person holding
+		// the mouse.
+		m.OpenSessionCloseForWindow(i)
+		return nil
+	}
+	m.FocusWindow(i)
+	m.RevealFocusedColumn()
 	return nil
+}
+
+// resolveWindowByIDPrefix finds the window an id or id prefix names.
+func (m *OS) resolveWindowByIDPrefix(id string) (int, bool) {
+	for i, w := range m.Windows {
+		if strings.EqualFold(w.ID, id) {
+			return i, true
+		}
+	}
+	matches := 0
+	index := 0
+	for i, w := range m.Windows {
+		if strings.HasPrefix(strings.ToLower(w.ID), strings.ToLower(id)) {
+			matches++
+			index = i
+		}
+	}
+	if matches == 1 {
+		return index, true
+	}
+	return 0, false
+}
+
+// linkTextClean reports whether an address holds no control byte and no
+// space.
+func linkTextClean(s string) bool {
+	for _, r := range s {
+		if r <= 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+			return false
+		}
+	}
+	return true
+}
+
+// linkHostLabel names where a link goes, for the message that confirms it.
+// The host is what tells a user whether the click went where they meant, and
+// for a link whose text differs from its target it is the second place the
+// target is shown, after the hover label.
+func linkHostLabel(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
+		return sanitizeLinkText(u.Host)
+	}
+	return "the link"
 }
 
 // A link's address is attacker-controlled. Any program running in a pane can

@@ -1,11 +1,13 @@
 package session
 
 import (
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	uv "github.com/charmbracelet/ultraviolet"
+	"tuios.dev/vt"
 )
 
 // A shell's commands, followed through its OSC 133 marks.
@@ -44,6 +46,36 @@ import (
 // in it are masked, the way an Inbox summary is.
 const shellCmdlineMax = 512
 
+// shellHistoryMax is how many finished commands a pane keeps for
+// command-history. The oldest goes first.
+const shellHistoryMax = 200
+
+// shellCommandRecord is one finished command, as command-history lists it.
+type shellCommandRecord struct {
+	// Seq is the pane's command_seq when the command finished.
+	Seq     uint64
+	Cmdline string
+	// Exit is nil when the shell sent no status.
+	Exit     *int
+	Started  time.Time
+	Duration time.Duration
+	// Cwd is the folder the shell last reported over OSC 7 when the command
+	// started, empty when it never reported one.
+	Cwd string
+	// promptOrigin is the row of the command's prompt plus the marker list's
+	// origin at the time (vt.SemanticMarkerList.Trimmed), so it names the
+	// same line however much history the pane drops later.
+	promptOrigin int
+}
+
+// markContext is what the pane knows beside a mark when it arrives: the
+// marker list's origin, which turns the mark's row into one that survives a
+// scrollback trim, and the folder the shell last reported.
+type markContext struct {
+	origin int
+	cwd    string
+}
+
 // shellPhase is where the shell is between its marks.
 type shellPhase uint8
 
@@ -63,11 +95,12 @@ const (
 // the emulator's callback with the terminal lock held, so it takes nothing
 // else and calls nothing out.
 type shellTrack struct {
-	mu      sync.Mutex
-	seen    bool
-	phase   shellPhase
-	cmdline string
-	started time.Time
+	mu          sync.Mutex
+	seen        bool
+	phase       shellPhase
+	promptReady bool
+	cmdline     string
+	started     time.Time
 	// startedLine is the row the running command's C mark was on.
 	startedLine int
 	// seq counts finished commands. A command a new prompt cut short, with no
@@ -96,6 +129,16 @@ type shellTrack struct {
 	// mark it. It stays true until a C mark shows the shell does mark
 	// commands after all.
 	promptOnly bool
+
+	// promptTop is the first row of the current prompt plus the origin: the
+	// row of its A mark, or of its B mark when no A came first.
+	promptTop int
+	// startedPrompt and startedCwd are promptTop and the folder when the
+	// running command's C mark came.
+	startedPrompt int
+	startedCwd    string
+	// history holds the last shellHistoryMax finished commands, oldest first.
+	history []shellCommandRecord
 }
 
 // ShellFacts is what a pane's shell has said about its commands. Seen is false
@@ -106,6 +149,9 @@ type ShellFacts struct {
 	// AtPrompt is true when the shell is reading a command line: after a
 	// prompt mark, or after a command finished and before the next prompt.
 	AtPrompt bool
+	// PromptReady follows a fresh A or B mark; C and D clear it. Unlike
+	// AtPrompt, a finished command alone does not make it true.
+	PromptReady bool
 	// Running is the command line running now, empty at a prompt.
 	Running string
 	// CommandSeq is how many commands the pane has finished.
@@ -134,6 +180,7 @@ func (t *shellTrack) facts() ShellFacts {
 	f := ShellFacts{
 		Seen:          t.seen,
 		AtPrompt:      !t.promptOnly && (t.phase == shellPrompt || t.phase == shellFinished),
+		PromptReady:   !t.promptOnly && t.phase == shellPrompt && t.promptReady,
 		CommandSeq:    t.seq,
 		LastCmdline:   t.lastCmdline,
 		LastDuration:  t.lastDuration,
@@ -153,19 +200,24 @@ func (t *shellTrack) facts() ShellFacts {
 
 // note folds one mark into the state and returns the events it raises, in the
 // order they happened. The caller emits them.
-func (t *shellTrack) note(m vt.SemanticMarker, now time.Time) []SessionEvent {
+func (t *shellTrack) note(m vt.SemanticMarker, now time.Time, mc markContext) []SessionEvent {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.seen = true
 	var out []SessionEvent
 	switch m.Type {
 	case vt.MarkerPromptStart, vt.MarkerCommandStart:
+		t.promptReady = true
 		// A prompt while a command runs is a command that ended without a
 		// D mark, which bash integrations commonly do on ctrl+c.
 		if t.phase == shellRunning {
 			out = append(out, t.finishLocked(nil, now))
 		}
 		newPrompt := t.phase != shellPrompt
+		// A B mark belongs to the prompt an A mark started, when one did.
+		if m.Type == vt.MarkerPromptStart || t.phase != shellPrompt {
+			t.promptTop = m.AbsLine + mc.origin
+		}
 		if t.expecting {
 			switch {
 			case t.phase != shellPrompt, m.Type == vt.MarkerCommandStart:
@@ -188,6 +240,7 @@ func (t *shellTrack) note(m vt.SemanticMarker, now time.Time) []SessionEvent {
 		t.phase = shellPrompt
 		t.promptLine = m.AbsLine
 	case vt.MarkerCommandExecuted:
+		t.promptReady = false
 		if t.phase == shellRunning {
 			// Two integrations at once, a shell's own and one from an rc
 			// file, send two C marks for one command at the same place. The
@@ -197,13 +250,19 @@ func (t *shellTrack) note(m vt.SemanticMarker, now time.Time) []SessionEvent {
 			}
 			out = append(out, t.finishLocked(nil, now))
 		}
+		t.startedPrompt = m.AbsLine + mc.origin
+		if t.phase == shellPrompt {
+			t.startedPrompt = t.promptTop
+		}
 		t.commands, t.promptOnly, t.expecting = true, false, false
 		t.phase = shellRunning
 		t.cmdline = shellCmdline(m.CapturedText)
 		t.started = now
 		t.startedLine = m.AbsLine
+		t.startedCwd = mc.cwd
 		out = append(out, SessionEvent{Type: EventCommandStarted, Cmdline: t.cmdline})
 	case vt.MarkerCommandFinished:
+		t.promptReady = false
 		// zsh and fish send D before every prompt, including one after an
 		// empty line where nothing ran. Only a D that ends a command counts.
 		if t.phase != shellRunning {
@@ -244,6 +303,24 @@ func (t *shellTrack) finishLocked(code *int, now time.Time) SessionEvent {
 	t.lastExit = code
 	t.lastDuration = max(now.Sub(t.started), 0)
 	t.lastAt = now
+	if t.cmdline != "" {
+		rec := shellCommandRecord{
+			Seq:          t.seq,
+			Cmdline:      t.cmdline,
+			Started:      t.started,
+			Duration:     t.lastDuration,
+			Cwd:          t.startedCwd,
+			promptOrigin: t.startedPrompt,
+		}
+		if code != nil {
+			c := *code
+			rec.Exit = &c
+		}
+		if len(t.history) >= shellHistoryMax {
+			t.history = append(t.history[:0], t.history[len(t.history)-shellHistoryMax+1:]...)
+		}
+		t.history = append(t.history, rec)
+	}
 	t.cmdline = ""
 	t.phase = shellUnknown
 	ev := SessionEvent{
@@ -257,6 +334,14 @@ func (t *shellTrack) finishLocked(code *int, now time.Time) SessionEvent {
 		ev.ExitCode = &c
 	}
 	return ev
+}
+
+// commandHistory returns a copy of the pane's finished commands, oldest
+// first.
+func (t *shellTrack) commandHistory() []shellCommandRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.history)
 }
 
 // shellCmdline is a command line as the daemon reports it: one line, no
@@ -273,7 +358,11 @@ func (p *PTY) ShellFacts() ShellFacts {
 // noteShellMark is the emulator's SemanticMark callback: it records the mark
 // and raises the events it implies.
 func (p *PTY) noteShellMark(m vt.SemanticMarker) {
-	for _, ev := range p.shell.note(m, time.Now()) {
+	mc := markContext{cwd: p.place.announcedCwd()}
+	if p.marks != nil {
+		mc.origin = p.marks.Trimmed()
+	}
+	for _, ev := range p.shell.note(m, time.Now(), mc) {
 		if p.emit != nil {
 			p.emit(ev)
 		}
@@ -289,8 +378,8 @@ const shellCommandOutputMax = 256 * 1024
 // read from the emulator between its C and D marks, and whether there was such
 // a command. truncated is true when the output was cut to its last
 // shellCommandOutputMax bytes, or when its start has already left the
-// scrollback.
-func (p *PTY) LastCommandOutput() (output string, truncated, ok bool) {
+// scrollback. unwrap joins the rows the terminal soft-wrapped.
+func (p *PTY) LastCommandOutput(unwrap bool) (output string, truncated, ok bool) {
 	p.terminalMu.RLock()
 	defer p.terminalMu.RUnlock()
 	if p.terminal == nil {
@@ -305,6 +394,11 @@ func (p *PTY) LastCommandOutput() (output string, truncated, ok bool) {
 		return "", false, false
 	}
 	lines, cut := readTerminalLines(p.terminal, c, d)
+	if unwrap {
+		// The lines start at the C mark's row, or at the oldest row the
+		// history still holds when the start has rolled off.
+		lines = unwrapRows(p.terminal, lines, max(c.AbsLine, 0), true)
+	}
 	out := strings.Join(lines, "\n")
 	if len(out) > shellCommandOutputMax {
 		out = out[len(out)-shellCommandOutputMax:]
@@ -354,29 +448,34 @@ func readTerminalLines(term vt.Terminal, c, d vt.SemanticMarker) ([]string, bool
 		to = last
 	}
 	var lines []string
-	for abs := from; abs <= to; abs++ {
-		var b strings.Builder
-		if abs < sbLen {
-			b.WriteString(vt.StripSixelMarkers(term.ScrollbackLine(abs).String()))
-		} else {
-			y := abs - sbLen
-			for x := 0; x < width; x++ {
-				cell := term.MainCellAt(x, y)
-				if cell == nil || cell.Content == "" {
-					b.WriteByte(' ')
-					continue
-				}
-				b.WriteString(cell.Content)
-				if cell.Width > 1 {
-					x += cell.Width - 1
-				}
-			}
-		}
-		line := b.String()
+	add := func(abs int, line string) {
 		if abs == d.AbsLine && d.Col > 0 {
 			line = truncateCells(line, d.Col)
 		}
 		lines = append(lines, strings.TrimRight(line, " "))
+	}
+	// The history rows are read in one pass that keeps no decoded copy.
+	if from < sbLen {
+		term.ScrollbackRows(from, min(to+1, sbLen), func(abs int, line uv.Line) bool {
+			add(abs, vt.StripSixelMarkers(line.String()))
+			return true
+		})
+	}
+	for abs := max(from, sbLen); abs <= to; abs++ {
+		var b strings.Builder
+		y := abs - sbLen
+		for x := 0; x < width; x++ {
+			cell := term.MainCellAt(x, y)
+			if cell == nil || cell.Content == "" {
+				b.WriteByte(' ')
+				continue
+			}
+			b.WriteString(cell.Content)
+			if cell.Width > 1 {
+				x += cell.Width - 1
+			}
+		}
+		add(abs, b.String())
 	}
 	return lines, cut
 }

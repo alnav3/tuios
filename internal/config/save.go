@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,140 +15,139 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// ConfigFileHeader is the comment block written at the top of a generated
-// config file. Exported so `tuios config reset` writes the same guidance a
-// first-run config gets, including the notes on which keys cost you what.
-func ConfigFileHeader(configPath string) string {
-	return configFileHeader(configPath)
-}
-
 // configFileHeader is the comment block written at the top of a generated
 // config file. Kept as a constant so createDefaultConfig and SaveUserConfig
 // produce identical, well-documented files.
 func configFileHeader(configPath string) string {
-	var sb strings.Builder
-	sb.WriteString("# TUIOS Configuration File\n")
-	sb.WriteString("# This file allows you to customize appearance and keybindings\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# Configuration location: " + configPath + "\n")
-	sb.WriteString("# Documentation: https://github.com/Gaurav-Gosain/tuios\n")
-	sb.WriteString("# For keybindings documentation, run: tuios keybinds list\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# tuios watches this file. A save takes effect at once, with no restart.\n")
-	sb.WriteString("# tuios does not apply a file that has an error. It keeps the settings that\n")
-	sb.WriteString("# are in use and shows the error on screen.\n\n")
-
-	sb.WriteString("# ============================================================================\n")
-	sb.WriteString("# APPEARANCE SETTINGS\n")
-	sb.WriteString("# ============================================================================\n")
-	sb.WriteString("# Many of these can be changed live from the in-app settings page\n")
-	sb.WriteString("# (open it with the leader key followed by ',').\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# border_style: rounded, normal, thick, double, hidden, block, ascii,\n")
-	sb.WriteString("#               outer-half-block, inner-half-block\n")
-	sb.WriteString("# dockbar_position: bottom, top, hidden\n")
-	sb.WriteString("# window_title_position: bottom, top, hidden\n")
-	sb.WriteString("# window_button_style: pill, dots (macOS traffic lights)\n")
-	sb.WriteString("# window_button_position: right, left. Independent of the style; dots and\n")
-	sb.WriteString("#               left is the shipped pair, the macOS arrangement\n")
-	sb.WriteString("# theme: color theme name (e.g. dracula, nord); empty for terminal colors\n")
-	sb.WriteString("# click_to_type: single (a click on a pane starts typing in it), double\n")
-	sb.WriteString("#               (two clicks do), off (a click only focuses)\n")
-	sb.WriteString("# auto_enter_terminal_on_focus: off (Tab keeps cycling windows),\n")
-	sb.WriteString("#               targeted (numbered select and arrows start typing),\n")
-	sb.WriteString("#               all (every covered focus command, including Tab)\n")
-	sb.WriteString("# [appearance.scrollbar]: style = thin, track; thumb/track = a one-cell glyph\n")
-	sb.WriteString("#               (track also takes \"none\"); tint = border, muted, #RRGGBB\n")
-	sb.WriteString("# background: off (your terminal shows through), theme (the theme's\n")
-	sb.WriteString("#               background), or #RRGGBB, for every surface at once\n")
-	sb.WriteString("# pane_background, desktop_background, window_chrome_background,\n")
-	sb.WriteString("#               dock_background, [appearance.sidebar] background: the same\n")
-	sb.WriteString("#               values for one surface; empty follows background, and a\n")
-	sb.WriteString("#               colour a program or the chrome chose always wins\n")
-	sb.WriteString("# ============================================================================\n\n")
-
-	sb.WriteString("# ============================================================================\n")
-	sb.WriteString("# KEYBINDINGS\n")
-	sb.WriteString("# ============================================================================\n")
-	sb.WriteString("# Set an action to [] to unbind it and hand the key back to the shell.\n")
-	sb.WriteString("# An empty list and a missing line are not the same thing. A line this file\n")
-	sb.WriteString("# does not have gets its default back the next time tuios starts; an action\n")
-	sb.WriteString("# set to [] stays empty.\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# You do not have to edit this by hand. In tuios, open the keybind manager\n")
-	sb.WriteString("# (leader then k, or the command palette) and press ctrl+d on a binding to\n")
-	sb.WriteString("# remove it, or ctrl+x to take its key off every action. From a shell:\n")
-	sb.WriteString("#\n")
-	sb.WriteString("#   tuios keybinds unbind close_window w   # one key off one action\n")
-	sb.WriteString("#   tuios keybinds free alt+left           # off every action\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# `tuios keybinds doctor` says which binding in each scope is live, what\n")
-	sb.WriteString("# clashes with what, and which keys never reach the program in the pane.\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# [keybindings.global] acts in window mode and terminal mode alike. It binds\n")
-	sb.WriteString("# ctrl+p to the command palette and alt+space to the launcher, which costs\n")
-	sb.WriteString("# you fish's history-back and readline's set-mark. To move or drop either:\n")
-	sb.WriteString("#\n")
-	sb.WriteString("#   [keybindings.global]\n")
-	sb.WriteString("#   command_palette = [\"ctrl+shift+p\"]\n")
-	sb.WriteString("#   launcher = []\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# [keybindings.terminal_mode] binds alt+arrows to move focus between panes.\n")
-	sb.WriteString("# In readline, fish and zsh, alt+left and alt+right move the cursor a word\n")
-	sb.WriteString("# at a time. If you want those back:\n")
-	sb.WriteString("#\n")
-	sb.WriteString("#   [keybindings.terminal_mode]\n")
-	sb.WriteString("#   terminal_focus_left = []\n")
-	sb.WriteString("#   terminal_focus_right = []\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# alt+up and alt+down are unclaimed by the common shells, so they are the\n")
-	sb.WriteString("# safer pair to keep.\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# hold_window_mode binds a key that puts tuios in window-management mode for\n")
-	sb.WriteString("# as long as it is physically held, and hands the previous mode back when it\n")
-	sb.WriteString("# is let go:\n")
-	sb.WriteString("#\n")
-	sb.WriteString("#   [keybindings.mode_control]\n")
-	sb.WriteString("#   hold_window_mode = [\"leftalt\"]\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# It needs a terminal that speaks the Kitty keyboard protocol (Ghostty, kitty,\n")
-	sb.WriteString("# WezTerm, foot, Alacritty; not Terminal.app), because nothing else reports\n")
-	sb.WriteString("# that a key was released. Naming a modifier key (leftalt, rightalt, leftctrl,\n")
-	sb.WriteString("# leftsuper) asks the terminal for one more thing on top: every keystroke in\n")
-	sb.WriteString("# the session then arrives as an escape code. Any ordinary key (f13 to f63,\n")
-	sb.WriteString("# scrolllock, a spare letter) avoids that. Unbound by default.\n")
-	sb.WriteString("# ============================================================================\n\n")
-
-	sb.WriteString("# ============================================================================\n")
-	sb.WriteString("# DOCK COMPONENTS\n")
-	sb.WriteString("# ============================================================================\n")
-	sb.WriteString("# The dock is three ordered lists of component names. Leave [dock] out\n")
-	sb.WriteString("# entirely and the bar draws what it always drew; write the lists to\n")
-	sb.WriteString("# reorder it, and omit a name to drop that segment.\n")
-	sb.WriteString("#\n")
-	sb.WriteString("#   [dock]\n")
-	sb.WriteString("#   left   = [\"mode\", \"workspaces\", \"trail\", \"tape\"]\n")
-	sb.WriteString("#   center = [\"windows\"]\n")
-	sb.WriteString("#   right  = [\"notifications\", \"copy-help\", \"cpu\", \"ram\", \"clock\", \"session-controls\"]\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# A cell of your own is a command whose first line of stdout is the text:\n")
-	sb.WriteString("#\n")
-	sb.WriteString("#   [dock.custom.branch]\n")
-	sb.WriteString("#   command = \"git branch --show-current\"\n")
-	sb.WriteString("#   refresh = \"event:after-focus-change\"   # or once, push, or \"30s\"\n")
-	sb.WriteString("#\n")
-	sb.WriteString("# and then \"custom/branch\" in one of the lists above. A component that\n")
-	sb.WriteString("# fails is hidden rather than left showing a stale value;\n")
-	sb.WriteString("# `tuios list-dock-components` says which and why.\n")
-	sb.WriteString("# ============================================================================\n\n")
-	return sb.String()
+	return configHeaderTop + "# Configuration location: " + configPath + "\n" + configHeaderRest
 }
+
+// configHeaderTop and configHeaderRest are the header above and below its
+// path line. They are constants because a WriteString per line compiled to
+// about 200 bytes of code each, 21 KB in all.
+const configHeaderTop = "# TUIOS Configuration File\n" +
+	"# This file allows you to customize appearance and keybindings\n" +
+	"#\n"
+
+const configHeaderRest = "# Documentation: https://github.com/Gaurav-Gosain/tuios\n" +
+	"# For keybindings documentation, run: tuios keybinds list\n" +
+	"#\n" +
+	"# tuios watches this file. A save takes effect at once, with no restart.\n" +
+	"# tuios does not apply a file that has an error. It keeps the settings that\n" +
+	"# are in use and shows the error on screen.\n\n" +
+
+	"# ============================================================================\n" +
+	"# APPEARANCE SETTINGS\n" +
+	"# ============================================================================\n" +
+	"# Many of these can be changed live from the in-app settings page\n" +
+	"# (open it with the leader key followed by ',').\n" +
+	"#\n" +
+	"# border_style: rounded, normal, thick, double, hidden, block, ascii,\n" +
+	"#               outer-half-block, inner-half-block\n" +
+	"# dockbar_position: bottom, top, hidden\n" +
+	"# window_title_position: bottom, top, hidden\n" +
+	"# window_button_style: pill, dots (macOS traffic lights)\n" +
+	"# window_button_position: right, left. Independent of the style; dots and\n" +
+	"#               left is the shipped pair, the macOS arrangement\n" +
+	"# theme: color theme name (e.g. dracula, nord); empty for terminal colors\n" +
+	"# click_to_type: single (a click on a pane starts typing in it), double\n" +
+	"#               (two clicks do), off (a click only focuses)\n" +
+	"# auto_enter_terminal_on_focus: off (Tab keeps cycling windows),\n" +
+	"#               targeted (numbered select and arrows start typing),\n" +
+	"#               all (every covered focus command, including Tab)\n" +
+	"# [appearance.scrollbar]: style = thin, track; thumb/track = a one-cell glyph\n" +
+	"#               (track also takes \"none\"); tint = border, muted, #RRGGBB\n" +
+	"# background: off (your terminal shows through), theme (the theme's\n" +
+	"#               background), or #RRGGBB, for every surface at once\n" +
+	"# pane_background, desktop_background, window_chrome_background,\n" +
+	"#               dock_background, [appearance.sidebar] background: the same\n" +
+	"#               values for one surface; empty follows background, and a\n" +
+	"#               colour a program or the chrome chose always wins\n" +
+	"# ============================================================================\n\n" +
+
+	"# ============================================================================\n" +
+	"# KEYBINDINGS\n" +
+	"# ============================================================================\n" +
+	"# Set an action to [] to unbind it and hand the key back to the shell.\n" +
+	"# An empty list and a missing line are not the same thing. A line this file\n" +
+	"# does not have gets its default back the next time tuios starts; an action\n" +
+	"# set to [] stays empty.\n" +
+	"#\n" +
+	"# You do not have to edit this by hand. In tuios, open the keybind manager\n" +
+	"# (leader then k, or the command palette) and press ctrl+d on a binding to\n" +
+	"# remove it, or ctrl+x to take its key off every action. From a shell:\n" +
+	"#\n" +
+	"#   tuios keybinds unbind close_window w   # one key off one action\n" +
+	"#   tuios keybinds free alt+left           # off every action\n" +
+	"#\n" +
+	"# `tuios keybinds doctor` says which binding in each scope is live, what\n" +
+	"# clashes with what, and which keys never reach the program in the pane.\n" +
+	"#\n" +
+	"# [keybindings.global] acts in window mode and terminal mode alike. It binds\n" +
+	"# ctrl+p to the command palette and alt+space to the launcher, which costs\n" +
+	"# you fish's history-back and readline's set-mark. To move or drop either:\n" +
+	"#\n" +
+	"#   [keybindings.global]\n" +
+	"#   command_palette = [\"ctrl+shift+p\"]\n" +
+	"#   launcher = []\n" +
+	"#\n" +
+	"# [keybindings.terminal_mode] binds alt+arrows to move focus between panes.\n" +
+	"# In readline, fish and zsh, alt+left and alt+right move the cursor a word\n" +
+	"# at a time. If you want those back:\n" +
+	"#\n" +
+	"#   [keybindings.terminal_mode]\n" +
+	"#   terminal_focus_left = []\n" +
+	"#   terminal_focus_right = []\n" +
+	"#\n" +
+	"# alt+up and alt+down are unclaimed by the common shells, so they are the\n" +
+	"# safer pair to keep.\n" +
+	"#\n" +
+	"# shift+pgup and shift+pgdown scroll one page. middle pastes from the host\n" +
+	"# clipboard. Write ctrl+middle to add a modifier.\n" +
+	"#\n" +
+	"# hold_window_mode binds a key that puts tuios in window-management mode for\n" +
+	"# as long as it is physically held, and hands the previous mode back when it\n" +
+	"# is let go:\n" +
+	"#\n" +
+	"#   [keybindings.mode_control]\n" +
+	"#   hold_window_mode = [\"leftalt\"]\n" +
+	"#\n" +
+	"# It needs a terminal that speaks the Kitty keyboard protocol (Ghostty, kitty,\n" +
+	"# WezTerm, foot, Alacritty; not Terminal.app), because nothing else reports\n" +
+	"# that a key was released. Naming a modifier key (leftalt, rightalt, leftctrl,\n" +
+	"# leftsuper) asks the terminal for one more thing on top: every keystroke in\n" +
+	"# the session then arrives as an escape code. Any ordinary key (f13 to f63,\n" +
+	"# scrolllock, a spare letter) avoids that. Unbound by default.\n" +
+	"# ============================================================================\n\n" +
+
+	"# ============================================================================\n" +
+	"# DOCK COMPONENTS\n" +
+	"# ============================================================================\n" +
+	"# The dock is three ordered lists of component names. Leave [dock] out\n" +
+	"# entirely and the bar draws what it always drew; write the lists to\n" +
+	"# reorder it, and omit a name to drop that segment.\n" +
+	"#\n" +
+	"#   [dock]\n" +
+	"#   left   = [\"mode\", \"workspaces\", \"trail\", \"tape\"]\n" +
+	"#   center = [\"windows\"]\n" +
+	"#   right  = [\"notifications\", \"copy-help\", \"cpu\", \"ram\", \"clock\", \"session-controls\"]\n" +
+	"#\n" +
+	"# A cell of your own is a command whose first line of stdout is the text:\n" +
+	"#\n" +
+	"#   [dock.custom.branch]\n" +
+	"#   command = \"git branch --show-current\"\n" +
+	"#   refresh = \"event:after-focus-change\"   # or once, push, or \"30s\"\n" +
+	"#\n" +
+	"# and then \"custom/branch\" in one of the lists above. A component that\n" +
+	"# fails is hidden rather than left showing a stale value;\n" +
+	"# `tuios list-dock-components` says which and why.\n" +
+	"# ============================================================================\n\n"
 
 // renderConfigFile is cfg as the bytes of a config file, header and all. It
 // touches memory only, which is what lets a caller that must not block do this
 // half of a save itself.
 func renderConfigFile(cfg *UserConfig, configPath string) ([]byte, error) {
-	data, err := toml.Marshal(cfg)
+	data, err := MarshalUserConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal config: %w", err)
 	}
@@ -159,16 +160,68 @@ func renderConfigFile(cfg *UserConfig, configPath string) ([]byte, error) {
 	return []byte(sb.String()), nil
 }
 
+// MarshalUserConfig is cfg as TOML, the way every config file tuios writes is
+// encoded. It differs from toml.Marshal in one thing: a field may write its own
+// TOML, which is how max_fps comes out as a bare 144 or a quoted "auto" from
+// one field. toml.Marshal would quote both.
+func MarshalUserConfig(cfg *UserConfig) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := toml.NewEncoder(&buf).SetIndentSymbol("  ").EnableMarshalerInterface()
+	if err := enc.Encode(cfg); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // writeConfigBytes puts already-rendered bytes at configPath, creating the
 // parent directory as needed.
+//
+// The bytes go to a temporary file beside the config and are renamed over
+// it, so a reader sees the old file or the new one and never part of one.
+// The config watcher reads the file 200 ms after the last change it saw. A
+// plain write truncates the file and then fills it, and a writer descheduled
+// between the two for longer than that (a loaded CI runner was enough) had
+// the watcher read an empty or cut file. That parsed, the defaults filled the
+// rest, and the dock or the rail of the running client moved back to its
+// default. The completed write that followed was then dropped as tuios's own
+// save, so the wrong settings stood.
+//
+// The content is noted as a self write before the rename, so the watcher that
+// sees the rename already knows it. A symlinked config is written through to
+// its target, so the link survives, and the file keeps its mode.
 func writeConfigBytes(data []byte, configPath string) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
-	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+	target := configPath
+	if resolved, err := filepath.EvalSymlinks(configPath); err == nil {
+		target = resolved
+	}
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(target); err == nil {
+		mode = info.Mode().Perm()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".config.toml.*")
+	if err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
+	tmpPath := tmp.Name()
+	_, werr := tmp.Write(data)
+	if werr == nil {
+		werr = tmp.Chmod(mode)
+	}
+	if cerr := tmp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to write config file: %w", werr)
+	}
 	noteSelfWrite(data)
+	if err := os.Rename(tmpPath, target); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
 	return nil
 }
 
@@ -220,56 +273,91 @@ func WriteConfigFile(cfg *UserConfig, configPath string) error {
 	return writeConfigBytes(data, configPath)
 }
 
-// saveSeq numbers renders and saveDone the newest one that has landed, so a
-// write held up behind another cannot put an older config back.
+// saveSeq numbers renders, and keyGen holds the number of the newest save
+// that wrote each key, so a write held up behind another cannot put an older
+// value of a key back. saveMu guards keyGen and serialises the writes.
 var (
-	saveMu   sync.Mutex
-	saveSeq  atomic.Uint64
-	saveDone atomic.Uint64
+	saveMu  sync.Mutex
+	saveSeq atomic.Uint64
+	keyGen  = map[string]uint64{}
 )
 
-// RenderUserConfig reads cfg into the bytes of a config file and hands back the
-// function that writes them. The split exists because the caller is the Update
-// goroutine: rendering is memory and can happen there, the file write cannot.
+// RenderUserConfig reads cfg into the change a save makes and hands back the
+// function that writes it. The split exists because the caller is the Update
+// goroutine: reading the model is memory and can happen there, the file write
+// cannot.
 //
 // Reading cfg here rather than in the returned function is also what makes this
 // safe without a deep copy. The config is the model's own and goes on being
 // edited; a writer holding the pointer would be marshalling a struct changing
 // underneath it.
 //
+// The change is the difference between the config cfg was loaded from and cfg
+// now, so a save writes the keys the person changed and nothing else (see
+// include_write.go). The next save starts from here, so a change is written
+// once.
+//
 // The returned function is safe to call from anywhere and from several places at
 // once. Writes are serialised and stamped, so when two saves are in flight the
-// older one gives way rather than overwriting the newer.
-func RenderUserConfig(cfg *UserConfig) (func() error, error) {
+// older one gives way rather than overwriting the newer. Its WriteNote says
+// when a read-only file sent a change to another file.
+func RenderUserConfig(cfg *UserConfig) (func() (WriteNote, error), error) {
 	configPath, err := xdg.ConfigFile("tuios/config.toml")
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve config path: %w", err)
 	}
-	data, err := renderConfigFile(cfg, configPath)
+	data, err := MarshalUserConfig(cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal config: %w", err)
 	}
+	base := cfg.baseline
+	cfg.baseline = data
 	gen := saveSeq.Add(1)
-	return func() error {
+	return func() (WriteNote, error) {
 		saveMu.Lock()
 		defer saveMu.Unlock()
-		if gen < saveDone.Load() {
-			return nil
+		// An older save that lost the race is not dropped: it carries a change
+		// of its own, which the newer one does not repeat. It skips only the
+		// keys a newer save already wrote.
+		note, err := saveConfigData(configPath, base, data, gen)
+		if err != nil {
+			return note, &SaveError{Err: err, cfg: cfg, base: base}
 		}
-		if err := writeConfigBytes(data, configPath); err != nil {
-			return err
-		}
-		saveDone.Store(gen)
-		return nil
+		return note, nil
 	}, nil
 }
 
-// SaveUserConfig persists cfg to the user's config file at the standard XDG
-// location. Used by the in-app settings page to make live changes durable.
-func SaveUserConfig(cfg *UserConfig) error {
-	configPath, err := xdg.ConfigFile("tuios/config.toml")
-	if err != nil {
-		return fmt.Errorf("failed to resolve config path: %w", err)
+// SaveError is a save that failed. The change it carried is not in any file,
+// so RewindSave puts the config's baseline back and the next save writes the
+// change again.
+type SaveError struct {
+	Err  error
+	cfg  *UserConfig
+	base []byte
+}
+
+func (e *SaveError) Error() string { return e.Err.Error() }
+func (e *SaveError) Unwrap() error { return e.Err }
+
+// RewindSave undoes what RenderUserConfig did to cfg's baseline when the save
+// err came from failed. Call it on the goroutine that owns cfg. It does
+// nothing for another config or another error.
+func RewindSave(cfg *UserConfig, err error) {
+	var se *SaveError
+	if cfg == nil || !errors.As(err, &se) || se.cfg != cfg {
+		return
 	}
-	return WriteConfigFile(cfg, configPath)
+	cfg.baseline = se.base
+}
+
+// SaveUserConfig persists cfg to the user's config file at the standard XDG
+// location, the same way the settings page does.
+func SaveUserConfig(cfg *UserConfig) (WriteNote, error) {
+	write, err := RenderUserConfig(cfg)
+	if err != nil {
+		return WriteNote{}, err
+	}
+	note, err := write()
+	RewindSave(cfg, err)
+	return note, err
 }

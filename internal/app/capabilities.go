@@ -15,6 +15,11 @@ import (
 	"time"
 
 	"github.com/adrg/xdg"
+	"golang.org/x/term"
+
+	"github.com/Gaurav-Gosain/tuios/internal/cellsize"
+	"github.com/Gaurav-Gosain/tuios/internal/lazyre"
+	"github.com/Gaurav-Gosain/tuios/internal/serverscope"
 )
 
 // HostCapabilities holds information about the host terminal's capabilities.
@@ -48,13 +53,28 @@ type HostCapabilities struct {
 	// wrong here costs nothing.
 	KittyPlaceholders bool
 	SixelGraphics     bool
-	// SixelPinned says SixelGraphics was set by TUIOS_SIXEL_GRAPHICS, so no
-	// later answer from the terminal changes it.
+	// SixelPinned says SixelGraphics was set by TUIOS_SIXEL_GRAPHICS, or by a
+	// host that stores images in its cells, so no later answer from the
+	// terminal changes it.
 	SixelPinned bool
+	// KittyPinned says KittyGraphics was set by TUIOS_KITTY_GRAPHICS, so a
+	// late answer from the terminal does not change it.
+	KittyPinned bool
+	// CellBoundImages says the host stores images in its cells, and its
+	// graphics are off for that reason. See cell_bound_images.go.
+	CellBoundImages bool
+	// DA1Late says the startup probe asked for DA1 and gave up before the
+	// answer came. A slow terminal, a console on a loaded machine say,
+	// still answers, and the program's input reader then gets the reply;
+	// see handleSixelProbe.
+	DA1Late bool
 	// Warnings are problems with the overrides, shown once the UI is up.
 	Warnings     []string
 	TrueColor    bool
 	TerminalName string
+	// Term is the host's TERM. It picks the glyph set a picture is drawn
+	// with on a host without graphics; see imageSymbolKind.
+	Term string
 	// FontFamily and BoldFontFamily are the faces the host draws with, as it
 	// named them itself. kitty answers a documented XTGETTCAP key with them,
 	// and fontconfig turns the name into a file, so a PNG capture can be drawn
@@ -163,7 +183,7 @@ func (m *OS) hostCellSize() (w, h int) {
 }
 
 func DetectHostCapabilities() *HostCapabilities {
-	caps := &HostCapabilities{}
+	caps := &HostCapabilities{Term: os.Getenv("TERM")}
 
 	// Detect terminal name from environment
 	detectTerminalName(caps)
@@ -195,7 +215,8 @@ func DetectHostCapabilities() *HostCapabilities {
 // per-user, and the pid keeps two clients on one machine apart.
 func capabilitiesDebugPath() string {
 	name := fmt.Sprintf("tuios-caps.%d.log", os.Getpid())
-	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+	// A named server's state home is set on xdg, not in the environment.
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" && serverscope.Name() == "" {
 		return filepath.Join(dir, "tuios", name)
 	}
 	return filepath.Join(xdg.StateHome, "tuios", name)
@@ -270,6 +291,12 @@ func detectTerminalName(caps *HostCapabilities) {
 	if os.Getenv("WEZTERM_PANE") != "" {
 		caps.TerminalName = "wezterm"
 	}
+	// Tern sets KITTY_WINDOW_ID and answers XTVERSION as kitty, so it is
+	// named last. Its kitty graphics and keyboard support are kitty's, and the
+	// probe finds them either way: the name is for logs and crash reports.
+	if termProgram == "tern" {
+		caps.TerminalName = "tern"
+	}
 }
 
 func detectTrueColor(caps *HostCapabilities) {
@@ -296,7 +323,7 @@ const probeTimeout = 300 * time.Millisecond
 // contain neither of the bytes that were being counted, so both of their reads
 // always ran to the timeout, and a terminal without kitty graphics never sent
 // the kitty terminators the graphics read was waiting for either.
-var da1Response = regexp.MustCompile(`\x1b\[\?[0-9;]*c`)
+var da1Response = lazyre.New(`\x1b\[\?[0-9;]*c`)
 
 // probeTerminal asks the host terminal what it can do, in one round trip.
 //
@@ -311,7 +338,7 @@ var da1Response = regexp.MustCompile(`\x1b\[\?[0-9;]*c`)
 // the DA1 parameters and the kitty replies, and pixel geometry from the
 // XTWINOPS replies.
 func probeTerminal(caps *HostCapabilities) {
-	if !isTerminal(os.Stdin.Fd()) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		setDefaultCellSize(caps)
 		return
 	}
@@ -324,12 +351,12 @@ func probeTerminal(caps *HostCapabilities) {
 	}
 	defer func() { _ = tty.Close() }()
 
-	oldState, err := makeRaw(tty.Fd())
+	oldState, err := term.MakeRaw(int(tty.Fd()))
 	if err != nil {
 		setDefaultCellSize(caps)
 		return
 	}
-	defer restoreTerminal(tty.Fd(), oldState)
+	defer func() { _ = term.Restore(int(tty.Fd()), oldState) }()
 
 	// Probe direct transmission (i=1) and, if we can stage a file for it,
 	// file transmission (i=2). The ids let the two answers be told apart; the
@@ -358,13 +385,17 @@ func probeTerminal(caps *HostCapabilities) {
 	q.WriteString("\x1b[c") // DA1 last, so its reply closes the whole batch
 	_, _ = tty.WriteString(q.String())
 
-	response := readTTYResponse(tty, probeTimeout, da1Response.MatchString)
+	response := readTTYResponse(tty, probeTimeout, da1Response().MatchString)
+	caps.DA1Late = !da1Response().MatchString(response)
 
 	parsePixelGeometry(caps, response)
 	parseGraphicsSupport(caps, response, probeFileErr == nil)
 	parseHostFont(caps, response)
 	parseHostPalette(caps, response)
 	caps.KittyPlaceholders = caps.KittyGraphics && hostDrawsPlaceholders(response)
+	// A host that stores images in its cells cannot have them moved or
+	// cleared; see cell_bound_images.go.
+	dropCellBoundGraphics(caps, response, os.Getenv)
 }
 
 // writePaletteQuery appends the colour questions to the probe batch: the
@@ -389,12 +420,11 @@ func writePaletteQuery(q *strings.Builder) {
 // colour name and terminals differ on how many they use: xterm and ghostty
 // answer four, some answer two. String terminator or BEL, because both are in
 // use and a reply that came back is worth reading whichever it ended with.
-var oscColorReply = regexp.MustCompile(
-	`\x1b\](4;(\d+)|10|11);rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})(?:\x1b\\|\x07)`)
+var oscColorReply = lazyre.New(`\x1b\](4;(\d+)|10|11);rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})(?:\x1b\\|\x07)`)
 
 // parseHostPalette reads the terminal's own colours out of a probe response.
 func parseHostPalette(caps *HostCapabilities, response string) {
-	for _, m := range oscColorReply.FindAllStringSubmatch(response, -1) {
+	for _, m := range oscColorReply().FindAllStringSubmatch(response, -1) {
 		packed := packOSCColor(m[3], m[4], m[5])
 		switch {
 		case strings.HasPrefix(m[1], "4;"):
@@ -453,11 +483,11 @@ func writeFontQuery(q *strings.Builder) {
 // xtgettcapReply matches one successful XTGETTCAP answer: DCS 1 + r
 // hexkey=hexvalue ST. The leading 1 is the terminal saying it knew the key; a 0
 // there is a refusal and matches nothing here, which is the point.
-var xtgettcapReply = regexp.MustCompile(`\x1bP1\+r([0-9a-fA-F]+)=([0-9a-fA-F]*)\x1b\\`)
+var xtgettcapReply = lazyre.New(`\x1bP1\+r([0-9a-fA-F]+)=([0-9a-fA-F]*)\x1b\\`)
 
 // parseHostFont reads the host's own font names out of a probe response.
 func parseHostFont(caps *HostCapabilities, response string) {
-	for _, m := range xtgettcapReply.FindAllStringSubmatch(response, -1) {
+	for _, m := range xtgettcapReply().FindAllStringSubmatch(response, -1) {
 		key, kerr := hex.DecodeString(m[1])
 		value, verr := hex.DecodeString(m[2])
 		if kerr != nil || verr != nil || len(value) == 0 {
@@ -569,7 +599,7 @@ func kittyProbeRefused(response string, id int) bool {
 
 // kittyProbeResponse matches one graphics reply: its parameters and its
 // message. Compiled once because the probe walks it several times.
-var kittyProbeResponse = regexp.MustCompile(`\x1b_G([^;\x1b]*);([^\x1b]*)\x1b\\`)
+var kittyProbeResponse = lazyre.New(`\x1b_G([^;\x1b]*);([^\x1b]*)\x1b\\`)
 
 // kittyProbeAnswer returns the message the host sent for the given image id,
 // and whether it answered at all. The first answer for an id wins: a terminal
@@ -577,7 +607,7 @@ var kittyProbeResponse = regexp.MustCompile(`\x1b_G([^;\x1b]*);([^\x1b]*)\x1b\\`
 // command.
 func kittyProbeAnswer(response string, id int) (string, bool) {
 	want := fmt.Sprintf("i=%d", id)
-	for _, m := range kittyProbeResponse.FindAllStringSubmatch(response, -1) {
+	for _, m := range kittyProbeResponse().FindAllStringSubmatch(response, -1) {
 		if !slices.Contains(strings.Split(m[1], ","), want) {
 			continue
 		}
@@ -718,8 +748,10 @@ func applyEnvironmentOverrides(caps *HostCapabilities) {
 	switch os.Getenv("TUIOS_KITTY_GRAPHICS") {
 	case "1":
 		caps.KittyGraphics = true
+		caps.KittyPinned = true
 	case "0":
 		caps.KittyGraphics = false
+		caps.KittyPinned = true
 	}
 
 	switch os.Getenv("TUIOS_KITTY_PLACEHOLDERS") {
@@ -787,19 +819,19 @@ func applyCellSizeOverride(caps *HostCapabilities, spec string) {
 // windowPixels and cellPixels match the two XTWINOPS replies the probe asks
 // for: the window's size in pixels and one cell's, both height before width.
 var (
-	windowPixels = regexp.MustCompile(`\x1b\[4;(\d+);(\d+)t`)
-	cellPixels   = regexp.MustCompile(`\x1b\[6;(\d+);(\d+)t`)
+	windowPixels = lazyre.New(`\x1b\[4;(\d+);(\d+)t`)
+	cellPixels   = lazyre.New(`\x1b\[6;(\d+);(\d+)t`)
 )
 
 // parsePixelGeometry reads the window and cell pixel sizes out of a probe
 // response, falling back to a derived or default cell size when the host
 // answered with neither.
 func parsePixelGeometry(caps *HostCapabilities, response string) {
-	if matches := windowPixels.FindStringSubmatch(response); len(matches) == 3 {
+	if matches := windowPixels().FindStringSubmatch(response); len(matches) == 3 {
 		caps.PixelHeight, _ = strconv.Atoi(matches[1])
 		caps.PixelWidth, _ = strconv.Atoi(matches[2])
 	}
-	if matches := cellPixels.FindStringSubmatch(response); len(matches) == 3 {
+	if matches := cellPixels().FindStringSubmatch(response); len(matches) == 3 {
 		caps.CellHeight, _ = strconv.Atoi(matches[1])
 		caps.CellWidth, _ = strconv.Atoi(matches[2])
 	}
@@ -826,9 +858,9 @@ func setDefaultCellSize(caps *HostCapabilities) {
 	}
 
 	if caps.CellWidth == 0 {
-		caps.CellWidth = 9
+		caps.CellWidth = cellsize.FallbackWidth
 	}
 	if caps.CellHeight == 0 {
-		caps.CellHeight = 20
+		caps.CellHeight = cellsize.FallbackHeight
 	}
 }

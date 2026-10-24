@@ -48,7 +48,7 @@ func screenOf(win *terminal.Window, col, row int) (int, int) {
 //
 // Negative control, both confirmed red: with markedLinkAt returning the cell's
 // own column as both ends of the run, the span assertions fail; with the OSC 8
-// parse taking the parameters as the URL, which is the bug internal/vt/osc.go
+// parse taking the parameters as the URL, which is the bug vt/osc.go
 // carries a comment about, the address assertion fails.
 func TestLinkHoverFindsAMarkedRun(t *testing.T) {
 	const want = "https://example.com/docs"
@@ -112,6 +112,14 @@ func TestLinkHoverYieldsToAMouseTrackingGuest(t *testing.T) {
 	m.Mode = WindowManagementMode
 	if !m.LinkHoverAt(sx, sy) {
 		t.Error("window management mode handed the pointer to the guest")
+	}
+
+	// link_hover = "always" hands the call to the user: the same setup that
+	// just suppressed the highlight now keeps it, tracking guest and all.
+	m.Mode = TerminalMode
+	m.Settings.LinkHover = config.LinkHoverAlways
+	if !m.LinkHoverAt(sx, sy) {
+		t.Error("link_hover = always still suppressed the hover over a tracking guest")
 	}
 }
 

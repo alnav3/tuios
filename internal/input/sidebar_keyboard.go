@@ -33,6 +33,16 @@ func handleToggleFocusSidebar(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // Keys with no rail binding are swallowed, not passed to the pane underneath:
 // the whole point of the scope is that pane bindings do not fire here.
 func HandleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarFocusOnSecondary() {
+		var result *app.OS
+		var cmd tea.Cmd
+		o.WithSecondarySidebar(func() { result, cmd = handleSidebarKey(msg, o) })
+		return result, cmd
+	}
+	return handleSidebarKey(msg, o)
+}
+
+func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	key := msg.String()
 	if o.KeybindRegistry == nil {
 		o.ExitSidebarFocus()
@@ -44,7 +54,7 @@ func HandleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// under the cursor is what decides which of the two answers. On every other
 	// row the lookup finds nothing and the rail's own binding runs, unchanged.
 	if o.SidebarCursorOnFile() {
-		if act := lookupAction(msg, o.KeybindRegistry.GetSidebarFilesAction); act != "" {
+		if act := lookupAction(o, msg, o.KeybindRegistry.GetSidebarFilesAction); act != "" {
 			o.NoteAction(act)
 			return o, handleSidebarFileAction(act, o)
 		}
@@ -55,7 +65,7 @@ func HandleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// the rail's binding for it, so r and x keep renaming and opening the menu
 	// until reply and cancel are built.
 	if o.SidebarCursorOnAgent() {
-		if act := lookupAction(msg, o.KeybindRegistry.GetSidebarAgentsAction); act != "" {
+		if act := lookupAction(o, msg, o.KeybindRegistry.GetSidebarAgentsAction); act != "" {
 			if cmd, handled := o.SidebarAgentAction(act); handled {
 				o.NoteAction(act)
 				return o, cmd
@@ -63,7 +73,7 @@ func HandleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		}
 	}
 
-	action := lookupAction(msg, o.KeybindRegistry.GetSidebarAction)
+	action := lookupAction(o, msg, o.KeybindRegistry.GetSidebarAction)
 	if action == "" {
 		// A global bind, on a key the rail does not bind itself.
 		//
@@ -82,10 +92,10 @@ func HandleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		// before this section existed, or a rebound exit) would otherwise trap
 		// the keyboard here with no way back to the panes.
 		//
-		// Checked after the lookup, not before it. Before, a user who put esc on
-		// a rail action of their own had it silently overridden, which is the
-		// same bug as hardcoding the key: the config said one thing and the
-		// program did another, with nothing to tell them apart.
+		// Checked after the lookup, not before it, so a user who puts esc on a
+		// rail action of their own is not silently overridden. Checking first
+		// would be the same fault as hardcoding the key: the config would say
+		// one thing and the program do another, with nothing to tell them apart.
 		if key == "esc" {
 			o.ExitSidebarFocus()
 		}
@@ -132,6 +142,8 @@ func HandleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.SidebarReorderCursor(-1)
 	case sidebarActSection:
 		o.SidebarCycleSection()
+	case sidebarActSwitchEdge:
+		o.FocusOtherSidebar()
 	case sidebarActPalette:
 		// The rail lists what exists; the palette finds it by name across every
 		// session and filters it by who needs a human. Rail focus is kept, so
@@ -229,6 +241,8 @@ func handleSidebarFileAction(action string, o *app.OS) tea.Cmd {
 		return o.SidebarFileOpen()
 	case sidebarActFileEdit:
 		return o.SidebarFileEdit()
+	case sidebarActFileCopyPath:
+		return o.SidebarFileCopyPath()
 	case sidebarActFileCreate:
 		o.SidebarFileCreate()
 	case sidebarActFileRename:
@@ -243,6 +257,8 @@ func handleSidebarFileAction(action string, o *app.OS) tea.Cmd {
 		o.SidebarFileCut()
 	case sidebarActFilePaste:
 		return o.SidebarFilePaste()
+	case sidebarActFileSend:
+		return o.SidebarFileSend()
 	}
 	return nil
 }

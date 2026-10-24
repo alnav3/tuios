@@ -9,10 +9,15 @@ across it.
 ```sh
 tuios hosts add build gaurav@buildbox   # add a machine
 tuios hosts test build                  # dial it and say what happened
+tuios hosts test build --start          # start its daemon if it does not run
 tuios hosts remove build                # drop it
 tuios hosts                             # every host and its link state
 tuios hosts tailnet                     # machines on a Tailscale tailnet
 tuios hosts add gpu --tailnet           # the tailnet machine named gpu
+tuios hosts signin build --print        # the Tailscale sign-in page build waits on
+tuios hosts sync --dry-run --json      # which hosts run another tuios version
+tuios hosts sync --dev                  # install a build of this checkout on each host
+tuios hosts sync build --start          # install tuios if missing, then start the daemon
 tuios ls --all-hosts
 tuios list-agents --all-hosts
 ```
@@ -20,6 +25,32 @@ tuios list-agents --all-hosts
 `hosts add` also takes `--command PATH` for the tuios binary on the host,
 `--ssh-option ARG` for extra ssh arguments, `--connect-timeout SECONDS`, and
 `--repos-root DIR` for where its checkouts live. A change takes effect at once.
+
+`hosts sync` installs the version of this machine where a host differs. It never
+restarts a daemon unless given `--restart`, and a restart ends every program in
+the panes of that daemon. Without a terminal, `--restart` also needs `--yes`.
+Do not pass either unless the person asked for a restart. Each row of `--json`
+has `restart_needed` and `restart_command`, and `daemon.sessions[].busy` lists
+the panes a restart would end.
+
+A host behind Tailscale SSH in check mode waits for the person to sign in in
+a browser. Its link reports `tailscale_check` with `approval_url` (the table of
+`tuios hosts` says "sign in"), and a `hosts sync --json` row has
+`"error_kind": "tailscale_check"` and `approval_url`. Give the person the URL,
+or tell them to run `tuios hosts signin NAME`. Do not open it and do not sign
+in yourself. tuios keeps only an https address on Tailscale's login origins,
+or on the host's `tailscale_login`. Any other is reported as
+`"approval_refused": true` with no address. The daemon's link comes up on its own after they sign in. Run a
+`hosts sync` or `hosts test` again after they sign in. A login the tailnet policy
+refuses has `"error_kind": "tailscale_policy"`, and the fix is the user in the
+host's `addr`.
+
+A host with tuios and no daemon reports `no_daemon`. `hosts test NAME --start`
+starts the daemon there over ssh. It does nothing on a host that already runs
+one, and it starts nothing on a host with no tuios. `hosts sync NAME --start`
+installs tuios first on such a host, then starts the daemon. Both take
+`--dry-run` and `--json`. Starting a daemon ends nothing, so it needs no
+question.
 
 The daemon follows each host's agents and Inbox over the link as they change, so
 `list-attention` and the person's Inbox cover every machine, and
@@ -89,10 +120,21 @@ tuios stash get -s build:api "$path" flame.png
 A message queued for a host whose link is down keeps its paths as written, so
 attach only stashed paths to it.
 
+For a file over 8 MB, or a folder, copy it with `tuios cp`. The daemon runs
+the copy, goes on after a dropped link, and checks each file with sha256
+(`tuios --skill files`):
+
+```sh
+tuios cp --json --conflict skip ./flame.png build:
+```
+
 ## What another machine allows
 
 Each machine decides what other machines may do to it: `list`, `mail`, `open`,
-`write` and `respond`. By default a machine may do all of that but `respond`. A
+`write`, `respond` and `files`. By default a machine may do all of that but
+`respond`. `files` writes only in that machine's `files_roots`: its receive
+folder, `~/Downloads/tuios`, unless the person there added more. It never
+writes in its keys, credentials or shell start files. A
 call the far machine does not allow fails with `forbidden`, naming the
 capability, and nothing was done. That is the other owner's decision: tell the
 person, do not look for another verb.
@@ -131,7 +173,7 @@ tuios wait-for agent-message -w "$TUIOS_PANE_ID" --timeout 600000
 ```
 
 Only `set-agent-state`, `set-agent-meta`, `set-agent-session`,
-`report-agent-activity`, `read-agent-messages`, `send-agent-message` and
+`report-agent-activity`, `agent-mail-notice`, `read-agent-messages`, `send-agent-message` and
 `wait-for agent-message` cross,
 and always as your own window. A wait there runs at most an hour. Everything
 else you run talks to the machine you are on.

@@ -67,6 +67,16 @@ func (m *OS) OverlayMouseClick(x, y int, right bool) (bool, tea.Cmd) {
 	// Clicking a panel brings it to the front.
 	m.raiseOverlay(h.Kind)
 
+	// The cockpit fills the screen and is not dragged: a click selects, a
+	// second one goes. See cockpit.go.
+	if h.Kind == "inbox" {
+		if right {
+			return true, nil
+		}
+		cmd, _ := m.CockpitClick(x, y)
+		return true, cmd
+	}
+
 	lx, ly := x-h.OriginX, y-h.OriginY
 
 	// Right-click anywhere on the panel grabs it for dragging.
@@ -146,6 +156,10 @@ func (m *OS) OverlayMouseMotion(x, y int) bool {
 	if !ok {
 		return false
 	}
+	if h.Kind == "inbox" {
+		m.CockpitHover(x, y)
+		return true
+	}
 	lx, ly := x-h.OriginX, y-h.OriginY
 	if h.Kind == "accent" {
 		// Only a held button paints in the picker. Bare hover must not, or the
@@ -180,6 +194,8 @@ func (m *OS) overlayRowHover(kind string, idx int) {
 		if idx != m.ThemePickerSelected {
 			m.ThemePickerMove(idx - m.ThemePickerSelected)
 		}
+	case "themeeditor":
+		m.themeEditor.cursor[m.themeEditor.tab] = idx
 	case "glyphpicker":
 		if idx != m.GlyphPickerSelected {
 			m.GlyphPickerMove(idx - m.GlyphPickerSelected)
@@ -203,6 +219,18 @@ func (m *OS) overlayRowHover(kind string, idx int) {
 		m.InboxSelect(idx)
 	case "workspace":
 		m.WorkspaceSwitcherSelected = idx
+	case "goto":
+		m.GotoPickerSelect(idx)
+	case overlayKindBuffers:
+		m.BufferChooserSelect(idx)
+	case overlayKindTransfers:
+		m.TransfersSelect(idx)
+	case overlayKindCopyDialog:
+		m.CopyDialogSelect(idx)
+	case overlayKindPluginApproval:
+		m.PluginApprovalSelect(idx)
+	case "navigator":
+		m.NavigatorSelect(idx)
 	case "aggregate":
 		m.AggregateViewSelected = idx
 	case "layout":
@@ -213,6 +241,10 @@ func (m *OS) overlayRowHover(kind string, idx int) {
 		m.QuitMenuSelected = idx
 	case "sessionclose":
 		m.SessionCloseSelected = idx
+	case overlayKindRestart:
+		if m.restart.phase == restartConfirm {
+			m.restart.selected = idx
+		}
 	case overlayKindLogs:
 		m.LogSelected = idx
 	case "filedialog":
@@ -273,10 +305,18 @@ func (m *OS) OverlayMouseWheel(x, y int, up bool) bool {
 	case "agentmail":
 		m.AgentMailMove(wheelDelta(up))
 	case "inbox":
-		m.InboxMove(wheelDelta(up))
+		m.CockpitWheel(x, up)
 	case "workspace":
 		n := len(FilterWorkspaceItems(m.WorkspaceSwitcherItems, m.WorkspaceSwitcherQuery))
 		m.WorkspaceSwitcherMove(wheelDelta(up), n)
+	case "goto":
+		m.GotoPickerMove(wheelDelta(up))
+	case overlayKindBuffers:
+		m.BufferChooserMove(wheelDelta(up))
+	case overlayKindTransfers:
+		m.TransfersMove(wheelDelta(up))
+	case "navigator":
+		m.NavigatorMove(wheelDelta(up))
 	case "layout":
 		m.LayoutPickerMove(wheelDelta(up))
 	case "hostpicker":
@@ -286,6 +326,8 @@ func (m *OS) OverlayMouseWheel(x, y int, up bool) bool {
 		m.AggregateViewMove(wheelDelta(up))
 	case "sessionclose":
 		m.SessionCloseMove(wheelDelta(up))
+	case overlayKindRestart:
+		m.DaemonRestartMove(wheelDelta(up))
 	case "filedialog":
 		m.FileConfirmMove(wheelDelta(up))
 	case "accent":
@@ -332,6 +374,8 @@ func (m *OS) setOverlayTab(kind string, i int) {
 		m.SettingsScroll = 0
 	case "keybinds":
 		m.KeybindSetTab(i)
+	case "themeeditor":
+		m.ThemeEditorTab(i - m.themeEditor.tab)
 	}
 }
 
@@ -346,6 +390,8 @@ func (m *OS) stepOverlayTab(kind string, delta int) {
 		m.setOverlayTab(kind, m.SettingsCategory+delta)
 	case "keybinds":
 		m.setOverlayTab(kind, m.KeybindTab+delta)
+	case "themeeditor":
+		m.ThemeEditorTab(delta)
 	}
 }
 
@@ -361,6 +407,10 @@ func (m *OS) overlayRowClick(kind string, row overlayRowHit, lx, ly int) tea.Cmd
 				// A click anywhere on a text row opens its inline editor.
 				m.SettingsBeginEdit()
 				return nil
+			case controlStatus:
+				// A status row has nothing to step, so a click anywhere on it
+				// is the row's enter.
+				return m.SettingsActivate()
 			case controlColor:
 				// And anywhere on a colour row, swatch included, opens its picker.
 				// The row's rect is the one the renderer recorded as it drew, so
@@ -397,6 +447,9 @@ func (m *OS) overlayRowClick(kind string, row overlayRowHit, lx, ly int) tea.Cmd
 	case "themepicker":
 		m.ThemePickerSelected = row.Idx
 		return m.ThemePickerApplySelection()
+	case "themeeditor":
+		m.themeEditor.cursor[m.themeEditor.tab] = row.Idx
+		m.ThemeEditorPick()
 	case "glyphpicker":
 		m.GlyphPickerSelected = row.Idx
 		return m.GlyphPickerApplySelection()
@@ -416,11 +469,23 @@ func (m *OS) overlayRowClick(kind string, row overlayRowHit, lx, ly int) tea.Cmd
 		// switch" was reportable at all.
 		m.SessionSwitcherSelected = row.Idx
 		m.sessionSwitcherActivate(row.Idx)
+		// A session on another machine opens off the Update goroutine.
+		return m.TakeSidebarCmd()
 	case "agentmail":
 		// A click opens, exactly like enter on the selected row.
 		m.AgentMailSelect(row.Idx)
 		return m.AgentMailOpenSelected()
 	case "inbox":
+		if m.Inbox.agents.on {
+			// A click with the bulk allow's sheet up closes the sheet,
+			// as any key but enter does, and goes nowhere.
+			if m.Inbox.agents.sheet != nil {
+				m.Inbox.agents.sheet = nil
+				return nil
+			}
+			m.InboxSelect(row.Idx)
+			return m.InboxAgentsGo()
+		}
 		// A click goes, exactly like enter on the selected row. A click on a
 		// group heading selects nothing and so does nothing.
 		if rows := m.inboxRows(); row.Idx < 0 || row.Idx >= len(rows) || rows[row.Idx].item == nil {
@@ -431,6 +496,29 @@ func (m *OS) overlayRowClick(kind string, row overlayRowHit, lx, ly int) tea.Cmd
 	case "workspace":
 		m.WorkspaceSwitcherSelected = row.Idx
 		m.WorkspaceSwitcherActivate(row.Idx)
+	case "goto":
+		m.GotoPickerSelect(row.Idx)
+		m.GotoPickerActivate()
+	case overlayKindBuffers:
+		return m.BufferChooserActivate(row.Idx)
+	case overlayKindTransfers:
+		// A click puts the cursor on the copy; a copy that waits for an
+		// answer opens its question.
+		m.TransfersSelect(row.Idx)
+		if r, ok := m.selectedTransfer(); ok && r.State == "conflict" {
+			m.TransfersAnswer()
+		}
+	case overlayKindCopyDialog:
+		return m.CopyDialogActivate(row.Idx)
+	case overlayKindPluginApproval:
+		return m.PluginApprovalActivate(row.Idx)
+	case "navigator":
+		// A click on a session or a workspace row folds it, and a click on
+		// a pane goes to it, as enter does.
+		m.NavigatorSelect(row.Idx)
+		if !m.NavigatorClickFolds(row.Idx) {
+			m.NavigatorActivate(row.Idx)
+		}
 	case "aggregate":
 		// The picker used to return no hit rows at all, so the one overlay whose
 		// entire purpose is choosing a window was the one that could not be
@@ -449,6 +537,8 @@ func (m *OS) overlayRowClick(kind string, row overlayRowHit, lx, ly int) tea.Cmd
 	case "sessionclose":
 		m.SessionCloseSelected = row.Idx
 		return m.SessionCloseActivate(row.Idx)
+	case overlayKindRestart:
+		return m.DaemonRestartActivate(row.Idx)
 	case "filedialog":
 		m.filePrompt.Selected = row.Idx
 		return m.FileConfirmActivate(row.Idx)
@@ -550,6 +640,23 @@ func (m *OS) closeOverlay(kind string) {
 		m.CloseInbox()
 	case "workspace":
 		m.CloseWorkspaceSwitcher()
+	case "goto":
+		m.CloseGotoPicker()
+	case overlayKindBuffers:
+		m.CloseBufferChooser()
+	case overlayKindTransfers:
+		m.CloseTransfers()
+	case overlayKindCopyDialog:
+		m.CloseCopyDialog()
+	case overlayKindPluginApproval:
+		// Click-away is not now: the plugin keeps waiting.
+		m.ClosePluginApproval()
+	case "worktreeprompt":
+		// Click-away cancels, matching Esc: nothing was asked yet, so nothing
+		// is lost.
+		m.WorktreePromptCancel()
+	case "navigator":
+		m.CloseNavigator()
 	case overlayKindShot:
 		// Click-away keeps the file. Only esc discards, because a click that
 		// lands outside a panel is as often a miss as an intention, and a
@@ -569,6 +676,12 @@ func (m *OS) closeOverlay(kind string) {
 		// Click-away cancels, like esc. Dismissing is the safe answer, so it is
 		// the one an ambiguous gesture gets.
 		m.CloseSessionClose()
+	case overlayKindRestart:
+		// The same rule. A failure that left no daemon is the exception:
+		// CloseDaemonRestart quits then, and an ambiguous gesture must not.
+		if !(m.restart.phase == restartFailed && m.restart.lost) {
+			_ = m.CloseDaemonRestart()
+		}
 	case "filedialog":
 		// Same rule, and it matters more here: the ambiguous gesture must never
 		// be the one that removes a file.

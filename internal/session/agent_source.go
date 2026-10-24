@@ -41,6 +41,15 @@ const (
 	// AgentSourceDetect is: only the daemon's own reader sets it, and a caller
 	// naming it over the socket has read nothing.
 	AgentSourceTranscript AgentSource = "transcript"
+	// AgentSourceProgram is the pane's own OSC 7501 report (the Program Status
+	// Protocol): the program saying what it is doing, for any program and not
+	// only a known agent. It ranks just below AgentSourceReport and above
+	// everything else: it is the program's own word, so it outranks every
+	// look at the screen, and a harness hook in the same pane keeps the last
+	// word, so the two never take the pane from each other in turn. It is
+	// daemon-internal: only the pane's emulator sets it, so a
+	// caller of set-agent-state cannot name it. See program_status.go.
+	AgentSourceProgram AgentSource = "program"
 	// AgentSourceOSC is an in-band escape sequence the pane emitted.
 	AgentSourceOSC AgentSource = "osc"
 	// AgentSourceScreen is a rule matched against the pane's rendered text.
@@ -97,6 +106,8 @@ func (a AgentSource) Name() string {
 // claim at all is a separate case, and is open to any source.
 func (a AgentSource) rank() int {
 	switch a {
+	case AgentSourceProgram:
+		return 38
 	case AgentSourceTranscript:
 		return 35
 	case AgentSourceOSC:
@@ -167,6 +178,13 @@ type agentClaim struct {
 	// reporter holds that is known to say working while its own prompt is
 	// up. See crushScreenWins.
 	screenWins bool
+	// promptHold is when a report from outside the pane moved the window off
+	// needs_input, as Unix nanoseconds, and 0 when nothing holds it. The
+	// prompt may still be on the screen, so typingRefusal holds the window as
+	// waiting on it. holdFg is the pane's foreground process group then, 0
+	// when it could not be read. See promptStillShown.
+	promptHold int64
+	holdFg     int
 }
 
 // herdrAnchor is one process a herdr claim follows, named by pid and start
@@ -256,18 +274,22 @@ func (s *Session) agentClaimFor(windowID string) agentClaim {
 // is still the best answer anyone has; it just stops being defended.
 //
 // The auto bit survives, because it is a lifecycle fact about the detector
-// rather than a precedence one: the pane still clears when the agent exits. A
-// window carrying it goes back to AgentSourceDetect rather than to the zero
-// claim, because the zero claim's empty source ranks as a report, and handing a
-// window back at the highest rank is the opposite of yielding it.
+// rather than a precedence one: the pane still clears when the agent exits. So
+// does sawProcess, for the same reason: it is what lets the detector clear a
+// claim it does not own once the agent has left, and a tier is often yielded in
+// the moment the agent exits, as a screen look that finds its idle box painted
+// over by the shell. A window carrying either goes back to AgentSourceDetect
+// rather than to the zero claim, because the zero claim's empty source ranks as
+// a report, and handing a window back at the highest rank is the opposite of
+// yielding it.
 func (s *Session) yieldAgentClaim(windowID string, source AgentSource) bool {
 	yielded := false
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if claim, held := s.agentClaims[windowID]; held && claim.source == source {
-		if claim.auto {
+		if claim.auto || claim.sawProcess {
 			s.agentClaims[windowID] = agentClaim{
-				source: AgentSourceDetect, harness: claim.harness, auto: true,
+				source: AgentSourceDetect, harness: claim.harness, auto: claim.auto, sawProcess: claim.sawProcess,
 			}
 		} else {
 			delete(s.agentClaims, windowID)

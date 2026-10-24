@@ -21,12 +21,13 @@ import (
 	"bufio"
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/childproc"
 )
 
 // State is what a rail row can say about a directory's repository.
@@ -175,23 +176,35 @@ func Forget() {
 // main checkout's branch on every worktree of the repository, which is exactly
 // the case this is for. A ".git" file whose git directory has no commondir
 // pointer also reports the two as the same.
+//
+// The first ".git" found ends the walk, whatever it is. A ".git" that is a
+// symlink is followed, so a checkout whose git directory lives elsewhere reports
+// its own branch. A broken one, a ".git" file with no "gitdir:" line, or any
+// other kind of file answers "no tree" rather than moving up: git itself stops
+// there, and the tree above is not the one dir is in.
 func Locate(dir string) (gitdir, commondir, root string, ok bool) {
 	dir = filepath.Clean(dir)
 	for p := dir; ; {
 		entry := filepath.Join(p, ".git")
 		st, err := os.Lstat(entry)
+		if err == nil && st.Mode()&os.ModeSymlink != 0 {
+			if st, err = os.Stat(entry); err != nil {
+				return "", "", "", false
+			}
+		}
 		switch {
 		case err != nil:
 			// keep walking
 		case st.IsDir():
 			return entry, entry, p, true
-		case st.Mode().IsRegular():
+		case !st.Mode().IsRegular():
+			return "", "", "", false
+		default:
 			// A linked worktree: the file names the git directory.
-			data, err := os.ReadFile(entry)
+			line, err := readFirstLine(entry)
 			if err != nil {
 				return "", "", "", false
 			}
-			line := strings.TrimSpace(string(data))
 			target, found := strings.CutPrefix(line, "gitdir:")
 			if !found {
 				return "", "", "", false
@@ -231,11 +244,10 @@ func commonDirOf(gitdir string) string {
 
 // readHead reads the checked out branch and the commit it points at.
 func readHead(gitdir, commondir string) (branch, sha string, detached bool) {
-	data, err := os.ReadFile(filepath.Join(gitdir, "HEAD"))
+	line, err := readFirstLine(filepath.Join(gitdir, "HEAD"))
 	if err != nil {
 		return "", "", false
 	}
-	line := strings.TrimSpace(string(data))
 	ref, isSymbolic := strings.CutPrefix(line, "ref:")
 	if !isSymbolic {
 		// Detached. The row still needs a name, and the short hash is the only
@@ -277,6 +289,8 @@ func resolveRef(gitdir, commondir, ref string) string {
 			return sha
 		}
 	}
+	// A read error leaves the ref unknown, the same as a ref that is not there.
+	_ = sc.Err()
 	return ""
 }
 
@@ -316,6 +330,10 @@ func upstreamOf(commondir, branch string) string {
 			merge = strings.TrimSpace(value)
 		}
 	}
+	if sc.Err() != nil {
+		// Half a section can pair a remote with the wrong merge ref.
+		return ""
+	}
 	if remote == "" || merge == "" {
 		return ""
 	}
@@ -338,7 +356,7 @@ func upstreamOf(commondir, branch string) string {
 var countCommits = func(root, head, upstream string) (ahead, behind int, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), countTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "rev-list", "--left-right", "--count", head+"..."+upstream)
+	cmd := childproc.CommandContext(ctx, "git", "rev-list", "--left-right", "--count", head+"..."+upstream)
 	cmd.Dir = root
 	// A repository is read with the user's git but never with the user's
 	// pager, editor or prompt: this runs unattended behind a sidebar.
@@ -388,7 +406,7 @@ func ReadDirty(root string) (Dirty, bool) {
 	// format is frozen by git's own compatibility promise. Untracked files are
 	// counted but not walked into: a directory of a thousand new files is one
 	// line and one number, not a thousand.
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain",
+	cmd := childproc.CommandContext(ctx, "git", "status", "--porcelain",
 		"--untracked-files=normal", "--no-renames")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")

@@ -18,6 +18,10 @@ import "slices"
 var (
 	// reviewNoteActions are what review-note does.
 	reviewNoteActions = []string{"add", "edit", "remove", "list", "clear"}
+	// reviewIndexModes are the index diffs review-diff reads.
+	reviewIndexModes = []string{"unstaged", "staged"}
+	// reviewStageActions are what review-stage does.
+	reviewStageActions = []string{"stage", "unstage", "undo"}
 	// reviewNoteSides are the sides of a diff a note can sit on.
 	reviewNoteSides = []string{"new", "old"}
 	// markAttentionActions are what mark-attention does to an item.
@@ -29,16 +33,45 @@ var (
 	// reportActivityEvents are the entries report-agent-activity takes: the
 	// same, and the events no state report carries, which set-agent-state
 	// predates.
-	reportActivityEvents = slices.Concat(activityEvents, []string{ActivitySubagentStart, ActivitySubagentStop, ActivitySessionStart})
+	reportActivityEvents = slices.Concat(activityEvents, []string{ActivitySubagentStart, ActivitySubagentStop, ActivitySessionStart, ActivitySubagentUpdate})
 )
 
 // agentWorkVerbs are the registry entries of the verbs above.
 func agentWorkVerbs() map[string]verbEntry {
 	humanNonce := verbParam{Name: "human_nonce", Type: "string", Description: "The nonce from the attach reply of a client attached now. The TUI sends its own. Without a live one the call is not the person's."}
 	return map[string]verbEntry{
+		// verb_agent_transcript.go
+		"agent-transcript": {
+			description: "Read the conversation of the agent in a pane, for a client that shows it to the person: prompts, answers, thinking, tool calls with their status, diffs of edits, plans and todo lists, decoded from the transcript the pane is joined to. Only the person can read it, with a live human_nonce, as reply-approval checks it. Claude Code transcripts only. Every string is the agent's or its tools', with control characters removed and likely secrets masked, so the reply is marked untrusted.",
+			params: []verbParam{
+				sessionParam,
+				{Name: "window", Type: "string", Required: true, Description: "The pane: a window id or name."},
+				{Name: "human_nonce", Type: "string", Required: true, Description: "The nonce of a client attached now, or of attach-presence on this connection. Without a live one the call is refused with not_human. A presence made for one session reads only that session's panes."},
+				{Name: "after", Type: "string", Description: "The cursor of an earlier reply. The reply then holds the entries after it. Omit it to read the newest limit entries."},
+				{Name: "before", Type: "string", Description: "The older cursor of an earlier reply. The reply then holds the newest limit entries before it. Do not give it with after."},
+				{Name: "limit", Type: "int", Description: "The most entries to return, 1 to 1000. Leave it out for the default. 0 is refused.", Default: "200"},
+			},
+			returns: []verbParam{
+				{Name: "session", Type: "string", Description: "The pane's session."},
+				{Name: "window", Type: "string", Description: "The pane's window id."},
+				{Name: "harness", Type: "string", Description: "The harness whose transcript was read."},
+				{Name: "cursor", Type: "string", Description: "Send it as after to read what comes next. It is opaque."},
+				{Name: "reset", Type: "bool", Description: "True when after was not a cursor into the file as it is now. The entries are then the newest limit, and the client starts its list again."},
+				{Name: "more", Type: "bool", Description: "True when a read after a cursor stopped before the end. Read again with the new cursor."},
+				{Name: "older", Type: "string", Description: "Send it as before to read the entries before this page. Empty when the page starts at the first entry."},
+				{Name: "entries", Type: "[]object", Description: "id, at (unix ms), role (user, assistant, tool), kind (text, thinking, tool_call, tool_result, plan, todos), text, truncated, tool, target, status (ok, error, running), tool_id, diff, plan and todos. Each diff line carries spans (syntax tokens with chroma CSS classes) and words (the changed part), in UTF-16 offsets. A diff with whole_replace true was not matched line by line: each hunk shows the changed old lines removed, then the changed new lines added. An entry with an id the client holds replaces it."},
+				{Name: "untrusted", Type: "bool", Description: "Always true: the text is the agent's."},
+			},
+			examples: []string{
+				`{"id":1,"verb":"agent-transcript","params":{"session":"work","window":"api","human_nonce":"<from attach-presence>"}}`,
+				`{"id":2,"verb":"agent-transcript","params":{"session":"work","window":"api","human_nonce":"<from attach-presence>","after":"<the cursor of the last reply>"}}`,
+				`{"id":3,"verb":"agent-transcript","params":{"session":"work","window":"api","human_nonce":"<from attach-presence>","before":"<the older cursor of the first reply>"}}`,
+			},
+			handler: (*Daemon).verbAgentTranscript,
+		},
 		// verb_review.go
 		"review-diff": {
-			description: "Read what the agent in a pane changed: the diff of its worktree against the base it was made from, or for a plain repository against the upstream merge base, untracked files included and ignored files left out. Nothing in the repository, its index or its working tree is changed. The text is the repository's, so it is marked untrusted.",
+			description: "Read what the agent in a pane changed: the diff of its worktree against the base it was made from, or for a plain repository against the upstream merge base, untracked files included (one larger than max_untracked_mb is listed as skipped and not read) and ignored files left out. Nothing in the repository, its index or its working tree is changed. The text is the repository's, so it is marked untrusted.",
 			params: []verbParam{
 				sessionParam,
 				windowParam,
@@ -47,19 +80,23 @@ func agentWorkVerbs() map[string]verbEntry {
 				{Name: "uncommitted", Type: "bool", Description: "Only what is not committed yet, against HEAD.", Default: "false"},
 				{Name: "paths", Type: "[]string", Description: "Only these paths, relative to the repository root. Omit for every changed file."},
 				{Name: "context", Type: "int", Description: "Lines of context around each change, 0 to 20.", Default: "3"},
+				{Name: "index", Type: "string", Description: "Read the worktree's index instead of the base. unstaged is the index against the working files, untracked files included. staged is HEAD against the index. Omit for the diff against the base. Not with base, against or uncommitted.", Accepted: reviewIndexModes},
+				{Name: "highlight", Type: "bool", Description: "Add the syntax colour and the changed part to each line: hl and changed. classes names the colour classes.", Default: "false"},
 			},
 			returns: []verbParam{
 				{Name: "session", Type: "string", Description: "The session of the pane reviewed."},
 				{Name: "window", Type: "string", Description: "The pane reviewed, by id: the one its notes are kept for."},
 				{Name: "repo_root", Type: "string", Description: "The repository's main checkout."},
 				{Name: "worktree", Type: "string", Description: "The worktree the diff was read from, symbolic links resolved."},
-				{Name: "base", Type: "string", Description: "The base as named (the ref given, the worktree's base, the upstream branch, or HEAD), empty with against."},
-				{Name: "base_sha", Type: "string", Description: "The commit the diff runs from: the merge base of HEAD and the base, or HEAD for uncommitted changes only."},
+				{Name: "base", Type: "string", Description: "The base as named (the ref given, the worktree's base, the upstream branch, or HEAD), empty with against. With index unstaged it is index, with index staged it is HEAD."},
+				{Name: "base_sha", Type: "string", Description: "The commit the diff runs from: the merge base of HEAD and the base, or HEAD for uncommitted changes only. With index it is a tree: the index, or HEAD's tree."},
+				{Name: "index", Type: "string", Description: "The index mode read, unstaged or staged. Absent without index."},
+				{Name: "classes", Type: "[]string", Description: "With highlight: the names of the colour classes, in the order of their numbers in hl. Absent without highlight."},
 				{Name: "uncommitted", Type: "bool", Description: "The diff shows only what is not committed: asked for, or no base was found."},
 				{Name: "tree_sha", Type: "string", Description: "The tree the working state was written to, for a later diff of the same state."},
 				{Name: "against", Type: "string", Description: "The sibling session, when one was given."},
 				{Name: "against_tree", Type: "string", Description: "The tree the sibling's working state was written to, with against."},
-				{Name: "files", Type: "[]object", Description: "One entry per changed file: path, old_path, status (A, M, D, R, or U for untracked), added, removed, binary, truncated, and hunks, each with header, old_start, old_lines, new_start, new_lines and lines of op (context, add or delete), old, new, text and no_newline."},
+				{Name: "files", Type: "[]object", Description: "One entry per changed file: path, old_path, status (A, M, D, R, or U for untracked), added, removed, binary, truncated, and hunks, each with header, old_start, old_lines, new_start, new_lines and lines of op (context, add or delete), old, new, text and no_newline. With highlight a line also has hl, its colour as [start, end, class] runs in bytes of text, and changed, the [start, end] bytes that changed against its paired line. Each is absent when empty."},
 				{Name: "totals", Type: "object", Description: "files, added and removed over the whole diff."},
 				{Name: "truncated", Type: "bool", Description: "The diff passed a cap (400 files, 2 MiB, 5000 lines in a file) and the files past it carry counts only."},
 				{Name: "notes", Type: "[]object", Description: "The pane's review notes, found again in this diff, as review-note lists them."},
@@ -68,8 +105,38 @@ func agentWorkVerbs() map[string]verbEntry {
 			examples: []string{
 				`{"id":1,"verb":"review-diff","params":{"session":"api-fan-retry-2"}}`,
 				`{"id":1,"verb":"review-diff","params":{"session":"work","window":"build","uncommitted":true}}`,
+				`{"id":1,"verb":"review-diff","params":{"session":"work","window":"build","index":"unstaged"}}`,
 			},
 			handler: (*Daemon).verbReviewDiff,
+		},
+		// verb_review_stage.go
+		"review-stage": {
+			description: "Stage or unstage a change in the worktree of a pane. Name a whole file, one hunk, or some lines of a hunk. Only the index changes. The working files do not change. Every result carries an undo object. Send it back with action undo to undo the call. The undo result carries its own undo object, which redoes the call.",
+			params: []verbParam{
+				{Name: "action", Type: "string", Required: true, Description: "What to do.", Accepted: reviewStageActions},
+				sessionParam,
+				windowParam,
+				{Name: "path", Type: "string", Description: "The file, relative to the repository root. Needed to stage and unstage."},
+				{Name: "hunk", Type: "string", Description: "The hunk header, exactly as review-diff returned it. Stage reads it from index unstaged, unstage from index staged. Omit for the whole file."},
+				{Name: "lines", Type: "[]int", Description: "Indices into the lines of the hunk. Only added and removed lines count. Context lines are ignored. Omit for the whole hunk."},
+				{Name: "context", Type: "int", Description: "The context of the diff the hunk came from, 0 to 20. It must match that diff.", Default: "3"},
+				{Name: "undo", Type: "object", Description: "For action undo: the undo object of the result to undo, with entries and after."},
+				humanNonce,
+			},
+			returns: []verbParam{
+				{Name: "session", Type: "string", Description: "The session of the pane."},
+				{Name: "window", Type: "string", Description: "The pane, by id."},
+				{Name: "worktree", Type: "string", Description: "The worktree whose index changed."},
+				{Name: "path", Type: "string", Description: "The file named."},
+				{Name: "action", Type: "string", Description: "The action done: stage, unstage or undo."},
+				{Name: "undo", Type: "object", Description: "entries: the index entries of the paths touched before the call, each path with mode and sha, or absent. after: the same paths after the call. Send it with action undo to undo the call."},
+			},
+			examples: []string{
+				`{"id":1,"verb":"review-stage","params":{"action":"stage","session":"work","window":"build","path":"api/retry.go","hunk":"@@ -40,7 +40,9 @@ func Do(ctx context.Context","lines":[3,4]}}`,
+				`{"id":1,"verb":"review-stage","params":{"action":"unstage","session":"work","window":"build","path":"api/retry.go"}}`,
+				`{"id":1,"verb":"review-stage","params":{"action":"undo","session":"work","window":"build","undo":{"entries":[{"path":"api/retry.go","mode":"100644","sha":"<sha>"}],"after":[{"path":"api/retry.go","mode":"100644","sha":"<sha>"}]}}}`,
+			},
+			handler: (*Daemon).verbReviewStage,
 		},
 		"review-note": {
 			description: "Keep the review notes on a pane's changes: add one on a line or a hunk, edit, remove, list or clear them. Notes are held by the daemon per worktree, so every client and the CLI see the same ones, and follow their line as the diff moves. A note is the person's only with a live human_nonce, and a pane without admin adds or edits notes only on panes it could type into.",
@@ -132,13 +199,16 @@ func agentWorkVerbs() map[string]verbEntry {
 			params: []verbParam{
 				{Name: "session", Type: "string", Description: "Any session of the fan. Omit for the most recently active session."},
 				{Name: "changes", Type: "bool", Description: "Count the changed files and lines of each attempt, a few git calls per sibling.", Default: "true"},
+				{Name: "detail", Type: "bool", Description: "With changes, also list each attempt's files (file_list, at most 8, most changed first) and its first changed lines (lines, at most 6). Two more git calls per sibling.", Default: "false"},
 			},
 			returns: []verbParam{
 				{Name: "group", Type: "string", Description: "The fan's group."},
 				{Name: "repo", Type: "string", Description: "The repository the fan is of."},
 				{Name: "repo_root", Type: "string", Description: "The repository's main checkout."},
 				{Name: "base", Type: "string", Description: "The base the attempts were made from: the fan's base, or the main checkout's branch for a fan made from HEAD."},
-				{Name: "rows", Type: "[]object", Description: "One per sibling: session, branch, path, agent, harness, state, files, added, removed, ahead, dirty, base_sha, prompt_status, verify, last_command (cmdline, exit, at, window), gone, and note when git could not count."},
+				{Name: "rows", Type: "[]object", Description: "One per sibling: session, branch, path, agent, harness, state, files, added, removed, ahead, dirty, base_sha, prompt_status, verify, last_command (cmdline, exit, at, window), gone, and note when git could not count. Also cost, the cost its agent reported, started_at and done_at, notes from the verdict, and file_list and lines with detail."},
+				{Name: "prompt", Type: "string", Description: "The task the fan gave the attempts."},
+				{Name: "verdict", Type: "object", Description: "The judge's pick, when set-fan-verdict recorded one: pick, summary, reasons, judge and at."},
 				{Name: "total", Type: "int", Description: "How many rows."},
 			},
 			examples: []string{
@@ -165,12 +235,58 @@ func agentWorkVerbs() map[string]verbEntry {
 			},
 			handler: (*Daemon).verbVerifyFan,
 		},
+		"set-fan-verdict": {
+			description: "Record a judge's pick among the attempts of a fan: the attempt it recommends, the verdict, its reasons and notes on each attempt. Only the judge pane judge-fan started for the fan, or a call from outside every pane, records one: a pane of an attempt is refused. The daemon records which of the two it was as by. It is written on every attempt, and compare-fan and the agents view show it. A later call replaces it. Nothing is kept or removed: keep-fan does that.",
+			params: []verbParam{
+				{Name: "session", Type: "string", Required: true, Description: "Any session of the fan."},
+				{Name: "pick", Type: "string", Required: true, Description: "The session of the attempt the judge recommends."},
+				{Name: "summary", Type: "string", Required: true, Description: "The verdict in a sentence or two, at most 400 bytes."},
+				{Name: "reasons", Type: "[]string", Description: "The reasons, one sentence each, at most 6."},
+				{Name: "notes", Type: "object", Description: "Notes per attempt: session name to a list of sentences, at most 4 each."},
+			},
+			returns: []verbParam{
+				{Name: "group", Type: "string", Description: "The fan's group."},
+				{Name: "pick", Type: "string", Description: "The attempt picked."},
+				{Name: "by", Type: "string", Description: "judge for the judge's pane, you for a call from outside every pane."},
+				{Name: "attempts", Type: "[]string", Description: "Every attempt the verdict was written on."},
+			},
+			examples: []string{
+				`{"id":1,"verb":"set-fan-verdict","params":{"session":"api-fan-retry","pick":"api-fan-retry-2","summary":"Keep B. It is the smallest change and passes the tests.","reasons":["A reads hits without the lock."],"notes":{"api-fan-retry":["Adds a test for eviction."]}}}`,
+			},
+			handler: (*Daemon).verbSetFanVerdict,
+		},
+		"judge-fan": {
+			description: "Start an agent that judges the attempts of a fan. It runs in a new session of its own, named after the fan with -judge, in the repository's main checkout, with the read grant alone. Once its pane exists, the attempts name that pane, and that pane alone reads them: it cannot type into them, run commands in their sessions or start agents there. Its first prompt, typed then, asks it to read the attempts and report its pick with set-fan-verdict. Only the person or a pane with admin starts a judge. The record is cleared when the judge's session ends. It answers once the agent is ready, as start-agent does.",
+			params: []verbParam{
+				{Name: "session", Type: "string", Required: true, Description: "Any session of the fan."},
+				{Name: "agent", Type: "string", Description: "The judge's agent, as start-agent takes it. Omit for the agent the first attempt ran."},
+				{Name: "env", Type: "object", Description: "Environment variables for the judge, as start-agent takes them."},
+				{Name: "ready_timeout", Type: "int", Description: "Milliseconds to wait for the judge to be ready.", Default: "120000"},
+			},
+			returns: []verbParam{
+				{Name: "judge_session", Type: "string", Description: "The judge's session."},
+				{Name: "group", Type: "string", Description: "The fan's group."},
+				{Name: "window_id", Type: "string", Description: "The judge's pane, with the rest of what start-agent returns."},
+			},
+			examples: []string{
+				`{"id":1,"verb":"judge-fan","params":{"session":"api-fan-retry"}}`,
+			},
+			handler: (*Daemon).verbJudgeFan,
+		},
 		"keep-fan": {
-			description: "Keep one attempt of a fan and remove the others: each sibling's worktree and session go, the way remove-worktree removes them, each on its own. A sibling with uncommitted changes is left in place unless stash or force says what to do with them. Branches are never deleted.",
+			description: "Keep one attempt of a fan and remove the others: each sibling's worktree and session go, the way remove-worktree removes them, each on its own. A sibling with uncommitted changes is left in place unless stash or force says what to do with them. Files git ignores are deleted with a worktree and never stashed: compare-fan with detail lists them. Branches are never deleted. With merge, the kept attempt's branch is first merged into its base, as ship-merge does.",
 			params: []verbParam{
 				{Name: "session", Type: "string", Required: true, Description: "The attempt to keep."},
 				{Name: "stash", Type: "bool", Description: "Stash a sibling's uncommitted changes before removing it.", Default: "false"},
 				{Name: "force", Type: "bool", Description: "Discard a sibling's uncommitted changes.", Default: "false"},
+				{Name: "merge", Type: "bool", Description: "First merge the kept attempt's branch into its base in the main checkout, as ship-merge does. A merge that conflicts or is refused stops the call before any sibling is removed.", Default: "false"},
+				{Name: "merge_mode", Type: "string", Description: "With merge: merge, squash or ff-only, as ship-merge takes mode.", Accepted: shipMergeModes, Default: "merge"},
+				{Name: "into", Type: "string", Description: "With merge: the branch to merge into. Omit for the base the attempt was made from."},
+				{Name: "group", Type: "string", Description: "The fan's group, as compare-fan gave it. When given, a session of another fan is refused."},
+				{Name: "repo_root", Type: "string", Description: "The fan's repository, as compare-fan gave it. When given, a session of another repository is refused."},
+				{Name: "fan_id", Type: "string", Description: "The fan's ID, as compare-fan gave it. When given, a session of another fan of the same name is refused."},
+				{Name: "siblings", Type: "[]string", Description: "The attempts the caller showed it would remove. When given, a fan whose other attempts differ is refused whole."},
+				{Name: "ignored", Type: "object", Description: "Per attempt to remove, the ignored_hash compare-fan gave for the list the caller showed. When given, an attempt whose ignored files changed, or that has no entry, is refused, and nothing is removed."},
 			},
 			returns: []verbParam{
 				{Name: "kept", Type: "string", Description: "The session kept."},
@@ -178,10 +294,12 @@ func agentWorkVerbs() map[string]verbEntry {
 				{Name: "group", Type: "string", Description: "The fan's group."},
 				{Name: "removed", Type: "[]object", Description: "One per sibling: session and removed, with remove-worktree's result when it was removed, or note and code when it was not."},
 				{Name: "left", Type: "int", Description: "How many siblings were not removed."},
+				{Name: "merge", Type: "object", Description: "With merge: what ship-merge returns for the kept attempt. Omitted without merge."},
 			},
 			examples: []string{
 				`{"id":1,"verb":"keep-fan","params":{"session":"api-fan-retry-1"}}`,
 				`{"id":1,"verb":"keep-fan","params":{"session":"api-fan-retry-1","stash":true}}`,
+				`{"id":1,"verb":"keep-fan","params":{"session":"api-fan-retry-1","merge":true,"merge_mode":"squash"}}`,
 			},
 			handler: (*Daemon).verbKeepFan,
 		},
@@ -241,20 +359,51 @@ func agentWorkVerbs() map[string]verbEntry {
 			params: []verbParam{
 				sessionParam,
 				{Name: "window", Type: "string", Description: "The agent's window, by id or name. Omit to target the focused window. It must run an agent tuios knows of; human is refused with no_keyboard."},
-				{Name: "text", Type: "string", Required: true, Description: "The message, at most 16 KiB."},
+				{Name: "text", Type: "string", Description: "The message, at most 16 KiB. Required without parts. With parts it is ignored, so a client can send the message both ways and a daemon older than parts types the text."},
+				{Name: "parts", Type: "[]object", Description: "The message as ordered parts, at most 64 and 8 MiB in all: {kind: text, text} for typed text, {kind: paste, text, n} for a pasted block, and {kind: image, data, n} for an image, data being the file in base64 (at most 8 MiB, 8 images a message), where n is the block's number as the person saw it. When the message is typed, its blocks go in their place if it is 12 KiB or less and the pane takes a bracketed paste. Otherwise each block is written to a file in the paste folder on the pane's machine, kept for 24 hours, and the typed text names it: [Pasted text #1: PATH, 42 lines]. Each image is written to a file there too; the harness's [input] images says whether its path goes in a paste of its own (path_paste), in the text (path_text), or is refused (none). The text parts with the labels must fit 16 KiB. Over a link, blocks need files in the link's policy."},
 				{Name: "human_nonce", Type: "string", Description: "The attached client's nonce, to queue as the person (by human). One that does not verify is refused with not_human."},
 				{Name: "from", Type: "string", Description: "The window the message is from. From a pane, its own; omit it there. human needs human_nonce."},
+				{Name: "host", Type: "string", Description: "A machine from [hosts]: queue for a pane there. This daemon passes the message to that machine's daemon over the link, where it is queued by link:THIS-MACHINE and typed. Session and window name the pane there. Only a caller outside every pane may send one; the far machine's policy for this one must allow write, and files for a block or an image."},
 			},
 			returns: []verbParam{
 				{Name: "id", Type: "string", Description: "The entry, which cancel-queued takes."},
 				{Name: "position", Type: "int", Description: "Its place in the queue, 1 for next."},
 				{Name: "queued", Type: "int", Description: "How many entries the queue holds now."},
 				{Name: "delivering", Type: "bool", Description: "True when it is next and the agent is at rest now, so it is typed within about a second rather than after the agent's turn."},
+				{Name: "parts", Type: "int", Description: "With parts, how many were read. A daemon older than parts leaves it out."},
 			},
 			examples: []string{
 				`{"id":1,"verb":"queue-prompt","params":{"session":"work","window":"build","text":"make the backoff jitter configurable"}}`,
+				`{"id":1,"verb":"queue-prompt","params":{"session":"work","window":"build","parts":[{"kind":"text","text":"this test fails: "},{"kind":"paste","text":"--- FAIL: TestJitter\n...","n":1}]}}`,
 			},
 			handler: (*Daemon).verbQueuePrompt,
+		},
+		// reply_history.go
+		"reply-history": {
+			description: "Read what the person sent to an agent, oldest first, for the reply editor's up and ctrl+r. It is kept in the daemon's memory only and ends with it: 100 messages a target, 64 targets, the least used going first. Only the person reads it, with a live human_nonce.",
+			params: []verbParam{
+				{Name: "target", Type: "string", Required: true, Description: "The key the client keeps the history under, such as the agent's harness and folder. At most 512 bytes."},
+				humanNonce,
+			},
+			returns: []verbParam{
+				{Name: "target", Type: "string", Description: "The target read."},
+				{Name: "entries", Type: "[]object", Description: "parts (as queue-prompt takes them), at (unix ms), and dropped: the blocks too large to keep, such as \"Pasted text #1\"."},
+			},
+			examples: []string{`{"id":1,"verb":"reply-history","params":{"target":"claude-code:/work/api","human_nonce":"<from the attach reply>"}}`},
+			handler:  (*Daemon).verbReplyHistory,
+		},
+		"add-reply-history": {
+			description: "Keep a message the person sent to an agent in the reply history. The same message again moves to the end. A message keeps at most 256 KiB of pastes and images: past that the largest are dropped and named. Only the person adds to it, with a live human_nonce.",
+			params: []verbParam{
+				{Name: "target", Type: "string", Required: true, Description: "The key the client keeps the history under."},
+				{Name: "parts", Type: "[]object", Required: true, Description: "The message, as queue-prompt takes it."},
+				humanNonce,
+			},
+			returns: []verbParam{
+				{Name: "dropped", Type: "[]string", Description: "The blocks too large to keep."},
+			},
+			examples: []string{`{"id":1,"verb":"add-reply-history","params":{"target":"claude-code:/work/api","parts":[{"kind":"text","text":"rerun with -count=1"}],"human_nonce":"<from the attach reply>"}}`},
+			handler:  (*Daemon).verbAddReplyHistory,
 		},
 		"list-queued": {
 			description: "List the messages waiting in a pane's delivery queue, or in every pane of the session.",

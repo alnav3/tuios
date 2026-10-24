@@ -3,9 +3,9 @@ package federation
 import "encoding/json"
 
 // StreamOpen is what the hub says about a connection when it opens the stream
-// for it, carried in the open frame's payload. The payload used to be empty,
-// and an empty payload still decodes to the zero value, so a hub that sends
-// nothing and a proxy that reads nothing keep linking exactly as before.
+// for it, carried in the open frame's payload. An empty payload decodes to the
+// zero value, so a hub that sends nothing and a proxy that reads nothing still
+// link.
 //
 // The payload is written by the hub's mux and never by the client whose bytes
 // the stream then carries: those go in data frames. So a field here is the
@@ -25,6 +25,11 @@ type StreamOpen struct {
 	// claim any name, which is why only a pinned name is a boundary. Empty
 	// from a hub that predates it.
 	From string `json:"from,omitempty"`
+	// Bulk marks a stream that carries file bytes: it writes small frames,
+	// waits behind every other stream for the pipe, and keeps to a window the
+	// reader grants in credit frames. Only a hub that speaks credit frames
+	// sets it. See bulk.go.
+	Bulk bool `json:"bulk,omitempty"`
 }
 
 // maxStreamOpenPayload bounds what the accepting side decodes. The frame cap

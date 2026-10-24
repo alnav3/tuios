@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/serverscope"
 	"github.com/adrg/xdg"
 )
 
@@ -45,8 +46,9 @@ var (
 func DefaultDaemonLogPath() string {
 	// The environment is read first, as the render trace does, because xdg
 	// resolves its directories once at package init and a test that redirects
-	// the state directory later would otherwise be ignored.
-	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+	// the state directory later would otherwise be ignored. A named server's
+	// state home is set on xdg, not in the environment, so it reads xdg.
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" && serverscope.Name() == "" {
 		return filepath.Join(dir, daemonLogName)
 	}
 	return filepath.Join(xdg.StateHome, daemonLogName)
@@ -228,17 +230,4 @@ func rotateDaemonLogLocked() {
 	daemonLogFH = fh
 	daemonLogSize = 0
 	writeDaemonLogHeaderLocked()
-}
-
-// closeDaemonLogFile releases the file. Test-only: the daemon holds it for the
-// life of the process.
-func closeDaemonLogFile() {
-	daemonLogMu.Lock()
-	defer daemonLogMu.Unlock()
-	if daemonLogFH != nil {
-		_ = daemonLogFH.Close()
-		daemonLogFH = nil
-	}
-	daemonLogPath = ""
-	daemonLogSize = 0
 }

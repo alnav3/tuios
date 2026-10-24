@@ -74,6 +74,36 @@ func (m *OS) ToggleSidebar() {
 	}
 }
 
+// ToggleOtherSidebar independently shows or hides the explicitly configured
+// opposite edge. Unlike the legacy rail this is client-local: the opposite
+// edge's opt-in belongs to this client's config, not to daemon session state.
+func (m *OS) ToggleOtherSidebar() bool {
+	if m.UserConfig == nil {
+		return false
+	}
+	cfg := m.UserConfig.Appearance.Sidebar.Left
+	if m.legacySidebarEdge() == sidebarLeft {
+		cfg = m.UserConfig.Appearance.Sidebar.Right
+	}
+	if cfg == nil || cfg.Enabled == nil {
+		return false // a table alone must never opt a rail in
+	}
+	on := !*cfg.Enabled
+	if !on && m.SidebarFocusOnSecondary() {
+		m.WithSecondarySidebar(func() { m.ExitSidebarFocus() })
+	}
+	cfg.Enabled = &on
+	m.secondarySidebarCache.invalidate()
+	m.secondarySidebarHits = m.secondarySidebarHits[:0]
+	m.tooltipClear()
+	if m.AutoTiling {
+		m.TileAllWindows()
+	} else {
+		m.ClampWindowsToView()
+	}
+	return on
+}
+
 // setSidebarShown shows or hides the rail on this client alone and lays the
 // panes out in the content region that leaves. It does not save the config
 // and does not tell the daemon.
@@ -221,7 +251,7 @@ func (m *OS) adoptSidebarVisibility(state *session.SessionState) bool {
 // SidebarActive reports whether the sidebar reserves any columns this frame, so
 // the mouse handlers know to test it before the window layer.
 func (m *OS) SidebarActive() bool {
-	return m.GetSidebarWidth() > 0
+	return m.GetSidebarWidth() > 0 || m.secondarySidebarWidth() > 0
 }
 
 // SidebarBandContains reports whether the absolute cell (x, y) falls inside the
@@ -230,19 +260,25 @@ func (m *OS) SidebarActive() bool {
 // in front of.
 func (m *OS) SidebarBandContains(x, y int) bool {
 	x, y = m.ScreenPoint(x, y)
-	w := m.GetSidebarWidth()
-	if w <= 0 {
-		return false
-	}
 	topMargin := m.viewReserve().Top
 	if y < topMargin || y >= topMargin+m.ViewUsableHeight() {
 		return false
 	}
-	sidebarX := 0
-	if m.Settings.SidebarPosition == "right" {
-		sidebarX = m.GetRenderWidth() - w
+	w := m.GetSidebarWidth()
+	primaryX := sidebarEdgeX(m.legacySidebarEdge(), w, m.GetRenderWidth())
+	if w > 0 && x >= primaryX && x < primaryX+w {
+		return true
 	}
-	return x >= sidebarX && x < sidebarX+w
+	secondary := m.secondarySidebarWidth()
+	if secondary <= 0 {
+		return false
+	}
+	opposite := sidebarRight
+	if m.legacySidebarEdge() == sidebarRight {
+		opposite = sidebarLeft
+	}
+	secondaryX := sidebarEdgeX(opposite, secondary, m.GetRenderWidth())
+	return x >= secondaryX && x < secondaryX+secondary
 }
 
 // sidebarRowAt returns the recorded row hit at absolute (x, y), if any.
@@ -307,6 +343,29 @@ func (m *OS) sidebarPeekAt(x, y int) {
 //   - Right press on any row: open the context menu (pane menu for a window or
 //     agent row, the session/desktop menu for a session row).
 func (m *OS) SidebarClick(x, y int, right bool) bool {
+	if edge, ok := m.SidebarSessionHeaderAt(x, y); ok {
+		if right {
+			m.OpenSettingsAt("Sidebar")
+		} else {
+			m.FocusSidebarSession(edge)
+		}
+		return true
+	}
+	if edge, ok := m.SidebarSessionAt(x, y); ok {
+		if right {
+			m.OpenSettingsAt("Sidebar")
+		} else {
+			m.FocusSidebarSession(edge)
+		}
+		return true
+	}
+	if m.secondarySidebarBandContains(x, y) {
+		return m.withSecondaryRail(func() bool { return m.sidebarClick(x, y, right) })
+	}
+	return m.sidebarClick(x, y, right)
+}
+
+func (m *OS) sidebarClick(x, y int, right bool) bool {
 	if !m.SidebarBandContains(x, y) {
 		return false
 	}
@@ -373,6 +432,8 @@ func (m *OS) SidebarClick(x, y int, right bool) bool {
 		m.queueSidebarCmd(m.OpenAgentMail())
 	case sidebarRowAgentFold:
 		m.SidebarUnfoldAgents()
+	case sidebarRowSubagentToggle:
+		m.SidebarToggleSubagents(hit.SessionID, hit.WindowID)
 	case sidebarRowNewSession:
 		m.SidebarNewSessionHere()
 	case sidebarRowNewWindow:
@@ -381,6 +442,8 @@ func (m *OS) SidebarClick(x, y int, right bool) bool {
 		m.openRemoteSession(hit.SessionID, hit.WindowID)
 	case sidebarRowHostNew:
 		m.createRemoteSession(hit.SessionID)
+	case sidebarRowHostSignIn:
+		m.queueSidebarCmd(m.openHostSignIn(hit.SessionID))
 	case sidebarRowGlobalNew:
 		m.SidebarNewGlobalSession()
 	case sidebarRowCollapse:
@@ -423,7 +486,7 @@ func (m *OS) SidebarClick(x, y int, right bool) bool {
 // SidebarDragActive reports whether a session-row press or drag is in
 // progress, so the motion and release handlers route to the sidebar first.
 func (m *OS) SidebarDragActive() bool {
-	return m.SidebarDrag.PressActive || m.SidebarDrag.Dragging
+	return m.SidebarDrag.PressActive || m.SidebarDrag.Dragging || m.secondaryRailView.drag.PressActive || m.secondaryRailView.drag.Dragging
 }
 
 // sidebarOnEdge reports whether column x is the rail's edge rule, the one-cell
@@ -434,7 +497,11 @@ func (m *OS) sidebarOnEdge(x int) bool {
 	if w <= 0 {
 		return false
 	}
-	if m.Settings.SidebarPosition == "right" {
+	edge := m.legacySidebarEdge()
+	if m.sidebarDrawing {
+		edge = m.sidebarDrawingEdge
+	}
+	if edge == sidebarRight {
 		return x == m.GetRenderWidth()-w
 	}
 	return x == w-1
@@ -443,7 +510,7 @@ func (m *OS) sidebarOnEdge(x int) bool {
 // SidebarEdgeActive reports whether a width-resize gesture is in progress, so
 // the motion and release handlers route to the sidebar first.
 func (m *OS) SidebarEdgeActive() bool {
-	return m.SidebarEdge.Active
+	return m.SidebarEdge.Active || m.secondaryRailView.edge.Active
 }
 
 // sidebarWidthBounds returns the clamp range for the rail's full width: no
@@ -460,6 +527,13 @@ func (m *OS) sidebarWidthBounds() (int, int) {
 // width comes from the pointer's distance from the far edge, so the hairline
 // tracks the cursor.
 func (m *OS) SidebarEdgeMotion(x, y int) bool {
+	if m.secondaryRailView.edge.Active {
+		return m.withSecondaryRail(func() bool { return m.sidebarEdgeMotion(x, y) })
+	}
+	return m.sidebarEdgeMotion(x, y)
+}
+
+func (m *OS) sidebarEdgeMotion(x, y int) bool {
 	if !m.SidebarEdge.Active {
 		return false
 	}
@@ -467,13 +541,27 @@ func (m *OS) SidebarEdgeMotion(x, y int) bool {
 		m.SidebarEdge.HaveRow = false // the gesture is a resize now, not a click
 	}
 	var w int
-	if m.Settings.SidebarPosition == "right" {
+	edge := m.legacySidebarEdge()
+	if m.sidebarDrawing {
+		edge = m.sidebarDrawingEdge
+	}
+	if edge == sidebarRight {
 		w = m.GetRenderWidth() - x
 	} else {
 		w = x + 1
 	}
 	lo, hi := m.sidebarWidthBounds()
 	w = max(min(w, hi), lo)
+	if m.sidebarDrawing {
+		m.secondaryCollapsed = w <= config.SidebarGlyphWidth
+		m.secondaryWidthPref = w
+		if m.AutoTiling {
+			m.TileAllWindows()
+		} else {
+			m.ClampWindowsToView()
+		}
+		return true
+	}
 	// Dragging the edge out of the strip is an expand: the gesture asks for a
 	// width, and a collapsed rail that ignored it would look broken.
 	collapsed := m.SidebarCollapsed && w <= config.SidebarGlyphWidth
@@ -493,12 +581,21 @@ func (m *OS) SidebarEdgeMotion(x, y int) bool {
 // SidebarEdgeRelease ends the resize and persists the new width beside the
 // order and collapse state.
 func (m *OS) SidebarEdgeRelease(x, y int) bool {
+	if m.secondaryRailView.edge.Active {
+		return m.withSecondaryRail(func() bool { return m.sidebarEdgeRelease(x, y) })
+	}
+	return m.sidebarEdgeRelease(x, y)
+}
+
+func (m *OS) sidebarEdgeRelease(x, y int) bool {
 	if !m.SidebarEdge.Active {
 		return false
 	}
 	edge := m.SidebarEdge
 	m.SidebarEdge = sidebarEdgeState{}
-	m.saveSidebarState()
+	if !m.sidebarDrawing {
+		m.saveSidebarState()
+	}
 	if edge.HaveRow && x == edge.PressX {
 		m.sidebarActivateRow(edge.Row)
 	}
@@ -523,6 +620,8 @@ func (m *OS) sidebarActivateRow(hit sidebarRowHit) {
 		m.queueSidebarCmd(m.OpenAgentMail())
 	case sidebarRowAgentFold:
 		m.SidebarUnfoldAgents()
+	case sidebarRowSubagentToggle:
+		m.SidebarToggleSubagents(hit.SessionID, hit.WindowID)
 	case sidebarRowNewSession:
 		m.SidebarNewSessionHere()
 	case sidebarRowNewWindow:
@@ -531,6 +630,8 @@ func (m *OS) sidebarActivateRow(hit sidebarRowHit) {
 		m.openRemoteSession(hit.SessionID, hit.WindowID)
 	case sidebarRowHostNew:
 		m.createRemoteSession(hit.SessionID)
+	case sidebarRowHostSignIn:
+		m.queueSidebarCmd(m.openHostSignIn(hit.SessionID))
 	case sidebarRowCollapse:
 		m.SidebarToggleCollapsed()
 	case sidebarRowRepo:
@@ -557,6 +658,13 @@ func (m *OS) sidebarActivateRow(hit sidebarRowHit) {
 // the dragged session follows the row under the pointer in a draft order that
 // the render displays live.
 func (m *OS) SidebarDragMotion(x, y int) bool {
+	if m.secondaryRailView.drag.PressActive || m.secondaryRailView.drag.Dragging {
+		return m.withSecondaryRail(func() bool { return m.sidebarDragMotion(x, y) })
+	}
+	return m.sidebarDragMotion(x, y)
+}
+
+func (m *OS) sidebarDragMotion(x, y int) bool {
 	d := &m.SidebarDrag
 	if !d.PressActive && !d.Dragging {
 		return false
@@ -667,6 +775,13 @@ func (m *OS) sidebarHostRowIDAt(y int) string {
 // session, or folds that machine's group. One gesture, one meaning: a release
 // on the session already attached is simply nothing to do.
 func (m *OS) SidebarRelease(x, y int) bool {
+	if m.secondaryRailView.drag.PressActive || m.secondaryRailView.drag.Dragging {
+		return m.withSecondaryRail(func() bool { return m.sidebarRelease(x, y) })
+	}
+	return m.sidebarRelease(x, y)
+}
+
+func (m *OS) sidebarRelease(x, y int) bool {
 	d := m.SidebarDrag
 	if !d.PressActive && !d.Dragging {
 		return false
@@ -702,6 +817,15 @@ func (m *OS) SidebarRelease(x, y int) bool {
 // the pane the sidebar sits in front of). Motion outside the band clears the
 // hover so no stale highlight lingers.
 func (m *OS) SidebarMotion(x, y int) bool {
+	if m.secondarySidebarBandContains(x, y) {
+		m.SidebarHoverActive = false
+		return m.withSecondaryRail(func() bool { return m.sidebarMotion(x, y) })
+	}
+	m.secondaryRailView.hover = false
+	return m.sidebarMotion(x, y)
+}
+
+func (m *OS) sidebarMotion(x, y int) bool {
 	if !m.SidebarBandContains(x, y) {
 		m.SidebarHoverActive = false
 		// The one out-of-band event the motion whitelist keeps flowing is what
@@ -722,6 +846,13 @@ func (m *OS) SidebarMotion(x, y int) bool {
 // whole rail unpins the headers and can scroll the agents section, the alarm,
 // off the screen entirely.
 func (m *OS) SidebarWheel(x, y int, up bool) bool {
+	if !m.sidebarDrawing && m.secondarySidebarBandContains(x, y) {
+		return m.withSecondaryRail(func() bool { return m.sidebarWheel(x, y, up) })
+	}
+	return m.sidebarWheel(x, y, up)
+}
+
+func (m *OS) sidebarWheel(x, y int, up bool) bool {
 	if !m.SidebarBandContains(x, y) {
 		return false
 	}
@@ -838,12 +969,27 @@ func (m *OS) openSidebarContextMenu(hit sidebarRowHit, x, y int) {
 		cm.Target = CtxTargetMachine
 		cm.SessionID = hit.SessionID
 		cm.Title, cm.Items = m.machineMenu(hit.SessionID)
-	case sidebarRowHostSession, sidebarRowHostNew, sidebarRowGlobalNew, sidebarRowRepo:
-		// A session on another machine, and a repository's group header.
-		// Neither is a local session and neither has a per-row menu in this
-		// release, so the right-click opens the rail's own settings the way a
-		// click on blank rail would, rather than building a session menu for a
-		// name that is not a local session.
+	case sidebarRowRepo:
+		// A repository's group header. Its row names a repository, which is the
+		// one thing a right-click on it can act on: a worktree of that
+		// repository. Without a daemon, or when the cached listing no longer
+		// names the repository's main checkout, there is nothing for the row to
+		// offer, so the right-click opens the rail's own settings the way a
+		// click on blank rail would.
+		if !m.IsDaemonSession || m.worktreeRepoRoot(hit.SessionID) == "" {
+			m.openRailSettingsMenu(x, y)
+			return
+		}
+		cm.Target = CtxTargetRepo
+		// The hit names the repository in its session field; the menu gives it
+		// a field of its own so no session action can be handed it.
+		cm.Repo = hit.SessionID
+		cm.Title, cm.Items = m.repoHeaderMenu(hit.SessionID)
+	case sidebarRowHostSession, sidebarRowHostNew, sidebarRowHostSignIn, sidebarRowGlobalNew:
+		// A session on another machine. It is not a local session and has no
+		// per-row menu in this release, so the right-click opens the rail's own
+		// settings the way a click on blank rail would, rather than building a
+		// session menu for a name that is not a local session.
 		m.openRailSettingsMenu(x, y)
 		return
 	case sidebarRowFileCd, sidebarRowFileUp, sidebarRowFileEntry:

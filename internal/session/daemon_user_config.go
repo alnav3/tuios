@@ -13,11 +13,11 @@ import (
 // and the hooks the daemon fires.
 //
 // Every starter calls it: `tuios daemon`, and the SSH and web servers when
-// they start a daemon in-process. It used to be three hand-written subsets,
-// and a daemon started by `tuios ssh` ran with no agent detection settings and
-// no hosts while the same file gave both to a daemon started by `tuios
-// attach`. The fields the starter owns (Version, Foreground, LogFile,
-// DisableAutoRestore) stay the starter's to fill.
+// they start a daemon in-process. One mapping keeps them agreeing: a
+// hand-written subset per starter lets a daemon started by `tuios ssh` run
+// with no agent detection settings and no hosts while the same file gives both
+// to a daemon started by `tuios attach`. The fields the starter owns (Version,
+// Foreground, LogFile, DisableAutoRestore) stay the starter's to fill.
 //
 // The log level is applied here as well, when nothing set it first: a flag or
 // the environment wins over the file. It is a process global, so it is set
@@ -37,12 +37,17 @@ func DaemonConfigFromUser(uc *config.UserConfig) *DaemonConfig {
 	if GetDebugLevel() == DebugOff && uc.Daemon.LogLevel != "" {
 		SetDebugLevel(ParseDebugLevel(uc.Daemon.LogLevel))
 	}
+	// [agents] enabled = false turns every agent feature off.
+	cfg.AgentsOff = !uc.Agents.On()
 	cfg.AgentAutoDetect = uc.Daemon.AgentAutoDetect
 	cfg.AgentDetectInterval = time.Duration(uc.Daemon.AgentDetectSeconds) * time.Second
 	cfg.AgentBinaries = uc.Daemon.AgentBinaries
 	cfg.RespondFromShell = uc.Daemon.RespondFromShell
 	cfg.ResumeAgents = uc.Daemon.ResumeAgents
 	cfg.WindowSize = uc.Daemon.WindowSize
+	cfg.SingleClient = uc.Daemon.SingleClient
+	cfg.SSHAgent = uc.Daemon.SSHAgent
+	cfg.Display = uc.Daemon.Display
 	cfg.History = ResolveHistoryPolicy(uc.Daemon.PersistScrollback, uc.Daemon.PersistScrollbackLines, uc.Daemon.PersistScrollbackKB)
 	cfg.Hosts = HostsFromConfig(uc)
 	// The same table says what each machine linked to this one may do here.
@@ -57,15 +62,21 @@ func DaemonConfigFromUser(uc *config.UserConfig) *DaemonConfig {
 		cfg.ConfigPath = path
 	}
 	// The daemon owns every pane's history, so the depth the user asked for
-	// has to reach it: the client's emulator honoured the setting and the
-	// daemon's kept ten thousand lines whatever it said.
+	// has to reach it, or the client's emulator honours the setting while the
+	// daemon's keeps ten thousand lines whatever it says.
 	cfg.ScrollbackLines = uc.Appearance.ScrollbackLines
 	// The daemon spawns every pane, so where a new one starts is its decision
 	// to make. Absent from the file means the default, which is to inherit.
 	cfg.NewWindowInheritCwd = uc.Appearance.NewWindowInheritCwd == nil || *uc.Appearance.NewWindowInheritCwd
 	// The daemon spawns every pane, so the shell the user asked for has to
-	// reach it: only standalone panes used to honour it.
+	// reach it, not only standalone panes.
 	cfg.PreferredShell = uc.Appearance.PreferredShell
+	// The daemon owns the window set, so it sees the workspace on screen
+	// lose its last pane, with or without a client attached.
+	cfg.StayOnEmptyWorkspace = !uc.Workspaces.ReturnsWhenEmpty()
+	// The daemon holds the paste buffers every client shares.
+	cfg.PasteBufferLimit, cfg.PasteBufferMaxBytes = uc.PasteBuffers.Resolved()
+	cfg.PasteBuffersOff = cfg.PasteBufferLimit == 0
 	// The daemon runs the hooks for the facts it owns, so a session with
 	// nobody attached still runs them. The client keeps the hooks that need a
 	// terminal.
@@ -81,9 +92,18 @@ func DaemonConfigFromUser(uc *config.UserConfig) *DaemonConfig {
 	cfg.RecapTestPatterns = uc.Agents.Recap.Resolved().TestPatterns
 	// The daemon holds every pane's delivery queue, so it bounds them.
 	cfg.QueueMax = uc.Agents.Queue.MaxEntries()
+	// The daemon types the wake prompt for mail, so it reads whether to.
+	cfg.MailWakeOff = !uc.Agents.Mail.WakeOn()
+	// The daemon takes every checkpoint, so it reads whether to.
+	cfg.Checkpoints = uc.Agents.Checkpoints
+	// The daemon runs the herdr plugins, so it reads which ones.
+	cfg.Plugins = uc.Plugins
 	// The daemon spawns every pane, so it decides which are told about the
 	// herdr protocol socket.
 	cfg.HerdrProtocol = uc.Agents.HerdrProtocol
+	// The daemon runs when nobody is attached, which is when a phone is the
+	// way to reach the person, so it sends the push notifications.
+	cfg.Notify = uc.Notify
 	return cfg
 }
 
@@ -108,6 +128,7 @@ func HostsFromConfig(cfg *config.UserConfig) []federation.Host {
 			ConnectTimeout: time.Duration(h.ConnectTimeout) * time.Second,
 			Command:        h.Command,
 			SSHOptions:     h.SSHOptions,
+			TailscaleLogin: h.TailscaleLogin,
 		})
 	}
 	return out

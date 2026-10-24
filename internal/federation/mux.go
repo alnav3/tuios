@@ -40,12 +40,12 @@ const defaultStallLimit = 10 * time.Second
 // connectionStallLimit is the same bound for a relayed connection, which is an
 // attached session rather than a listing.
 //
-// Ten seconds is the wrong number there and it cost the maintainer his session.
+// Ten seconds is the wrong number there.
 // The reader at the end of a relayed connection is a person's terminal, and a
 // terminal legitimately stops reading for a while: a large paint, a client
 // swapped out under memory pressure, a laptop lid closed and opened. Ten
-// seconds of that is not a dead consumer, and dropping the stream for it threw
-// away a session the far daemon was still running perfectly.
+// seconds of that is not a dead consumer, and dropping the stream for it throws
+// away a session the far daemon is still running perfectly.
 //
 // Thirty seconds is the trade in the other direction. The read loop is shared,
 // so a stream this side is waiting on freezes every other stream on the link
@@ -106,10 +106,12 @@ const (
 // and this is where that is enforced rather than assumed. The proxy side passes
 // an accept function that dials the local daemon socket.
 type mux struct {
-	w  io.Writer
-	r  io.Reader
-	c  io.Closer
-	wm sync.Mutex
+	w io.Writer
+	r io.Reader
+	c io.Closer
+	// wl serialises frames onto the pipe, ordinary streams first. See
+	// bulk.go.
+	wl *prioLock
 
 	// accept handles an open frame from the peer. Nil means opens are refused.
 	accept func(*Stream)
@@ -127,8 +129,7 @@ type mux struct {
 	// lastRead is when the read loop last took a frame off the pipe, in Unix
 	// nanoseconds, and blocked counts the read loop's own waits inside
 	// deliver. Together they answer one question: is this pipe alive? A
-	// control call that timed out does not answer it, and used to be treated
-	// as if it did.
+	// control call that timed out does not answer it.
 	lastRead atomic.Int64
 	blocked  atomic.Int32
 
@@ -166,6 +167,7 @@ func newMuxRW(r io.Reader, w io.Writer, c io.Closer, accept func(*Stream), first
 		w:          w,
 		r:          r,
 		c:          c,
+		wl:         newPrioLock(),
 		accept:     accept,
 		stallLimit: defaultStallLimit,
 		streams:    make(map[uint32]*Stream),
@@ -239,6 +241,9 @@ func (m *mux) open(stall time.Duration, info StreamOpen) (*Stream, error) {
 	m.nextID += idStride
 	s := newStream(m, id)
 	s.stall = stall
+	if info.Bulk {
+		s.makeBulk(true)
+	}
 	m.streams[id] = s
 	m.mu.Unlock()
 
@@ -252,10 +257,17 @@ func (m *mux) open(stall time.Duration, info StreamOpen) (*Stream, error) {
 	return s, nil
 }
 
-// writeFrame serialises one frame onto the pipe.
+// writeFrame serialises one frame onto the pipe, ahead of any bulk frame
+// that waits.
 func (m *mux) writeFrame(t frameType, id uint32, payload []byte) error {
-	m.wm.Lock()
-	defer m.wm.Unlock()
+	return m.writeFrameLane(t, id, payload, true)
+}
+
+// writeFrameLane is writeFrame in the given lane: urgent for every ordinary
+// frame, not urgent for a bulk stream's data.
+func (m *mux) writeFrameLane(t frameType, id uint32, payload []byte, urgent bool) error {
+	m.wl.lock(urgent)
+	defer m.wl.unlock()
 	select {
 	case <-m.done:
 		return ErrLinkClosed
@@ -304,6 +316,8 @@ func (m *mux) run() error {
 			m.handleData(f.Stream, f.Payload)
 		case frameClose:
 			m.dropStream(f.Stream)
+		case frameCredit:
+			m.handleCredit(f.Stream, f.Payload)
 		}
 	}
 }
@@ -328,13 +342,43 @@ func (m *mux) handleOpen(id uint32, payload []byte) {
 		_ = m.writeFrame(frameClose, id, nil)
 		return
 	}
-	s := newStream(m, id)
-	s.open = decodeStreamOpen(payload)
+	open := decodeStreamOpen(payload)
+	s := newStreamSized(m, id, open.Bulk)
+	s.open = open
+	if open.Bulk {
+		s.makeBulk(false)
+	}
 	m.streams[id] = s
 	m.mu.Unlock()
+	if open.Bulk {
+		// The answer that says this side takes part in the window. It goes
+		// before the accept handler can write a byte, so the opener hears it
+		// ahead of any data.
+		_ = m.writeFrame(frameCredit, id, encodeCredit(0))
+	}
 	m.wg.Go(func() {
 		m.accept(s)
 	})
+}
+
+// handleCredit takes a reader's credit for a bulk stream this side writes.
+func (m *mux) handleCredit(id uint32, payload []byte) {
+	n, ok := decodeCredit(payload)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	s := m.streams[id]
+	m.mu.Unlock()
+	if s == nil || s.win == nil {
+		return
+	}
+	if !s.creditsOK.Load() {
+		// The first credit is the far side saying it takes part.
+		s.creditsOK.Store(true)
+		s.win.enable()
+	}
+	s.win.credit(n)
 }
 
 func (m *mux) handleData(id uint32, payload []byte) {
@@ -397,6 +441,15 @@ type Stream struct {
 	// written again.
 	open StreamOpen
 
+	// bulk streams only. win holds this side's writes to the far reader's
+	// window; creditsOK says the far side takes part, so this side may send
+	// credit frames and must keep to the window. read counts the bytes the
+	// reader here has taken and credited the last count sent.
+	win       *window
+	creditsOK atomic.Bool
+	read      atomic.Uint64
+	credited  atomic.Uint64
+
 	mu       sync.Mutex
 	buf      []byte
 	incoming chan []byte
@@ -406,12 +459,66 @@ type Stream struct {
 }
 
 func newStream(m *mux, id uint32) *Stream {
+	return newStreamSized(m, id, false)
+}
+
+// newStreamSized makes a stream whose receive buffer fits a bulk stream's
+// whole window when bulk is set.
+func newStreamSized(m *mux, id uint32, bulk bool) *Stream {
+	frames := streamBufferFrames
+	if bulk {
+		frames = bulkBufferFrames
+	}
 	return &Stream{
 		m:        m,
 		id:       id,
-		incoming: make(chan []byte, streamBufferFrames),
+		incoming: make(chan []byte, frames),
 		closed:   make(chan struct{}),
 	}
+}
+
+// makeBulk turns a stream into a bulk stream. The opener waits for the far
+// side's first credit before it keeps to a window or sends credits; the
+// accepter knows at once, because only a peer that speaks credits opens one.
+func (s *Stream) makeBulk(opener bool) {
+	if s.win == nil {
+		s.win = newWindow()
+	}
+	if len(s.incoming) == 0 && cap(s.incoming) < bulkBufferFrames {
+		s.incoming = make(chan []byte, bulkBufferFrames)
+	}
+	if !opener {
+		s.creditsOK.Store(true)
+		s.win.enable()
+	}
+}
+
+// Bulk reports whether the stream is a bulk stream.
+func (s *Stream) Bulk() bool { return s.win != nil }
+
+// WindowSize is a bulk stream's window now, zero for any other stream.
+func (s *Stream) WindowSize() uint64 {
+	if s.win == nil {
+		return 0
+	}
+	return s.win.Size()
+}
+
+// noteRead counts bytes the reader took off a bulk stream and grants the far
+// writer room for more once enough were read.
+func (s *Stream) noteRead(n int) {
+	if s.win == nil || n <= 0 {
+		return
+	}
+	total := s.read.Add(uint64(n))
+	if !s.creditsOK.Load() {
+		return
+	}
+	if total-s.credited.Load() < bulkCreditEvery {
+		return
+	}
+	s.credited.Store(total)
+	_ = s.m.writeFrame(frameCredit, s.id, encodeCredit(total))
 }
 
 // deliver hands a data frame to the stream's reader.
@@ -461,6 +568,9 @@ func (s *Stream) peerClosed(cause error) {
 		}
 		s.mu.Unlock()
 		close(s.closed)
+		if s.win != nil {
+			s.win.close()
+		}
 	})
 }
 
@@ -470,37 +580,41 @@ func (s *Stream) Read(p []byte) (int, error) {
 		n := copy(p, s.buf)
 		s.buf = s.buf[n:]
 		s.mu.Unlock()
+		s.noteRead(n)
 		return n, nil
 	}
 	s.mu.Unlock()
 
 	select {
 	case chunk := <-s.incoming:
-		s.mu.Lock()
-		n := copy(p, chunk)
-		if n < len(chunk) {
-			s.buf = chunk[n:]
-		}
-		s.mu.Unlock()
-		return n, nil
+		return s.take(p, chunk), nil
 	case <-s.closed:
-		// Drain anything already buffered before reporting the end, so a peer
-		// that answered and then hung up does not lose its answer.
-		select {
-		case chunk := <-s.incoming:
-			s.mu.Lock()
-			n := copy(p, chunk)
-			if n < len(chunk) {
-				s.buf = chunk[n:]
-			}
-			s.mu.Unlock()
-			return n, nil
-		default:
-		}
-		return 0, s.readErr()
 	case <-s.m.done:
-		return 0, s.readErr()
 	}
+	// The stream or the whole link has ended. Drain anything already
+	// delivered before reporting the end, so a peer that answered and then
+	// hung up does not lose its answer. Both arms drain: select picks among
+	// ready arms at random, so with one draining arm a link that closed with
+	// chunks still queued would drop them about half the time.
+	select {
+	case chunk := <-s.incoming:
+		return s.take(p, chunk), nil
+	default:
+	}
+	return 0, s.readErr()
+}
+
+// take copies a chunk off the stream into p and keeps what does not fit for
+// the next Read.
+func (s *Stream) take(p, chunk []byte) int {
+	s.mu.Lock()
+	n := copy(p, chunk)
+	if n < len(chunk) {
+		s.buf = chunk[n:]
+	}
+	s.mu.Unlock()
+	s.noteRead(n)
+	return n
 }
 
 // readErr reports the end of a stream. A clean close reads as io.EOF, which is
@@ -523,10 +637,31 @@ func (s *Stream) Write(p []byte) (int, error) {
 		return 0, ErrLinkClosed
 	default:
 	}
+	if s.win != nil {
+		return s.writeBulk(p)
+	}
 	written := 0
 	for len(p) > 0 {
 		n := min(len(p), MaxFramePayload)
 		if err := s.m.writeFrame(frameData, s.id, p[:n]); err != nil {
+			return written, err
+		}
+		written += n
+		p = p[n:]
+	}
+	return written, nil
+}
+
+// writeBulk writes a bulk stream's bytes in small frames, behind every other
+// stream, inside the window the far reader grants.
+func (s *Stream) writeBulk(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		n := min(len(p), bulkFramePayload)
+		if !s.win.reserve(n) {
+			return written, ErrStreamClosed
+		}
+		if err := s.m.writeFrameLane(frameData, s.id, p[:n], false); err != nil {
 			return written, err
 		}
 		written += n
@@ -546,6 +681,9 @@ func (s *Stream) Close() error {
 		}
 		s.mu.Unlock()
 		close(s.closed)
+		if s.win != nil {
+			s.win.close()
+		}
 	})
 	s.m.mu.Lock()
 	delete(s.m.streams, s.id)

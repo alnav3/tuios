@@ -54,6 +54,15 @@ func TestEveryProgramTakesTheSharedOptions(t *testing.T) {
 			if newProgram == nil {
 				return
 			}
+			// The explorers behind tuios help -i, config browse and keybinds
+			// browse are not clients. They draw no panes, run their own small
+			// model, and keep Bubble Tea's signal handler, so a kill still
+			// gives the terminal back. ProgramOptions removes that handler,
+			// because a client's command owns its signals. The look list of
+			// tuios look pick is the same kind of program.
+			if path == "internal/explore/explore.go" || path == "cmd/tuios/look_pick.go" {
+				return
+			}
 			sites++
 			where := fmt.Sprintf("%s:%d", path, fset.Position(newProgram.Pos()).Line)
 			if shared == nil {
@@ -86,6 +95,13 @@ func TestEveryProgramTakesTheSharedOptions(t *testing.T) {
 			// unwraps and calls FilterMouseMotion.
 			if path == "cmd/tuios-wasm/main_js.go" &&
 				(name == "WithInput" || name == "WithWindowSize" || name == "WithFilter") {
+				return true
+			}
+			// The GUI bridge is a transport with no terminal at all: its
+			// input is frames from a renderer, its size is the renderer's
+			// grid, and nothing is drawn.
+			if path == "internal/guibridge/bridge.go" &&
+				(name == "WithInput" || name == "WithWindowSize" || name == "WithoutRenderer") {
 				return true
 			}
 			t.Errorf("%s:%d: tea.%s set outside ProgramOptions; the other clients do not get it",

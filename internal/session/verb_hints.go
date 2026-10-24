@@ -57,11 +57,12 @@ var (
 	EventTypeNames = []string{
 		EventWindowCreated, EventWindowClosed, EventWindowExit, EventWindowRetitled,
 		EventWindowFocused, EventWindowMoved, EventWindowMinimized, EventWindowRestored,
-		EventWorkspaceSwitched, EventWorkspaceRenamed, EventAgentState, EventAgentMessage,
+		EventWorkspaceSwitched, EventWorkspaceRenamed, EventLayoutChanged, EventAgentState, EventAgentMessage,
 		EventOutput, EventBell, EventNotification, EventModeChanged,
-		EventSessionCreated, EventSessionClosed, EventGap, EventAttention,
+		EventSessionCreated, EventSessionClosed, EventClientSessionChanged, EventGap, EventAttention,
 		EventHostChanged, EventPrompt, EventCommandStarted, EventCommandFinished,
-		EventAgentActivity,
+		EventAgentActivity, EventTranscript, EventTransfer, EventTransferProgress, EventTransferFile,
+		EventTML,
 	}
 	// knownEventTypes are the event types a subscribe filter can name.
 	knownEventTypes = EventTypeNames
@@ -79,6 +80,7 @@ var errorCodeCatalog = []struct {
 	{ErrVerbInvalidParams, "A parameter was missing, malformed, or outside its accepted set. The hint names the parameter."},
 	{ErrVerbSessionNotFound, "The named session does not exist. The hint lists the sessions that do."},
 	{ErrVerbSessionExists, "new-session was given a name the daemon already holds. Choose another name or omit it to have one generated."},
+	{ErrVerbFanExists, "fan was given the name of a fan that exists in the repository. Choose another name, or pass join with a session of that fan to add attempts to it on purpose."},
 	{ErrVerbWindowNotFound, "The window target did not resolve. The hint lists the addressable windows."},
 	{ErrVerbNoWindows, "The session exists but holds no windows to act on."},
 	{ErrVerbPTYNotFound, "The target window has no live PTY. Its shell has already exited."},
@@ -95,7 +97,9 @@ var errorCodeCatalog = []struct {
 	{ErrVerbNotHuman, "Only the person at an attached client may make this call, and it carried no nonce from a live attach. dismiss-attention, respond and reply-approval raise it."},
 	{ErrVerbPromptChanged, "respond pressed nothing: the pane is not on needs_input, no rule reads its prompt now, the prompt is not the one prompt_id names, or another client already answered it. Read it again with peek-prompt."},
 	{ErrVerbNotResumable, "resume-agent found no conversation it can resume in the pane: none was recorded by a hook, the harness has no resume command, the recorded id is not one plain shell token, or the pane runs on another machine. Nothing was typed."},
-	{ErrVerbConfirmRequired, "A write addressed by selector was not sent, because it carried no confirm token or the token names a different set of panes than the selector matches now. Nothing was sent. The hint lists the panes the selector matches and carries the token for them in confirm: check the list, then call again with that token."},
+	{ErrVerbConfirmRequired, "A write addressed by selector, or a ship-push or ship-pr, was not sent, because it carried no confirm token or the token names something other than what would be sent now. Nothing was sent. The hint lists the panes the selector matches, or what the push would send, and carries the token in confirm: check the list, then call again with that token."},
+	{ErrVerbNoTranscript, "agent-transcript found no transcript for the pane: it is not joined to one, or the file is gone. Nothing was read."},
+	{ErrVerbUnsupportedHarness, "agent-transcript cannot read the transcript of the pane's harness. Read the pane with capture-pane or stream-pane."},
 	{ErrVerbNoKeyboard, "The target is the person's inbox, human, which has no pane to type into. Leave a message with send-agent-message -w human and wait for the reply on your own inbox."},
 	{ErrVerbNoShellIntegration, "The pane's shell has not sent the OSC 133 marks that say where a command starts and ends, so the daemon cannot run a command in it and report its exit code, or say what the last command printed. Nothing was typed. Enable the shell's prompt integration, or use send-text and wait-for window-output."},
 	{ErrVerbNotAtPrompt, "run typed nothing because the pane's shell is not at its prompt: a command is running in it. The message names the command. Wait for it with wait-for command-finished, or run in another pane."},
@@ -106,12 +110,40 @@ var errorCodeCatalog = []struct {
 	{ErrVerbUnknownPane, "This daemon is not running a pane with that id. The pane was real and is gone, so drop it rather than correct it."},
 	{ErrVerbNotWorktree, "The session is not in a git worktree, so there is nothing to remove or diff."},
 	{ErrVerbWorktreeDirty, "remove-worktree refused: the worktree holds uncommitted changes and neither stash nor force was passed. Nothing was removed."},
+	{ErrVerbWorktreeDetached, "remove-worktree refused: the worktree sits on a detached HEAD holding commits no branch has. Nothing was removed."},
+	{ErrVerbWorktreeNested, "remove-worktree refused: an ignored or untracked path in the worktree holds a nested git repository, whose history no stash can save. Nothing was removed."},
 	{ErrVerbGitFailed, "A git command failed. The message is git's own. The repository is as it was."},
 	{ErrVerbRepoNotFound, "No checkout on this machine has the origin repo_url names, and clone was not passed. Pass clone to clone it, repos_root to look somewhere else, or repo to name the directory."},
 	{ErrVerbNotRepo, "No git repository is under the pane or session named, so there is nothing to review. Nothing was read."},
+	{ErrVerbNothingToCommit, "ship-commit found no change in the work tree, so nothing was committed. ship-push and ship-pr raise it for a branch with no commit."},
+	{ErrVerbMergeConflict, "ship-merge stopped on conflicts and aborted the merge. The main checkout is as it was. The hint lists the conflicting files. Rebase the branch in the worktree, resolve them there, and merge again."},
+	{ErrVerbCheckoutDirty, "ship-merge refused: the main checkout has uncommitted changes, a merge or rebase in progress, or is not on the branch to merge into. Nothing was merged."},
+	{ErrVerbNoRemote, "ship-push or ship-pr found no remote to push to, or not the one named. Nothing was pushed. Add a remote, or name one with remote."},
+	{ErrVerbGhUnavailable, "ship-pr or ship-status needs the gh CLI, and it is not installed or not logged in. Nothing was pushed or opened. Install gh and run gh auth login."},
+	{ErrVerbNoCheckpoint, "The pane has no checkpoint by that number, or none at all. Nothing was read or changed. The hint lists the checkpoints it has. list-checkpoints lists them too."},
+	{ErrVerbHunkChanged, "review-stage did not find the file or the hunk in the diff now. Nothing was changed. Read the diff again with review-diff and the same index and context."},
+	{ErrVerbIndexChanged, "review-stage did not undo the call: the index changed after it. Nothing was changed. Read the diff again with review-diff."},
+	{ErrVerbWholeFileOnly, "review-stage stages a rename, a binary file or a very large file only whole. Nothing was changed. Leave hunk and lines out."},
 	{ErrVerbNoNotes, "send-review found no unsent review notes for the pane, so nothing was sent. Add one with review-note first."},
+	{ErrVerbNoBuffer, "No paste buffer has the name given, or there are no paste buffers when none was named. Nothing was read, pasted or deleted. list-buffers shows the names."},
 	{ErrVerbQueueFull, "The pane's delivery queue holds as many messages as [agents.queue] max allows. Nothing was queued. Wait for the agent to take one, or drop one with cancel-queued."},
 	{ErrVerbRiskUnacknowledged, "An allow for an approval that matches a risk rule was refused because risk_ack did not name exactly the rules it matched. Nothing was answered. Read the rules with get-approval, or answer in the pane."},
+	{ErrVerbAgentsDisabled, "The verb is an agent feature, and the agent features are off: [agents] enabled = false. Nothing was done. Set agents.enabled = true in the config to use it."},
+	{ErrVerbBusy, "The daemon had no room for the request now: other large requests held its memory, the pane has not read the last large input, or another copy writes the path a transfer-start names. Nothing was done. Try again when the other work ends."},
+	{ErrVerbTooManyConnections, "The daemon already serves as many connections as it takes, and closed this one. Nothing was done. Close some clients or commands, then try again."},
+	{ErrVerbNoFile, "A file verb was given a path that does not exist on that machine. Nothing was read or changed. file-list shows what is there."},
+	{ErrVerbFileExists, "The destination exists, and the call was not told to replace it. Nothing was changed. Say what to do with conflict or replace."},
+	{ErrVerbNoPermission, "The user the daemon runs as may not read or change that path. Nothing was changed."},
+	{ErrVerbHashMismatch, "A copy's bytes did not match the original's sha256, so the copy was removed and nothing was put in place. The transfer starts that file again once by itself."},
+	{ErrVerbCrossDevice, "file-rename cannot move a path to another disk. Nothing was moved. Copy it with transfer-start and move set."},
+	{ErrVerbDiskFull, "The disk had no room for the write. What was written stays in the part file. Free space, then resume the transfer."},
+	{ErrVerbSourceChanged, "A file changed on its machine while it was copied: its size or time is not what the copy started from. Nothing was put in place for it. Copy it again when it is not being written."},
+	{ErrVerbNoTransfer, "No transfer has that id. Finished transfers leave the list after 30 minutes. transfer-list shows the ids."},
+	{ErrVerbSameSession, "move-window was given to_session, and the window is already in that session. Nothing moved. Name another session, or leave out to_session and give workspace."},
+	{ErrVerbPaneNotMovable, "move-window cannot move the window to another session: it is a popup, a scratch pane, a TML pane, or a pane that runs on another machine. Nothing moved."},
+	{ErrVerbInvalidTML, "The TML document does not parse or does not validate. Nothing was opened or changed. The error lists each problem with a JSON Pointer to the node and the fix. Check a document with tuios tml validate."},
+	{ErrVerbNoSurface, "No open TML surface has that id. It closed, or the id is wrong. list-windows names the surface of each TML window."},
+	{ErrVerbTooManySurfaces, "The caller holds as many open TML surfaces as it may: 8 for a pane, and 32 per session for the callers outside the panes. Nothing was opened. Close one with tml-close."},
 	{ErrVerbInternal, "Unexpected server-side failure."},
 }
 
@@ -142,16 +174,28 @@ type VerbHint struct {
 	// it back as confirm and the write goes to that set, or is refused again
 	// if the set changed. See selector.go.
 	Confirm string `json:"confirm,omitempty"`
+	// Missing lists the link capabilities a forbidden refusal over a link
+	// lacks, such as "files".
+	Missing []string `json:"missing,omitempty"`
+	// Table is the config table on the refusing machine that grants Missing,
+	// such as [hosts.laptop].
+	Table string `json:"table,omitempty"`
+	// Host is the [hosts] entry, on the caller's side, of the machine that
+	// refused, when a daemon passes on a refusal it got over its link.
+	Host string `json:"host,omitempty"`
 }
 
 // empty reports whether the hint carries nothing worth serializing.
 func (h *VerbHint) empty() bool {
 	return h == nil || (h.Verb == "" && h.Command == "" && h.Param == "" &&
-		len(h.Accepted) == 0 && h.DidYouMean == "" && len(h.Available) == 0 && h.Detail == "" && h.Confirm == "")
+		len(h.Accepted) == 0 && h.DidYouMean == "" && len(h.Available) == 0 && h.Detail == "" && h.Confirm == "" &&
+		len(h.Missing) == 0 && h.Table == "" && h.Host == "")
 }
 
 // hintedVerbError builds a *verbError carrying a hint. A hint with no populated
 // field is dropped so the envelope stays clean.
+//
+//go:noinline
 func hintedVerbError(code, message string, hint *VerbHint) *verbError {
 	e := newVerbError(code, message)
 	if !hint.empty() {
@@ -162,6 +206,8 @@ func hintedVerbError(code, message string, hint *VerbHint) *verbError {
 
 // invalidParam builds an invalid_params error naming the offending parameter and
 // the values it accepts (accepted may be nil when the set is open).
+//
+//go:noinline
 func invalidParam(param, message string, accepted ...string) *verbError {
 	return hintedVerbError(ErrVerbInvalidParams, message, &VerbHint{
 		Param:    param,
@@ -307,8 +353,8 @@ func editDistance(a, b string) int {
 
 // knownVerbNames returns every registered verb name in sorted order.
 func knownVerbNames() []string {
-	names := make([]string, 0, len(verbRegistry))
-	for name := range verbRegistry {
+	names := make([]string, 0, len(verbRegistry()))
+	for name := range verbRegistry() {
 		names = append(names, name)
 	}
 	sort.Strings(names)

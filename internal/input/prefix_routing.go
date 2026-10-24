@@ -34,7 +34,7 @@ func runPrefix(msg tea.KeyPressMsg, o *app.OS, lookup sectionLookup) (*app.OS, t
 	if o.KeybindRegistry == nil {
 		return o, nil
 	}
-	action := lookupAction(msg, func(key string) string { return lookup(o.KeybindRegistry, key) })
+	action := lookupAction(o, msg, func(key string) string { return lookup(o.KeybindRegistry, key) })
 	m, cmd, _ := dispatchAction(action, msg, o)
 	return m, cmd
 }
@@ -47,7 +47,7 @@ func HandlePrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	o.PrefixActive = false
 
 	if o.KeybindRegistry != nil {
-		action := lookupAction(msg, o.KeybindRegistry.GetPrefixAction)
+		action := lookupAction(o, msg, o.KeybindRegistry.GetPrefixAction)
 		if app.PrefixWorkActions[action] {
 			if cmd, handled := runPrefixWork(action, o); handled {
 				armIfRepeatable(o, action)
@@ -135,6 +135,15 @@ func HandleTapePrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) 
 	return runPrefix(msg, o, (*config.KeybindRegistry).GetTapePrefixAction)
 }
 
+// HandleTuiosPrefixCommand handles the key in the tuios menu. A key there may
+// open another menu (leader ctrl+t m is the minimize menu under the tmux
+// preset): the action sets that menu's flag as it does from the leader.
+func HandleTuiosPrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.TuiosPrefixActive = false
+	o.PrefixActive = false
+	return runPrefix(msg, o, (*config.KeybindRegistry).GetTuiosPrefixAction)
+}
+
 // handleTerminalModeBinds dispatches the direct (prefix-less) binds from the
 // [keybindings.terminal_mode] section, plus the handful of main-section actions
 // that must keep working while typing into a shell. It reports whether the key
@@ -143,7 +152,7 @@ func handleTerminalModeBinds(msg tea.KeyPressMsg, o *app.OS) bool {
 	if o.KeybindRegistry == nil {
 		return false
 	}
-	action := lookupAction(msg, o.KeybindRegistry.GetTerminalModeAction)
+	action := lookupAction(o, msg, o.KeybindRegistry.GetTerminalModeAction)
 	if o.Mode == app.TerminalMode && isTerminalFocusAction(action) && o.ArmNvimNavigation(nvimNavigationDirection(action)) {
 		return false
 	}
@@ -159,7 +168,7 @@ func handleTerminalModeBinds(msg tea.KeyPressMsg, o *app.OS) bool {
 	if !isReservedTerminalChord(msg) {
 		return false
 	}
-	action = lookupAction(msg, o.KeybindRegistry.GetAction)
+	action = lookupAction(o, msg, o.KeybindRegistry.GetAction)
 	if !isTerminalSafeAction(action) {
 		return false
 	}
@@ -196,6 +205,8 @@ func isReservedTerminalChord(msg tea.KeyPressMsg) bool {
 func isTerminalSafeAction(action string) bool {
 	return strings.HasPrefix(action, "switch_workspace_") ||
 		strings.HasPrefix(action, "move_and_follow_") ||
+		strings.HasPrefix(action, "send_to_workspace_") ||
+		strings.HasPrefix(action, "switch_session_") ||
 		action == "next_workspace" || action == "prev_workspace" ||
 		action == "next_session" || action == "prev_session"
 }

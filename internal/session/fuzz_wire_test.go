@@ -92,10 +92,30 @@ func wireSamples() []any {
 		&ErrorPayload{Code: 3, Message: "no"},
 		&ResizePTYPayload{PTYID: "p", Width: 10, Height: 5},
 		&TerminalStatePayload{},
+		&TerminalStatePayload{PTYID: "p", State: &TerminalState{Width: 4, Height: 2, CursorX: 3, PendingWrap: true}},
+		// The state no cell shows: DECSCA on the pen and on two runs of
+		// cells, REP's character, and a saved cursor on each screen.
+		&TerminalStatePayload{PTYID: "p", State: &TerminalState{
+			Width: 4, Height: 2, IsAltScreen: true,
+			PenProtected: true, Protected: []int{0, 1, 2}, MainProtected: []int{1, 0, 4},
+			LastPrinted: "日", LastPrintedKnown: true,
+			SavedCursor: &SavedCursorState{X: 3, Y: 1, PendingWrap: true, Origin: true, Protected: true,
+				Pen: &StyleState{FgColor: "a1", LinkURL: "https://example.test"}, Charsets: []int{'0', 'B', 'B', 'A', 1, 2}},
+			MainSavedCursor: &SavedCursorState{X: 1},
+		}},
 		&CommandResultPayload{Success: true, Data: map[string]any{"a": 1, "b": []string{"x"}}},
 		&StateSyncPayload{State: &SessionState{Name: "s", WorkspaceTrees: map[int]*SerializedBSPTree{1: {Root: root}}}, TriggerType: "window"},
 		&SessionState{Name: "s", WorkspaceTrees: map[int]*SerializedBSPTree{1: {Root: root}}},
 		&SessionListPayload{Sessions: []SessionInfo{{Name: "a"}, {Name: "b"}}},
+		// A window and a summary with subagents, the list a peer before it
+		// drops on decode.
+		&StateSyncPayload{State: &SessionState{Name: "s", Windows: []WindowState{{ID: "w", AgentState: AgentStateDone, AgentSubagents: 1,
+			AgentSubagentList: []SubagentInfo{
+				{ID: "ab34da07d2d63ee3c", Type: "general-purpose", Description: "Echo one in background", State: SubagentRunning, StartedAt: 1, Now: "Bash: sleep 3; echo one", Tools: 1},
+				{ID: "aa84fb4f695c1ee02", Type: "general-purpose", State: SubagentDone, StartedAt: 1, EndedAt: 2, Last: "Bash: echo two", Tools: 1, Result: "done"},
+			}}}}},
+		&SessionListPayload{Sessions: []SessionInfo{{Name: "a", Windows: []WindowSummary{{ID: "w", Subagents: 1,
+			SubagentList: []SubagentInfo{{ID: "a1", State: SubagentFailed, Result: "boom"}}}}}}},
 	}
 }
 

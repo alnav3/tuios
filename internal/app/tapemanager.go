@@ -12,8 +12,10 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/listnav"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/tape"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
+	"github.com/Gaurav-Gosain/tuios/internal/units"
 	"github.com/adrg/xdg"
 )
 
@@ -363,30 +365,30 @@ func (m *OS) TapeManagerPlaySelected() {
 
 	selected := m.TapeManager.Files[m.TapeManager.SelectedIndex]
 
-	// Read the tape file
-	content, err := os.ReadFile(selected.Path)
+	if m.scriptBusy() {
+		m.TapeManager.ErrorMessage = "A tape is already playing"
+		m.TapeManager.MessageTime = time.Now()
+		return
+	}
+
+	// Read the tape file, with its Source lines resolved
+	script, err := tape.LoadFile(selected.Path)
 	if err != nil {
 		m.TapeManager.ErrorMessage = fmt.Sprintf("Failed to read tape: %s", err)
 		m.TapeManager.MessageTime = time.Now()
 		return
 	}
-
-	// Parse the tape
-	lexer := tape.New(string(content))
-	parser := tape.NewParser(lexer)
-	commands := parser.Parse()
-
-	// Create and start player
-	player := tape.NewPlayer(commands)
-	m.ScriptPlayer = player
-	m.ScriptMode = true
-	m.ScriptPaused = false
-	m.ScriptFinishedTime = time.Time{}
-	m.ScriptAwaitWindows = 0
-	m.ScriptAwaitDeadline = time.Time{}
-
-	// Create executor
-	m.ScriptExecutor = tape.NewCommandExecutor(m)
+	// A tape with errors does not play. It used to play whatever parsed and
+	// skip the rest without a word.
+	if len(script.Errors) > 0 {
+		m.TapeManager.ErrorMessage = fmt.Sprintf("Tape has %s. The first is at %s", plural.Count(len(script.Errors), "error"), script.Errors[0])
+		m.TapeManager.MessageTime = time.Now()
+		return
+	}
+	if m.ScriptMode {
+		m.exitScriptMode()
+	}
+	m.startTapePlayback(script.Commands, 0)
 
 	// Close the manager UI
 	m.ShowTapeManager = false
@@ -509,7 +511,7 @@ func (m *OS) tapeFileRow(i, width int, pal overlay.Palette) string {
 
 	// The name gives way first, then the timestamp: a row that keeps its whole
 	// name at the cost of the panel's edge is not a row anyone can read.
-	size := formatFileSize(file.Size)
+	size := units.ShortBytes(file.Size)
 	stamp := file.Modified.Format("Jan 02 15:04")
 	nameW := max(width-lipgloss.Width(size)-lipgloss.Width(stamp)-6, 6)
 	if width < 40 {
@@ -527,15 +529,6 @@ func (m *OS) tapeFileRow(i, width int, pal overlay.Palette) string {
 
 	gap := max(width-lipgloss.Width(row)-lipgloss.Width(right), 1)
 	return pal.Row(row+overlay.Style(rowBg).Render(strings.Repeat(" ", gap))+right, width, st, pal.Surface)
-}
-
-func formatFileSize(size int64) string {
-	if size < 1024 {
-		return fmt.Sprintf("%dB", size)
-	} else if size < 1024*1024 {
-		return fmt.Sprintf("%.1fKB", float64(size)/1024)
-	}
-	return fmt.Sprintf("%.1fMB", float64(size)/(1024*1024))
 }
 
 func truncateString(s string, maxLen int) string {
@@ -592,7 +585,7 @@ func (m *OS) HandleTapeManagerInput(key string) bool {
 		}
 
 	case TapeManagerList:
-		if motion := listnav.Keys(key, true); motion != listnav.None {
+		if motion := m.ListKeys.Keys(key, true); motion != listnav.None {
 			m.TapeManagerMove(listnav.Delta(motion, 10))
 			return true
 		}

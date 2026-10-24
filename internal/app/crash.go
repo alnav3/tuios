@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/Gaurav-Gosain/tuios/internal/release"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
 	"github.com/adrg/xdg"
+	"tuios.dev/vt"
 )
 
 // What tuios does when it reaches a state it should not have reached.
@@ -178,11 +178,6 @@ func crashMachineFacts() []CrashFact {
 	}
 }
 
-// baseFacts is the whole set for a report with no model behind it.
-func baseFacts(where string) []CrashFact {
-	return append(crashHeadFacts(where), crashMachineFacts()...)
-}
-
 // Title is the one-line summary, used as the issue title and as the overlay's
 // second line. It is the panic value on its own line, clipped, because that is
 // the part that tells two reports apart.
@@ -219,7 +214,11 @@ func (r *CrashReport) Markdown(stackLines int) string {
 	b.WriteString("| | |\n|---|---|\n")
 	fmt.Fprintf(&b, "| Time | %s |\n", r.When.Format(time.RFC3339))
 	for _, f := range r.Facts {
-		b.WriteString("| " + f.Label + " | " + f.Value + " |\n")
+		b.WriteString("| ")
+		b.WriteString(f.Label)
+		b.WriteString(" | ")
+		b.WriteString(f.Value)
+		b.WriteString(" |\n")
 	}
 	b.WriteString("\n### Stack trace\n\n```\n")
 	stack, trimmed := clipStack(r.Stack, stackLines)
@@ -232,7 +231,9 @@ func (r *CrashReport) Markdown(stackLines int) string {
 	}
 	b.WriteString("```\n")
 	if trimmed > 0 && r.LogPath != "" {
-		b.WriteString("\nThe whole trace is in `" + r.LogPath + "` on the machine that ran tuios.\n")
+		b.WriteString("\nThe whole trace is in `")
+		b.WriteString(r.LogPath)
+		b.WriteString("` on the machine that ran tuios.\n")
 	}
 	return b.String()
 }
@@ -296,11 +297,17 @@ func (r *CrashReport) shortBody() string {
 	b.WriteString("The report is too large for a prefilled issue. ")
 	b.WriteString("Press c in the crash overlay to copy it, then paste it here.\n\n")
 	if r.LogPath != "" {
-		b.WriteString("Crash log: `" + r.LogPath + "`\n\n")
+		b.WriteString("Crash log: `")
+		b.WriteString(r.LogPath)
+		b.WriteString("`\n\n")
 	}
 	b.WriteString("### Details\n\n| | |\n|---|---|\n")
 	for _, f := range r.Facts {
-		b.WriteString("| " + f.Label + " | " + f.Value + " |\n")
+		b.WriteString("| ")
+		b.WriteString(f.Label)
+		b.WriteString(" | ")
+		b.WriteString(f.Value)
+		b.WriteString(" |\n")
 	}
 	return b.String()
 }

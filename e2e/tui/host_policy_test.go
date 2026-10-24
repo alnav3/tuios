@@ -190,7 +190,7 @@ func TestMailWaitsForAMachineWhoseLinkIsDown(t *testing.T) {
 		t.Fatalf("ASSERTION: the send did not say the message waits:\n%s", out)
 	}
 	hosts, _ := tuiosCLIEnv(t, base, env, "hosts")
-	if !contains(hosts, "build: 1 message(s) wait here for the link") {
+	if !contains(hosts, "build: 1 message waits here for the link") {
 		t.Errorf("tuios hosts does not say mail waits:\n%s", hosts)
 	}
 
@@ -198,7 +198,7 @@ func TestMailWaitsForAMachineWhoseLinkIsDown(t *testing.T) {
 		t.Fatalf("open the Inbox: %v", err)
 	}
 	if err := term.WaitFor(func(s tuitest.Screen) bool {
-		return containsAll(s.Text(), "Waiting to send", "for build", "1 message waits for the link to build")
+		return containsAll(s.Text(), "To send", "for build", "1 message waits for the link to build")
 	}, uiTimeout); err != nil {
 		t.Fatalf("ASSERTION: the Inbox does not say mail waits for build: %v\n%s", err, term.Snapshot())
 	}
@@ -255,7 +255,7 @@ func TestAMachineHoldsALinkToItsPolicy(t *testing.T) {
 	}
 	// The CLI wraps its message to the terminal, so words are compared, not
 	// lines.
-	if flat := strings.Join(strings.Fields(out), " "); !contains(flat, "may not write on") {
+	if flat := strings.Join(strings.Fields(out), " "); !contains(flat, "(write) on") {
 		t.Errorf("the refusal does not name what is missing:\n%s", out)
 	}
 

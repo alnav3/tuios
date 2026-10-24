@@ -15,6 +15,7 @@ package integration
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -135,11 +136,19 @@ type Report struct {
 	// State is empty, without SessionOnly, for a report that is its Activity
 	// alone, a report-agent-activity call: a subagent starting or stopping,
 	// which says nothing about what the pane's own agent is doing.
-	State          string `json:"state,omitempty"`
-	Kind           string `json:"kind,omitempty"`
-	Message        string `json:"message,omitempty"`
-	SessionID      string `json:"agent_session_id,omitempty"`
+	State     string `json:"state,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Message   string `json:"message,omitempty"`
+	SessionID string `json:"agent_session_id,omitempty"`
+	// SessionStart marks the report of a conversation starting or resuming.
+	// For a harness that runs every conversation from one server process,
+	// it is the only report that lets a different conversation take a pane
+	// over. See Manifest.SharedServer in internal/harness.
+	SessionStart   bool   `json:"session_start,omitempty"`
 	TranscriptPath string `json:"transcript_path,omitempty"`
+	// Cwd is the folder the harness names in the hook payload. The daemon
+	// keeps the first one of a session as the agent's start folder.
+	Cwd string `json:"agent_cwd,omitempty"`
 	// IfState is a comma-separated state list: the report applies only when
 	// the pane is in one of them.
 	IfState string `json:"if_state,omitempty"`
@@ -149,6 +158,11 @@ type Report struct {
 	// only to a daemon whose set-agent-state lists activity. Any other goes
 	// with report-agent-activity, after the state report when there is one.
 	Activity *Activity `json:"activity,omitempty"`
+	// Extra are more report-agent-activity calls the same hook event makes,
+	// sent in order after the report and its Activity: the subagent updates
+	// a Claude Code event carries beside the main agent's own report. A
+	// daemon that refuses one refuses only that one.
+	Extra []Activity `json:"extra,omitempty"`
 }
 
 // Activity is set-agent-state's activity parameter, in the verb's own field
@@ -169,7 +183,30 @@ type Activity struct {
 	// harness's id for it, which pairs its start with its stop, and its type.
 	AgentID   string `json:"agent_id,omitempty"`
 	AgentType string `json:"agent_type,omitempty"`
+	// CallID is the harness's id for the tool call: the call that launched a
+	// subagent on a spawn hint, and the call a subagent_update without an
+	// AgentID is about.
+	CallID string `json:"call_id,omitempty"`
+	// Spawn marks a tool call that launches a subagent (Claude Code's Agent
+	// tool). AgentType is then the type asked for and Target, as for any tool
+	// call, the description, which the daemon gives the next subagent that
+	// starts.
+	Spawn bool `json:"spawn,omitempty"`
+	// Outcome is how a subagent_update says the subagent is ending:
+	// OutcomeStopping or OutcomeFailed.
+	Outcome string `json:"outcome,omitempty"`
+	// Tools is how many tool calls a finished subagent made, when the harness
+	// said.
+	Tools int `json:"tools,omitempty"`
 }
+
+// Subagent outcomes, the values of Activity.Outcome.
+const (
+	// OutcomeStopping is the main agent asking to stop the subagent.
+	OutcomeStopping = "stopping"
+	// OutcomeFailed is the subagent's call failing. Text is then the error.
+	OutcomeFailed = "failed"
+)
 
 // Activity events, the values of Activity.Event.
 const (
@@ -178,11 +215,15 @@ const (
 	ActivityToolDone   = "tool_done"
 	ActivityToolFailed = "tool_failed"
 	ActivityTurnEnd    = "turn_end"
-	// The three below go with report-agent-activity, which set-agent-state
+	// The four below go with report-agent-activity, which set-agent-state
 	// predates: see StateActivity.
 	ActivitySubagentStart = "subagent_start"
 	ActivitySubagentStop  = "subagent_stop"
 	ActivitySessionStart  = "session_start"
+	// ActivitySubagentUpdate is news about a running subagent: the tool it
+	// runs, its description, or how it is ending. A daemon older than it
+	// refuses it, which costs nothing.
+	ActivitySubagentUpdate = "subagent_update"
 )
 
 // StateActivity reports whether set-agent-state takes event as the activity
@@ -234,6 +275,68 @@ type Decision struct {
 	// harness takes a decision back from the hook. The hook may then hold the
 	// prompt for an answer from the Inbox. See approval.go.
 	Approval *Approval `json:"approval,omitempty"`
+	// Context is set for an event whose output the harness adds to the
+	// agent's context, where the hook may tell the agent about its unread
+	// mail. It may be set on a skip: Claude Code's compact SessionStart
+	// reports no state, and the agent still has to hear where it is. See
+	// ContextOutput.
+	Context ContextOutput `json:"context,omitempty"`
+	// ContextSessionID is the conversation id of a skip that has Context, so
+	// the hook can hold its mail notice to the same guard a report meets.
+	ContextSessionID string `json:"context_session_id,omitempty"`
+}
+
+// ContextOutput says how a hook adds text to the agent's context for one
+// event, or that it cannot.
+type ContextOutput string
+
+// The ways a hook adds context.
+const (
+	// ContextNone: the harness does not read the hook's output as context.
+	ContextNone ContextOutput = ""
+	// ContextPlain: plain text on stdout is added as context. Claude Code
+	// and Codex read SessionStart and UserPromptSubmit this way.
+	ContextPlain ContextOutput = "plain"
+	// ContextJSON: only hookSpecificOutput.additionalContext in a JSON
+	// object on stdout is added. Plain text is ignored. Claude Code and
+	// Codex read PostToolUse this way.
+	ContextJSON ContextOutput = "json"
+)
+
+// contextFor is how harness id adds context for event. Sources: the Claude
+// Code hooks reference (plain stdout is context for SessionStart and
+// UserPromptSubmit; additionalContext lands next to the tool result for
+// PostToolUse and PostToolUseFailure), and the Codex hooks guide ("Plain text
+// on stdout is added as extra developer context" for SessionStart and
+// UserPromptSubmit; "Plain text on stdout is ignored" for PostToolUse, which
+// takes additionalContext).
+func contextFor(id, event string) ContextOutput {
+	if id != ClaudeCode && id != Codex {
+		return ContextNone
+	}
+	switch event {
+	case "SessionStart", "UserPromptSubmit":
+		return ContextPlain
+	case "PostToolUse":
+		return ContextJSON
+	case "PostToolUseFailure":
+		if id == ClaudeCode {
+			return ContextJSON
+		}
+	}
+	return ContextNone
+}
+
+// ContextJSONOutput is the stdout that adds text to the agent's context for
+// an event read as ContextJSON.
+func ContextJSONOutput(event, text string) string {
+	out, _ := json.Marshal(map[string]any{
+		"hookSpecificOutput": map[string]any{
+			"hookEventName":     event,
+			"additionalContext": text,
+		},
+	})
+	return string(out) + "\n"
 }
 
 func skip(harness, event, why string) Decision {
@@ -268,9 +371,8 @@ const AgentHintEnv = "TUIOS_AGENT"
 //
 // It never guesses. A payload that does not parse, an event it has no mapping
 // for, and a notification type it does not know all report nothing, because a
-// wrong state is worse than a missing one: the old shim's habit of reading
-// every notification as needs_input is what this replaces. In particular a
-// failure never becomes done.
+// wrong state is worse than a missing one. In particular a failure never
+// becomes done.
 //
 // The checks that apply to every harness run first: a TUIOS_AGENT naming a
 // different harness means this event comes from an agent nested inside the one
@@ -303,9 +405,9 @@ func Translate(harnessName string, in Input) Decision {
 	p := fields(payload)
 	switch id {
 	case ClaudeCode:
-		return translateClaude(in, p)
+		return withContext(translateClaude(in, p), p)
 	case Codex:
-		return translateCodex(in, p)
+		return withContext(translateCodex(in, p), p)
 	case GeminiCLI:
 		return translateGemini(in, p)
 	case OpenCode, Kilo:
@@ -329,6 +431,29 @@ func Translate(harnessName string, in Input) Decision {
 	}
 }
 
+// withContext marks a decision whose event the harness reads as context. A
+// skip is marked only when it is Claude Code's compact SessionStart, the one
+// skip of a pane's own agent: the others are a nested or foreign harness, a
+// subagent, or a payload that did not parse.
+func withContext(d Decision, p fields) Decision {
+	if d.Report == nil && d.Skip != SkipCompact {
+		return d
+	}
+	if d.Report != nil && d.Report.State == "" {
+		// A subagent's event, which has no state of its own.
+		return d
+	}
+	d.Context = contextFor(d.Harness, d.Event)
+	if d.Report == nil {
+		d.ContextSessionID = p.str("session_id")
+	}
+	return d
+}
+
+// SkipCompact is the skip reason of Claude Code's SessionStart after a
+// compaction.
+const SkipCompact = "compaction restarts the session mid-turn"
+
 // StdoutAnswer is what a hook for harness must print on stdout whatever it
 // decides: the answer that changes nothing, for a harness that parses a
 // hook's stdout as JSON. It is empty for the rest, which read an empty stdout
@@ -342,10 +467,48 @@ func StdoutAnswer(harness string) string {
 	return ""
 }
 
+// StartsWithContext reports whether a harness adds the plain text a
+// SessionStart hook prints to the agent's context. The hook then tells the
+// agent where it runs (see SessionStartHint). Claude Code and Codex both do,
+// and treat an empty stdout as nothing to add.
+func StartsWithContext(harness string) bool {
+	id, _ := Canonical(harness)
+	return id == ClaudeCode || id == Codex
+}
+
+// SessionStartHint is what the SessionStart hook prints for the agent: the
+// pane and the session it runs in, and where to learn the rest. It is two
+// short lines because it costs tokens in every session.
+//
+// The text goes into the agent's context, so neither name may carry text of
+// its own there. A session name may hold any printable text, and a pane given
+// by name instead of id may even hold a newline, so the pane must be a short id
+// (hex digits) or nothing is printed, and the session is cut to
+// maxHintSession runes and quoted with every non-printable rune escaped
+// (newlines, U+2028, bidi overrides).
+func SessionStartHint(pane, session string) string {
+	if pane == "" || session == "" || strings.ContainsFunc(pane, func(r rune) bool {
+		return !('0' <= r && r <= '9' || 'a' <= r && r <= 'f' || 'A' <= r && r <= 'F')
+	}) {
+		return ""
+	}
+	if r := []rune(session); len(r) > maxHintSession {
+		session = string(r[:maxHintSession]) + "..."
+	}
+	return "You run in tuios pane " + pane + " in session " + strconv.Quote(session) + ".\n" +
+		"Run `tuios --skill` to learn how to drive tuios.\n"
+}
+
+// maxHintSession is the most runes of a session name the start hint shows.
+const maxHintSession = 64
+
 // fields reads a decoded payload without panicking on a field of the wrong
 // type: a harness that changes a field's type costs that field, not the hook.
 type fields map[string]any
 
+// str is the string at key, or "" when it is missing or not a string.
+//
+//go:noinline
 func (f fields) str(key string) string {
 	if v, ok := f[key].(string); ok {
 		return v
@@ -371,6 +534,8 @@ func eventName(in Input, p fields) string {
 }
 
 // first is the first of keys holding a non-empty string.
+//
+//go:noinline
 func (f fields) first(keys ...string) string {
 	for _, k := range keys {
 		if v := f.str(k); v != "" {
@@ -385,5 +550,6 @@ func (f fields) first(keys ...string) string {
 func identity(r Report, p fields) Report {
 	r.SessionID = p.str("session_id")
 	r.TranscriptPath = p.str("transcript_path")
+	r.Cwd = p.str("cwd")
 	return r
 }

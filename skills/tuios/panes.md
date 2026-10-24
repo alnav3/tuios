@@ -14,6 +14,13 @@ tuios new --detach scratch
 tuios new-window -s scratch build --cwd /src/api
 ```
 
+`tuios new` starts the session's windows in the directory you run it from.
+`--cwd DIR` names another one:
+
+```sh
+tuios new --detach api --cwd /src/api
+```
+
 Over the control protocol this is the `new-session` verb, which does both in one
 call and returns the ids:
 
@@ -27,9 +34,13 @@ with the names that do exist, so pick another name rather than assuming you took
 it over.
 
 `tuios session-info -s work` reports the workspace you are on, how many exist,
-the tiling mode, any workspace names and, when the workspaces were rearranged,
-their display `order`. They keep their numbers, so `select-workspace 2` still
-means workspace 2.
+the tiling mode and any workspace names. A workspace's number is its position:
+moving one, with the move keys, by dragging its dock pill or with
+`set-workspace-order`, renumbers it, and `select-workspace 2` then means
+whatever workspace is second now. Closing a pane or a workspace closes up
+the numbers above an empty place, and so does `exit` typed in a pane's own
+shell. A pane whose program exits on its own (a command, `close_on_exit`)
+renumbers nothing, so a number you read stays good until a close or a move.
 
 ## Opening a pane and running work in it
 
@@ -41,7 +52,8 @@ tuios send-text -s work -w build 'go test ./... 2>&1 | tee /tmp/test.log
 
 To make the pane's process the program itself rather than a shell, put the argv
 after the name. Nothing re-parses it, and the pane closes when the program
-exits. Put `--` before a command that has flags of its own:
+exits. `--keep-open` keeps the pane, with a line that shows the exit status.
+Put `--` before a command that has flags of its own:
 
 ```sh
 tuios new-window -s work htop /usr/bin/htop
@@ -65,7 +77,23 @@ Close what you open. On a detached session a window whose shell has exited
 stays in the list until something closes it:
 
 ```sh
-tuios run-command -s work CloseWindow "$id"
+tuios close-window -s work "$id"
+```
+
+## A pane on the machine a pane is ssh'd into
+
+The actions `split_ssh_vertical`, `split_ssh_horizontal` and `new_window_ssh`
+open a pane that runs the focused pane's ssh again, to the same host as the
+same user. The new line keeps only the connection options, with no remote
+command. A pane that does not run ssh gets an ordinary pane. So does an ssh
+line with an `-o` option outside a fixed list (`ProxyCommand`,
+`XAuthLocation` and similar), with `-F` or `-E`, or ssh that `scp` or `git`
+started. They are keybinding actions, so `run-command` runs them, and the
+same grant rules apply as for any other `run-command`:
+
+```sh
+tuios focus-window -s work build
+tuios run-command -s work split_ssh_vertical
 ```
 
 ## Many panes at once
@@ -85,7 +113,9 @@ its item. Without `-s`, `-c` is typed into the pane's shell, which stays.
 `-s` runs it with no shell and holds the pane until Enter; `-ss` closes the
 pane when it exits. `--interval` spaces the panes. `--session` names the
 session (`-s` is speedy mode, as in tmux-xpanes). `tuios close-workspace N`
-closes them all, like tmux kill-window. `--json` prints the window ids. The layout and
+closes them all, like tmux kill-window, and the workspaces above N move down
+one. When the last of them closes, the
+session goes back to the workspace that ran `xpanes`. `--json` prints the window ids. The layout and
 multifocus need an attached client; without one the panes open and a warning
 says so. More than 64 panes needs `--force`. For work you drive yourself, open
 panes with `new-window` and keep the ids; xpanes is for a person who wants to
@@ -93,7 +123,12 @@ type into all of them.
 
 ## Text from many panes
 
-For a script, loop over the panes and use `capture-pane`:
+`tuios list-windows --all --text 20 --json` lists every pane of every session
+with its folder, command and last 20 lines. `--all-hosts` adds the other
+machines. It reads with `capture-pane`, under the same grants: without `admin`
+you get your own session and an `errors` entry for the rest.
+
+To read one session's panes in a loop, use `capture-pane`:
 
 ```sh
 tuios list-windows --json | jq -r '.windows[] | "\(.index)\t\(.window_id)"' |
@@ -170,7 +205,10 @@ mode. With no client attached they go to the focused window.
 
 Names are case-insensitive. Arrows, `Home` and `End` are sent in the form the
 program asked for: `less` and `vim` turn on application cursor keys and get
-`ESC O A`, a shell gets `ESC [ A`. A word that looks like a key but is not one
+`ESC O A`, a shell gets `ESC [ A`. A named key or a key with modifiers is
+sent the way the client sends it for a person. A program that asked for the
+kitty keyboard protocol gets `ctrl+h` as `ESC [ 104;5u`, a shell gets `0x08`.
+A word that looks like a key but is not one
 (`Dwon`, `KEY_FOO`, `F13`) fails with `invalid_params`, the names above, and
 the closest one; nothing is sent. A plain lower-case word such as `ls` is still
 typed as its letters.
@@ -220,7 +258,8 @@ tuios wait-for command-finished -s work -w build --timeout 600000
   prints, including scrollback.
 - `window-idle` returns once the pane has printed nothing for `--idle`
   milliseconds. Use it when a command has no marker.
-- `window-exit` returns when the pane's process exits.
+- `window-exit` returns when the pane's process exits, and shows its exit
+  status (`exit_code` with `--json`). It still exits 0.
 - `agent-state` returns when an agent pane reaches one of the `--until` states.
   Without `-w`, any agent in the session matches; `--any-session` watches every
   session; `--select` watches a set of panes (`tuios --skill fleet`).
@@ -251,7 +290,22 @@ match; the output shows `tests_done_1786700000`, which it does.
 
 ### Running a command and getting its exit code
 
-When the pane's shell marks its commands with OSC 133 (fish 4 on its own, zsh
+The simplest way needs no shell integration. Run the command as the program of
+a new pane. `--wait` waits for it and exits with its status. `--keep-open`
+keeps the pane, so you can read the output after the exit:
+
+```sh
+tuios new-window -s work tests --no-focus --keep-open --wait -- go test ./...
+echo "tests exited $?"
+tuios capture-pane -s work -w tests --scrollback --lines 60
+tuios close-window -s work tests
+```
+
+A program that a signal stopped exits 128 plus the signal number. `--json`
+gives `exit_code`, and `signal` when a signal stopped it. `--timeout` limits
+the wait in milliseconds. Close the pane when you are done with it.
+
+To run the command in a shell pane that exists, use `run`. When the pane's shell marks its commands with OSC 133 (fish 4 on its own, zsh
 and bash 4.4 or newer with the lines `tuios doctor shell` prints), `run` types
 the line at the prompt, waits for the shell to say it finished, prints exactly
 what that command printed, and exits with its status:
@@ -271,7 +325,7 @@ the `wait-for command-finished --command-seq N` that picks it up.
 `capture-pane --last-command` prints only what the last finished command
 printed.
 
-Without shell integration, put the status in the marker:
+Into a shell pane without shell integration, put the status in the marker:
 
 ```sh
 n=$(date +%s)
@@ -281,7 +335,8 @@ tuios wait-for window-output -s work -w build --pattern "done_${n}_rc=" --timeou
 tuios capture-pane -s work -w build --scrollback --lines 60 | grep -o "done_${n}_rc=[0-9]*"
 ```
 
-Or run the work in a window that exits, and wait for the exit:
+A daemon older than `--keep-open` warns and opens an ordinary pane. There, run
+the work in a window that exits, and wait for the exit:
 
 ```sh
 tuios new-window -s work job
@@ -301,6 +356,7 @@ tuios list-workspaces -s work
 tuios focus-window -s work build               # focus a named pane, on any workspace
 tuios focus-window -s work --relative next
 tuios move-window -s work 2 -w build --follow  # send a pane to workspace 2
+tuios move-window -s work -w build --to-session review  # send it to another session
 tuios select-workspace -s work 2
 tuios set-window -s work -w build --name "api tests"
 tuios set-window -s work -w build --minimize
@@ -312,11 +368,17 @@ Geometry belongs to the attached client, so these need one and say
 
 ```sh
 tuios split-window -s work vertical -w build --name logs
+tuios split-window -s work left -w build      # the new pane takes the left side
 tuios set-layout -s work --tiling true --equalize
 tuios set-layout -s work --rotate
 tuios set-layout -s work --master-position center --masters 1
 tuios focus-window -s work --direction left
 ```
+
+`--equalize` gives every tiled pane an equal share. In the master-stack layout
+it puts the master back at its configured ratio and shares the rest equally.
+`tuios list-clients` says whether a client shows the session
+(`tuios --skill clients`).
 
 Reading, writing, waiting, creating and moving never need a client, and neither
 does anything to do with agents.
@@ -329,11 +391,13 @@ needs a client attached.
 
 ```sh
 tuios popup -s work --width 60 --height 20 -- gum choose one two three
+tuios popup -s work --dim 30 -- gum choose one two three
 file=$(tuios popup -s work --capture-stdout -- fzf)
 tuios popup -s work --wait -- gum confirm "Deploy?" && ./deploy.sh
 ```
 
-`--width` and `--height` take cells or a percent. `--wait` returns the command's
+`--width` and `--height` take cells or a percent. `--dim` overrides
+`appearance.popup_dim` (0 to 90; 0 is off). `--wait` returns the command's
 status; `--capture-stdout` prints its standard output. A popup closed by hand
 exits 130. Capture is not on Windows.
 
@@ -369,16 +433,44 @@ other window-manager verbs. Do not pin a pane the person did not ask about.
 
 ### The escape hatch
 
-A keybinding with no verb of its own is reachable by name:
+A keybinding with no verb of its own is reachable by name. Every action
+`tuios keybinds list` prints runs this way:
 
 ```sh
 tuios run-command -s work ToggleZoom
+tuios run-command -s work toggle_spotlight
+tuios run-command -s work Press "ctrl+b ?"
 tuios run-command --list
 ```
 
-A name that is not a command is an error. `run-command` reports that the command
-ran and nothing about what it changed, and from a pane it needs `admin`. Prefer
-a verb where one exists.
+`Press` sends keys through the window manager, as the person would: the
+leader, a prefix, copy mode or an open dialog gets them. An action and
+`Press` need a client attached.
+
+A name that is not a command or an action is an error. `run-command` reports
+that the command ran and nothing about what it changed, and from a pane it
+needs `admin`. Prefer a verb where one exists.
+
+### A tape of steps
+
+For several steps in a row, write them in a tape and run it with
+`tuios tape exec`. It returns when the tape ends, and exits non-zero at the
+first step that fails, with the line:
+
+```sh
+cat > steps.tape <<'TAPE'
+Run "make build"
+WaitFor text "BUILD (OK|FAILED)" 120s
+Expect text "BUILD OK"
+Action equalize_splits
+TAPE
+tuios tape exec -s work steps.tape
+```
+
+`WaitFor` holds until a condition holds: `text "re"`, `pane "name"`,
+`gone "name"`, `focus "name"`, `panes N`, `agent "state"`, `workspace N` or
+`mode window`. Add `in "pane"` to read a pane other than the focused one.
+`Expect` checks once. Prefer these to `Sleep`.
 
 ## Naming things for the person watching
 
@@ -387,9 +479,19 @@ tuios rename-session work payments        # the name: ls, attach and -s use it
 tuios set-session-name "Payments API"     # the label; the session keeps its name
 tuios set-session-accent cyan
 tuios set-workspace-name 2 review
+tuios set-session-space payments          # file the session under the space payments
+tuios set-session-space                   # take it out of any space
+tuios new --detach pay-api --space payments
 ```
 
 A display name does not change how the session is addressed: `-s work` keeps
 working. A rename does change it. After a rename, the old name still reaches
 the session from panes that already run, but `tuios attach` takes only the new
 name.
+
+A space is a label the person files related sessions under, such as every
+session of one project. It exists while a session is in it, and `tuios ls`
+and the sidebar list the sessions under one heading per space, the sessions
+in no space last. Over the control protocol it is `set-session-space` and the
+`space` param of `new-session`. A space name follows the session name rules
+and is at most 64 bytes. A global session cannot be in a space.

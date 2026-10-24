@@ -128,7 +128,7 @@ func TestHandshakeAgainstLegacyDaemonReportsMismatch(t *testing.T) {
 		"client 1.4.0",
 		"upgraded while the daemon kept running",
 		"tuios kill-server",
-		"2 session(s)",
+		"2 sessions",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("mismatch message missing %q\n--- message ---\n%s", want, msg)
@@ -150,9 +150,9 @@ func TestHandshakeToleratesDaemonWithoutHelloVerb(t *testing.T) {
 
 	// Temporarily remove the hello verb from the registry to reproduce a daemon
 	// built before the handshake existed.
-	entry := verbRegistry["hello"]
-	delete(verbRegistry, "hello")
-	t.Cleanup(func() { verbRegistry["hello"] = entry })
+	entry := verbRegistry()["hello"]
+	delete(verbRegistry(), "hello")
+	t.Cleanup(func() { verbRegistry()["hello"] = entry })
 
 	client, err := DialVerbClientAs("1.4.0")
 	if err != nil {

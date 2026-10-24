@@ -8,9 +8,9 @@ import (
 	"testing"
 
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
-	"github.com/Gaurav-Gosain/tuios/internal/shot"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
 	"github.com/Gaurav-Gosain/tuitest"
+	"tuios.dev/shot"
 )
 
 // The chrome at each colour depth a terminal can have. The depth is what the
@@ -19,7 +19,7 @@ import (
 // (Apple Terminal, mosh, tmux without Tc), and COLORTERM=truecolor is 24-bit.
 //
 // Each run saves the frame as text, as styled text and as a PNG drawn by
-// tuios's own renderer (internal/shot) from the cells the terminal received,
+// tuios's own renderer (tuios.dev/shot) from the cells the terminal received,
 // with the palette a terminal of that kind would paint the sixteen slots with.
 
 // chromeDepth is one terminal the chrome is drawn for.
@@ -80,7 +80,25 @@ func resolveCell(c tuitest.Color, p *shot.Palette, def shot.Color) shot.Color {
 	return def
 }
 
-// savePNG draws the screen through internal/shot and writes it beside the
+// frameFont is the font the PNG frames are drawn in: TUIOS_E2E_FONT and
+// TUIOS_E2E_FONT_BOLD name the files. Unset, shot's own Go Mono draws them.
+func frameFont() *shot.Frame {
+	path := os.Getenv("TUIOS_E2E_FONT")
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	f := &shot.Frame{Font: shot.Font{Data: data}}
+	if bold, err := os.ReadFile(os.Getenv("TUIOS_E2E_FONT_BOLD")); err == nil {
+		f.BoldFont = shot.Font{Data: bold}
+	}
+	return f
+}
+
+// savePNG draws the screen through tuios.dev/shot and writes it beside the
 // text artifacts, so the frame can be looked at the way the terminal shows it.
 func savePNG(t *testing.T, s tuitest.Screen, p *shot.Palette, dir, name string) {
 	t.Helper()
@@ -105,7 +123,7 @@ func savePNG(t *testing.T, s tuitest.Screen, p *shot.Palette, dir, name string) 
 			g.Cells[y][x] = cell
 		}
 	}
-	data, err := shot.RenderPNG(g, nil, nil)
+	data, err := shot.RenderPNG(g, frameFont())
 	if err != nil {
 		t.Fatalf("render %s: %v", name, err)
 	}
@@ -198,9 +216,13 @@ func TestChromeAtEveryColourDepth(t *testing.T) {
 				base := t.TempDir()
 				killDaemon(t, base)
 				useShippedLooks(base)
+				// The dock's caps are on so checkPillCaps has dock pills to
+				// read. They ship on, and the test does not lean on that.
+				cfg := "[appearance]\ndock_pill_caps = true\n"
 				if look.theme != "" {
-					writeConfig(t, base, "[appearance]\ntheme = \""+look.theme+"\"\n")
+					cfg += "theme = \"" + look.theme + "\"\n"
 				}
+				writeConfig(t, base, cfg)
 				for _, name := range []string{"e2e-depth", "e2e-other"} {
 					if out, err := tuiosCLI(t, base, "new", name, "--detach"); err != nil {
 						t.Fatalf("create session %s: %v\n%s", name, err, out)

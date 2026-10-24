@@ -1,35 +1,26 @@
 package app
 
 import (
-	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
 
 // renameDialogWidth is the micro-dialog's preferred inner width: a name and a
-// cursor, and nothing that would make it a panel.
-const renameDialogWidth = 28
+// cursor, and nothing that would make it a panel. It is the least that keeps
+// all three hints in the border once their modifiers are shortened.
+const renameDialogWidth = 31
+
+// renameHintClear is the clear hint's index in renameHints, which is how its
+// drawn rect is found to make it pressable.
+const renameHintClear = 1
 
 // renameHints are built per render because the key glyph follows ASCII mode.
 func renameHints() []overlay.Hint {
 	return []overlay.Hint{
 		{Key: overlay.EnterKey(), Label: "save"},
+		{Key: "ctrl+u", Label: "clear"},
 		{Key: "esc", Label: "cancel"},
 	}
-}
-
-// renameFieldText windows the buffer so the tail is always visible: what you
-// are typing is at the end, so a name longer than the field scrolls left rather
-// than truncating away the part you are looking at.
-func renameFieldText(buf string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	r := []rune(buf)
-	for len(r) > 0 && lipgloss.Width(string(r)) > width {
-		r = r[1:]
-	}
-	return string(r)
 }
 
 // renderRenameDialog draws the rename micro-dialog and its absolute origin, or
@@ -54,7 +45,7 @@ func (m *OS) renderRenameDialog() (string, overlay.Geometry, int, int, bool) {
 
 	// Sigil, a space, the field, and one cell of right pad, so the cursor never
 	// sits against the frame.
-	field := renameFieldText(printableRunes(m.RenameBuffer), max(inner-4, 1))
+	field := fieldTail(printableRunes(m.RenameBuffer), max(inner-4, 1))
 	body := overlay.Style(pal.Canvas).Render(" ") +
 		overlay.Style(pal.Canvas).Foreground(pal.AccentBright).Bold(true).Render(overlay.Sigil()) +
 		overlay.Style(pal.Canvas).Foreground(pal.Fg).Render(field) +

@@ -12,11 +12,9 @@ import (
 
 // The daemon's half of the rail's file section.
 //
-// The section used to read the filesystem in the client. That was the same
-// machine as the pane for as long as a pane could only be on this machine, and
-// federation ended it: a client attached to a session on another host listed its
-// own disk and reported that the pane's directory did not exist. The daemon that
-// owns the pane owns the disk the pane is on, so the listing is asked for here.
+// A client attached to a session on another host that read its own disk would
+// report that the pane's directory did not exist. The daemon that owns the pane
+// owns the disk the pane is on, so the listing is asked for here.
 //
 // The spoof verdict comes back with it for the same reason, and it is the more
 // important half. It is a comparison between what a pane announced and where its
@@ -33,11 +31,11 @@ const dirListingMax = 2000
 func (d *Daemon) handleReadDir(cs *connState, msg *Message) error {
 	var payload ReadDirPayload
 	if err := msg.ParsePayload(&payload); err != nil {
-		return d.sendError(cs, ErrCodeInvalidMessage, "invalid read-dir payload")
+		return d.replyError(cs, msg, ErrCodeInvalidMessage, "invalid read-dir payload")
 	}
 	dir := filepath.Clean(payload.Dir)
 	if dir == "" || dir == "." {
-		return d.sendMessage(cs, MsgDirListing, &DirListingPayload{
+		return d.reply(cs, msg, MsgDirListing, &DirListingPayload{
 			Dir: payload.Dir, Err: "There is no folder to show.",
 		})
 	}
@@ -45,15 +43,17 @@ func (d *Daemon) handleReadDir(cs *connState, msg *Message) error {
 	// machine. Listing it here would read this filesystem and answer about a
 	// path that means nothing to the pane: either "that folder is gone", or,
 	// worse, a listing of an unrelated directory that happens to share the
-	// name. Both are wrong in the same way the client's own listing was before
-	// the daemon took this over, and the fix is the same one: the machine that
-	// owns the process owns the filesystem the answer is about.
+	// name. The machine that owns the process owns the filesystem the answer
+	// is about.
 	//
 	// This daemon is not that machine, so it says so rather than guessing.
 	if host := d.windowHost(cs.sessionID, payload.WindowID); host != "" {
-		return d.sendMessage(cs, MsgDirListing, d.remoteListing(host, dir, payload.Max))
+		return d.reply(cs, msg, MsgDirListing, d.remoteListing(host, dir, payload.Max))
 	}
 
+	if verr := d.checkLinkRead(cs, dir); verr != nil {
+		return d.reply(cs, msg, MsgDirListing, &DirListingPayload{Dir: payload.Dir, Err: verr.Message})
+	}
 	out := listDir(dir, payload.Max)
 	// Asked whether or not the directory could be read, because the two answers
 	// are independent and this is the one that changes what a person should do
@@ -62,7 +62,7 @@ func (d *Daemon) handleReadDir(cs *connState, msg *Message) error {
 	if spoofCheckWanted(payload) {
 		out.Spoofed = d.paneIsSpoofed(cs.sessionID, payload.WindowID, dir)
 	}
-	return d.sendMessage(cs, MsgDirListing, out)
+	return d.reply(cs, msg, MsgDirListing, out)
 }
 
 // spoofCheckWanted reports whether a listing should be judged against the

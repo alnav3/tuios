@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,9 +81,13 @@ type remoteSessionRow struct {
 	// same way: a global session is in the rail's global group whichever
 	// machine you are looking from, rather than being a global session here
 	// and an ordinary session on the machine next to it.
-	Global     bool  `json:"global,omitempty"`
-	LastActive int64 `json:"last_active,omitempty"`
-	Created    int64 `json:"created,omitempty"`
+	Global bool `json:"global,omitempty"`
+	// Space is the space the session is filed under on its own machine, so
+	// ls --all-hosts can group a host's sessions the way ls does there. A
+	// daemon from before spaces sends none, and its sessions list ungrouped.
+	Space      string `json:"space,omitempty"`
+	LastActive int64  `json:"last_active,omitempty"`
+	Created    int64  `json:"created,omitempty"`
 	// AgentState is the most urgent agent state among the session's panes, by
 	// the rail's own ranking, empty when nothing in it is running an agent.
 	//
@@ -94,6 +99,80 @@ type remoteSessionRow struct {
 	// about the session, and this client has not looked at another machine's
 	// panes, so they roll up as unseen, which is what they are.
 	AgentState string `json:"agent_state,omitempty"`
+	// Agents are the session's agent panes, one row each, for the agents
+	// view, which draws every agent on every machine as a row of its own. It
+	// is built here from the host's window summaries, never decoded from the
+	// host: whatever a host sends under this name is replaced.
+	Agents []remoteAgentPane `json:"agents,omitempty"`
+}
+
+// remoteAgentPane is one agent pane of a session on another machine: what its
+// row in the agents view says. The host is untrusted, so every field is
+// bounded (see agentPanes).
+type remoteAgentPane struct {
+	ID        string           `json:"id"`
+	Title     string           `json:"title,omitempty"`
+	State     string           `json:"state"`
+	StateAt   int64            `json:"state_at,omitempty"`
+	Harness   string           `json:"harness,omitempty"`
+	Message   string           `json:"message,omitempty"`
+	Kind      string           `json:"kind,omitempty"`
+	Meta      []AgentMetaToken `json:"meta,omitempty"`
+	Subagents int              `json:"subagents,omitempty"`
+}
+
+// Bounds of a host's agent panes as a listing passes them on: about 600 bytes
+// a pane at most, 32 panes a session and 256 a host.
+const (
+	remoteAgentPanesMax = 32
+	remoteAgentHostMax  = 256
+	remoteAgentMetaMax  = 8
+	remoteAgentTextMax  = 160
+	remoteAgentIDMax    = 64
+)
+
+// plausibleWindowID reports whether id can be a window ID: letters, digits
+// and hyphens, at most remoteAgentIDMax bytes. A host chooses the IDs of its
+// panes, and the agents view draws one when a pane has no title.
+func plausibleWindowID(id string) bool {
+	if id == "" || len(id) > remoteAgentIDMax {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// agentPanes are the agent panes among a host's window summaries, bounded.
+func agentPanes(windows []WindowSummary) []remoteAgentPane {
+	var out []remoteAgentPane
+	clip := func(s string) string {
+		if len(s) <= remoteAgentTextMax {
+			return s
+		}
+		return strings.ToValidUTF8(s[:remoteAgentTextMax], "")
+	}
+	for _, w := range windows {
+		if w.AgentState == "" || !plausibleWindowID(w.ID) {
+			continue
+		}
+		if len(out) == remoteAgentPanesMax {
+			break
+		}
+		p := remoteAgentPane{ID: w.ID, Title: clip(w.Title), State: clip(w.AgentState), StateAt: w.AgentStateAt,
+			Harness: clip(w.AgentHarness), Message: clip(w.AgentMessage), Kind: clip(w.AgentKind), Subagents: max(w.Subagents, 0)}
+		for _, t := range w.AgentMeta {
+			if len(p.Meta) == remoteAgentMetaMax {
+				break
+			}
+			p.Meta = append(p.Meta, AgentMetaToken{Key: clip(t.Key), Value: clip(t.Value)})
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // remoteSessionListRow is a row as a host sends it. It carries the window
@@ -128,10 +207,10 @@ type hostAgentsEntry struct {
 	Reason string            `json:"reason,omitempty"`
 	Error  string            `json:"error,omitempty"`
 	Code   string            `json:"code,omitempty"`
-	// Session used to name the one session a host answered about, its most
-	// recently active. Every session is listed now and each row names its
-	// own, so this is set only when the host has exactly one session with
-	// rows in the answer, which keeps the field meaning what it meant.
+	// Session names the one session a host answered about. Every session is
+	// listed and each row names its own, so this is set only when the host
+	// has exactly one session with rows in the answer: a reader that takes it
+	// as the host's one session is never told a wrong one.
 	Session string           `json:"session,omitempty"`
 	Agents  []remoteAgentRow `json:"agents,omitempty"`
 	hostFreshness
@@ -148,6 +227,7 @@ type remoteAgentRow struct {
 	Message        string `json:"message,omitempty"`
 	HarnessID      string `json:"harness_id,omitempty"`
 	Unread         int    `json:"unread,omitempty"`
+	Seen           int    `json:"seen,omitempty"`
 	Ready          bool   `json:"ready,omitempty"`
 	Since          int64  `json:"agent_state_at,omitempty"`
 	Cwd            string `json:"cwd,omitempty"`
@@ -198,11 +278,13 @@ func filterHostAgents(entries []hostAgentsEntry, sel *Selector) {
 // This is `tuios hosts`. It answers the question the design document says a
 // listing has to answer on its own: why is this host not usable, and is it the
 // machine, the daemon, or the version.
-func (d *Daemon) verbListHosts(_ *connState, _ json.RawMessage) (any, *verbError) {
+func (d *Daemon) verbListHosts(cs *connState, _ json.RawMessage) (any, *verbError) {
 	// events_push says this daemon pushes every change to a host it streams:
 	// host-changed on subscribe, and MsgHostsChanged to attached clients. A
 	// client that sees it polls only the hosts whose events are not live.
-	out := map[string]any{"type": "host_list", "events_push": true}
+	// load is this machine's own, so a client draws its machine from the
+	// daemon on every system, as it draws the hosts.
+	out := map[string]any{"type": "host_list", "events_push": true, "load": machineLoad(d.manager.ListSessions())}
 	if problems := d.configProblems(); len(problems) > 0 {
 		out["config_problems"] = problems
 	}
@@ -218,9 +300,55 @@ func (d *Daemon) verbListHosts(_ *connState, _ json.RawMessage) (any, *verbError
 	for i := range reports {
 		reports[i].Events, reports[i].EventsNote = d.fleet.mode(reports[i].Host)
 		reports[i].Queued = d.outbox.count(reports[i].Host)
+		if cs != nil && cs.viaLink {
+			// The sign-in page logs this machine's person in to a host. It is
+			// for them, not for the machine at the other end of a link.
+			reports[i].ApprovalURL = ""
+			reports[i].ApprovalRefused = false
+			reports[i].Reason = linkSafeReason(reports[i].Status, reports[i].Reason)
+		}
 	}
 	out["hosts"] = reports
 	out["total"] = len(reports)
+	return out, nil
+}
+
+// linkSafeReason is a host's reason as a link caller gets it. The reason of a
+// host that waits for a Tailscale sign-in names the sign-in page, which is
+// for the person on this machine and not for another machine.
+func linkSafeReason(status federation.Status, reason string) string {
+	if status == federation.StatusApproval {
+		return federation.SignInSentence
+	}
+	return reason
+}
+
+// verbRetryHost makes one host's link dial again now. See
+// federation.Manager.Retry.
+func (d *Daemon) verbRetryHost(_ *connState, params json.RawMessage) (any, *verbError) {
+	var p struct {
+		Host string `json:"host"`
+	}
+	if verr := decodeParams(params, &p); verr != nil {
+		return nil, verr
+	}
+	if p.Host == "" {
+		return nil, newVerbError(ErrVerbInvalidParams, "retry-host needs a host")
+	}
+	if verr := d.checkHostParam(p.Host); verr != nil {
+		return nil, verr
+	}
+	d.federation.Retry(p.Host)
+	out := map[string]any{"type": "host_retry", "host": p.Host}
+	if r, ok := d.federation.Report(p.Host); ok {
+		out["status"] = r.Status
+		if r.ApprovalURL != "" {
+			out["approval_url"] = r.ApprovalURL
+		}
+		if r.ApprovalRefused {
+			out["approval_refused"] = true
+		}
+	}
 	return out, nil
 }
 
@@ -229,7 +357,7 @@ func (d *Daemon) verbListHosts(_ *connState, _ json.RawMessage) (any, *verbError
 // Local always comes first and is never fetched over a link; it is this
 // daemon's own listing. Remote hosts follow in the table's sorted order,
 // answering or not.
-func (d *Daemon) verbListHostSessions(_ *connState, params json.RawMessage) (any, *verbError) {
+func (d *Daemon) verbListHostSessions(cs *connState, params json.RawMessage) (any, *verbError) {
 	var p struct {
 		Host string `json:"host"`
 	}
@@ -257,6 +385,9 @@ func (d *Daemon) verbListHostSessions(_ *connState, params json.RawMessage) (any
 	defer cancel()
 	for _, a := range d.federationAnswers(ctx, p.Host, "list-sessions", nil) {
 		e := hostSessionsEntry{Host: a.Host, Status: a.Report.Status, Reason: a.Report.Reason, Detail: a.Report.Detail}
+		if cs != nil && cs.viaLink {
+			e.Reason = linkSafeReason(e.Status, e.Reason)
+		}
 		e.Events, _ = d.fleet.mode(a.Host)
 		var rows []remoteSessionListRow
 		err := a.Err
@@ -298,11 +429,19 @@ func decodeHostSessions(raw json.RawMessage) ([]remoteSessionListRow, error) {
 }
 
 // sessionRowsOut is a host's rows as a listing sends them, each rolled up to
-// its most urgent agent state.
+// its most urgent agent state, with at most remoteAgentHostMax agent panes
+// over all of them.
 func sessionRowsOut(in []remoteSessionListRow) []remoteSessionRow {
 	rows := make([]remoteSessionRow, 0, len(in))
+	left := remoteAgentHostMax
 	for _, r := range in {
 		r.remoteSessionRow.AgentState = rollUpAgentState(r.Windows)
+		agents := agentPanes(r.Windows)
+		if len(agents) > left {
+			agents = agents[:left]
+		}
+		left -= len(agents)
+		r.remoteSessionRow.Agents = agents
 		rows = append(rows, r.remoteSessionRow)
 	}
 	return rows
@@ -585,6 +724,7 @@ func localSessionRows(infos []SessionInfo) []remoteSessionRow {
 			Attached:    s.Attached,
 			Restored:    s.Restored,
 			Global:      s.Global,
+			Space:       s.Space,
 			LastActive:  s.LastActive,
 			Created:     s.Created,
 			AgentState:  rollUpAgentState(s.Windows),

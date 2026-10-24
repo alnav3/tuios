@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"slices"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
@@ -153,6 +154,9 @@ func openStartRect(rect layout.Rect) (x, y, w, h int) {
 
 // ApplyBSPLayout applies the BSP tree layout to all windows in the current workspace
 func (m *OS) ApplyBSPLayout() {
+	// Deferred so every way out refreshes it, and after noteDragSlot has
+	// recorded the held pane's slot, which a drop that changes nothing lands in.
+	defer m.refreshDropZone()
 	tree := m.GetOrCreateBSPTree()
 	if tree == nil || tree.IsEmpty() {
 		return
@@ -194,6 +198,12 @@ func (m *OS) ApplyBSPLayout() {
 			continue
 		}
 		rect = canvas.apply(rect)
+		// The open pane of a stack gives a row to each other member, above
+		// and below it in stack order. See stack.go.
+		if above, below := m.stackRows(win); above+below > 0 && rect.H > above+below+1 {
+			rect.Y += above
+			rect.H -= above + below
+		}
 		// A zoomed pane keeps its slot in the tree and loses its rectangle to the
 		// zoom box, so the tiler leaves the rectangle alone. Zoom is shared, so
 		// a peer's sync can bring a pane, close one or move the box while
@@ -203,7 +213,7 @@ func (m *OS) ApplyBSPLayout() {
 		//
 		// Under a camera it is placed like every other pane: it is not holding
 		// a box of its own, it is simply the pane the camera is on.
-		if win.Zoomed && !canvas.on {
+		if win.Zoomed && !m.zoomUsesLayout(win) {
 			continue
 		}
 		// A pane the pointer is dragging keeps its rectangle; the slot is
@@ -219,10 +229,6 @@ func (m *OS) ApplyBSPLayout() {
 		// placement makes the next retile play the open animation again.
 		opening := win.Opening
 		win.Opening = false
-
-		// Cancel any existing snap animation for this window to prevent
-		// animation pileup during continuous resize.
-		m.CancelSnapAnimation(win)
 
 		// A live resize drag reapplies this layout on every composed frame, to
 		// keep the separator overlay's ratios in step with the geometry the
@@ -254,6 +260,9 @@ func (m *OS) ApplyBSPLayout() {
 		// resize_deferral.go: a deferral that outlives its gesture leaves every
 		// later retile placing panes visually and never giving them a real size.
 		if deferring {
+			// The geometry is set directly, so a snap in flight would stamp
+			// its own rectangle back over it on the next tick.
+			m.CancelSnapAnimation(win)
 			win.X, win.Y = rect.X, rect.Y
 			borderChanged := win.Tiled != borderless
 			if borderChanged {
@@ -310,6 +319,7 @@ func (m *OS) ApplyBSPLayout() {
 		}
 		if opening && dur > 0 {
 			if x, y, w, h := openStartRect(rect); w != rect.W || h != rect.H {
+				m.CancelSnapAnimation(win)
 				win.X, win.Y = x, y
 				// Assigned, not resized: the emulator keeps the size the pane was
 				// created at for the length of the animation, the way every other
@@ -319,12 +329,9 @@ func (m *OS) ApplyBSPLayout() {
 			}
 		}
 
-		// Create animation for smooth transition
-		anim := m.newSnapAnimation(win, rect.X, rect.Y, rect.W, rect.H, dur)
-
-		if anim != nil {
-			m.Animations = append(m.Animations, anim)
-		} else if borderless != wasTiled {
+		// Move the pane from where it is drawn now. A pane already sliding is
+		// turned toward the new slot rather than started again.
+		if anim := m.animateWindow(win, rect.X, rect.Y, rect.W, rect.H, dur); anim == nil && borderless != wasTiled {
 			// A pane already at its target rectangle is left alone by
 			// NewSnapAnimation unless it is daemon-backed, and a changed
 			// allowance owes the guest a new box even at the same rectangle.
@@ -419,7 +426,7 @@ func (m *OS) AddWindowToBSPTree(window *terminal.Window) {
 	// A new pane is a structural change, not a resize step. Whatever resize was
 	// in flight, the layout this produces is what the user is left looking at,
 	// so it has to be a real one.
-	m.requireRealLayout()
+	m.requireRealRelayout()
 
 	tree := m.GetOrCreateBSPTree()
 	windowIntID := m.GetWindowIntID(window.ID)
@@ -484,15 +491,19 @@ func (m *OS) bspSplitTarget(tree *layout.BSPTree, windowID string) int {
 func (m *OS) RemoveWindowFromBSPTree(window *terminal.Window) {
 	// Closing a pane is structural too; the panes that inherit its space must
 	// end up at real sizes. See AddWindowToBSPTree.
-	m.requireRealLayout()
+	m.requireRealRelayout()
 
 	tree := m.WorkspaceTrees[m.CurrentWorkspace]
 	if tree == nil {
 		return
 	}
 
-	windowIntID := m.GetWindowIntID(window.ID)
-	tree.RemoveWindow(windowIntID)
+	// The open pane of a stack hands its tile to the next member, so the
+	// stack keeps its place. See stack.go.
+	if !m.handOverStack(window, tree) {
+		windowIntID := m.GetWindowIntID(window.ID)
+		tree.RemoveWindow(windowIntID)
+	}
 
 	// Apply the new layout
 	m.ApplyBSPLayout()
@@ -563,6 +574,18 @@ func (m *OS) SyncBSPTreeFromGeometry() {
 
 // SplitFocusedHorizontal splits the focused window horizontally (top/bottom) and creates a new terminal
 func (m *OS) SplitFocusedHorizontal() {
+	m.splitFocused(layout.PreselectionDown, false)
+}
+
+// SplitFocusedVertical splits the focused window vertically (left/right) and creates a new terminal
+func (m *OS) SplitFocusedVertical() {
+	m.splitFocused(layout.PreselectionRight, false)
+}
+
+// splitFocused splits the focused window toward dir and creates a new
+// terminal. With followSSH, a focused pane that runs ssh gets a new pane that
+// runs the same ssh; see ssh_split.go.
+func (m *OS) splitFocused(dir layout.PreselectionDir, followSSH bool) {
 	if !m.AutoTiling {
 		return
 	}
@@ -571,13 +594,17 @@ func (m *OS) SplitFocusedHorizontal() {
 	if focusedWin == nil {
 		return
 	}
+	if err := m.SplitRefusal(dir); err != nil {
+		m.ShowNotification("This pane is too small to split.", "warning", m.Settings.NotificationDuration)
+		return
+	}
 
 	// In a daemon session the new pane is created daemon-side and arrives through
 	// a later state sync, so the preselection set here would never be consumed
 	// (AddWindow only asks the daemon and returns). Record the forced direction so
 	// the sync path applies it; see adoptSyncedWindows.
 	if m.IsDaemonSession && m.DaemonClient != nil {
-		m.pendingSplitDir = layout.PreselectionDown
+		m.pendingSplitDir = dir
 		m.pendingSplitTarget = focusedWin.ID
 		// The split's own direction replaces a preselection, as it does on
 		// the local path below.
@@ -587,7 +614,11 @@ func (m *OS) SplitFocusedHorizontal() {
 		// every other way of making one does. The recorded direction outlives
 		// the question: the window still arrives through a state sync, and
 		// adoptSyncedWindows still applies it.
-		m.NewWindowHere()
+		if followSSH {
+			m.newWindowFollowingSSH(focusedWin)
+		} else {
+			m.NewWindowHere()
+		}
 		return
 	}
 
@@ -595,48 +626,46 @@ func (m *OS) SplitFocusedHorizontal() {
 	m.SplitTargetWindowID = focusedWin.ID
 
 	// Set preselection direction for the next window
-	m.PreselectionDir = layout.PreselectionDown
+	m.PreselectionDir = dir
 
 	// Create a new window. It will be added with the preselection.
-	m.AddWindow("")
+	if followSSH {
+		m.newWindowFollowingSSH(focusedWin)
+	} else {
+		m.AddWindow("")
+	}
 
 	// Clear the split target
 	m.SplitTargetWindowID = ""
 }
 
-// SplitFocusedVertical splits the focused window vertically (left/right) and creates a new terminal
-func (m *OS) SplitFocusedVertical() {
-	if !m.AutoTiling {
-		return
+// ErrPaneTooSmall is why a split is refused: one of the two panes it makes
+// would be under the smallest pane size.
+var ErrPaneTooSmall = errors.New("the pane is too small to split")
+
+// SplitRefusal says why a split of the focused pane toward dir would not run,
+// or nil. A split that leaves either pane under the smallest size
+// (config.DefaultWindowWidth by config.DefaultWindowHeight cells) is refused,
+// because a pane that small cannot be resized back up without a jump and no
+// program in it fits. Only the split tree is checked: the other tilers place
+// panes by their own rules.
+func (m *OS) SplitRefusal(dir layout.PreselectionDir) error {
+	if !m.AutoTiling || m.LayoutName() != LayoutModeBSP {
+		return nil
 	}
-
-	focusedWin := m.GetFocusedWindow()
-	if focusedWin == nil {
-		return
+	focused := m.GetFocusedWindow()
+	tree := m.WorkspaceTrees[m.CurrentWorkspace]
+	if focused == nil || tree == nil || focused.IsFloating {
+		return nil
 	}
-
-	// See SplitFocusedHorizontal: on the daemon path the forced direction has to
-	// outlive the round trip that creates the pane.
-	if m.IsDaemonSession && m.DaemonClient != nil {
-		m.pendingSplitDir = layout.PreselectionRight
-		m.pendingSplitTarget = focusedWin.ID
-		m.PreselectionDir = layout.PreselectionNone
-		// See SplitFocusedHorizontal.
-		m.NewWindowHere()
-		return
+	split := layout.SplitHorizontal
+	if dir == layout.PreselectionLeft || dir == layout.PreselectionRight {
+		split = layout.SplitVertical
 	}
-
-	// Store the target window ID BEFORE creating new window (which will change focus)
-	m.SplitTargetWindowID = focusedWin.ID
-
-	// Set preselection direction for the next window
-	m.PreselectionDir = layout.PreselectionRight
-
-	// Create a new window. It will be added with the preselection.
-	m.AddWindow("")
-
-	// Clear the split target
-	m.SplitTargetWindowID = ""
+	if !tree.CanSplit(m.GetWindowIntID(focused.ID), split, tree.DefaultRatio, m.GetBSPBounds(), m.separatorGap()) {
+		return ErrPaneTooSmall
+	}
+	return nil
 }
 
 // SmartSplitFocused splits the focused window using the smart split algorithm:
@@ -735,9 +764,21 @@ func (m *OS) RotateFocusedSplit() {
 	m.ApplyBSPLayout()
 }
 
-// EqualizeSplits resets all split ratios to 0.5 (equal splits)
+// EqualizeSplits resets the splits of the layout on screen: every BSP split
+// ratio to 0.5, or the master-stack splits to the configured master ratio and
+// equal shares for every other pane.
 func (m *OS) EqualizeSplits() {
 	if !m.AutoTiling {
+		return
+	}
+	if m.inMasterStack() {
+		m.equalizeMasterStack()
+		return
+	}
+	// The scrolling layout keeps no splits to reset. A BSP tree left from
+	// before the layout changed is not on screen, and laying it out here
+	// would put the panes in the wrong layout.
+	if !m.UseBSPLayout {
 		return
 	}
 
@@ -750,6 +791,23 @@ func (m *OS) EqualizeSplits() {
 
 	// Reapply layout
 	m.ApplyBSPLayout()
+}
+
+// equalizeMasterStack is EqualizeSplits for the master-stack layout. It
+// looked only for a BSP tree, which master-stack does not use, so it did
+// nothing there.
+//
+// Each value is written rather than deleted. The session merges these maps
+// by union and keeps an entry a push leaves out, so a deleted entry would
+// come back from the daemon. A zero stack ratio and empty splits both mean
+// equal shares.
+func (m *OS) equalizeMasterStack() {
+	ws := m.CurrentWorkspace
+	m.setMasterRatio(m.Settings.MasterRatioFraction())
+	m.setWorkspaceStackRatio(ws, 0)
+	m.setWorkspaceMasterSplits(ws, layout.MasterSplits{})
+	m.TileAllWindows()
+	m.SyncStateToDaemon()
 }
 
 // tilingSchemeCycle is the fixed order cycle_tiling_scheme steps through,

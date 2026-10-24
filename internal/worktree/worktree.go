@@ -19,13 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/Gaurav-Gosain/tuios/internal/childproc"
+
 	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
+	"github.com/Gaurav-Gosain/tuios/internal/lazyre"
 	"github.com/adrg/xdg"
 )
 
@@ -132,13 +133,13 @@ func PathFor(dir, repoRoot, branch string) string {
 	return filepath.Join(dir, filepath.Base(repoRoot), Slug(branch))
 }
 
-var slugStrip = regexp.MustCompile(`[^A-Za-z0-9._]+`)
+var slugStrip = lazyre.New(`[^A-Za-z0-9._]+`)
 
 // Slug turns a branch name into one path component and one session-name
 // component: every run of characters outside [A-Za-z0-9._] becomes one
 // hyphen. "feat/retry" reads as "feat-retry".
 func Slug(branch string) string {
-	s := slugStrip.ReplaceAllString(branch, "-")
+	s := slugStrip().ReplaceAllString(branch, "-")
 	s = strings.Trim(s, "-.")
 	if s == "" {
 		return "branch"
@@ -158,7 +159,7 @@ func ValidBranch(name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("branch name is empty")
 	}
-	cmd := exec.Command("git", "check-ref-format", "--branch", name)
+	cmd := childproc.Command("git", "check-ref-format", "--branch", name)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%q is not a valid branch name", name)
 	}
@@ -184,13 +185,18 @@ func Add(repoRoot, path, branch, base string) (created bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // a folder in the user's own tree, with ordinary permissions
 		return false, err
 	}
+	// "--" ends the options, so a base or a path that starts with "-",
+	// such as --force, is never read as one.
 	if BranchExists(repoRoot, branch) {
-		if _, err := run(repoRoot, "worktree", "add", path, branch); err != nil {
+		if _, err := run(repoRoot, "worktree", "add", "--", path, branch); err != nil {
 			return false, err
 		}
 		return false, nil
 	}
-	args := []string{"worktree", "add", "-b", branch, path}
+	if strings.HasPrefix(base, "-") {
+		return false, fmt.Errorf("base %q starts with -, which git would read as an option", base)
+	}
+	args := []string{"worktree", "add", "-b", branch, "--", path}
 	if base != "" {
 		args = append(args, base)
 	}
@@ -214,6 +220,124 @@ func Changes(path string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// statusEntries reads `git status --porcelain -z --untracked-files=all
+// --ignored=matching` in the worktree at path and returns the ignored and the
+// untracked paths it lists, the status markers stripped. -z ends every record
+// at NUL and keeps git from quoting, so a path with a space or a non-ASCII
+// character survives the round trip. Splitting on a newline would cut such a
+// path in half, and a quoted name would lstat as its quoted form and fail the
+// walk a clean worktree never fails.
+func statusEntries(path string) (ignored, untracked []string, err error) {
+	out, err := run(path, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored=matching")
+	if err != nil {
+		return nil, nil, err
+	}
+	for record := range strings.SplitSeq(out, "\x00") {
+		if entry, ok := strings.CutPrefix(record, "!! "); ok {
+			ignored = append(ignored, entry)
+		} else if entry, ok := strings.CutPrefix(record, "?? "); ok {
+			untracked = append(untracked, entry)
+		}
+	}
+	return ignored, untracked, nil
+}
+
+// Ignored scans the paths a removal would take unsaved: git never stashes
+// them, and git worktree remove deletes them without --force. --ignored=matching
+// reports a matched directory as one entry however many files sit in it, so the
+// entry is walked to count the files a person deleting the worktree is owed.
+func Ignored(path string) (int, error) {
+	entries, _, err := statusEntries(path)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, entry := range entries {
+		c, err := countFiles(filepath.Join(path, entry))
+		if err != nil {
+			return 0, err
+		}
+		n += c
+	}
+	return n, nil
+}
+
+// NestedRepo reports the first ignored or untracked path in a worktree that
+// holds a git repository — a .git of its own — whose history no stash and no
+// count can save: git worktree remove deletes it with everything around it.
+// Empty when there is none. Untracked paths are in the scan because --stash
+// saves their files but not a nested repository's .git.
+func NestedRepo(path string) (string, error) {
+	ignored, untracked, err := statusEntries(path)
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range append(ignored, untracked...) {
+		nested, err := findNestedRepo(filepath.Join(path, entry))
+		if err != nil {
+			return "", err
+		}
+		if nested {
+			return entry, nil
+		}
+	}
+	return "", nil
+}
+
+// countFiles counts the files under dir, descending into nothing named .git:
+// a nested repository's internals are not the worktree's files, and the
+// removal deletes them either way.
+//
+// ponytail: walks every ignored and untracked directory in full; the removal
+// reads and deletes them all anyway, so a lazy walk is the same order of cost.
+func countFiles(dir string) (int, error) {
+	n := 0
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		n++
+		return nil
+	})
+	return n, err
+}
+
+// findNestedRepo reports whether dir holds a .git anywhere below it, stopping
+// at the first one. A .git directory is a repository; a .git file (a linked
+// worktree's) points at one just as well.
+func findNestedRepo(dir string) (bool, error) {
+	found := false
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || found {
+			return err
+		}
+		if d.Name() == ".git" {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found, err
+}
+
+// OwnCommits counts the commits the worktree's HEAD holds that no branch,
+// tag or remote holds. On a branch they are the branch's own commits, and
+// keeping the branch keeps them; on a detached HEAD nothing holds them once
+// the worktree is gone.
+func OwnCommits(path string) (int, error) {
+	out, err := run(path, "rev-list", "--count", "HEAD", "--not", "--branches", "--tags", "--remotes")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(out))
 }
 
 // Ahead counts the commits on the worktree's HEAD that base does not have.
@@ -271,7 +395,9 @@ func Diff(path string, stat bool) (string, error) {
 		}
 		b.WriteString("untracked:\n")
 		for f := range strings.SplitSeq(u, "\n") {
-			b.WriteString("  " + f + "\n")
+			b.WriteString("  ")
+			b.WriteString(f)
+			b.WriteString("\n")
 		}
 	}
 	return b.String(), nil
@@ -284,13 +410,15 @@ func Log(path, base string) (string, error) {
 
 // run executes git in dir and returns its stdout. A failure carries git's own
 // stderr, which is the message a person needs.
+//
+//go:noinline
 func run(dir string, args ...string) (string, error) {
 	return runEnv(dir, nil, args...)
 }
 
 // runEnv is run with extra environment entries.
 func runEnv(dir string, env []string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := childproc.Command("git", args...)
 	cmd.Dir = dir
 	// Nothing here is interactive, and a git that waits on a terminal for a
 	// credential or an editor would hang the daemon.

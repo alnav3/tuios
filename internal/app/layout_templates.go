@@ -358,8 +358,12 @@ func FilterLayoutTemplates(templates []LayoutTemplate, query string) []LayoutTem
 // version-controlled, and executed in CI/headless environments.
 func GenerateTapeScript(tmpl LayoutTemplate) string {
 	var sb strings.Builder
-	sb.WriteString("# Auto-generated layout script: " + tmpl.Name + "\n")
-	sb.WriteString("# Created: " + tmpl.CreatedAt.Format(time.RFC3339) + "\n\n")
+	sb.WriteString("# Auto-generated layout script: ")
+	sb.WriteString(tmpl.Name)
+	sb.WriteString("\n")
+	sb.WriteString("# Created: ")
+	sb.WriteString(tmpl.CreatedAt.Format(time.RFC3339))
+	sb.WriteString("\n\n")
 
 	if tmpl.AutoTiling {
 		sb.WriteString("EnableTiling\n")
@@ -390,7 +394,9 @@ func GenerateTapeScript(tmpl LayoutTemplate) string {
 			if len(w.Args) > 0 {
 				cmd += " " + strings.Join(w.Args, " ")
 			}
-			fmt.Fprintf(&sb, "Type %s\nEnter\n", cmd)
+			// Quoted: Type takes a string, and an unquoted command line did
+			// not parse, so an exported layout with a command never played.
+			fmt.Fprintf(&sb, "Run %q\n", cmd)
 		}
 		sb.WriteString("Sleep 200ms\n")
 	}

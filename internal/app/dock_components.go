@@ -197,9 +197,6 @@ func dockTruncateCell(text string, maxWidth int) string {
 	if maxWidth <= 0 {
 		maxWidth = config.DockCustomDefaultMaxWidth
 	}
-	if lipgloss.Width(text) <= maxWidth {
-		return text
-	}
 	return overlay.Truncate(text, maxWidth)
 }
 
@@ -219,6 +216,11 @@ func (m *OS) dockCustomCell(name string) string {
 	if name == config.DockComponentClock && (!m.Settings.ShowClock || m.Settings.HideClock) {
 		return ""
 	}
+	// The copies between machines draw from the mirror, not from the
+	// engine, and nothing while no copy exists. See transfers_render.go.
+	if name == config.DockComponentTransfers {
+		return m.transfersDockCell()
+	}
 	text := m.dockEngine.Text(name)
 	if name == config.DockComponentClock && text == "" {
 		// The clock is a built-in that carries a value, so it draws through the
@@ -226,14 +228,82 @@ func (m *OS) dockCustomCell(name string) string {
 		// for the first frame, before the engine has filled it.
 		text = m.DockClockText()
 	}
+	if name == config.DockComponentSession {
+		text = m.dockSessionText()
+	}
 	if text == "" {
 		return ""
 	}
-	pal := m.groundUI()
-	return lipgloss.NewStyle().
-		Background(pal.Panel).
-		Foreground(theme.Readable(pal.FgDim, pal.Panel)).
-		Render(" " + text + " ")
+	return renderDockCell(text, m.dockCellStyle(name), m.groundUI())
+}
+
+// renderDockCell draws a cell's text with a column either side. A cell with no
+// style rests on Panel in FgDim, as every cell did before styles existed. A
+// styled one takes its own colours; an unset background still falls back to
+// Panel, for the SGR-reset reason dockCustomCell gives. A value that is not a
+// colour counts as unset, because lipgloss turns it into no colour at all,
+// which is the hole that fallback exists to close; the config warns about it.
+// A role such as accent is read off the dock's own palette.
+// An unset foreground is the dim ink made readable on the background the cell
+// really has. The caps are drawn in that background colour.
+func renderDockCell(text string, st config.DockCellStyle, pal overlay.Palette) string {
+	bg := pal.Panel
+	if c := theme.ConfigColorOn(st.Bg, &pal); c != nil {
+		bg = c
+	}
+	fg := theme.Readable(pal.FgDim, bg)
+	if c := theme.ConfigColorOn(st.Fg, &pal); c != nil {
+		fg = c
+	}
+	body := lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(st.Bold).Render(" " + text + " ")
+	if st.CapLeft == "" && st.CapRight == "" {
+		return body
+	}
+	// At 16 colours an unset ground is the terminal's own, so a cap has no
+	// colour to take and would read as a glyph beside the cell. Blanks of the
+	// same width keep the geometry, as workspacePill does.
+	if overlay.IsNoColor(bg) {
+		return strings.Repeat(" ", lipgloss.Width(st.CapLeft)) + body + strings.Repeat(" ", lipgloss.Width(st.CapRight))
+	}
+	caps := lipgloss.NewStyle().Foreground(bg)
+	if st.CapLeft != "" {
+		body = caps.Render(st.CapLeft) + body
+	}
+	if st.CapRight != "" {
+		body += caps.Render(st.CapRight)
+	}
+	return body
+}
+
+// dockCellStyle is the style a cell component's table asks for: [dock.session]
+// for the session component, [dock.custom.NAME] for a custom one.
+func (m *OS) dockCellStyle(name string) config.DockCellStyle {
+	if m.UserConfig == nil {
+		return config.DockCellStyle{}
+	}
+	if name == config.DockComponentSession {
+		return m.UserConfig.Dock.Session.DockCellStyle
+	}
+	if key, ok := strings.CutPrefix(name, config.DockCustomPrefix); ok {
+		return m.UserConfig.Dock.Custom[key].DockCellStyle
+	}
+	return config.DockCellStyle{}
+}
+
+// dockSessionText is the session component's text: the session name, the
+// current workspace and the focused pane's place in it, through
+// [dock.session] format. Read from model state each frame, so it needs no
+// refresh of its own.
+func (m *OS) dockSessionText() string {
+	format := ""
+	if m.UserConfig != nil {
+		format = m.UserConfig.Dock.Session.Format
+	}
+	pane := 0
+	if w := m.GetFocusedWindow(); w != nil {
+		pane = m.workspacePosition(w)
+	}
+	return config.FormatDockSession(format, m.SessionName, m.dockWorkspace(), pane)
 }
 
 // dockCustomCells renders the custom components on one side, in list order,
@@ -257,7 +327,15 @@ func (m *OS) dockCustomCells(names []string) (cells []string, widths []int, keys
 // dockCellComponent reports whether a component draws as a bar cell from a
 // value the engine holds, rather than from model state the renderer reads.
 func dockCellComponent(name string) bool {
-	return strings.HasPrefix(name, config.DockCustomPrefix) || name == config.DockComponentClock
+	return strings.HasPrefix(name, config.DockCustomPrefix) || name == config.DockComponentClock ||
+		name == config.DockComponentTransfers || name == config.DockComponentSession
+}
+
+// dockCellClickable reports whether a cell records where it was drawn, for a
+// click: a custom component, which runs its on-click command, and the
+// copies, which open the Copies panel.
+func dockCellClickable(name string) bool {
+	return strings.HasPrefix(name, config.DockCustomPrefix) || name == config.DockComponentTransfers
 }
 
 // dockCustomWidth is the room a side's custom cells want.
@@ -278,7 +356,7 @@ func (m *OS) dockCustomWidth(names []string) int {
 type DockComponentInfo struct {
 	Name     string `json:"name"`
 	Side     string `json:"side"`
-	Source   string `json:"source"` // builtin | custom
+	Source   string `json:"source"` // builtin | custom | rail
 	Refresh  string `json:"refresh"`
 	Interval string `json:"interval,omitempty"`
 	Events   string `json:"events,omitempty"`
@@ -291,6 +369,9 @@ type DockComponentInfo struct {
 	LastRun  string `json:"last_run,omitempty"`
 	LastErr  string `json:"last_error,omitempty"`
 	Stopped  bool   `json:"stopped"`
+	// Off names the setting that keeps a placed built-in off the bar, such as
+	// "show_cpu = false". Empty when nothing does.
+	Off string `json:"off,omitempty"`
 }
 
 // DockComponentsData is the listing shaped for the wire: plain maps rather than
@@ -320,6 +401,7 @@ func (m *OS) DockComponentsData() []map[string]any {
 			"last_run":   c.LastRun,
 			"last_error": c.LastErr,
 			"stopped":    c.Stopped,
+			"off":        c.Off,
 		})
 	}
 	return out
@@ -373,8 +455,22 @@ func (m *OS) DockComponents() []DockComponentInfo {
 			// condition holds, which is not knowable here; a refreshable one is
 			// visible exactly when it has text.
 			info.Visible = info.Refresh == "render" || info.Text != ""
+			// The meters and the clock keep their own switch: the plan says
+			// where they go, the switch says whether they draw at all. A
+			// component a switch turns off says so, and names the switch.
+			if off := m.dockSwitchedOff(name); off != "" {
+				info.Visible = false
+				info.Off = off
+			}
 			out = append(out, info)
 		}
+	}
+	// The rail's custom section, after the bar's three sides. It is listed
+	// here because this listing is where a component that draws nothing says
+	// why, and a rail section that drew nothing has the same question to
+	// answer.
+	if m.railCustomEnabled() || m.railCustomConfig().HasCommand() {
+		out = append(out, m.railCustomInfo())
 	}
 	return out
 }
@@ -395,7 +491,8 @@ func (m *OS) renderDockRightCells(room int, meterStyle lipgloss.Style) (string, 
 		text   string
 		width  int
 		name   string
-		custom bool // records a hit rectangle, and yields first when room runs out
+		custom bool // yields first when room runs out
+		hit    bool // records a hit rectangle
 		meters bool // stands for whatever is left of the CPU and RAM readouts
 	}
 
@@ -423,6 +520,7 @@ func (m *OS) renderDockRightCells(room int, meterStyle lipgloss.Style) (string, 
 				width:  lipgloss.Width(cell),
 				name:   name,
 				custom: strings.HasPrefix(name, config.DockCustomPrefix),
+				hit:    dockCellClickable(name),
 			})
 		}
 	}
@@ -437,7 +535,7 @@ func (m *OS) renderDockRightCells(room int, meterStyle lipgloss.Style) (string, 
 				text = meterStyle.Render(strings.Join(meters, " "))
 				width = lipgloss.Width(text)
 			}
-			if seg.custom {
+			if seg.hit {
 				hits = append(hits, dockCustomHit{X0: x, X1: x + width, Name: seg.name})
 			}
 			b.WriteString(text)
@@ -480,4 +578,27 @@ func lastSegmentMatching(n int, pred func(int) bool) int {
 		}
 	}
 	return -1
+}
+
+// dockSwitchedOff names the setting that keeps a placed built-in off the bar,
+// or returns "" when nothing does.
+func (m *OS) dockSwitchedOff(name string) string {
+	switch name {
+	case config.DockComponentCPU:
+		if !m.Settings.ShowCPU {
+			return "show_cpu = false"
+		}
+	case config.DockComponentRAM:
+		if !m.Settings.ShowRAM {
+			return "show_ram = false"
+		}
+	case config.DockComponentClock:
+		if m.Settings.HideClock {
+			return "hide_clock = true"
+		}
+		if !m.Settings.ShowClock {
+			return "show_clock = false"
+		}
+	}
+	return ""
 }

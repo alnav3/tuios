@@ -21,6 +21,15 @@ reading one JSON line back per request:
 {"id":1,"verb":"list-agents","params":{"session":"work"}}
 ```
 
+`tuios call VERB '{...}'` sends one verb and prints its reply as JSON, for a
+program that can start a process but cannot open the socket. A verb error
+exits 1, bad input 2 and a daemon it cannot reach 3. It refuses the verbs
+that hold the connection open, such as `subscribe`.
+
+```sh
+tuios call list-windows '{"session":"work"}'
+```
+
 A parameter the verb does not take is refused, not ignored, and the failure
 lists what it does take. `invalid_params` naming a parameter you believed in
 means the daemon is older than you think.
@@ -34,7 +43,9 @@ through a client except the few that say `needs_client`.
 ```sh
 tuios subscribe --types window-created,window-exit
 tuios subscribe --types agent-state,attention
+tuios subscribe --types client-session-changed
 tuios subscribe --hosts --types agent-state
+tuios subscribe --types transfer,transfer-progress,transfer-file
 ```
 
 ```
@@ -47,10 +58,52 @@ subscribe, so subscribe before you start the thing you want to watch. Useful
 types: `agent-state`, `attention` (the Inbox changed), `notification` (a pane
 sent OSC 9, 777 or 99), `command-started`, `command-finished` (with `exit_code`,
 `duration_ms`, `command_seq`), `prompt`, `window-created`, `window-exit`.
-`tuios list-verbs subscribe` lists them all. `agent-activity` (one entry of
+`client-session-changed` carries `client_id`, the kernel peer `pid`, and the
+`session` the client entered or left. `attached` is true when entering and false
+when leaving, including a disconnect while attached. Pair it with
+`tuios list-clients --json` to follow daemon connections (`tuios --skill clients`). A session rename
+sends one with the new name for each client in the session.
+`tuios list-verbs subscribe` lists them all, and a type that is not one of
+them is refused. `agent-activity` (one entry of
 a pane's activity ring, as `entry`: a prompt, a tool call, its result or a
 finished turn) is opt-in: it arrives only when `--types` names it, and a
 resumed stream does not replay it, so read `tuios agent-log` after a gap.
+`transcript` (a pane's joined transcript grew, with the `cursor` of
+`agent-transcript`) is opt-in in the same way. It is for a client that shows
+the conversation to the person. `transfer-progress` (a copy's row while its bytes
+move, at most four a second) and `transfer-file` (one file of a copy ended) are
+opt-in in the same way. `layout-changed` (the panes on `workspace` opened,
+closed, moved or changed size) is opt-in and not replayed. Read `tuios
+list-windows` after it to get the new rectangles.
+
+Every type, and what it reports:
+
+| Type | When |
+| --- | --- |
+| `window-created`, `window-closed` | A pane opens or closes |
+| `window-exit` | A pane's program exits |
+| `window-retitled`, `window-moved`, `window-focused` | A pane's title, workspace or focus changes |
+| `window-minimized`, `window-restored` | A pane is minimized or restored |
+| `workspace-switched`, `workspace-renamed` | The workspace on screen, or a workspace name, changes |
+| `layout-changed` | The panes on a workspace sit differently. Opt-in |
+| `mode-changed` | A client switches between window and terminal mode |
+| `session-created`, `session-closed` | A session is made or ends |
+| `client-session-changed` | A client enters or leaves a session |
+| `agent-state`, `agent-message`, `agent-activity` | An agent changes state, gets mail, or logs activity |
+| `transcript` | The transcript a pane is joined to grows |
+| `attention` | The Inbox changes |
+| `notification`, `bell` | A pane sends a notification or a bell |
+| `prompt`, `command-started`, `command-finished` | Shell integration marks in a pane |
+| `output` | A pane writes output. High volume |
+| `host-changed` | A host link connects or drops |
+| `transfer`, `transfer-progress` | A copy the daemon runs is created, changes state, ends, or leaves the list (`action` `removed`, after `transfer-clear` or 30 minutes after it ended); its progress, opt-in (`tuios --skill files`) |
+| `transfer-file` | One file of a copy ended: `file` has `id`, `rel`, `state` (`done`, `same`, `skipped`, `conflict` or `failed`), `sha256`, `code`, `error`. Opt-in |
+| `tml-event` | A person ran an `emit` on a TML surface, or the surface closed: `tml` has `surface`, `name`, `value`, `reason` (on a close) and `version`. Opt-in |
+| `gap` | Events were lost. See below |
+
+The hook names (`after-new-window` and the rest) are not event types. The
+daemon fires six hooks from these events: `window-created`, `window-closed`,
+`window-focused`, `workspace-switched`, `agent-state` and `command-finished`.
 
 ## Resuming a dropped stream
 

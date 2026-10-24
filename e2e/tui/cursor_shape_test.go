@@ -258,3 +258,186 @@ func TestCursorShapeSurvivesReattach(t *testing.T) {
 	waitCursorShape(t, secondStream, shapeBar, "after the reattach")
 	alive(t, second, "after reattach")
 }
+
+// cursorColourRE is the cursor colour the host is told: OSC 12 with a colour,
+// or OSC 112, which hands the cursor back to the host's own colour.
+var cursorColourRE = regexp.MustCompile(`\x1b\](?:12;([^\x07\x1b]*)|(112))(?:\x07|\x1b\\)`)
+
+// hostCursorColour is the colour the host cursor has now: the last OSC 12 or
+// OSC 112 in the stream. "reset" is OSC 112, and "" is that the host was never
+// told anything, which leaves its own colour as well.
+func hostCursorColour(stream []byte) string {
+	m := cursorColourRE.FindAllSubmatch(stream, -1)
+	if len(m) == 0 {
+		return ""
+	}
+	last := m[len(m)-1]
+	if len(last[2]) > 0 {
+		return "reset"
+	}
+	return strings.ToLower(string(last[1]))
+}
+
+// waitCursorColour blocks until the host cursor has the colour want.
+func waitCursorColour(t *testing.T, stream *hostStream, want, what string) {
+	t.Helper()
+	deadline := time.Now().Add(uiTimeout)
+	got := ""
+	for time.Now().Before(deadline) {
+		if got = hostCursorColour(stream.bytes()); got == want {
+			return
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	var trail strings.Builder
+	for _, m := range cursorColourRE.FindAll(stream.bytes(), -1) {
+		fmt.Fprintf(&trail, "  %q\n", m)
+	}
+	t.Fatalf("%s: the host cursor colour is %q, want %q\ncursor colours the host was sent:\n%s",
+		what, got, want, trail.String())
+}
+
+// TestCursorColourFollowsFocusedPane: a pane that sets its cursor colour with
+// OSC 12 gets that colour on the host cursor, the same as its shape. A pane
+// that set none leaves the host its own colour, so moving the focus there
+// resets it, and moving back sets it again. OSC 112 in the pane resets it too.
+//
+// tuios used to read OSC 12 into the pane's emulator and stop there, so the
+// host cursor kept its own colour whatever the guest asked for.
+func TestCursorColourFollowsFocusedPane(t *testing.T) {
+	stream := &hostStream{}
+	term, base := start(t, startOpts{cols: 120, rows: 40, args: []string{"new", "colour"}, out: stream})
+	waitBoot(t, term)
+
+	newWindow(t, term)
+	enterTerminalMode(t, term)
+	stream.mark("colour-set")
+	runInShell(t, term, `printf '\033]12;#ff00ff\007'; echo `+splitMarker("COLOURSET"), "COLOURSET", shellTimeout)
+	waitCursorColour(t, stream, "#ff00ff", "after the focused pane set its cursor colour")
+
+	// A second pane that set no colour. The focus moves to it.
+	leaveTerminalMode(t, term)
+	newWindow(t, term)
+	enterTerminalMode(t, term)
+	stream.mark("plain-pane")
+	runInShell(t, term, `echo `+splitMarker("PLAINPANE"), "PLAINPANE", shellTimeout)
+	waitCursorColour(t, stream, "reset", "with the focus on a pane that set no colour")
+
+	stream.mark("focus-back")
+	if out, err := tuiosCLI(t, base, "focus-window", "-s", "colour", "0"); err != nil {
+		t.Fatalf("focus-window: %v\n%s", err, out)
+	}
+	waitCursorColour(t, stream, "#ff00ff", "with the focus back on the pane that set a colour")
+
+	stream.mark("colour-reset")
+	runInShell(t, term, `printf '\033]112\007'; echo `+splitMarker("COLOURRESET"), "COLOURRESET", shellTimeout)
+	waitCursorColour(t, stream, "reset", "after the pane reset its cursor colour")
+
+	alive(t, term, "after the cursor colour checks")
+}
+
+// textCell is the screen cell where text starts, found on the grid the host
+// terminal shows. Columns are cells, so a border drawn with box glyphs or a
+// wide rune before the text does not move the answer.
+func textCell(s tuitest.Screen, text string) (col, row int, ok bool) {
+	cols, rows := s.Size()
+	for r := range rows {
+		var line strings.Builder
+		at := make([]int, 0, cols)
+		for c := range cols {
+			content := s.Cell(c, r).Content
+			if content == "" {
+				continue
+			}
+			for range len(content) {
+				at = append(at, c)
+			}
+			line.WriteString(content)
+		}
+		if i := strings.Index(line.String(), text); i >= 0 {
+			return at[i], r, true
+		}
+	}
+	return 0, 0, false
+}
+
+// waitHostCursor blocks until the host terminal's own cursor, as the PTY
+// stream left it, is at (col, row) with the given visibility. An input
+// method opens its candidate window at that cursor, hidden or not, so this is
+// where a Chinese or Japanese IME would put it.
+func waitHostCursor(t *testing.T, term *tuitest.Terminal, col, row int, visible bool, what string) {
+	t.Helper()
+	waitHostCursorWithin(t, term, col, row, visible, uiTimeout, what)
+}
+
+// waitHostCursorWithin is waitHostCursor with its own deadline, for a state
+// that only holds for a while.
+func waitHostCursorWithin(t *testing.T, term *tuitest.Terminal, col, row int, visible bool, within time.Duration, what string) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	var gotCol, gotRow int
+	var gotVisible bool
+	for time.Now().Before(deadline) {
+		if gotCol, gotRow, gotVisible = term.Screen().Cursor(); gotCol == col && gotRow == row && gotVisible == visible {
+			return
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	t.Fatalf("%s: the host cursor is at (%d,%d) visible=%v, want (%d,%d) visible=%v\n%s",
+		what, gotCol, gotRow, gotVisible, col, row, visible, term.Snapshot())
+}
+
+// TestHiddenCursorParksAtGuestCursor is #649. Claude Code hides the cursor
+// and draws its own, but moves the hidden cursor to its prompt, because an
+// input method opens its candidate window at the terminal's real cursor.
+// tuios hid the host cursor too and then left it wherever the frame's last
+// write ended, so the candidate window opened in the bottom-right corner.
+//
+// The guest here does the same: it hides its cursor, writes a word and puts
+// the cursor on an empty cell away from it. The host cursor has to be on that cell, hidden. Then the
+// guest shows the cursor without drawing anything, which changes no cell, and
+// the host cursor has to come back on in the same place. Then the guest hides
+// it again, still without drawing, and the host cursor has to go off there.
+// Neither change writes a frame.
+//
+// The second pane makes the offsets real: the pane under test is the right
+// half of a tiled screen, so its cells are not at the screen's.
+//
+// Negative controls (NEGATIVE_CONTROLS.md): with viewCursor parking nothing,
+// the host cursor stays where the frame ended and the first wait times out.
+// With cursorPark.frame passing frames through, the renderer shows the parked
+// cursor and the first wait times out. With the write in cursorPark.set
+// removed, the show and the hide without a frame never reach the host.
+func TestHiddenCursorParksAtGuestCursor(t *testing.T) {
+	term, _ := start(t, startOpts{cols: 120, rows: 40})
+	waitBoot(t, term)
+	newWindow(t, term)
+	newWindow(t, term)
+	enableTiling(t, term)
+	waitWindowCount(t, term, 2, "two tiled panes")
+	enterTerminalMode(t, term)
+
+	runInShell(t, term,
+		`clear; printf '\033[?25l\033[6;12H'IME""CARET'\033[10;30H'; sleep 5; printf '\033[?25h'; sleep 5; printf '\033[?25l'; sleep 60`,
+		"IMECARET", shellTimeout)
+	word, top, ok := textCell(term.Screen(), "IMECARET")
+	if !ok {
+		t.Fatalf("the word is not on the screen\n%s", term.Snapshot())
+	}
+	if word < 60 {
+		t.Fatalf("the word is at column %d, want it in the right pane\n%s", word, term.Snapshot())
+	}
+	// The guest cursor is on an empty cell 4 rows down and 18 columns right
+	// of the word, a cell no frame writes to, so the host cursor cannot be
+	// there by chance.
+	col, row := word+18, top+4
+	// Within the 5 seconds before the guest shows its cursor. Later, the
+	// guest hides it again on the same cell, and a build that parks nothing
+	// leaves the host cursor there by chance.
+	waitHostCursorWithin(t, term, col, row, false, 4*time.Second, "with the guest cursor hidden")
+	saveFrame(t, term, "ime-cursor-hidden")
+	waitHostCursor(t, term, col, row, true, "after the guest showed its cursor again")
+	waitHostCursor(t, term, col, row, false, "after the guest hid its cursor again without drawing")
+
+	alive(t, term, "after the hidden cursor checks")
+}

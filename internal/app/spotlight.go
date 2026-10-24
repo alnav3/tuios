@@ -86,13 +86,12 @@ const (
 
 // spotlightDark is the colour every unlit cell is carried toward.
 //
-// Black, and not the theme's own ground. Carrying a cell toward the ground was
-// the first spelling of this and it cannot dim a screen, because a pane's
-// background already is the ground: at the maximum setting a background moved
-// from (40,40,60) to (30,30,46), a quarter darker, so the screen still read as
-// lit however dark the text got. On a light theme it was worse than nothing.
-// The ground is bright there, so "dim" carried every colour up and washed the
-// text out instead of hiding it.
+// Black, and not the theme's own ground. Carrying a cell toward the ground
+// cannot dim a screen, because a pane's background already is the ground: at
+// the maximum setting a background moves from (40,40,60) to (30,30,46), a
+// quarter darker, so the screen still reads as lit however dark the text gets.
+// On a light theme it is worse than nothing. The ground is bright there, so
+// "dim" carries every colour up and washes the text out instead of hiding it.
 //
 // Blending toward black by t is the same arithmetic as scaling every channel by
 // 1-t, so the setting is a brightness control: the unlit part of the screen is
@@ -102,7 +101,7 @@ const (
 // unlit character at a fifth of its brightness.
 //
 // Boxed once at package level. Assigning a color.RGBA into a color.Color per
-// cell is the line that used to cost 8,000 allocations a frame.
+// cell costs 8,000 allocations a frame.
 var spotlightDark = theme.SpotlightShade()
 
 // spotBlendKey names one cached blend: a source colour and which of the 16
@@ -146,6 +145,9 @@ type spotlightState struct {
 	// moved yet), the beam stays here rather than jumping to the middle.
 	x, y     int
 	anchored bool
+	// chip is where the dock drew the spotlight chip last frame. See
+	// spotlight_exit.go.
+	chip spotlightChipHit
 
 	cellShade
 }
@@ -170,7 +172,7 @@ type cellShade struct {
 	// color.RGBA into a color.Color per cell was the single line that cost
 	// 8,000 allocations a frame.
 	groundFg, groundBg color.Color
-	groundTheme        string
+	groundTheme        uint64
 	groundValid        bool
 
 	// levels is the blend fraction for each of the 16 rim steps, rebuilt when
@@ -207,7 +209,7 @@ func (m *OS) ToggleSpotlight() tea.Cmd {
 func (m *OS) SetSpotlight(on bool) {
 	m.spotlight.on = on
 	if m.UserConfig != nil {
-		m.UserConfig.Spotlight.Enabled = boolPtr(on)
+		m.UserConfig.Spotlight.Enabled = new(on)
 	}
 }
 
@@ -267,14 +269,17 @@ func (m *OS) applySpotlight(canvas cellCanvas) {
 	cfg := m.spotlightConfig()
 	cx, cy := m.spotlightAnchor()
 	m.spotlight.apply(canvas, cx, cy, cfg.RadiusRows(), cfg.DimPercent(),
-		cfg.EdgeStyle() == config.SpotlightEdgeSoft)
+		cfg.EdgeStyle() == config.SpotlightEdgeSoft, m.spotlightLitSpans())
 }
 
 // apply dims every cell outside the beam centred on (cx, cy).
 //
 // The ellipse is a circle on screen: a terminal cell is about twice as tall as
 // it is wide, so a radius given in rows reaches twice as many columns.
-func (s *spotlightState) apply(canvas cellCanvas, cx, cy, radius, dim int, soft bool) {
+//
+// The cells in keep stay lit wherever the beam is: they are the way out of the
+// spotlight. See spotlight_exit.go.
+func (s *spotlightState) apply(canvas cellCanvas, cx, cy, radius, dim int, soft bool, keep [2]spotlightSpan) {
 	width, height := canvas.Width(), canvas.Height()
 	if width <= 0 || height <= 0 || radius <= 0 {
 		return
@@ -297,7 +302,19 @@ func (s *spotlightState) apply(canvas cellCanvas, cx, cy, radius, dim int, soft 
 		// the flat dark level, which needs no distance computed for it at all,
 		// and on most rows that is the whole row.
 		lit, x0, x1 := spotlightRowSpan(cx, dy, rad, width)
+		// At most two runs on a row are kept lit, and on almost every row
+		// none are, so the check per cell is two compares against empty runs.
+		var k0, k1 spotlightSpan
+		if keep[0].y == y {
+			k0 = keep[0]
+		}
+		if keep[1].y == y {
+			k1 = keep[1]
+		}
 		for x := range width {
+			if (x >= k0.x0 && x < k0.x1) || (x >= k1.x0 && x < k1.x1) {
+				continue
+			}
 			cell := canvas.CellAt(x, y)
 			if cell == nil || cell.Content == "" {
 				// A zero cell is the placeholder that follows a wide glyph.
@@ -516,11 +533,11 @@ func packColor8(c color.Color) uint32 {
 // syncGround re-reads the pair a cell that names no colour is dimmed from, when
 // the theme has changed or nothing has been read yet.
 func (s *cellShade) syncGround() {
-	id := theme.CurrentThemeID()
-	if s.groundValid && s.groundTheme == id {
+	gen := theme.Generation()
+	if s.groundValid && s.groundTheme == gen {
 		return
 	}
-	s.groundTheme, s.groundValid = id, true
+	s.groundTheme, s.groundValid = gen, true
 	s.groundFg, s.groundBg = dimGround()
 	// The old ground was the source of every blend a colourless cell got, so
 	// none of those survives it. Clearing the whole cache is cheaper than

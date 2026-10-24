@@ -10,6 +10,7 @@ import (
 	_ "image/jpeg" // same
 	"image/png"
 	"maps"
+	"math"
 	"os"
 	"sync"
 
@@ -93,8 +94,8 @@ type launcherIcons struct {
 	// the protocol scopes a placement to: a placement id belongs to an image,
 	// so drawing a different picture at the same row is a second placement and
 	// not a replacement of the first. Keyed by row alone, scrolling the list
-	// left one orphaned image behind per row it moved, since the record of the
-	// picture that had been there was overwritten before anything deleted it.
+	// would leave one orphaned image behind per row it moved, since the record of
+	// the picture there would be overwritten before anything deleted it.
 	//
 	// The value records where the icon was drawn, because the panel is
 	// draggable: the same row can need a new placement without its picture
@@ -527,4 +528,43 @@ type byteWriter struct{ b []byte }
 func (w *byteWriter) Write(p []byte) (int, error) {
 	w.b = append(w.b, p...)
 	return len(p), nil
+}
+
+// shotPieces is the icons the host shows now, for a screen capture. An icon
+// is drawn at its own pixel size, which is its two by one cell box at the
+// host's cell size, over the cells, as the host draws it.
+func (s *launcherIcons) shotPieces() []shotPiece {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.shown) == 0 {
+		return nil
+	}
+	keys := make(map[uint32]iconKey, len(s.hostID))
+	for k, id := range s.hostID {
+		keys[id] = k
+	}
+	var out []shotPiece
+	for at, pl := range s.shown {
+		k, ok := keys[at.img]
+		if !ok {
+			continue
+		}
+		pix := s.pixels[k]
+		if pix == nil {
+			continue
+		}
+		b := pix.Bounds()
+		out = append(out, shotPiece{
+			key:      at.img,
+			declared: b.Dx() * b.Dy(),
+			decode:   func(int) (image.Image, error) { return pix, nil },
+			source:   func(p image.Image) image.Rectangle { return p.Bounds() },
+			col:      pl.X, row: pl.Y, cols: launcherIconCols, rows: launcherIconRows,
+			z: math.MaxInt32,
+		})
+	}
+	return out
 }

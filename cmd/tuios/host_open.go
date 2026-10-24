@@ -62,6 +62,7 @@ func resolveConfiguredHost(name string) (federation.Host, error) {
 		ConnectTimeout: time.Duration(entry.ConnectTimeout) * time.Second,
 		Command:        entry.Command,
 		SSHOptions:     entry.SSHOptions,
+		TailscaleLogin: entry.TailscaleLogin,
 	}})
 	if len(problems) > 0 {
 		return federation.Host{}, problems[0]
@@ -132,6 +133,9 @@ func runAttachOnHost(host, name string, create, hold, ssh bool) error {
 		if create {
 			remote = append(remote, "--create")
 		}
+		if attachDetachOthers {
+			remote = append(remote, "-d")
+		}
 		return runOnHost(host, hold, true, remote...)
 	}
 	if err := ensureDaemon(); err != nil {
@@ -152,7 +156,7 @@ func explainHostConnectError(host string, err error) error {
 		case session.ErrVerbUnknownHost:
 			fix = "run 'tuios hosts' for the configured names, or 'tuios hosts add " + host + " user@machine'"
 		case session.ErrVerbProtocolMismatch, session.ErrVerbUnknownVerb:
-			fix = "run 'tuios kill-server' and attach again, or 'tuios attach --host " + host + " NAME --ssh' to use ssh directly"
+			fix = "run 'tuios restart-server' and attach again, or 'tuios attach --host " + host + " NAME --ssh' to use ssh directly"
 		case session.ErrVerbHostRefused:
 			fix = "close a session on " + host + " and try again"
 		}

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/Gaurav-Gosain/tuios/internal/invisible"
@@ -102,6 +101,10 @@ type Approval struct {
 	// plan.
 	Tool   string `json:"tool,omitempty"`
 	Target string `json:"target,omitempty"`
+	// Cwd is the folder the call runs in, as the harness sent it (the hook
+	// payload's cwd). The risk rules resolve a relative Target against it.
+	// Empty when the harness did not send one.
+	Cwd string `json:"cwd,omitempty"`
 	// Plan is a plan's text, whole. Set only for KindPlan.
 	Plan string `json:"plan,omitempty"`
 	// DenyMessage says the harness hands the model a reason with a deny, so
@@ -302,22 +305,7 @@ func shownWhole(shapes map[string]toolShape, tool string, input fields) bool {
 		}
 	}
 	full := tool + ": " + value
-	return ToolSummary(tool, input) == full && printableLine(full)
-}
-
-// printableLine reports whether s reads on screen as it is: every rune a
-// visible character or a plain space. A format character such as a bidi
-// override, which can make a line read differently from what it holds, fails.
-func printableLine(s string) bool {
-	if !utf8.ValidString(s) {
-		return false
-	}
-	for _, r := range s {
-		if !unicode.IsPrint(r) || invisible.Rune(r) {
-			return false
-		}
-	}
-	return true
+	return ToolSummary(tool, input) == full && invisible.Printable(full)
 }
 
 // claudeHeldTools are tools whose PermissionRequest is not a yes or no: an
@@ -350,6 +338,7 @@ func claudeApproval(p fields) *Approval {
 		Options:     []string{DecisionOnce, DecisionDeny},
 		Tool:        tool,
 		Target:      input.str(claudeWholeTools[tool].key),
+		Cwd:         p.str("cwd"),
 		DenyMessage: true,
 	}
 	if scope, rules, ok := claudeScope(p["permission_suggestions"]); ok {
@@ -512,7 +501,7 @@ func scopeShowable(scope []string) bool {
 		return false
 	}
 	for _, line := range scope {
-		if utf8.RuneCountInString(line) > MaxMessage || !printableLine(line) || Clip(line) != line {
+		if utf8.RuneCountInString(line) > MaxMessage || !invisible.Printable(line) || Clip(line) != line {
 			return false
 		}
 	}

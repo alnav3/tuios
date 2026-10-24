@@ -83,13 +83,78 @@ func (c *popupCapture) finish() (string, bool) {
 	return c.buf.String(), c.truncated
 }
 
+// popupExit keeps the exit status of a popup's command. The daemon closes a
+// popup when its command exits (see verbPopup), and the close removes the PTY
+// that holds the status. A caller that waits can come to the PTY after that,
+// so the exit callback keeps the status here first.
+//
+// new-window with wait keeps its status here for the same reason: an attached
+// client closes a command window when its command exits.
+type popupExit struct {
+	once sync.Once
+	done chan struct{}
+	code int
+	// signal is the signal that ended the process, 0 for none. Read only
+	// after done is closed.
+	signal int
+}
+
+func newPopupExit() *popupExit {
+	return &popupExit{done: make(chan struct{})}
+}
+
+// record keeps the first status it is given.
+func (e *popupExit) record(code int) {
+	e.once.Do(func() {
+		e.code = code
+		close(e.done)
+	})
+}
+
+// recordPTY keeps the status of a PTY whose process has exited.
+func (e *popupExit) recordPTY(pty *PTY) {
+	code, ok := pty.ExitStatus()
+	if !ok {
+		return
+	}
+	e.once.Do(func() {
+		e.code = code
+		e.signal = pty.ExitSignal()
+		close(e.done)
+	})
+}
+
+// popupBeforeWaitHook, when set, runs before a popup with wait starts to wait
+// for its command. Test-only: it lets a test close the popup first.
+var popupBeforeWaitHook func(sess *Session, win WindowState)
+
 // waitPopupExit blocks until the popup's process exits, the timeout passes (a
 // zero timeout waits for as long as the popup is open), or the daemon stops.
 // It reports the exit status and whether the process exited.
-func (d *Daemon) waitPopupExit(sess *Session, win WindowState, timeout time.Duration) (int, bool) {
+//
+// kept is the status the exit callback kept, or nil. It is read when the PTY
+// is gone already, which is what a popup whose command exited at once and was
+// closed by the daemon looks like.
+func (d *Daemon) waitPopupExit(sess *Session, win WindowState, timeout time.Duration, kept *popupExit) (int, bool) {
+	var deadline <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		deadline = timer.C
+	}
 	pty := sess.GetPTY(win.PTYID)
 	if pty == nil {
-		return -1, true
+		if kept == nil {
+			return -1, true
+		}
+		select {
+		case <-kept.done:
+			return kept.code, true
+		case <-deadline:
+			return 0, false
+		case <-d.ctx.Done():
+			return 0, false
+		}
 	}
 	sub := d.events.subscribe(eventFilter{
 		session: sess.Name(),
@@ -98,12 +163,6 @@ func (d *Daemon) waitPopupExit(sess *Session, win WindowState, timeout time.Dura
 		types:   map[string]bool{EventWindowExit: true, EventWindowClosed: true},
 	}, defaultEventQueue)
 	defer d.events.unsubscribe(sub)
-	var deadline <-chan time.Time
-	if timeout > 0 {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		deadline = timer.C
-	}
 	for {
 		if code, exited := pty.ExitStatus(); exited {
 			return code, true

@@ -3,7 +3,9 @@ package app
 import (
 	"fmt"
 	"image/color"
+	"math"
 	"strings"
+	"time"
 
 	"charm.land/lipgloss/v2"
 
@@ -15,20 +17,16 @@ import (
 // The message block that lives in the dock's right-hand end.
 //
 // The placement is the whole point: a message belongs to the bar and never
-// covers a pane. The corner toast this replaces was drawn as a layer on top of
-// the workspace, three rows tall, and landed exactly where a freshly split
-// pane's first output goes.
+// covers a pane, where a freshly split pane's first output goes.
 //
-// The block wears no fill. It used to sit on the chrome's Surface step, and
-// that slab was the largest ink object in the bar while the words inside it
-// were the information: structure drawn at the weight of content, the same
-// shape of problem the rail's edges had. The bar's own ground does the job for
-// free, and it does it better for the marks, which no longer have to be lifted
-// toward the text colour to clear the mark floor on a raised grey: info blue
-// measures 3.16:1 on the bare canvas against 2.20:1 on the old fill, so
-// dropping the slab bought back the hue. What separates the message from the
-// dock items beside it is that they are filled pills and it is not, plus the
-// cap on its left and the lit rule above its span.
+// The block wears no fill. A slab on the chrome's Surface step would be the
+// largest ink object in the bar while the words inside it are the
+// information: structure drawn at the weight of content. The bar's own ground
+// does the job for free, and it does it better for the marks, which then need
+// no lift toward the text colour to clear the mark floor: info blue measures
+// 3.16:1 on the bare canvas against 2.20:1 on a Surface fill. What separates
+// the message from the dock items beside it is that they are filled pills and
+// it is not, plus the cap on its left and the lit rule above its span.
 //
 // The cap is a freestanding partial block in the severity's ink, two eighths
 // for info and success, four for a warning, six for an error. The weight is a
@@ -97,6 +95,51 @@ func (m *OS) notifBurnMoved() bool {
 	d := m.notifDrawn
 	return s.msg.ID != d.id || s.queued != d.queued ||
 		notifLitSpan(s.frac, d.span) != d.lit
+}
+
+// notifNextMove is how long from now until the live messages would draw
+// differently with nothing else happening: the next lit cell of the drawn rule
+// going out, or a message running out. ok is false when the last frame did not
+// draw the live message as it stands now. The tick answers that at the frame
+// rate, as it did before it asked.
+//
+// The tick sleeps until this moment instead of waking at the frame rate. A
+// six second message on a rule 35 cells wide moves about six times a second,
+// and a tick at 60 or 240 frames a second woke the client ten to forty times
+// for each of those moves.
+//
+// While the pointer holds the burn, the next move is the end of the hold. A
+// pointer move or a key ends it sooner, and each is a message of its own.
+func (m *OS) notifNextMove(now time.Time) (time.Duration, bool) {
+	s, ok := m.notifStatus()
+	if !ok {
+		return 0, false
+	}
+	d := m.notifDrawn
+	if s.msg.ID != d.id || s.queued != d.queued || d.span <= 0 ||
+		notifLitSpan(s.frac, d.span) != d.lit {
+		return 0, false
+	}
+	next := time.Duration(math.MaxInt64)
+	if m.notifPaused() {
+		// Nothing moves until the hold ends, and notifMaxHold ends it with
+		// no event of its own.
+		return m.notifHoverAt.Add(notifMaxHold).Sub(now), true
+	}
+	for _, n := range m.Notifications {
+		if !n.Sticky {
+			next = min(next, n.StartTime.Add(n.Duration).Sub(now))
+		}
+	}
+	// notifLitSpan keeps d.lit cells while span*frac+0.5 >= d.lit, so the next
+	// cell goes out when frac falls below (d.lit-0.5)/span. The last cell
+	// stays lit until the message runs out, which the loop above covers.
+	if top := s.msg; !top.Sticky && top.Duration > 0 && d.lit > 1 {
+		frac := (float64(d.lit) - 0.5) / float64(d.span)
+		at := top.StartTime.Add(time.Duration((1 - frac) * float64(top.Duration)))
+		next = min(next, at.Sub(now))
+	}
+	return next, true
 }
 
 // notifStatus is the reading of the live queue that the block is drawn from:
@@ -227,9 +270,8 @@ func notifBudget(renderWidth int) int {
 // later info pushed out of the block still says so from underneath it.
 // Otherwise it is dim, because a queue of routine messages is not news.
 func (s notifStatus) notifMeta(pal overlay.Palette) string {
-	// Dim against the bar's own ground rather than a fixed grey. The grey it
-	// used to be was picked for one background and measured under 4.5:1 on two
-	// thirds of the themes.
+	// Dim against the bar's own ground rather than a fixed grey: a grey picked
+	// for one background measures under 4.5:1 on two thirds of the themes.
 	bg := pal.Canvas
 	dim := theme.Readable(pal.FgDim, bg)
 
@@ -269,9 +311,8 @@ const notifChromeWidth = 7
 //
 // Width is a hard contract, not an aspiration: the returned Width is what the
 // dock reserves, what the rule is drawn to, and what the block actually
-// measures. The old renderer clamped the message with MaxWidth after the fact,
-// which cut whatever happened to be last, and what was last was the block's
-// own trailing columns.
+// measures. Clamping the message with MaxWidth after the fact would cut
+// whatever happens to be last, which is the block's own trailing columns.
 func (m *OS) renderNotificationBlock(renderWidth, avail int) (notifBlock, bool) {
 	s, ok := m.notifStatus()
 	if !ok {
@@ -291,7 +332,7 @@ func (m *OS) renderNotificationBlock(renderWidth, avail int) (notifBlock, bool) 
 	// left edge now that there is no fill to open.
 	lead := inked.Render(notifCap(s.msg.Type, &m.Settings))
 	mark := inked.Render(" " + notifGlyph(s.msg.Type, &m.Settings))
-	if glyph, fg := agentMark(s.msg.AgentState, false, ground); glyph != "" {
+	if glyph, fg := agentMark(s.msg.AgentState, false, 0, ground); glyph != "" {
 		// A message about an agent wears that state's mark in that state's
 		// colour, the same one the rail and the title bar draw, so the dock
 		// does not say "needs you" in a shape used nowhere else.
@@ -397,7 +438,22 @@ func notifFit(message string, room int) string {
 	if room <= ellW {
 		return truncateToWidth(ell, room)
 	}
-	return strings.TrimRight(truncateToWidth(message, room-ellW), " ") + ell
+	return notifWordCut(truncateToWidth(message, room-ellW), message) + ell
+}
+
+// notifWordCut takes a cut message back to the end of its last whole word,
+// so the block never shows part of a word: "Ctrl+label ope" reads as a word
+// that does not exist, and the reader cannot tell what is missing. The word
+// boundary is given up only when it would throw away more than half of the
+// text, which is a long path or an address with no space in it, and then the
+// cut stays where it fell.
+func notifWordCut(cut, message string) string {
+	if len(cut) < len(message) && strings.HasPrefix(message, cut) && message[len(cut)] != ' ' {
+		if i := strings.LastIndexByte(cut, ' '); i > 0 && 2*lipgloss.Width(cut[:i]) >= lipgloss.Width(cut) {
+			cut = cut[:i]
+		}
+	}
+	return strings.TrimRight(cut, " ,;:")
 }
 
 // notifBurnRule lights the dock's hairline across the message's span and

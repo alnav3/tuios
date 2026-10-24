@@ -271,6 +271,9 @@ func TestMCPServerOverStdioIsHeldToItsPane(t *testing.T) {
 // TestMCPServerWithoutAPaneReachesNothing: a server restricted to its own
 // session that cannot prove a pane is refused everything that reads a session.
 func TestMCPServerWithoutAPaneReachesNothing(t *testing.T) {
+	// A run started in a tuios pane would hand the server that pane.
+	t.Setenv("TUIOS_PANE_ID", "")
+	t.Setenv("TUIOS_PANE_TOKEN", "")
 	c := startSubscribeDaemon(t)
 	if _, err := c.Call("new-session", map[string]any{"name": "any"}); err != nil {
 		t.Fatal(err)
@@ -372,5 +375,27 @@ func TestIntegrationInstallMCPRegistersTheServer(t *testing.T) {
 	root.SilenceErrors, root.SilenceUsage = true, true
 	if err := root.Execute(); err == nil {
 		t.Error("install amp --mcp did not fail")
+	}
+}
+
+// TestMCPHelpNamesTheToolsThatChangeState holds tuios mcp --help to the
+// catalog. The help called the default server read-only, while four of its
+// default tools change state: the caller's agent state and meta, mail sent,
+// and mail marked read. A person deciding whether to load the server needs
+// the real list.
+func TestMCPHelpNamesTheToolsThatChangeState(t *testing.T) {
+	srv := mcp.New(mcp.Options{Verbs: mcpVerbDocs()})
+	changing := srv.ChangingTools()
+	if len(changing) == 0 {
+		t.Fatal("the default server lists no tool that changes state, want set_agent_state and the mail tools")
+	}
+	help := newMCPCommand().Long
+	if strings.Contains(strings.ToLower(help), "read-only") {
+		t.Errorf("tuios mcp --help calls the server read-only, but these default tools change state: %v", changing)
+	}
+	for _, name := range changing {
+		if !strings.Contains(help, strings.TrimPrefix(name, "tuios_")) {
+			t.Errorf("tuios mcp --help does not name %s, a default tool that changes state", name)
+		}
 	}
 }

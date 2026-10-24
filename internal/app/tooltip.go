@@ -55,6 +55,10 @@ const (
 	tooltipRailAdd
 	// tooltipDockSession is one of the dock's session controls.
 	tooltipDockSession
+	// tooltipRailHost is a machine's header on the expanded rail while its
+	// link waits for a Tailscale sign-in. "sign in" is two words, and the
+	// label says why and what a click does. Key is the header's screen row.
+	tooltipRailHost
 	// tooltipDockWorkspace is a workspace pill on the dock strip whose name did
 	// not fit the twelve cells the pill has.
 	tooltipDockWorkspace
@@ -70,6 +74,9 @@ type tooltipState struct {
 	// it: the screen row for a rail strip row, the action for a dock control.
 	Source tooltipSource
 	Key    int
+	// Secondary identifies a tooltip on the opposite rail. The source and
+	// row alone are not unique when both edges show the same controls.
+	Secondary bool
 	// At is when the pointer arrived on this target.
 	At time.Time
 	// Shown latches on the frame that draws the label, so moving to the next
@@ -85,15 +92,19 @@ func (m *OS) tooltipsEnabled(src tooltipSource) bool {
 	if !m.Settings.Tooltips || src == tooltipNone {
 		return false
 	}
+	w := m.GetSidebarWidth()
+	if !m.sidebarDrawing && m.Tooltip.Secondary {
+		w = m.secondarySidebarWidth()
+	}
 	if src == tooltipRailStrip {
 		// The expanded rail says all of it in words already, so a label over it
 		// would only repeat what is on the screen.
-		return sidebarVariant(m.GetSidebarWidth()) == sidebarVariantGlyph
+		return sidebarVariant(w) == sidebarVariantGlyph
 	}
-	if src == tooltipRailAdd {
+	if src == tooltipRailAdd || src == tooltipRailHost {
 		// The mirror of the rule above: these controls only exist on the expanded
 		// rail, and they are the one thing on it drawn as a bare glyph.
-		return sidebarVariant(m.GetSidebarWidth()) != sidebarVariantGlyph
+		return sidebarVariant(w) != sidebarVariantGlyph
 	}
 	if src == tooltipDockWorkspace {
 		return m.Settings.DockWorkspaceTooltip
@@ -108,10 +119,10 @@ func (m *OS) tooltipTrack(src tooltipSource, key int) {
 		m.tooltipClear()
 		return
 	}
-	if m.Tooltip.Source == src && m.Tooltip.Key == key {
+	if m.Tooltip.Source == src && m.Tooltip.Key == key && m.Tooltip.Secondary == m.sidebarDrawing {
 		return // already on this target; the clock keeps running
 	}
-	m.Tooltip = tooltipState{Source: src, Key: key, At: time.Now(), Shown: m.Tooltip.Shown}
+	m.Tooltip = tooltipState{Source: src, Key: key, Secondary: m.sidebarDrawing, At: time.Now(), Shown: m.Tooltip.Shown}
 }
 
 // tooltipClear drops the hover and the latch. Called when the pointer leaves a
@@ -158,11 +169,25 @@ func tooltipLayer(label string, x, y, renderW int, id string) *lipgloss.Layer {
 // renderTooltip composes whichever surface's label is live. Nil when there is
 // nothing to show.
 func (m *OS) renderTooltip() *lipgloss.Layer {
+	if m.Tooltip.Secondary {
+		var layer *lipgloss.Layer
+		m.withSecondaryRail(func() bool {
+			layer = m.renderTooltipOnRail()
+			return true
+		})
+		return layer
+	}
+	return m.renderTooltipOnRail()
+}
+
+func (m *OS) renderTooltipOnRail() *lipgloss.Layer {
 	switch m.Tooltip.Source {
 	case tooltipRailStrip:
 		return m.renderRailTooltip()
 	case tooltipRailAdd:
 		return m.renderRailAddTooltip()
+	case tooltipRailHost:
+		return m.renderRailHostTooltip()
 	case tooltipDockSession:
 		return m.renderDockSessionTooltip()
 	case tooltipDockWorkspace:

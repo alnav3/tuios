@@ -14,7 +14,7 @@ func (m *OS) Snap(i int, quarter SnapQuarter) *OS {
 	// Create and start snap animation
 	anim := m.CreateSnapAnimation(i, quarter)
 	if anim != nil {
-		m.Animations = append(m.Animations, anim)
+		m.addAnimation(anim)
 	} else {
 		// No animation needed (already at target), but still resize terminal if needed
 		win := m.Windows[i]
@@ -120,10 +120,9 @@ func (m *OS) ScaleWindowsToTerminal(oldWidth, oldHeight, newWidth, newHeight int
 		return // Invalid dimensions
 	}
 
-	oldUsableHeight := oldHeight - m.GetTopMargin()
-	if m.Settings.DockbarPosition != "hidden" {
-		oldUsableHeight -= 1
-	}
+	// The reserve did not move with the viewport, so the old viewport lost the
+	// same rows to it that the new one does.
+	oldUsableHeight := oldHeight - m.GetTopMargin() - m.GetBottomMargin()
 
 	newUsableHeight := m.GetUsableHeight()
 	newRenderWidth := m.GetLayoutWidth()
@@ -317,8 +316,10 @@ func (m *OS) GetUsableHeight() int {
 }
 
 // GetRenderWidth returns the width to use for rendering.
-// In multi-client mode, this is the minimum of the terminal width and
-// the effective session width (min of all connected clients).
+// Against a daemon that sizes sessions by window_size it is the terminal's
+// width: the session's panes are drawn as a view inside it (see
+// pane_view.go). Against an older daemon it is the minimum of the terminal
+// width and the session's.
 func (m *OS) GetRenderWidth() int {
 	// If terminal size not yet known, use effective size if available
 	if m.Width == 0 {
@@ -326,6 +327,9 @@ func (m *OS) GetRenderWidth() int {
 			return m.EffectiveWidth
 		}
 		return 0
+	}
+	if m.windowSizeAware() {
+		return m.Width
 	}
 	// Use minimum of terminal and effective size
 	if m.EffectiveWidth > 0 && m.EffectiveWidth < m.Width {
@@ -352,6 +356,9 @@ func (m *OS) GetRenderWidth() int {
 // to nothing. If the floor would be violated it steps down to a narrower variant
 // first, then hides.
 func (m *OS) GetSidebarWidth() int {
+	if m.sidebarDrawing {
+		return m.sidebarDrawingWidth
+	}
 	return m.sidebarWidthFor(m.sidebarPreferredWidth())
 }
 
@@ -392,7 +399,39 @@ func (m *OS) sidebarWidthFor(prefer int) int {
 	if !m.Settings.SidebarEnabled || m.Settings.SidebarPosition == "hidden" {
 		return 0
 	}
-	rw := m.GetRenderWidth()
+	return sidebarResponsiveWidth(prefer, m.GetRenderWidth())
+}
+
+// secondarySidebarWidth gives the newly configured edge only columns left
+// after the original rail and the pane floor. Without an explicit enabled
+// override, a second rail cannot appear merely because a table was written.
+func (m *OS) secondarySidebarWidth() int {
+	if m.UserConfig == nil {
+		return 0
+	}
+	var cfg *config.SidebarEdgeConfig
+	if m.legacySidebarEdge() == sidebarRight {
+		cfg = m.UserConfig.Appearance.Sidebar.Left
+	} else {
+		cfg = m.UserConfig.Appearance.Sidebar.Right
+	}
+	if cfg == nil || cfg.Enabled == nil || !*cfg.Enabled {
+		return 0
+	}
+	width := cfg.Width
+	if width <= 0 {
+		width = config.SidebarDefaultWidth
+	}
+	if m.secondaryWidthPref > 0 {
+		width = m.secondaryWidthPref
+	}
+	if m.secondaryCollapsed {
+		width = config.SidebarGlyphWidth
+	}
+	return sidebarResponsiveWidth(width, m.GetRenderWidth()-m.sidebarWidthFor(m.sidebarPreferredWidth()))
+}
+
+func sidebarResponsiveWidth(prefer, rw int) int {
 	if rw <= 0 {
 		return 0
 	}
@@ -434,20 +473,26 @@ func (m *OS) sidebarWidthFor(prefer int) int {
 // any client and leaves no blank band on another client's screen.
 func (m *OS) OwnLayoutReserve() session.LayoutReserve {
 	var r session.LayoutReserve
+	secondary := m.secondarySidebarWidth()
+	if m.legacySidebarEdge() == sidebarLeft {
+		r.Right = secondary
+	} else {
+		r.Left = secondary
+	}
 	if !m.SidebarRevealedForFocus {
 		switch m.Settings.SidebarPosition {
 		case "left":
-			r.Left = m.GetSidebarWidth()
+			r.Left = m.sidebarWidthFor(m.sidebarPreferredWidth())
 		case "right":
-			r.Right = m.GetSidebarWidth()
+			r.Right = m.sidebarWidthFor(m.sidebarPreferredWidth())
 		}
 	}
 	switch m.Settings.DockbarPosition {
 	case "top":
-		r.Top = config.DockHeight
+		r.Top = m.Settings.DockHeight()
 	case "hidden":
 	default:
-		r.Bottom = config.DockHeight
+		r.Bottom = m.Settings.DockHeight()
 	}
 	return r
 }
@@ -463,8 +508,26 @@ func (m *OS) OwnLayoutReserve() session.LayoutReserve {
 // The consequence is deliberate: a client with less chrome than the session
 // agreed leaves the difference blank rather than handing it to the panes. A
 // client absorbs its own chrome; it never moves the panes to make room.
+//
+// Under window_size latest the daemon agrees on the latest client's reserve
+// alone. A client whose size or chrome differs from the latest client's along
+// an axis draws the session as a view inside its own chrome, so along that
+// axis it takes the session's reserve as it is. Floored by its own chrome
+// there, it would lay the panes out in a box no other client uses.
 func (m *OS) paneReserve() session.LayoutReserve {
-	return m.OwnLayoutReserve().Max(m.SessionReserve)
+	own := m.OwnLayoutReserve()
+	r := own.Max(m.SessionReserve)
+	if m.DaemonClient == nil || m.DaemonClient.SessionWindowSize() != config.WindowSizeLatest ||
+		!m.DaemonClient.ViewChrome() {
+		return r
+	}
+	if m.widthDiffers() {
+		r.Left, r.Right = m.SessionReserve.Left, m.SessionReserve.Right
+	}
+	if m.heightDiffers() {
+		r.Top, r.Bottom = m.SessionReserve.Top, m.SessionReserve.Bottom
+	}
+	return r
 }
 
 // GetLeftMargin returns the columns reserved on the left before any pane is
@@ -503,9 +566,8 @@ func (m *OS) GetContentWidth() int {
 	return max(m.GetLayoutWidth()-m.GetLeftMargin()-m.GetRightMargin(), 0)
 }
 
-// GetRenderHeight returns the height to use for rendering.
-// In multi-client mode, this is the minimum of the terminal height and
-// the effective session height (min of all connected clients).
+// GetRenderHeight returns the height to use for rendering. See
+// GetRenderWidth.
 func (m *OS) GetRenderHeight() int {
 	// If terminal size not yet known, use effective size if available
 	if m.Height == 0 {
@@ -513,6 +575,9 @@ func (m *OS) GetRenderHeight() int {
 			return m.EffectiveHeight
 		}
 		return 0
+	}
+	if m.windowSizeAware() {
+		return m.Height
 	}
 	// Use minimum of terminal and effective size
 	if m.EffectiveHeight > 0 && m.EffectiveHeight < m.Height {

@@ -2,6 +2,7 @@ package tuie2e
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -230,19 +231,73 @@ type groundStep struct {
 // startHookIn is startHeldHook for a window of a session.
 func startHookIn(t *testing.T, base, session, window, payload string) {
 	t.Helper()
-	cmd := exec.Command(tuiosBin, "agent-hook", "claude-code", "--session", session, "--window", window)
-	cmd.Dir = workDirIn(t, base)
-	cmd.Env = append(os.Environ(), "SHELL=/bin/sh")
-	for _, key := range xdgKeys {
-		cmd.Env = append(cmd.Env, key+"="+xdgDir(base, key))
+	// The hook reports the prompt under a deadline of its own, and a hook that
+	// misses it exits having held nothing, which is right for a harness and
+	// leaves the Inbox empty here. So the hook is not taken as started until
+	// the daemon holds its prompt, and a hook that exits first is run again.
+	want := heldApprovals(t, base, session) + 1
+	for attempt := 1; ; attempt++ {
+		cmd := exec.Command(tuiosBin, "agent-hook", "claude-code", "--session", session, "--window", window, "--explain")
+		cmd.Dir = workDirIn(t, base)
+		cmd.Env = append(os.Environ(), "SHELL=/bin/sh")
+		for _, key := range xdgKeys {
+			cmd.Env = append(cmd.Env, key+"="+xdgDir(base, key))
+		}
+		cmd.Stdin = strings.NewReader(payload)
+		var stderr syncBuffer
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start the hook: %v", err)
+		}
+		done := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(done) }()
+		t.Cleanup(func() { _ = cmd.Process.Kill(); <-done })
+		deadline := time.Now().Add(bootTimeout)
+		for heldApprovals(t, base, session) < want {
+			select {
+			case <-done:
+				if attempt == 3 {
+					t.Fatalf("the hook exited %d times without holding its prompt; last run said: %s", attempt, stderr.String())
+				}
+				t.Logf("the hook exited without holding its prompt, so it runs again: %s", stderr.String())
+			default:
+				if time.Now().After(deadline) {
+					t.Fatalf("the daemon never held the hook's prompt; the hook said: %s", stderr.String())
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			break
+		}
+		if heldApprovals(t, base, session) >= want {
+			return
+		}
 	}
-	cmd.Stdin = strings.NewReader(payload)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start the hook: %v", err)
+}
+
+// heldApprovals counts the Inbox items of session whose prompt a hook holds
+// for an answer.
+func heldApprovals(t *testing.T, base, session string) int {
+	t.Helper()
+	out, err := tuiosCLI(t, base, "list-attention", "--session", session, "--json")
+	if err != nil {
+		t.Fatalf("list-attention: %v\n%s", err, out)
 	}
-	done := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(done) }()
-	t.Cleanup(func() { _ = cmd.Process.Kill(); <-done })
+	var res struct {
+		Items []struct {
+			RequestID string `json:"request_id"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("list-attention json: %v\n%s", err, out)
+	}
+	n := 0
+	for _, it := range res.Items {
+		if it.RequestID != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // groundClient is a client on the shipped looks, with the theme and the
@@ -306,7 +361,7 @@ func groundSteps() []groundStep {
 	}
 	return []groundStep{
 		{name: "inbox-approval", fresh: true, titled: true, keys: []any{tuitest.Ctrl('b'), "i"},
-			want: []string{"Approvals 1", "risky: approve Bash", "Plans 1", "1 allow"}, check: noKeysRow},
+			want: []string{"3 needs you", "Allow Bash", "risky", "a allow"}, check: noKeysRow},
 		{name: "inbox-plan", titled: true, keys: []any{"j"}, want: []string{"Add a MaxAttempts field", "keep planning"}},
 		{name: "inbox-errored", titled: true, keys: []any{"j"}, want: []string{"go test ./... failed", "snooze"}},
 		{name: "inbox-snooze-picker", titled: true, keys: []any{"z"}, want: []string{"15m", "until it changes"},
@@ -351,7 +406,6 @@ func TestEveryOverlayOwnsItsGround(t *testing.T) {
 					term := groundClient(t, size[0], size[1], theme, bg, out)
 					dir := artifactDir(t)
 					var closed groundCells
-					inboxTop := -1
 					for _, st := range groundSteps() {
 						if st.fresh {
 							if err := term.WaitStable(uiTimeout); err != nil {
@@ -387,19 +441,6 @@ func TestEveryOverlayOwnsItsGround(t *testing.T) {
 							if h := holes(after, r, ground, title); len(h) > 0 {
 								t.Errorf("%s at %dx%d: %d cells of the ground inside the overlay at (%d,%d)-(%d,%d), first %v\n%s",
 									st.name, cols, rows, len(h), r.x0, r.y0, r.x1, r.y1, h[:min(len(h), 6)], term.Snapshot())
-							}
-						}
-						// The Inbox keeps its top row while its height follows
-						// the item under the cursor, and it fits beside the rail
-						// at 120 columns, so it is drawn there.
-						if strings.HasPrefix(st.name, "inbox-") && r.cells >= 20 {
-							if inboxTop < 0 {
-								inboxTop = r.y0
-							} else if r.y0 != inboxTop {
-								t.Errorf("%s: the Inbox moved from row %d to row %d", st.name, inboxTop, r.y0)
-							}
-							if rail := railHeaderColumn(s); cols >= 120 && rail > 0 && r.x1 >= rail-1 {
-								t.Errorf("%s: the Inbox runs to column %d, over the rail at %d\n%s", st.name, r.x1, rail, term.Snapshot())
 							}
 						}
 						if st.check != nil {

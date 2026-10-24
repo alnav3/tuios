@@ -6,14 +6,15 @@ import (
 	"strings"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
+	"tuios.dev/vt"
 )
 
 // The picture-in-picture view: a small live copy of one pane, drawn in a
@@ -216,7 +217,13 @@ func (m *OS) pipRegion() image.Rectangle {
 // edge. It is empty when no cursor is drawn, which is the case in window mode
 // and under an open panel.
 func (m *OS) pipKeepClear() image.Rectangle {
-	c := m.getRealCursor()
+	cur, _ := m.viewCursor()
+	return m.pipKeepClearAt(cur)
+}
+
+// pipKeepClearAt is pipKeepClear for the cursor c, as viewCursor returned it.
+// A cursor parked hidden counts: it is where the guest is taking typing.
+func (m *OS) pipKeepClearAt(c *tea.Cursor) image.Rectangle {
 	if c == nil {
 		return image.Rectangle{}
 	}
@@ -231,6 +238,16 @@ func (m *OS) pipKeepClear() image.Rectangle {
 		left = min(left, c.X)
 	}
 	return image.Rect(left, c.Y, c.X+1, c.Y+1)
+}
+
+// pipCoversCursor reports whether the box, where the last composed frame drew
+// it, covers what the view keeps clear around the cursor c. View composes a
+// frame again when it does, rather than show c under the box.
+func (m *OS) pipCoversCursor(c *tea.Cursor) bool {
+	if m.pip.rect.Empty() || c == nil {
+		return false
+	}
+	return m.pip.rect.Overlaps(m.pipKeepClearAt(c))
 }
 
 // PinPiP pins the pane with this id as the picture-in-picture view, in place
@@ -423,9 +440,9 @@ func (m *OS) renderPiP() *lipgloss.Layer {
 	pal := theme.UI()
 	state, seen := m.railAgentState(src.ID, src.AgentState, src.AgentCompletionSeq)
 	name := pipPaneName(src)
-	key := fmt.Sprintf("%d:%d:%s:%s:%t:%t", box.Dx(), box.Dy(), name, state, seen, overlay.UseASCII())
+	key := fmt.Sprintf("%d:%d:%s:%s:%t:%d:%t", box.Dx(), box.Dy(), name, state, seen, src.AgentSubagents, overlay.UseASCII())
 	if m.pip.box == "" || m.pip.boxKey != key {
-		m.pip.box = pipFrame(m.pip.body, cols, rows, name, state, seen, pal)
+		m.pip.box = pipFrame(m.pip.body, cols, rows, name, state, seen, src.AgentSubagents, pal)
 		m.pip.boxKey = key
 	}
 	m.pip.rect = box
@@ -549,7 +566,7 @@ func pipRowHasText(scr pipScreen, y, w int) bool {
 
 // pipFrame draws the box: a border in the accent, the source's agent mark and
 // name on the top edge, and the body inside.
-func pipFrame(body string, cols, rows int, name, state string, seen bool, pal overlay.Palette) string {
+func pipFrame(body string, cols, rows int, name, state string, seen bool, running int, pal overlay.Palette) string {
 	tl, tr, bl, br, hz, vl := "╭", "╮", "╰", "╯", "─", "│"
 	if overlay.UseASCII() {
 		tl, tr, bl, br, hz, vl = "+", "+", "+", "+", "-", "|"
@@ -558,7 +575,7 @@ func pipFrame(body string, cols, rows int, name, state string, seen bool, pal ov
 
 	// The title: the state's mark in its own colour, then the name, cut to
 	// fit between the corner and a cell of rule on the right.
-	glyph, glyphColor := agentMark(state, seen, pal)
+	glyph, glyphColor := agentMark(state, seen, running, pal)
 	mark := ""
 	if glyph != "" {
 		mark = lipgloss.NewStyle().Foreground(glyphColor).Bold(sidebarAttention(state)).Render(" " + glyph)

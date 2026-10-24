@@ -11,9 +11,9 @@ import (
 )
 
 // The effect picker is the theme picker's third sibling. screensaver.effect
-// used to accept five values and a cycler stepped through them; it accepts
-// thirty-six now, and a control that costs one keypress per stop is the wrong
-// shape for a set that size. The next largest closed list in the panel is ten.
+// accepts thirty-six values, and a control that costs one keypress per stop is
+// the wrong shape for a set that size. The next largest closed list in the
+// panel is ten.
 //
 // Names alone would not fix it. orbittingvolley, synthgrid, binarypath and
 // errorcorrect say nothing about what lands on the screen, so this picker does
@@ -184,7 +184,7 @@ func (m *OS) effectPreviewTick() tea.Cmd {
 
 // effectPreviewFrameCmd waits one frame and asks for the next one.
 func effectPreviewFrameCmd(gen int, s *config.Settings) tea.Cmd {
-	return tea.Tick(time.Second/time.Duration(s.NormalFPS), func(time.Time) tea.Msg {
+	return tea.Tick(time.Second/time.Duration(screensaverRate(s)), func(time.Time) tea.Msg {
 		return effectPreviewFrameMsg{gen: gen}
 	})
 }
@@ -454,7 +454,7 @@ const (
 
 // effectOpeningBandOf is the band an effect falls in over the reference screen.
 //
-// It takes seconds from the table at the current frame rate and throws them
+// It takes seconds from the table at the saver's paint rate and throws them
 // away again. Nothing else may read effectOpenings: a caller that wants the
 // number wants to show it, and the number is not true of the screen the user is
 // looking at.
@@ -466,11 +466,9 @@ func effectOpeningBandOf(name string, s *config.Settings) effectOpeningBand {
 	if opening.keepsScreen {
 		return effectOpeningNone
 	}
-	fps := s.NormalFPS
-	if fps <= 0 {
-		fps = 60
-	}
-	switch seconds := float64(opening.frames) / float64(fps); {
+	// The saver paints at screensaverRate, so that is the rate the frames in
+	// the table turn into seconds at.
+	switch seconds := float64(opening.frames) / float64(screensaverRate(s)); {
 	case seconds < effectMediumOpening:
 		return effectOpeningShort
 	case seconds < effectSlowOpening:

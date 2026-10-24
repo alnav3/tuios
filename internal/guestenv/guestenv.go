@@ -138,11 +138,41 @@ func KittyAnimationVar(supported bool) string {
 // from a tuios pane inherits that pane's TUIOS_ variables, and its own panes
 // would name the outer pane, session and socket where they set none of their
 // own. The ones a pane sets for itself are set again after this filter.
+//
+// Tern is a multiplexing terminal and the same case again. Its TERN_ pane and
+// window variables name the Tern pane the daemon started in, so `tern open`,
+// Tern's agent verbs and its lens and completion hooks in a tuios pane would
+// act on that pane. Tern also answers as kitty and sets KITTY_WINDOW_ID and
+// KITTY_PID, which send `kitty @` to the same outer pane; a real kitty sets
+// them too, with the same effect. TERN_DAEMON_SOCKET, TERN_CONFIG_DIR and
+// TERN_BLOB_DIR stay: they name Tern's daemon and folders, not a pane.
+//
+// An agent's tool call is the same case again. A command such as `tuios new
+// --detach` starts the daemon when none runs, and when an agent ran it, every
+// pane got the call's variables. Codex's CODEX_THREAD_ID made a Codex started
+// in a pane look nested, so tuios's Codex hook dropped its events; the other
+// CODEX_ and CLAUDE_ ones name the outer session, process or tool call, and
+// CLAUDE_CODE_MESSAGING_TOKEN is that session's credential. CODEX_SANDBOX and
+// CODEX_SANDBOX_NETWORK_DISABLED describe the call's sandbox, and AI_AGENT
+// tells a program an agent is driving it, which a person's pane is not. Tool
+// calls also set NO_COLOR and its kin for their own captured output, which
+// turned colour off in every pane, though tuios describes the pane through
+// TERM and COLORTERM. CODEX_HOME, CODEX_API_KEY and CLAUDE_CONFIG_DIR stay: they name
+// the user's folders and keys, not a session.
 var hostMultiplexerVars = []string{
 	"TMUX", "TMUX_PANE", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_BIN_PATH",
 	"TUIOS_SESSION", "TUIOS_SESSION_REMOTE", "TUIOS_SOCKET", "TUIOS_PANE_ID", "TUIOS_WINDOW_ID",
 	"TUIOS_WINDOW_NAME", "TUIOS_PANE_TOKEN", "TUIOS_PANE_GRANTS", "TUIOS_PANE_HOSTED",
 	"TUIOS_PANE_TTY", "TUIOS_RESTORED",
+	"TERN_PANE", "TERN_PANE_SOCKET", "TERN_WINDOW_KEY", "TERN_WINDOW_SOCKET", "TERN_WINDOW_PANE",
+	"TERN_IDENTITY", "TERN_LENSES", "TERN_COMPLETE", "TERN_ACP",
+	"KITTY_WINDOW_ID", "KITTY_PID",
+	"CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_TOOL_CALL_ID", "CODEX_SHELL", "CODEX_CI",
+	"CODEX_APP_TOOLS_PIPE_PATH", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED",
+	"CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID",
+	"CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
+	"CLAUDE_CODE_MESSAGING_TOKEN", "AI_AGENT",
+	"NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR",
 }
 
 // WithoutHostMultiplexer returns env with every assignment of the variables

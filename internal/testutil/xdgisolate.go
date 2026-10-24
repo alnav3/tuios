@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -57,11 +58,22 @@ func isolateXDG() (dir string, check func() error) {
 	if err := os.Setenv("HOME", tmp); err != nil {
 		panic(fmt.Sprintf("testutil: set HOME: %v", err))
 	}
+	// On Windows os.UserHomeDir reads USERPROFILE, so it moves as well.
+	if runtime.GOOS == "windows" {
+		if err := os.Setenv("USERPROFILE", tmp); err != nil {
+			panic(fmt.Sprintf("testutil: set USERPROFILE: %v", err))
+		}
+	}
 	// A run started from a tuios pane inherits the pane's TUIOS_SOCKET, which
 	// names the person's daemon. Nothing selects a daemon by it, but the check
 	// against it dials the socket it names, and a test has no business there.
 	if err := os.Unsetenv("TUIOS_SOCKET"); err != nil {
 		panic(fmt.Sprintf("testutil: unset TUIOS_SOCKET: %v", err))
+	}
+	// A pane of a named server exports TUIOS_SERVER; a test that runs tuios
+	// would otherwise land on that server.
+	if err := os.Unsetenv("TUIOS_SERVER"); err != nil {
+		panic(fmt.Sprintf("testutil: unset TUIOS_SERVER: %v", err))
 	}
 	xdg.Reload()
 
@@ -116,6 +128,14 @@ func stillRedirected(tmp string) error {
 		"XDG_RUNTIME_DIR": xdg.RuntimeDir,
 		"HOME":            xdg.Home,
 	} {
+		// On Windows xdg takes the home folder from the Known Folder API,
+		// which no environment variable moves, so xdg.Home always names
+		// the real profile there. Nothing in tuios reads xdg.Home; the
+		// paths that matter are the XDG ones above and os.UserHomeDir,
+		// which USERPROFILE moves.
+		if name == "HOME" && runtime.GOOS == "windows" {
+			continue
+		}
 		if !strings.HasPrefix(filepath.Clean(path)+string(filepath.Separator), filepath.Clean(tmp)+string(filepath.Separator)) {
 			escaped = append(escaped, fmt.Sprintf("  %s is %s", name, path))
 		}

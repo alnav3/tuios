@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"slices"
 	"strconv"
 	"sync/atomic"
 )
@@ -119,6 +120,10 @@ type gfxScanner struct {
 	// always starts at an ESC, and the next scan starts with it.
 	carry []byte
 
+	// segs is the storage scan hands its segments out in. A caller uses
+	// them before the next scan, so one slice serves every read.
+	segs []gfxSeg
+
 	cmdFrame bool // the command in progress belongs to a frame
 	cmdLast  bool // the command in progress ends its frame
 
@@ -146,6 +151,12 @@ type gfxScanner struct {
 	alt  bool
 	mode []byte
 
+	// frameAlt is alt as it was at the first chunk of the frame in progress,
+	// and frameKey is the key its first chunk got. Every segment of a frame
+	// carries both, whichever read the segment came in.
+	frameAlt bool
+	frameKey string
+
 	// What classify found in the command in progress.
 	frameID        uint32
 	frameMoves     bool
@@ -165,6 +176,8 @@ const maxCUP = 16
 func (s *gfxScanner) scan(data []byte, end int64) (segs []gfxSeg, saw bool) {
 	buf := data
 	base := end - int64(len(data))
+	segs = s.segs[:0]
+	defer func() { s.segs = segs[:0] }()
 	if len(s.carry) > 0 {
 		buf = make([]byte, 0, len(s.carry)+len(data))
 		buf = append(buf, s.carry...)
@@ -180,6 +193,12 @@ func (s *gfxScanner) scan(data []byte, end int64) (segs []gfxSeg, saw bool) {
 
 	segStart := 0
 	cur := gfxSeg{frame: (s.state == gfxPayload || s.state == gfxPayloadEsc) && s.cmdFrame}
+	if cur.frame {
+		// A payload the last read ended inside. Its segments describe the
+		// same frame as the ones before them did.
+		cur.id, cur.alt, cur.moves, cur.keep = s.frameID, s.frameAlt, s.frameMoves, s.frameKeep
+		cur.key = s.frameKey
+	}
 	emit := func(to int) {
 		if to > segStart {
 			cur.b = buf[segStart:to]
@@ -286,9 +305,11 @@ func (s *gfxScanner) scan(data []byte, end int64) (segs []gfxSeg, saw bool) {
 					if s.frameIDless && cup != nil {
 						cur.key = string(cup) + "\x00" + string(keys)
 					}
-					cur.alt = s.alt
+					s.frameAlt = s.alt
+					s.frameKey = cur.key
 				}
-				cur.id, cur.moves, cur.keep = s.frameID, s.frameMoves, s.frameKeep
+				cur.id, cur.alt, cur.moves, cur.keep = s.frameID, s.frameAlt, s.frameMoves, s.frameKeep
+				cur.key = s.frameKey
 				s.inFrame = true
 			} else {
 				cur.pins = true
@@ -340,12 +361,16 @@ const maxMode = 32
 // follows the screen switches: CSI ? 47, 1047 or 1049 with h or l, and RIS
 // (ESC c), which returns to the main screen. Everything else is ignored.
 func (s *gfxScanner) trackScreen(buf []byte, at int) {
-	seq := s.mode
+	// The sequence is gathered in an array on the stack. Every escape in a
+	// pane's output comes through here, most of them colours, and a slice
+	// grown per byte allocated once for each.
+	var arr [maxMode]byte
+	seq := append(arr[:0], s.mode...)
 	if len(seq) == 0 {
-		seq = buf[at : at+1]
+		seq = append(seq, buf[at])
 		at++
 	}
-	s.mode = nil
+	s.mode = s.mode[:0]
 	for i := at; i < len(buf); i++ {
 		c := buf[i]
 		switch {
@@ -366,7 +391,16 @@ func (s *gfxScanner) trackScreen(buf []byte, at int) {
 				return
 			}
 		case c == 'h', c == 'l':
-			for _, param := range bytes.Split(seq[3:], []byte{';'}) {
+			// Split by hand: a range over bytes.SplitSeq moves arr to
+			// the heap.
+			params := seq[3:]
+			for len(params) > 0 {
+				param := params
+				if j := bytes.IndexByte(params, ';'); j >= 0 {
+					param, params = params[:j], params[j+1:]
+				} else {
+					params = nil
+				}
 				switch string(param) {
 				case "47", "1047", "1049":
 					s.alt = c == 'h'
@@ -376,10 +410,10 @@ func (s *gfxScanner) trackScreen(buf []byte, at int) {
 		default:
 			return
 		}
-		seq = append(seq[:len(seq):len(seq)], c)
+		seq = append(seq, c)
 	}
 	// The read ended inside the sequence: keep it for the next one.
-	s.mode = append([]byte(nil), seq...)
+	s.mode = append(s.mode, seq...)
 }
 
 // keepTail records the last bytes the scan has passed.
@@ -699,22 +733,21 @@ func (p *PTY) enqueue(clientID string, sub *ptySubscriber, c ptyChunk, end int64
 	// Counted before the send, so the stream goroutine can never take more
 	// than was counted.
 	sub.queued.Add(n)
-	select {
-	case sub.ch <- c:
+	c.end = end
+	if sub.out.push(c) {
 		// Only an item that was queued counts as reached: a client dropped
 		// here resumes from the gap rather than past it.
 		sub.sent.Store(end)
 		return true
-	default:
-		sub.queued.Add(-n)
-		sub.gapped.Store(true)
-		p.streamsCut.Add(1)
-		sub.forgetFrames()
-		if p.debug {
-			debugLog("[DEBUG] PTY %s: channel full for %s, gapped", p.ID[:8], clientID)
-		}
-		return false
 	}
+	sub.queued.Add(-n)
+	sub.gapped.Store(true)
+	p.streamsCut.Add(1)
+	sub.forgetFrames()
+	if p.debug {
+		debugLog("[DEBUG] PTY %s: queue full for %s, gapped", p.ID[:8], clientID)
+	}
+	return false
 }
 
 // forgetFrames drops what a client was gathering and every frame it could
@@ -789,9 +822,9 @@ func (s *gfxScanner) spanEnd(from int64) (end int64, closed bool) {
 	if s.spanOpen && s.spanFrom == from {
 		return 0, false
 	}
-	for i := len(s.spans) - 1; i >= 0; i-- {
-		if s.spans[i][0] == from {
-			return s.spans[i][1], true
+	for _, v := range slices.Backward(s.spans) {
+		if v[0] == from {
+			return v[1], true
 		}
 	}
 	// Pruned: it ended before the ring's start, so long ago.

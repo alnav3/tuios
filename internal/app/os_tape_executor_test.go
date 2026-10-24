@@ -9,7 +9,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/tape"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // focusedOS builds a minimal OS with a single focused window whose terminal
@@ -74,7 +74,8 @@ func TestParseKeyToMessage(t *testing.T) {
 	}{
 		// Basic keys
 		{"single letter", "a", "a", 0},
-		{"uppercase letter", "A", "a", 0}, // normalized to lowercase
+		// A capital is the shifted key, so it reaches the binding for A.
+		{"uppercase letter", "A", "A", tea.ModShift},
 		{"number", "5", "5", 0},
 
 		// Modifier combos

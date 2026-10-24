@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -14,7 +15,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // Multi copy mode is copy mode on every pane of the multifocus set at once.
@@ -72,12 +73,7 @@ func (mc *MultiCopy) Has(id string) bool {
 	if mc == nil {
 		return false
 	}
-	for _, v := range mc.IDs {
-		if v == id {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(mc.IDs, id)
 }
 
 // multiCopyCandidates is the panes multi copy mode would take: the multifocus
@@ -119,8 +115,9 @@ func (m *OS) EnterCopyModeFocused() {
 	}
 	if fw := m.GetFocusedWindow(); fw != nil {
 		m.ExitMultiCopyMode()
+		// No message says the keys: the dock's legend does, for as long as
+		// copy mode is open (see mode_legend.go).
 		m.enterCopyMode(fw)
-		m.ShowNotification("Copy mode (hjkl, q to exit)", "info", 2*m.Settings.NotificationDuration)
 	}
 }
 
@@ -151,8 +148,9 @@ func (m *OS) EnterMultiCopyMode() bool {
 		m.enterCopyMode(w)
 		mc.IDs = append(mc.IDs, w.ID)
 	}
+	// The mode pill says "MULTI" and the pane count, and the dock's legend
+	// says the keys, so no message repeats either over the legend.
 	m.MultiCopy = mc
-	m.ShowNotification(fmt.Sprintf("Multi copy mode: %d panes", len(panes)), "info", m.Settings.NotificationDuration)
 	return true
 }
 

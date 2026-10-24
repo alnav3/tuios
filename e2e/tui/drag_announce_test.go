@@ -29,6 +29,14 @@ import (
 // it, which is what the two tests below need.
 func dragAnnouncePanes(t *testing.T) *tuitest.Terminal {
 	t.Helper()
+	term, _ := dragAnnounceBoard(t)
+	return term
+}
+
+// dragAnnounceBoard is dragAnnouncePanes with the isolation root, for a test
+// that also reads the geometry the daemon holds.
+func dragAnnounceBoard(t *testing.T) (*tuitest.Terminal, string) {
+	t.Helper()
 	base := t.TempDir()
 	writeConfig(t, base, "[appearance]\nshared_borders = true\nclick_to_type = 'double'\n")
 	term := startIn(t, base, startOpts{
@@ -44,8 +52,12 @@ func dragAnnouncePanes(t *testing.T) *tuitest.Terminal {
 	waitWindowCount(t, term, 3, "drag-announce setup")
 	enableTiling(t, term)
 	enterTerminalMode(t, term)
+	// bash reads the system rc file, which on CI sets a user@host:path prompt
+	// longer than a narrow pane is wide. The marker is printed after the
+	// prompt, so it could wrap across two rows and not be counted. A short
+	// prompt keeps every marker on one row.
 	runInShell(t, term,
-		`trap 'printf "WI%sCH\n" N' WINCH; clear; printf "AR%sED\n" M`,
+		`PS1='$ '; trap 'printf "WI%sCH\n" N' WINCH; clear; printf "AR%sED\n" M`,
 		"ARMED", shellTimeout)
 	// The trap is armed once the marker is on screen, and the clear has left
 	// the command echo behind it, so every WINCH row after this came from a
@@ -53,7 +65,7 @@ func dragAnnouncePanes(t *testing.T) *tuitest.Terminal {
 	time.Sleep(2 * time.Second)
 	leaveTerminalMode(t, term)
 	time.Sleep(time.Second)
-	return term
+	return term, base
 }
 
 // TestDragIntoASameSizeSlotResizesNothing is the regression. The armed pane is

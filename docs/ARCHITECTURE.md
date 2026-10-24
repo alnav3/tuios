@@ -12,6 +12,7 @@ This document provides a comprehensive overview of TUIOS's internal architecture
 - [Rendering Pipeline](#rendering-pipeline)
 - [SSH Server Architecture](#ssh-server-architecture)
 - [Core Components](#core-components)
+- [File transfers between machines](#file-transfers-between-machines)
 
 ## Overview
 
@@ -298,7 +299,7 @@ graph LR
 
 ### SGR Sequence Processing
 
-The pure Go emulator's SGR handler (`internal/vt/csi_sgr.go`) reads every SGR
+The pure Go emulator's SGR handler (`vt/csi_sgr.go`) reads every SGR
 through one function, `readStyleWithTheme`, with or without a theme. It used to
 hand the unthemed case to `uv.ReadStyle`, which read an underline
 subparameter such as `4:7` as a bare SGR 7 and dropped SGR 21, so a pane drew
@@ -345,10 +346,16 @@ its own and no pane background is painted, and it never becomes a cell's
 background. With no theme the emulator's defaults are black and white, which
 is not what the host terminal really is, so a client asks its terminal for its
 own colours (OSC 10, 11 and 4, through the startup probe or Bubble Tea) and
-hands them to `SetReportColors` and `SetReportPalette`; see
+hands them, with the sixteen, to `SetReportColors`; see
 `internal/app/host_colors.go`. The answers are held per client, since one
 server process serves clients on different terminals, and a local client
 follows the terminal's light and dark switch through mode 2031 and DSR 997.
+In the other direction, a `SetReportColors` call that changes any of the
+answers sends a guest that turned on mode 2031 one `CSI ? 997 ; Ps n`
+notice, and the emulator answers `CSI ? 996 n` with the same report.
+`SetThemeColors` sends no notice, so the client holds the report while the
+theme picker or editor previews a theme. In a daemon session only the client
+with the newest input (`MsgClientActivity`) sets the report colours.
 
 **Design Rationale:**
 
@@ -386,7 +393,7 @@ TUIOS supports live theme switching without restarting windows:
 
 | Component         | File                          | Responsibility                             |
 | ----------------- | ----------------------------- | ------------------------------------------ |
-| **SGR Handler**   | `internal/vt/csi_sgr.go`      | Parse SGR sequences, resolving the sixteen palette slots through the theme when one claims them |
+| **SGR Handler**   | `vt/csi_sgr.go`      | Parse SGR sequences, resolving the sixteen palette slots through the theme when one claims them |
 | **Theme Colors**  | `internal/terminal/window_theme.go` | Initialize and update window theme colors; cells keep a nil default background |
 | **Theme Manager** | `internal/app/os_window.go`   | Propagate theme changes to all windows     |
 | **Theme Config**  | `internal/theme/theme.go`     | Define color palettes and theme variants   |
@@ -571,7 +578,7 @@ This ensures:
 | **Terminal Windows**  | `internal/terminal/window.go`   | Terminal session container | PTY lifecycle, VT emulator integration, content caching         |
 | **Input Handler**     | `internal/input/keyboard.go`    | Event dispatcher           | Modal routing, prefix commands, keyboard/mouse processing       |
 | **Action Registry**   | `internal/input/actions.go`     | Command execution          | 40+ action handlers for window management and navigation        |
-| **VT Emulator**       | `internal/vt/emulator.go`       | ANSI parser                | Screen buffer management, scrollback, escape sequence handling, kitty keyboard protocol (CSI u, fish 4.x compatible), OSC 4/52, mode 2026/2027  |
+| **VT Emulator**       | `vt/emulator.go`       | ANSI parser                | Screen buffer management, scrollback, escape sequence handling, kitty keyboard protocol (CSI u, fish 4.x compatible), OSC 4/52, mode 2026/2027  |
 | **Kitty Passthrough** | `internal/app/kitty_passthrough.go` | Graphics forwarding    | Flicker-free image passthrough with ID reuse and mode 2026 sync. Video playback via mpv --vo=kitty (shm and base64) and youterm. Unicode placeholders forwarded as declarations, see below. |
 | **Sixel Passthrough** | `internal/app/sixel_passthrough.go` | Sixel images           | Decodes each pane's sixel, crops it to what is visible on the frame, and sends it as sixel, as kitty graphics, or as a placeholder box. See [Sixel images](#sixel-images). |
 | **Rendering Engine**  | `internal/app/render.go`        | View generation            | Layer composition, viewport culling, ANSI generation            |
@@ -639,7 +646,7 @@ images: scrolling the pane scrolls the cells, and the host redraws whatever is
 still on screen. The one thing it must do is rewrite the image id the cells
 name, because the host knows the image by whichever id it actually arrived
 under and a cell naming an unknown id draws nothing. That rewrite happens in
-the emulator as the cells are built (`internal/vt/kitty_placeholder.go`).
+the emulator as the cells are built (`vt/kitty_placeholder.go`).
 
 Two consequences follow from the id living in a color:
 
@@ -753,14 +760,20 @@ file (`t=t`) or a shared memory object (`t=s`). A path means something only on
 the machine it was written on, so where it gets read decides whether it works.
 
 - **Standalone.** The pane and tuios are on one machine. When the host
+  terminal draws no kitty graphics, `a=q` gets no answer. When the host
   terminal can read files there (the capability probe's `i=2` answer), tuios
   hands it the path. When it cannot (a browser, an SSH client), tuios reads the
   file itself and sends the bytes inline. The `a=q` answer says which: file
   media are refused when the host cannot read files, so a guest that asks,
   such as icat, streams the bytes instead.
 - **Daemon.** The daemon answers `a=q` itself, before any client sees the
-  query, so it answers for the one thing it knows: whether the path will be
-  read on the machine it names a file on. File media are refused for a pane
+  query, from what the attached clients told it. While no attached client's
+  host draws kitty graphics, the query gets no answer, which is what a
+  terminal without kitty graphics gives. The rule is the one DA1 follows for
+  sixel (see below): any attached client that shows the image is enough, and
+  with no client attached the last answer stands. Otherwise the answer says
+  whether the path will be read on the machine it names a file on. File
+  media are refused for a pane
   whose process runs on another machine over a link, and while any client
   attached over a link is drawing the session. Everywhere else they are
   accepted, and each client handles the path as in standalone. Direct
@@ -808,11 +821,21 @@ and over the next pane, with nothing to take it back.
   the guess.
 - `tuios-web` draws with xterm.js and its image addon, which does both sixel and
   kitty graphics.
+- A terminal whose XTVERSION answer names xterm.js (VS Code, Netcatty, Tabby,
+  Hyper) gets neither sixel nor kitty graphics, whatever it answers to the
+  graphics queries. A local one is also recognised by `TERM_PROGRAM=vscode`.
+  An answer that misses the startup probe is read when it arrives, and an SSH
+  client is asked XTVERSION before DA1. Its image addon writes every image into the cells
+  under it. Text does not erase it there, a second placement with the same ids
+  adds a second picture, and a delete leaves a grey placeholder, so tuios could
+  not move or clear a pane's picture (issue 567). The picture is drawn as
+  block glyphs instead (`internal/app/cell_bound_images.go`).
 - `TUIOS_SIXEL_GRAPHICS=1` or `0` overrides all of these.
 
 A pane is told it can draw sixel (DA1 attribute 4, and an answer to
 XTSMGRAPHICS for 256 colour registers and the pane's size in pixels) only when
-its picture will be shown: the host draws sixel or kitty graphics. In daemon
+its picture will be shown: the host draws sixel or kitty graphics, or the
+client draws images as block glyphs (see below), which is the default. In daemon
 mode the daemon's emulator answers, from the clients attached to the session:
 yes while any of them will show the picture (`Session.SetSixelAdvertised`).
 chafa, lsix, timg, yazi and notcurses choose between sixel and a text fallback
@@ -822,7 +845,7 @@ also mean protocols tuios does not pass (WezTerm makes yazi use iTerm2 images).
 The pixel size replies (`CSI 14 t`, `16 t`, `18 t`) use the host's cell size.
 
 **Cells.** The emulator does to a sixel image what a sixel terminal does: every
-cell the image covers is written with a marker (`internal/vt/sixel_marker.go`).
+cell the image covers is written with a marker (`vt/sixel_marker.go`).
 A marker is U+10EEED with four combining marks from kitty's placeholder table:
 the cell's row and column in the image, and the image id. From then on the
 picture is wherever its cells are. It scrolls into the scrollback with them,
@@ -853,7 +876,29 @@ the frame's text in the same write:
   row, where a sixel would scroll the screen.
 - On a host with kitty graphics and no sixel, as a kitty image with one
   placement per rectangle, cropped with a source rectangle.
-- On a host with neither, the cells show a dim box with "image" in it.
+- On a host with neither, as block glyphs (`internal/app/sixel_symbols.go`,
+  `shot/mosaic`): one glyph with a foreground and a background colour per
+  image cell. Each cell is split into sub-cells (2x4 for octants, 2x3 for
+  sextants, 2x2 for quadrants, 1x2 for half blocks), each the average of the
+  pixels under it in linear light, and the sub-cells are split into the two
+  groups whose OKLab means leave the least error. The part a pane shows when
+  the image arrives is drawn on its PTY reader, and the rest by the frame pass
+  as it comes into view, within a drawing budget per pane and, on the frame
+  pass, one budget shared by every pane. The images the pass draws count as on
+  screen, so eviction spares them. The frame pass puts
+  the glyphs on the canvas before the scrim and the spotlight, and gives them
+  the pane's dim, so they shade like text. At 256 colours the
+  sub-cells are dithered with a 4x4 Bayer matrix and snapped to the xterm
+  palette. At 16 colours they are always half blocks, dithered to the ANSI
+  colours with dark backgrounds only, and a picture whose fidelity falls
+  under `mosaic.MinFidelity` shows the box. `appearance.image_symbols` picks
+  the set: `auto` reads `TERM` (octants on kmscon, half blocks on the Linux
+  console, quadrants elsewhere). `off` shows a dim box with "image" in it,
+  and the pane is told no sixel. A host that answers for sixel or kitty
+  graphics never gets glyphs.
+
+  This is how a picture reaches the Linux console under kmscon, which has no
+  image protocol. See [KMSCON-GRAPHICS.md](KMSCON-GRAPHICS.md).
 
 Each marker becomes a space with the conceal attribute. It draws nothing, but a
 cell that stops being part of an image changes, the renderer rewrites it, and a
@@ -875,15 +920,15 @@ tuios mode does not change the result, because every client shows images to
 its own terminal: standalone, daemon, an SSH client (its DA1 answer decides)
 and tuios-web (a sixel host) all take the same path.
 
-| Program | Sixel host (foot, WezTerm, xterm, mlterm, Konsole, Windows Terminal, tuios-web) | Kitty host without sixel (kitty, Ghostty) | Host with neither |
+| Program | Sixel host (foot, WezTerm, xterm, mlterm, Konsole, Windows Terminal, tuios-web) | Kitty host without sixel (kitty, Ghostty) | Host with neither (kmscon, plain SSH) |
 | --- | --- | --- | --- |
-| chafa | tested: sixel | expected: chafa draws kitty graphics | expected: chafa's text |
-| timg | tested: sixel | expected: timg draws kitty graphics | expected: timg's text |
-| lsix | tested: sixel | expected: sent as kitty graphics | expected: lsix refuses to run |
-| yazi | tested: sixel preview | expected: yazi draws kitty graphics | expected: no preview picture |
-| a sixel file (`cat`), img2sixel | tested: sixel | tested: sent as kitty graphics | tested: placeholder box |
+| chafa | tested: sixel | expected: chafa draws kitty graphics | tested: sixel, drawn as glyphs |
+| timg | tested: sixel | expected: timg draws kitty graphics | expected: sixel, drawn as glyphs |
+| lsix | tested: sixel | expected: sent as kitty graphics | expected: sixel, drawn as glyphs |
+| yazi | tested: sixel preview | expected: yazi draws kitty graphics | expected: sixel preview, drawn as glyphs |
+| a sixel file (`cat`), img2sixel | tested: sixel | tested: sent as kitty graphics | tested: drawn as glyphs |
 | viu | no sixel in common builds: text | expected: viu draws kitty graphics | expected: viu's text |
-| notcurses, matplotlib sixel backends | expected: sixel | expected: sent as kitty graphics | expected: text or placeholder box |
+| notcurses, matplotlib sixel backends | expected: sixel | expected: sent as kitty graphics | expected: drawn as glyphs |
 
 img2sixel 1.10.5 on the test machine writes nothing for any input, so its row
 was tested with a sixel file of the same form.
@@ -893,6 +938,30 @@ replays what tuios wrote to a stand-in sixel terminal and checks that the
 picture lands in the right cells, clipped, and is gone when cleared. An SSH
 client and a browser use the same code with a different writer; neither has an
 end-to-end test.
+
+## File transfers between machines
+
+A copy between machines is a job in the daemon of the machine where it was
+started (`internal/session/transfer.go`). That daemon reads and writes its own
+disk directly and reaches another machine's disk through that machine's
+daemon, with the file verbs (`verb_files.go`), over the link. So every
+direction, this machine to a host, a host to this machine and one host to
+another, is one code path with a different end.
+
+The bytes ride bulk streams (`internal/federation/bulk.go`). A link's mux has
+two write lanes: every ordinary frame goes first, and a bulk frame (64 KiB at
+most) waits for the ordinary lane to be empty. A bulk stream also keeps to a
+credit window, sized at twice the bytes of the shortest round trip seen, from
+256 KiB to 16 MiB, so a copy never fills the ssh channel's buffer ahead of a
+keystroke. A peer that sends no credit frames gets no window, so an older peer
+still works.
+
+Each file goes through a part file named by its job, a sha256 of the original
+and of the part, and a rename into place. A job that has not ended is in a
+journal under the state folder, so a daemon restart goes on with it from its
+parts. Writes that arrive over a link go through an `os.Root` at the home
+folder and are refused in a deny list (`verb_files_confine.go`). The contract
+is in [protocol.md](protocol.md#files-and-transfers).
 
 ## Performance Characteristics
 

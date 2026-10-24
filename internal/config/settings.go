@@ -45,6 +45,15 @@ type Settings struct {
 	// Set via appearance.max_fps config (default 60, up to MaxFPSCap).
 	NormalFPS int
 
+	// MaxFPSAuto is set when appearance.max_fps is "auto": NormalFPS then
+	// follows DisplayFPS.
+	MaxFPSAuto bool
+
+	// DisplayFPS is the refresh rate the client found for this machine's
+	// displays, or 0 before it has looked or when it cannot tell. It is not
+	// read from the config, so a reload keeps it.
+	DisplayFPS int
+
 	// UseASCIIOnly controls whether to use ASCII fallback characters instead
 	// of Nerd Fonts. It is the effective answer: set by --ascii-only
 	// (ASCIIRequested), or by a terminal whose locale is not UTF-8 when no
@@ -83,6 +92,9 @@ type Settings struct {
 	// ModalDim is the percent the screen behind a modal overlay is darkened
 	// by. Zero turns it off. Set via appearance.modal_dim.
 	ModalDim int
+	// PopupDim is the percent the screen behind a focused plain popup is darkened
+	// by. Zero turns it off. Set via appearance.popup_dim.
+	PopupDim int
 
 	// AlwaysConfirmQuit controls whether the quit confirmation dialog is shown
 	// every time, regardless of whether there are active foreground processes.
@@ -113,6 +125,10 @@ type Settings struct {
 	// Set via --border-style flag or appearance.border_style config
 	BorderStyle string
 
+	// FramePanels frames every overlay panel in OverlayBorder, not only the
+	// panels at 16 colours that need a frame. Set via appearance.frame_panels.
+	FramePanels bool
+
 	// TilingScheme is the BSP insertion scheme a workspace starts with the
 	// first time it is tiled: one of the TilingScheme* constants (spiral,
 	// longest_side, alternate, smart_split). Set via appearance.tiling_scheme.
@@ -130,6 +146,27 @@ type Settings struct {
 	// the Links* constants: off, marked (OSC 8 only) or all (bare URLs too). Set
 	// via appearance.links.
 	Links string
+
+	// LinkClick is the click that opens a link: one of the LinkClick*
+	// constants. Set via appearance.link_click.
+	LinkClick string
+
+	// LinkHover is the hover highlight policy: one of the LinkHover*
+	// constants. Set via appearance.link_hover.
+	LinkHover string
+
+	// DropPreview is what a BSP drag draws where the pane would land: one of
+	// the DropPreview* constants. Set via appearance.drop_preview.
+	DropPreview string
+
+	// DropPreviewDelay is how long the pointer rests on one drop zone before
+	// the preview shows. Zero shows it at once. Set via
+	// appearance.drop_preview_delay.
+	DropPreviewDelay time.Duration
+
+	// LinkOpener is the command that opens a web link. Empty uses $BROWSER,
+	// then the system opener. Set via appearance.link_opener.
+	LinkOpener string
 
 	// DockbarPosition controls the position of the dockbar
 	// Set via --dockbar-position flag or appearance.dockbar_position config
@@ -152,6 +189,11 @@ type Settings struct {
 	// SidebarShowCounts draws the window count on each session row.
 	SidebarShowCounts bool
 
+	// SidebarShowNumbers draws the switch number ahead of each session name.
+	// Off by default: the quiet rail is the default, and the people who want
+	// the numbers set show_numbers in [appearance.sidebar].
+	SidebarShowNumbers bool
+
 	// SidebarMarquee scrolls a hovered row's title when it overflows its columns.
 	SidebarMarquee bool
 
@@ -173,6 +215,20 @@ type Settings struct {
 	// SidebarFolderClick is what a click on a folder row does: walk the listing
 	// into it, tell the pane to cd there, or both.
 	SidebarFolderClick string
+	// RailHeaderCase is how the rail's section headers read: "lowercase"
+	// keeps the quiet furniture look they have always had, "uppercase" draws
+	// the heading treatment (bold, secondary ink, the rule glyph and the
+	// uppercase label). Set via appearance.sidebar.header_case.
+	RailHeaderCase string
+	// RailRowStyle is how the rail marks the row you are on. Set via
+	// appearance.sidebar.row_style; read it through GetRailRowStyle.
+	RailRowStyle string
+	// RailHeaderStyle is how a rail section header is drawn. Set via
+	// appearance.sidebar.header_style; read it through GetRailHeaderStyle.
+	RailHeaderStyle string
+	// RailRoomy puts a blank row in front of each rail section header after
+	// the first. Set via appearance.sidebar.density = "roomy".
+	RailRoomy bool
 	// SidebarEditor is the terminal editor command; empty uses the environment.
 	SidebarEditor string
 
@@ -191,6 +247,13 @@ type Settings struct {
 	// Zero never folds. From appearance.sidebar.agent_rest_fold.
 	SidebarAgentRestFold time.Duration
 
+	// SidebarSubagents is how the rail draws the subagents under an agent
+	// row: rows or the count, tree lines, the heading line that folds them,
+	// the fields, the row cap and when a finished row goes. From the
+	// appearance.sidebar.subagent_* keys and the rail's edge table. The rail
+	// on the other edge resolves its own; see renderSecondarySidebar.
+	SidebarSubagents SidebarSubagentView
+
 	// SidebarFileDelete is where a deleted file goes: the trash, or nowhere.
 	SidebarFileDelete string
 
@@ -205,8 +268,8 @@ type Settings struct {
 
 	// SessionColors gives every session a colour of its own and marks it on the
 	// surfaces that show more than one session at once: the rail's sessions and
-	// agents sections, and the session switcher. Off leaves each of those exactly
-	// as it was before the colours existed.
+	// agents sections, and the session switcher. Off leaves each of those
+	// without a session colour.
 	// SessionBorder carries the session's colour on every pane border, not only
 	// on the rail. It is off by default because it changes the look of every
 	// window, and it is separate from SessionColors so the rail's marks and the
@@ -229,8 +292,8 @@ type Settings struct {
 	//
 	// A click is different from the other ways focus moves. A workspace switch
 	// or a focus the daemon moved is not a statement about the viewport, and
-	// revealing on those threw away wherever the user had scrolled the strip,
-	// which is the bug that put every focus change on the least-scroll rule.
+	// revealing on those would throw away wherever the user had scrolled the
+	// strip, so they follow the least-scroll rule.
 	// Clicking a column that is half off the edge is a statement: you picked
 	// that pane to work in, so the strip brings all of it to you.
 	NiriClickReveals bool
@@ -272,15 +335,48 @@ type Settings struct {
 	// the historic rendering.
 	DockWorkspaceTabFormat string
 
-	// DockWorkspaceTooltip pops the whole name of a workspace whose pill had to cut
-	// it short. Off, a long name stays truncated with no way to read the rest.
+	// DockWorkspaceTooltip pops the whole name of a workspace whose pill does not
+	// show it: the pill had to cut it short, or the tab format has no {name}.
+	// Off, the name stays cut or hidden with no way to read it from the dock.
 	DockWorkspaceTooltip bool
 
-	// DockPillCaps puts powerline half-circle caps back on the dock's mode pill,
-	// workspace tabs and minimized-window pills. Off, each is a flat filled cell:
-	// the caps repeated on every one of them, so a status line read as a row of
-	// beads. The capped look is one key away for anyone who wants it.
+	// DockWorkspaceLabelMax caps a workspace pill's label in cells. 0 draws the
+	// whole name and lets the strip's scroll arithmetic handle the width.
+	DockWorkspaceLabelMax int
+
+	// DockPillCaps puts powerline half-circle caps on the dock's mode chip,
+	// workspace tabs and minimized-window pills. On by default. Off, each is a
+	// flat filled cell, for anyone who reads a row of caps as a row of beads.
 	DockPillCaps bool
+
+	// DockModeSplitLetter shows the next split's direction, V or H, after the
+	// tiling icon in the mode pill. On by default. Off, the pill is the icon
+	// alone. With the default icons that is as wide as the leader's pill, so
+	// pressing the leader no longer moves the workspace tabs.
+	DockModeSplitLetter bool
+
+	// DockPrefixIndicator is where an armed leader shows: "pill" colours the
+	// dock's mode pill, "badge" draws the floating PREFIX badge. The badge is
+	// drawn either way when the dock is hidden or has no mode pill.
+	DockPrefixIndicator string
+
+	// BorderFocusedGradient and BorderGradientAngle are
+	// appearance.border_focused_gradient and border_gradient_angle. Read the
+	// stops through BorderGradientStops.
+	BorderFocusedGradient string
+	BorderGradientAngle   int
+
+	// DockModeIconWindow, DockModeIconTerminal and DockModeIconTiling are the
+	// mode pill's icons from appearance.dock_mode_icon_*. Nil is unset, which
+	// draws the built-in for the glyph set. An empty string draws no icon.
+	// Read them through GetDockModeIconWindow and its siblings.
+	DockModeIconWindow   *string
+	DockModeIconTerminal *string
+	DockModeIconTiling   *string
+
+	// DockCompact draws the dock as one row: the pills without the rule above
+	// or below them. The panes get the row back. Off by default.
+	DockCompact bool
 
 	// HideWindowButtons controls whether to hide window control buttons
 	// Set via --hide-window-buttons flag or appearance.hide_window_buttons config
@@ -348,6 +444,11 @@ type Settings struct {
 	// Set via --window-title-position flag or appearance.window_title_position config
 	WindowTitlePosition string
 
+	// WindowTitleStyle and WindowTitleAlign are appearance.window_title_style
+	// and window_title_align.
+	WindowTitleStyle string
+	WindowTitleAlign string
+
 	// WindowTitleFormat is the template used to build a window's displayed title.
 	// Empty (the default) means the title is shown as-is. See FormatWindowTitle for
 	// the supported placeholders.
@@ -396,6 +497,13 @@ type Settings struct {
 	// window-manager habit, so it defaults off and users opt in.
 	// Set via appearance.focus_follows_mouse config.
 	FocusFollowsMouse bool
+
+	// FocusFollowsMousePause is the modifier, "ctrl" or "alt", that pauses
+	// FocusFollowsMouse while it is held. Empty never pauses. tuios learns the
+	// modifier from the motion report itself, and does not consume it: a pane
+	// program that tracks the mouse still gets the motion with the modifier.
+	// Set via appearance.focus_follows_mouse_pause config.
+	FocusFollowsMousePause string
 
 	// AltDrag makes alt + left-drag move a pane, the gesture nearly every desktop
 	// window manager binds. It is on by default because the hands that know it
@@ -464,18 +572,35 @@ type Settings struct {
 	// Set via appearance.kitty_placeholders config.
 	KittyPlaceholders string
 
+	// ImageSymbols decides how a pane's sixel image is shown on a host
+	// terminal that draws no graphics, such as kmscon or the Linux console.
+	// A glyph set name draws the picture as block glyphs of that set:
+	// octant (Unicode 16), sextant (Unicode 13), quadrant, half. "auto"
+	// picks by TERM: octant on kmscon, half on the Linux console, quadrant
+	// elsewhere (see imageSymbolKind in internal/app). "off" draws a box and
+	// tells the pane there is no sixel, so programs use their own text.
+	// Set via appearance.image_symbols config.
+	ImageSymbols string
+
 	// NewWindowInheritCwd starts a new window in the working directory of the
 	// pane that was focused when it was asked for, rather than in the
 	// directory the daemon itself was started in.
 	//
 	// On by default. A window opened from a pane deep in a project is almost
-	// always wanted in that project, and the old behaviour dropped the shell
-	// back in $HOME to be cd'd again by hand. The directory is read from the
-	// focused pane's live shell, so it follows the pane rather than where the
-	// pane started, and anything that cannot be read falls back to the old
-	// behaviour rather than failing to open a window.
+	// always wanted in that project, and a shell started elsewhere has to be
+	// cd'd there again by hand. The directory is read from the focused pane's
+	// live shell, so it follows the pane rather than where the pane started,
+	// and anything that cannot be read falls back to the default directory
+	// rather than failing to open a window.
 	// Set via appearance.new_window_inherit_cwd config.
 	NewWindowInheritCwd bool
+
+	// NewWindowFollowSSH makes the ordinary split and new-window actions
+	// behave like their ssh versions: when the focused pane runs ssh, the new
+	// pane runs the same ssh. Off by default, so a split is a local shell
+	// unless the person asks for the ssh version by its own key.
+	// Set via appearance.new_window_follow_ssh config.
+	NewWindowFollowSSH bool
 
 	// WordCharacters lists the punctuation that counts as part of a word when a
 	// double-click selects one, on top of letters and digits, which always do.
@@ -507,6 +632,11 @@ type Settings struct {
 	// LeaderKey is the prefix key for commands (default: ctrl+b)
 	// Set via appearance.leader_key config
 	LeaderKey string
+	// KeyboardLayout and OptionGlyphs are keybindings.keyboard_layout and
+	// keybindings.option_glyphs, for the leader check, which reads Settings
+	// rather than the binding tables. Empty is the default of each.
+	KeyboardLayout string
+	OptionGlyphs   string
 
 	// PaneGap is the cells of empty space the tiler keeps between two neighbouring
 	// panes: i3's inner gap, and about the only spacing a terminal window manager
@@ -599,6 +729,26 @@ type Settings struct {
 	// another, where two panes change at once and neither says so.
 	ZoomAnimation bool
 
+	// AnimationSpeed is the percent window animations run at: 100 is as
+	// shipped, 200 twice as fast, 50 half as fast.
+	AnimationSpeed int
+
+	// ThemeTransition is how a change of theme is shown: ThemeTransitionNone
+	// swaps the colours in one frame, ThemeTransitionFade crosses the whole
+	// screen over, and ThemeTransitionCircle grows the new theme from the
+	// middle of the screen. Read it through ThemeTransitionStyle, which also
+	// honours appearance.motion.
+	ThemeTransition string
+	// ThemeTransitionMs is how long the transition takes at animation speed
+	// 100. Read it through ThemeTransitionDuration.
+	ThemeTransitionMs int
+
+	// ZoomBorderless makes a zoom the whole pane region with no chrome: the
+	// zoomed pane drops its border and title bar, and its guest is told the
+	// full size of the region. zoom_size and zoom_max_width do not apply while
+	// it is on, since a pane with no border has nothing to show around it.
+	ZoomBorderless bool
+
 	// DimUnfocused is how far an unfocused pane's content is carried toward the
 	// pane's own ground, as a percentage. Zero, the default, draws every pane's
 	// content the same.
@@ -610,6 +760,13 @@ type Settings struct {
 	// thing a rice wants. One number is also the only form that says the same thing
 	// on a light theme as on a dark one.
 	DimUnfocused int
+
+	// DimForeground lets DimUnfocused carry a pane's text toward its ground,
+	// the same as its background. True, the default, dims both; false keeps
+	// the text at full strength and dims only the background, for a rice that
+	// wants an unfocused pane to read as quieter without its text going dim
+	// too.
+	DimForeground bool
 
 	// DimMultifocus dims the panes in the multifocus set like every other
 	// unfocused pane. False, the default, leaves them undimmed: they take the
@@ -665,16 +822,24 @@ const (
 // KittyPlaceholderModes is what appearance.kitty_placeholders accepts.
 var KittyPlaceholderModes = []string{KittyPlaceholdersAuto, KittyPlaceholdersOn, KittyPlaceholdersOff}
 
+// ImageSymbolsAuto is the default of appearance.image_symbols.
+const ImageSymbolsAuto = "auto"
+
+// ImageSymbolModes is what appearance.image_symbols accepts. The names other
+// than auto are mosaic.Kind names.
+var ImageSymbolModes = []string{ImageSymbolsAuto, "octant", "sextant", "quadrant", "half", "off"}
+
 func DefaultSettings() Settings {
 	return Settings{
 		NotificationDuration:        6 * time.Second,
 		NotificationWarningDuration: 8 * time.Second,
 		NotificationErrorDuration:   15 * time.Second,
 		NotificationErrorSticky:     true,
-		NormalFPS:                   60,
+		NormalFPS:                   DefaultFPS,
 		UseASCIIOnly:                false,
 		Motion:                      MotionFull,
 		ModalDim:                    ModalDimDefault,
+		PopupDim:                    PopupDimDefault,
 		AnimationsSuppressed:        false,
 		AlwaysConfirmQuit:           false,
 		WhichKeyEnabled:             true,
@@ -685,12 +850,16 @@ func DefaultSettings() Settings {
 		TilingScheme:                TilingSchemeSpiral,
 		ZenMode:                     ZenModeDisabled,
 		Links:                       LinksAll,
+		LinkClick:                   LinkClickBoth,
+		DropPreview:                 DropPreviewFill,
+		DropPreviewDelay:            DefaultDropPreviewDelay,
 		DockbarPosition:             DefaultDockbarPosition,
 		SidebarEnabled:              true,
 		SidebarPosition:             DefaultSidebarPosition,
 		SidebarWidth:                SidebarDefaultWidth,
 		SidebarShowGlyphs:           true,
 		SidebarShowCounts:           true,
+		SidebarShowNumbers:          false,
 		SidebarMarquee:              true,
 		SidebarSections:             SidebarDefaultSections,
 		SidebarFileIcons:            true,
@@ -700,6 +869,7 @@ func DefaultSettings() Settings {
 		SidebarFileDelete:           SidebarFileDeleteTrash,
 		SidebarAgentRow:             DefaultSidebarAgentRow(),
 		SidebarAgentRestFold:        DefaultAgentRestFold,
+		SidebarSubagents:            DefaultSidebarSubagentView(),
 		Tooltips:                    true,
 		SessionColors:               true,
 		SessionBorder:               false,
@@ -710,7 +880,11 @@ func DefaultSettings() Settings {
 		DockWorkspaceTabs:           true,
 		DockWorkspaceTabFormat:      "",
 		DockWorkspaceTooltip:        true,
-		DockPillCaps:                false,
+		DockWorkspaceLabelMax:       12,
+		DockPillCaps:                true,
+		DockModeSplitLetter:         true,
+		DockPrefixIndicator:         DefaultDockPrefixIndicator,
+		BorderGradientAngle:         DefaultBorderGradientAngle,
 		HideWindowButtons:           false,
 		WindowButtonStyle:           WindowButtonStyleDots,
 		WindowButtonPosition:        WindowButtonPositionLeft,
@@ -736,6 +910,8 @@ func DefaultSettings() Settings {
 		OSC52Write:                  OSC52WriteFocused,
 		HideScrollbar:               false,
 		WindowTitlePosition:         DefaultWindowTitlePosition,
+		WindowTitleStyle:            DefaultWindowTitleStyle,
+		WindowTitleAlign:            DefaultWindowTitleAlign,
 		WindowTitleFormat:           "",
 		HideClock:                   false,
 		ShowClock:                   false,
@@ -750,6 +926,7 @@ func DefaultSettings() Settings {
 		ClickToType:                 ClickToTypeDouble,
 		NewWindowInheritCwd:         true,
 		KittyPlaceholders:           KittyPlaceholdersAuto,
+		ImageSymbols:                ImageSymbolsAuto,
 		RightClickOpensMenu:         false,
 		AutoEnterTerminalOnFocus:    AutoEnterTerminalOff,
 		WordCharacters:              `@-./_~?&=%+#`,
@@ -765,9 +942,13 @@ func DefaultSettings() Settings {
 		ScrollColumnMax:             ScrollColumnWidthMax,
 		ZoomSize:                    ZoomSizeDefault,
 		ZoomAnimation:               true,
+		AnimationSpeed:              AnimationSpeedDefault,
+		ThemeTransition:             ThemeTransitionNone,
+		ThemeTransitionMs:           ThemeTransitionMsDefault,
 		ZoomFollowsFocus:            true,
 		WindowButtonZoom:            true,
 		DimUnfocused:                0,
+		DimForeground:               true,
 		Background:                  BackgroundOff,
 		ClockFormat:                 "",
 		ZoomMaxWidth:                0,

@@ -204,10 +204,22 @@ func (m *OS) sidebarSignature() uint64 {
 	mixB(m.filesView.Loading)
 	mixI(m.SidebarScrollF)
 	mixU(m.filesView.Gen)
+	// The custom section: its rows change when its command's output does,
+	// which is the generation, and the section scrolls like the others.
+	if m.sidebarDrawing {
+		mixU(m.railCustomSecond.gen)
+	} else {
+		mixU(m.railCustom.gen)
+	}
+	mixI(m.SidebarScrollC)
+	// The git section scrolls like the others once it is given fewer lines
+	// than its two rows.
+	mixI(m.SidebarScrollG)
 
 	// The agents section's two controls decide which rows it holds and in what
 	// order, so both are drawn state and both are folded. The tokens themselves
 	// change ink with them, which is the other half of what the frame shows.
+	mixB(m.agentsOn())
 	mixS(m.sidebarAgentsFilter())
 	mixS(m.sidebarAgentsSort())
 	// The fold of rows at rest: whether it is open, its threshold, and the
@@ -220,11 +232,38 @@ func (m *OS) sidebarSignature() uint64 {
 	if m.Settings.SidebarAgentRestFold > 0 && m.SidebarAgentsSeen {
 		mixI(int(sidebarFoldClock().Unix() / 60))
 	}
+	// The subagent options of the rail being drawn, which differ per edge,
+	// and the open or shut headings, which a toggle on either rail moves.
+	sv := m.Settings.SidebarSubagents
+	mixB(sv.Rows)
+	mixB(sv.Tree)
+	mixS(sv.Collapse)
+	mixB(sv.Fields.Mark)
+	mixB(sv.Fields.Name)
+	mixB(sv.Fields.Type)
+	mixB(sv.Fields.Time)
+	mixB(sv.Fields.Note)
+	mixI(sv.MaxRows)
+	mixB(sv.Hide)
+	mixI(int(sv.HideAfter / time.Millisecond))
+	mixI(m.sidebarSubagentFoldGen)
+	var hideNow time.Time
+	if sv.Hide {
+		hideNow = time.Now()
+	}
 
 	// Rail keyboard focus: the accent edge and the cursor-row highlight both
 	// depend on it, so a focus change or a cursor move must rebuild.
-	mixB(m.SidebarFocused)
+	mixB(m.sidebarRailFocused())
 	mixI(m.SidebarCursor)
+
+	// The switch numbers are drawn state, on while show_numbers is set.
+	mixB(m.Settings.SidebarShowNumbers)
+	// The row style marks the current row's gutter or its name.
+	mixS(m.Settings.RailRowStyle)
+	mixS(m.Settings.RailHeaderStyle)
+	mixS(m.Settings.RailHeaderCase)
+	mixB(m.Settings.RailRoomy)
 
 	// Which terminal rows carry a workspace tag turns on which workspace is
 	// current; the per-window workspaces themselves are folded in below. The
@@ -234,7 +273,7 @@ func (m *OS) sidebarSignature() uint64 {
 	// The order arranges the rail's terminals section and the dock's pills both,
 	// and a draft one is live for the length of a drag, so it is drawn state and
 	// belongs in here.
-	for _, ws := range m.WorkspaceOrder {
+	for _, ws := range m.pendingWorkspaceOrder {
 		mixI(ws)
 	}
 	mixB(m.dockWorkspaceDrag.Dragging)
@@ -317,9 +356,14 @@ func (m *OS) sidebarSignature() uint64 {
 		mixS(m.SessionWorktree.Repo)
 		mixS(m.SessionWorktree.Branch)
 		mixB(m.SessionWorktree.Gone)
+		mixS(m.SessionWorktree.PR.Badge())
 	} else {
 		mixI(-1)
 	}
+	// The attached session's space decides which heading its row is drawn
+	// under, and like its worktree record it arrives on the session state, so
+	// the client's cache generation below does not speak for it.
+	mixS(m.SessionSpace)
 
 	// Foreign-session data, folded by generation instead of by locking the client.
 	if m.DaemonClient != nil {
@@ -399,6 +443,44 @@ func (m *OS) sidebarSignature() uint64 {
 		}
 		if w.AgentSubagents > 0 {
 			mixI(w.AgentSubagents)
+		}
+		// The subagents' rows: each one's name, state, tool and end, and the
+		// minute a running one's age reads as. A pane with none folds
+		// nothing.
+		if n := len(w.AgentSubagentList); n > 0 {
+			mixI(n)
+			for _, sa := range w.AgentSubagentList {
+				mixS(sa.ID)
+				mixS(sa.State)
+				mixS(sa.Description)
+				mixS(sa.Type)
+				mixS(sa.Now)
+				mixS(sa.Last)
+				mixI(sa.Tools)
+				mixS(sa.Result)
+				// Whether subagent_hide_finished hides it by now, so the
+				// row goes on the frame the hide is due.
+				if sv.Hide {
+					mixB(sidebarSubagentHidden(sv, sa, hideNow))
+				}
+				if sa.EndedAt == 0 {
+					mixI(int(agentElapsedBucket(sa.StartedAt)))
+				} else {
+					mixI(int((sa.EndedAt - sa.StartedAt) / int64(time.Minute)))
+				}
+			}
+		}
+		// The OSC 7501 records draw the app and the progress on the row.
+		if n := len(w.ProgramStatus); n > 0 {
+			mixI(n)
+			for _, r := range w.ProgramStatus {
+				mixS(r.ID)
+				mixS(r.State)
+				mixS(r.App)
+				mixI(r.Progress)
+				mixS(r.Title)
+				mixS(r.Msg)
+			}
 		}
 		// The agents section prints the age of the state, so the row changes on a
 		// minute boundary with no other input moving. Folding the whole timestamp

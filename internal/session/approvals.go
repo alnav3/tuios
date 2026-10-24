@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/integration"
+	"github.com/Gaurav-Gosain/tuios/internal/procinfo"
 	"github.com/Gaurav-Gosain/tuios/internal/risk"
 )
 
@@ -158,6 +160,26 @@ func ApprovalPolicyFromConfig(c config.ApprovalsConfig) ApprovalPolicy {
 	return p
 }
 
+// narrowApprovalPolicy is next as a file change may apply it over was: only
+// where it narrows. A rule in force that next drops stays in force, beside
+// the rules next adds, and a pane may not allow a risky call unless it could
+// already. waits reports that next asks for more than it was given, which
+// waits for tuios config apply or a restart.
+func narrowApprovalPolicy(was, next ApprovalPolicy) (kept ApprovalPolicy, waits bool) {
+	kept = next
+	for _, r := range was.Risk {
+		if !slices.ContainsFunc(next.Risk, r.Same) {
+			kept.Risk = append(slices.Clone(kept.Risk), r)
+			waits = true
+		}
+	}
+	if next.PanesMayAllow && !was.PanesMayAllow {
+		kept.PanesMayAllow = false
+		waits = true
+	}
+	return kept, waits
+}
+
 // canonicalHarness resolves a harness name to the id hooks report under, or
 // lower-cases a name nothing knows.
 func canonicalHarness(name string) string {
@@ -223,9 +245,10 @@ type approvalHold struct {
 	// tool and target are the call the risk rules read, as the hook named
 	// it. Empty when the hook did not.
 	tool, target string
-	// root is the pane's worktree root, else its working directory, when
-	// the hold began: where the outside-the-worktree rule measures from.
-	root string
+	// root is the pane's fixed root (approvalRoot) when the hold began: where
+	// the outside-the-worktree rule measures from. runDir is the folder the
+	// call runs in, which a relative path is resolved against.
+	root, runDir string
 	// risk are the rules the call matched. An allow needs risk_ack naming
 	// exactly these.
 	risk []risk.Hit
@@ -259,7 +282,7 @@ type holdSpec struct {
 	scope   []string
 	expires time.Time
 	// tool, target and root are the call as the risk rules read it.
-	tool, target, root string
+	tool, target, root, runDir string
 	// risk are the rules the call matched, computed before the hold opens.
 	risk []risk.Hit
 	// plan is a plan's text.
@@ -307,6 +330,7 @@ func (a *attentionStore) startHold(spec holdSpec) (*approvalHold, string) {
 		tool:        spec.tool,
 		target:      spec.target,
 		root:        spec.root,
+		runDir:      spec.runDir,
 		risk:        slices.Clone(spec.risk),
 		denyMessage: spec.denyMessage,
 		done:        make(chan approvalOutcome, 1),
@@ -322,7 +346,9 @@ func (a *attentionStore) startHold(spec holdSpec) (*approvalHold, string) {
 	a.rev++
 	it.RequestID, it.Options, it.Expires = h.id, h.options, spec.expires.UnixNano()
 	it.Summary, it.AlwaysScope = spec.summary, slices.Clone(scope)
-	it.Kind, it.Risk, it.DenyMessage = kind, risk.Names(h.risk), h.denyMessage
+	// A hold adds to the mark on the item and takes nothing off it
+	// (stickyRisk): the requester may be the pane itself.
+	it.Kind, it.Risk, it.DenyMessage = kind, stickyRisk(it.Risk, risk.Names(h.risk)), h.denyMessage
 	it.PlanLines, it.PlanSHA = 0, h.planSHA
 	if kind == AttentionPlan {
 		it.PlanLines = planLineCount(h.plan)
@@ -364,7 +390,7 @@ func (a *attentionStore) endHoldLocked(requestID string, out approvalOutcome, cl
 		// reason for, so the item is the pane's approval again, marked by
 		// what its line says now.
 		it.Kind, it.DenyMessage, it.PlanLines, it.PlanSHA = AttentionApproval, false, 0, ""
-		it.Risk = risk.Names(a.riskOfLine(it.Summary, h.root))
+		it.Risk = stickyRisk(it.Risk, risk.Names(a.riskOfLine(it.Summary, h.root, h.runDir)))
 		it.Seq = a.rev
 		a.publish(attentionEvent(AttentionUpdated, *it))
 		a.changedLocked()
@@ -540,6 +566,7 @@ func (d *Daemon) verbRequestApproval(cs *connState, params json.RawMessage) (any
 		Tool        string `json:"tool"`
 		Target      string `json:"target"`
 		DenyMessage bool   `json:"deny_message"`
+		Cwd         string `json:"cwd"`
 	}
 	if verr := decodeParams(params, &p); verr != nil {
 		return nil, verr
@@ -643,19 +670,27 @@ func (d *Daemon) verbRequestApproval(cs *connState, params json.RawMessage) (any
 		scope:       p.Scope,
 		tool:        p.Tool,
 		target:      p.Target,
-		root:        paneRoot(st, w),
+		root:        sess.windowApprovalRoot(managedWorktreePath(st.Worktree), w.ID, w.AgentSessionID),
+		runDir:      resolvedRunDir(approvalRunDir(p.Cwd, sess.paneRunDir(w.PTYID))),
 		denyMessage: p.DenyMessage,
 	}
 	if isPlan {
 		spec.kind, spec.plan, spec.tool, spec.target = AttentionPlan, p.Plan, "", ""
 	} else {
-		spec.risk = d.attention.riskOfCall(spec.tool, spec.target, summary, spec.root)
+		spec.risk = d.attention.riskOfCall(spec.tool, spec.target, summary, spec.root, spec.runDir)
 	}
 	holdFor := policy.holdFor()
 	spec.expires = time.Now().Add(holdFor)
 	hold, reason := d.attention.startHold(spec)
 	if hold == nil {
 		return approvalResult("", approvalOutcome{Reason: reason}), nil
+	}
+	// The call was admitted while the agent features were on, and they went
+	// off before the hold started, after the switch closed every item. The
+	// harness gets its prompt back now rather than after the hold.
+	if d.agentsOff.Load() {
+		d.attention.closeAll(AttentionClosedAgentsDisabled)
+		return approvalResult(hold.id, <-hold.done), nil
 	}
 	LogBasic("Approval %s held for %s in %s (%s) for up to %s", hold.id, w.ID, sess.Name(), harnessID, holdFor)
 
@@ -712,8 +747,7 @@ func (d *Daemon) verbReplyApproval(cs *connState, params json.RawMessage) (any, 
 		}
 		return nil, invalidParam("decision", msg, approvalReplies...)
 	}
-	by, ok := d.humanNonceClient(p.HumanNonce, cs)
-	if !ok {
+	if !d.humanNonceHeld(p.HumanNonce, cs) {
 		return nil, hintedVerbError(ErrVerbNotHuman, "reply-approval is for the person at an attached client", &VerbHint{
 			Param:  "human_nonce",
 			Detail: "Nothing was answered. Only a client attached right now can answer an approval, by passing the nonce its attach reply carried. An agent never can.",
@@ -738,6 +772,11 @@ func (d *Daemon) verbReplyApproval(cs *connState, params json.RawMessage) (any, 
 			return nil, noHoldError("no approval is held for window " + echoName(p.Window))
 		}
 		requestID = id
+	}
+	holdSession, _ := d.attention.holdSession(requestID)
+	by, ok := d.humanNonceFor(p.HumanNonce, d.sessionIDOf(holdSession), cs)
+	if !ok {
+		return nil, nonceScopeError("reply-approval")
 	}
 	message := attentionText(p.Message, approvalMaxMessage)
 	out, hold, applied, err := d.attention.answer(requestID, p.Decision, message, by, p.Summary, p.RiskAck, p.PlanSHA)
@@ -780,6 +819,9 @@ func (d *Daemon) verbReplyApproval(cs *connState, params json.RawMessage) (any, 
 			_, _, _, _ = sess.applyAgentReport(hold.window, AgentReport{
 				State:   AgentStateWorking,
 				IfState: []AgentState{AgentStateNeedsInput},
+				// The prompt was the pane's own held approval, now
+				// answered, so nothing is left on the screen to hold.
+				fromPane: true,
 			})
 		}
 	}
@@ -813,11 +855,24 @@ func noHoldError(msg string) *verbError {
 	})
 }
 
-// humanNonceClient is verifyAnyHumanNonce that also names the client whose
-// attach the nonce came from, for the record of who answered.
-func (d *Daemon) humanNonceClient(nonce string, sender *connState) (string, bool) {
-	id, ok := d.matchHumanNonceClient(nonce, "", sender)
-	return id, ok
+// holdSession is the session a running hold is in, by name.
+func (a *attentionStore) holdSession(requestID string) (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if h, ok := a.holds[requestID]; ok {
+		return h.session, true
+	}
+	return "", false
+}
+
+// nonceScopeError refuses a nonce that is live but does not cover the
+// session the act lands in (humanNonceFor).
+func nonceScopeError(verb string) *verbError {
+	return hintedVerbError(ErrVerbNotHuman, verb+" is refused: the human_nonce is for another session", &VerbHint{
+		Param:  "human_nonce",
+		Verb:   "attach-presence",
+		Detail: "Nothing was done. A presence made for one session acts only in that session. To act in every session, call attach-presence with no session.",
+	})
 }
 
 // paneInFrontOfPerson reports whether a client the person holds is attached
@@ -887,7 +942,7 @@ func (d *Daemon) peerPaneWindow(cs *connState) (bool, string) {
 			}
 		}
 	}
-	if id, ok := readProcEnvVar(pid, "TUIOS_PANE_ID"); ok && id != "" && d.holdsWindow(id) {
+	if id, ok := procinfo.EnvVar(pid, "TUIOS_PANE_ID"); ok && id != "" && d.holdsWindow(id) {
 		return true, id
 	}
 	return true, ""
@@ -919,4 +974,22 @@ func watchPeerGone(conn net.Conn) (<-chan struct{}, func()) {
 		<-finished
 		_ = conn.SetReadDeadline(time.Time{})
 	}
+}
+
+// approvalRunDir is the folder a held call runs in: the cwd the harness sent
+// with it, when that is an absolute path, else the pane's live folder.
+func approvalRunDir(harnessCwd, live string) string {
+	if harnessCwd != "" && filepath.IsAbs(harnessCwd) {
+		return filepath.Clean(harnessCwd)
+	}
+	return live
+}
+
+// resolvedRunDir is a run folder with its links resolved, so it compares
+// with the resolved root. "" stays "".
+func resolvedRunDir(dir string) string {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return ""
+	}
+	return realPath(filepath.Clean(dir))
 }

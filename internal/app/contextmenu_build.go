@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/federation"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 )
 
@@ -118,7 +118,8 @@ func (m *OS) contextMenuTargetAt(x, y int) (target ContextMenuTarget, windowInde
 // must never treat the dock band as a pane.
 //
 // A dock of DockHeight rows at the top of the screen occupies rows 0 to
-// DockHeight-1, so the test is exclusive. Writing it inclusive, as the click
+// DockHeight-1, so the test is exclusive. DockHeight is one row when the dock
+// is compact and two when it is not. Writing it inclusive, as the click
 // handler in internal/input still does, claims one row more than the dock draws
 // on: with the dock at the top that extra row is the first row of the topmost
 // window, which is how the pane menu came to be unreachable there.
@@ -128,9 +129,9 @@ func (m *OS) InDockBand(y int) bool {
 	case "hidden":
 		return false
 	case "top":
-		return y < config.DockHeight
+		return y < m.Settings.DockHeight()
 	default:
-		return y >= m.Height-config.DockHeight
+		return y >= m.Height-m.Settings.DockHeight()
 	}
 }
 
@@ -226,6 +227,8 @@ func contextMenuWindowName(m *OS, windowIndex int, fallback string) string {
 }
 
 // item builds a row, resolving its key hint from the live registry.
+//
+//go:noinline
 func (m *OS) item(icon, label, action string, dim bool) ContextMenuItem {
 	return ContextMenuItem{
 		Icon:   icon,
@@ -317,11 +320,17 @@ func (m *OS) dockItemMenu(windowIndex int) (string, []ContextMenuItem) {
 // them.
 //
 // The title is what the tab says, so the menu names the workspace it will act
-// on even when that workspace is not the one being shown.
+// on even when that workspace is not the one being shown. Every row acts on the
+// tab's workspace, Close included: it raises close_workspace's confirmation for
+// this workspace, and is dimmed when the workspace has no pane to close.
 func (m *OS) workspacePillMenu(ws int) (string, []ContextMenuItem) {
+	closeItem := m.item(glyphClose, "Close", "close_workspace", len(m.workspacePanes(ws)) == 0)
+	closeItem.Warn = true
 	return printableTitle(m.WorkspaceLabel(ws)), []ContextMenuItem{
 		m.item(glyphSwitch, "Switch to", "workspace_pill_switch", ws == m.CurrentWorkspace),
 		m.item(glyphRename, "Rename", "workspace_prefix_rename", false),
+		separator(),
+		closeItem,
 	}
 }
 
@@ -362,6 +371,11 @@ func (m *OS) desktopMenu() (string, []ContextMenuItem) {
 // Detaching stays attached-only for the same reason it always was: there is
 // nothing to detach from a session this client is not in. The accent belongs to
 // the row's own session and is offered on every one of them.
+//
+// Kill-and-quit on a worktree session takes a directory with it, so it goes
+// through the close confirmation — the one dialog that offers to delete the
+// worktree too — instead of killing outright. A plain session's row keeps its
+// instant quit: there is nothing on disk to ask about.
 func (m *OS) sessionMenu(sessionID string) (string, []ContextMenuItem) {
 	if sessionID == "" {
 		sessionID = m.SessionName
@@ -372,7 +386,11 @@ func (m *OS) sessionMenu(sessionID string) (string, []ContextMenuItem) {
 	kill := []ContextMenuItem{m.item(glyphClose, "Kill session", "kill_session", false)}
 	if attached {
 		killNext := m.item(glyphClose, "Kill session, go to next", "kill_session_next", !hasOthers)
-		killQuit := m.item(glyphClose, "Kill session and quit", "kill_session_quit", false)
+		killQuitAction := "kill_session_quit"
+		if m.sessionWorktreeInfo(m.SessionName) != nil {
+			killQuitAction = "prefix_close_session"
+		}
+		killQuit := m.item(glyphClose, "Kill session and quit", killQuitAction, false)
 		kill = []ContextMenuItem{killNext, killQuit}
 	}
 	for i := range kill {
@@ -399,8 +417,35 @@ func (m *OS) sessionMenu(sessionID string) (string, []ContextMenuItem) {
 		// "this session's workspaces" and opened the attached session's,
 		// which is a row naming one session and acting on another.
 		m.item(glyphSwitch, "Switch workspace...", "prefix_workspace_switcher", !attached),
+		// A worktree of the session's repository. The dialog and the verb behind
+		// it need the repository's main checkout, which the rail only knows for
+		// a session that is itself a worktree, so that is the only row it is
+		// live on — dimmed elsewhere, saying the action exists, the way the
+		// pane menu dims a paste it cannot reach.
+		m.item(glyphNew, "New worktree...", "session_new_worktree", m.sessionWorktreeInfo(sessionID) == nil),
 		separator(),
 	}, kill...)
+}
+
+// repoHeaderMenu is the menu for a repository's group header on the rail: the
+// row that names the repository, which is exactly where a person looks for
+// "make another worktree of this one".
+//
+// The header's left-click folds and unfolds the group, which the rail draws a
+// mark for and every other group header does from its own menu; this menu's
+// one row is the one thing the header offers that no click on it suggests.
+// What the menu is about rides in ContextMenu.Repo; see TakeMenuRepo.
+func (m *OS) repoHeaderMenu(repo string) (string, []ContextMenuItem) {
+	title := printableTitle(repo)
+	if title == "" {
+		title = "Repository"
+	}
+	return title, []ContextMenuItem{
+		// Live only while some cached session names the repository, which for a
+		// header on screen is every moment but the one where the listing changed
+		// since it was drawn.
+		m.item(glyphNew, "New worktree...", "repo_new_worktree", m.worktreeRepoRoot(repo) == ""),
+	}
 }
 
 // OpenSelectionMenu opens the small terminal-mode selection menu: what you can
@@ -458,10 +503,15 @@ func (m *OS) machineMenu(host string) (string, []ContextMenuItem) {
 	if title == "" {
 		title = "Machine"
 	}
-	return title, []ContextMenuItem{
+	items := []ContextMenuItem{
 		m.item(glyphUp, "Move up", "reorder_up", first),
 		m.item(glyphDown, "Move down", "reorder_down", last),
 	}
+	// This machine's daemon is the one this client can restart.
+	if host == federation.LocalHostName && m.DaemonRestartAvailable() {
+		items = append(items, separator(), m.item(glyphRestore, "Restart the daemon", "restart_daemon", false))
+	}
+	return title, items
 }
 
 // ============================================================================
@@ -522,6 +572,11 @@ func (m *OS) fileRowMenu(t fileMenuTarget) (string, []ContextMenuItem) {
 	if t.Name != "" && !t.IsDir && !t.Up {
 		rows = append(rows, m.item(glyphFile, "Edit", "file_edit", !canOpen))
 	}
+	// A file's first row already copies its path. A folder's opens it, so the
+	// copy is a row of its own (issue #414).
+	if t.Name != "" && t.IsDir && !t.Up {
+		rows = append(rows, m.item(glyphCopy, "Copy path", "file_copy_path", !canOpen))
+	}
 	return fileMenuTitle(t), append(rows,
 		separator(),
 		m.item(glyphCopy, "Copy", "file_copy", !hasTarget),
@@ -530,6 +585,9 @@ func (m *OS) fileRowMenu(t fileMenuTarget) (string, []ContextMenuItem) {
 		// clipboard and not a target. It overwrites nothing, which is why it is
 		// live here with no dialog behind it; see SidebarFilePaste.
 		m.item(glyphPaste, "Paste", "file_paste", !on || m.fileClip.Empty()),
+		// Send copies the row to another machine, after it asks which one
+		// and which folder there. See transfers_dialog.go.
+		m.item(glyphCopy, "Send to host", "file_send", !hasTarget),
 		separator(),
 		m.item(glyphNew, "New file or folder", "file_create", !on),
 		m.item(glyphRename, "Rename", "file_rename", !hasTarget),

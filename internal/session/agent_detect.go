@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Gaurav-Gosain/tuios/internal/harness"
+	"github.com/Gaurav-Gosain/tuios/internal/procinfo"
 )
 
 // defaultAgentBinaries is the built-in set of AI-agent CLI binary names the
@@ -513,6 +514,37 @@ func foregroundProcess(shellPid int) (foregroundInfo, bool) {
 	return info, true
 }
 
+// harnessProc is the harness process a hook named (harness_pid): its pid, and
+// its start time when the pid is the reporter or one of its ancestors
+// (callerRunsHarness) and could be read as it was recorded. The pid alone is
+// what sessionGuard compares. The start time is what says the process has
+// exited: a pid from another pid namespace, an agent in a container say, or
+// on a platform that reads no processes, has none, and is never taken for
+// gone.
+type harnessProc struct {
+	pid   int
+	start uint64
+	timed bool
+}
+
+// readHarnessProc records pid with its start time, if it can be read.
+func readHarnessProc(pid int) harnessProc {
+	h := harnessProc{pid: pid}
+	h.start, h.timed = procinfo.StartTime(pid)
+	return h
+}
+
+// exited reports whether the recorded harness process is gone: its start time
+// no longer reads, or reads different, which is another process that was given
+// the pid.
+func (h harnessProc) exited() bool {
+	if !h.timed {
+		return false
+	}
+	start, ok := procinfo.StartTime(h.pid)
+	return !ok || start != h.start
+}
+
 // agentDetectMissLimit is how many consecutive detection ticks may find no agent
 // in a pane the detector holds before the claim clears, while something other
 // than the pane's shell is in the foreground. An agent that opens an editor or a
@@ -521,7 +553,30 @@ func foregroundProcess(shellPid int) (foregroundInfo, bool) {
 // once. At the default two-second tick this is twelve seconds.
 const agentDetectMissLimit = 6
 
-// applyAgentDetection reconciles each window's agent state with the foreground
+// detectReading is what one pane's foreground read found, taken with no session
+// lock held. ptyID is the PTY the read was taken for, so a window whose PTY was
+// swapped while the read ran is not judged on a read of the old one.
+type detectReading struct {
+	// at is when the reading was taken, before the process was read.
+	at      int64
+	ptyID   string
+	info    foregroundInfo
+	running bool
+	det     detection
+	isAgent bool
+}
+
+// detectOutcome counts what a detection pass changes. changed is agent states,
+// labels the row label and shell pid that ride the same read, and bookkeeping
+// the claim map alone: a miss counted, a sighting noted, a claim on a window
+// that is gone. Only the first two reach clients.
+type detectOutcome struct {
+	changed     int
+	labels      int
+	bookkeeping bool
+}
+
+// scanAgentDetection reconciles each window's agent state with the foreground
 // process of its pane, using the injected resolve and identify so it is testable
 // without a real /proc or a real agent. It returns how many windows it changed.
 //
@@ -550,38 +605,8 @@ const agentDetectMissLimit = 6
 // disappearance): a process name cannot honestly distinguish working from waiting
 // or idle, so it does not pretend to.
 //
-// Every pane is read. The daemon's poll goes through scanAgentDetection, which
-// backs off panes that have been quiet.
-func (s *Session) applyAgentDetection(
-	resolve func(ptyID string) (foregroundInfo, bool),
-	identify func(foregroundInfo) (detection, bool),
-) int {
-	return s.scanAgentDetection(resolve, identify, nil)
-}
-
-// detectReading is what one pane's foreground read found, taken with no session
-// lock held. ptyID is the PTY the read was taken for, so a window whose PTY was
-// swapped while the read ran is not judged on a read of the old one.
-type detectReading struct {
-	ptyID   string
-	info    foregroundInfo
-	running bool
-	det     detection
-	isAgent bool
-}
-
-// detectOutcome counts what a detection pass changes. changed is agent states,
-// labels the row label and shell pid that ride the same read, and bookkeeping
-// the claim map alone: a miss counted, a sighting noted, a claim on a window
-// that is gone. Only the first two reach clients.
-type detectOutcome struct {
-	changed     int
-	labels      int
-	bookkeeping bool
-}
-
-// scanAgentDetection is applyAgentDetection in the three steps that keep the
-// foreground reads off the session lock:
+// It works in the three steps that keep the foreground reads off the session
+// lock:
 //
 //  1. Under the read lock, list the panes to read.
 //  2. With no lock held, read each pane's foreground process and identify it.
@@ -616,7 +641,7 @@ func (s *Session) scanAgentDetection(
 			continue
 		}
 		_, claimed := s.agentClaims[w.ID]
-		holdsAgent := w.AgentState != AgentStateNone || claimed || s.agentHarnessPIDs[w.ID] != 0
+		holdsAgent := w.AgentState != AgentStateNone || claimed || s.agentHarnessPIDs[w.ID].pid != 0
 		targets = append(targets, target{w.ID, w.PTYID, holdsAgent})
 	}
 	s.stateMu.RUnlock()
@@ -628,13 +653,23 @@ func (s *Session) scanAgentDetection(
 		if due != nil && !t.holdsAgent && !due(t.ptyID) {
 			continue
 		}
+		at := time.Now().UnixNano()
 		info, running := resolve(t.ptyID)
 		det, isAgent := identify(info)
-		readings[t.windowID] = detectReading{ptyID: t.ptyID, info: info, running: running, det: det, isAgent: isAgent}
+		readings[t.windowID] = detectReading{at: at, ptyID: t.ptyID, info: info, running: running, det: det, isAgent: isAgent}
 	}
 
 	shell := agentBaseName(s.getShell())
 	now := time.Now().UnixNano()
+
+	// A program whose process group has ended has exited, which ends its OSC
+	// 7501 working, blocked and idle records. See
+	// PTY.endProgramStatusOfEndedGroups.
+	for _, r := range readings {
+		if pty := s.GetPTY(r.ptyID); pty != nil {
+			pty.endProgramStatusOfEndedGroups(r.info, r.running)
+		}
+	}
 
 	s.stateMu.RLock()
 	dry := s.detectionPass(s.state, readings, shell, now, false)
@@ -694,7 +729,8 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 		// process was read for the agent check either way. Counted apart from
 		// the agent states: a pane starting or leaving a command has to reach
 		// the clients, but it is not a state change.
-		if cmd := ClampDisplayText(foregroundCommand(info, running, shell)); cmd != w.ForegroundCmd {
+		fg := foregroundCommand(info, running, shell)
+		if cmd := ClampDisplayText(fg); cmd != w.ForegroundCmd {
 			if write {
 				w.ForegroundCmd = cmd
 			}
@@ -713,12 +749,31 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 		}
 		det := r.det
 		detected := running && r.isAgent
-		claim := s.agentClaims[w.ID]
+		// A pane back at its shell has no harness left to protect, so the
+		// shared-server guard forgets its conversations. The stored
+		// AgentSessionID stays, for a later resume. A guard armed after the
+		// reading was taken is newer than what the reading says, so it stays.
+		if g, ok := s.agentSharedGuards[w.ID]; ok && g.armedAt < r.at && !detected && running && info.atShell() && fg == "" {
+			out.bookkeeping = true
+			if write {
+				delete(s.agentSharedGuards, w.ID)
+			}
+		}
+		claim, held := s.agentClaims[w.ID]
 		owned := claim.auto
 		// Noted whoever owns the claim, and before the switch, because
 		// most of its branches do nothing for a claim the detector does
 		// not own. It is what lets the exit be acted on later.
+		//
+		// On a pane nothing holds, the mark goes on a claim at the detector's
+		// rank, not on the zero claim: that one's empty source ranks as a
+		// report, and storing it would shut every other tier out of a pane
+		// whose state a tier has since yielded, for as long as the agent ran.
+		// It is not auto: the detector did not set the state it finds.
 		if detected && !claim.sawProcess {
+			if !held {
+				claim.source = AgentSourceDetect
+			}
 			claim.sawProcess = true
 			out.bookkeeping = true
 			if write {
@@ -770,6 +825,7 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 			}
 			delete(s.agentClaims, w.ID)
 			delete(s.agentHarnessPIDs, w.ID)
+			delete(s.agentSharedGuards, w.ID)
 			w.AgentState = AgentStateNone
 			clearAgentNote(w)
 			w.AgentHarness = ""
@@ -798,6 +854,13 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 			// leave a note. Everything else here was inferred, and an
 			// inference about an agent that is not there is wrong.
 			//
+			// A hook's report is the exception: it names the harness process
+			// it ran under (harness_pid), so it is the harness speaking, and
+			// once that process has exited (harnessProc.exited) nothing is
+			// left to retract what it said. Claude Code does not always get its SessionEnd hook out
+			// on /exit, and a crashed or killed one sends none, so without
+			// this the pane kept its last state, and its row, until it closed.
+			//
 			// And only where a real agent process was seen. Without that
 			// this swept away any state on any pane sitting at a shell,
 			// including a screen rule's reading of a pane that has never
@@ -813,8 +876,16 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 			// "shell", so the foreground must also be a shell by name.
 			// A blocker the screen took over a herdr report follows the same
 			// reporter, so it lapses the same way.
-			herdrHeld := claim.source == AgentSourceReport || (claim.blocker && claim.prior.source == AgentSourceReport)
-			if herdrHeld && claim.herdrClaimLapsed(now) && foregroundCommand(info, running, shell) == "" {
+			reportHeld := claim.source == AgentSourceReport || (claim.blocker && claim.prior.source == AgentSourceReport)
+			if reportHeld && claim.herdrClaimLapsed(now) && fg == "" {
+				lapsed = true
+			}
+			// The same shell test as herdr's: a start-agent --protocol pane
+			// has the protocol program as its "shell", so it reads as at its
+			// shell while the agent runs, and a harness child of it that
+			// restarts has not left the pane. The shell check goes first: a
+			// busy pane costs no process read.
+			if !lapsed && reportHeld && running && info.atShell() && fg == "" && s.agentHarnessPIDs[w.ID].exited() {
 				lapsed = true
 			}
 			if running && info.atShell() && lapsed {
@@ -824,6 +895,7 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 				}
 				delete(s.agentClaims, w.ID)
 				delete(s.agentHarnessPIDs, w.ID)
+				delete(s.agentSharedGuards, w.ID)
 				w.AgentState = AgentStateNone
 				clearAgentNote(w)
 				w.AgentHarness = ""
@@ -857,6 +929,15 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 			delete(s.agentHarnessPIDs, id)
 		}
 	}
+	for id := range s.agentSharedGuards {
+		if _, ok := live[id]; !ok {
+			out.bookkeeping = true
+			if !write {
+				break
+			}
+			delete(s.agentSharedGuards, id)
+		}
+	}
 	return out
 }
 
@@ -877,7 +958,7 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 //     timer assigns, and without it a pane latched there for the rest of its
 //     life however hard the agent then worked.
 //
-// It obeys the same precedence as applyAgentDetection: it only ever touches a
+// It obeys the same precedence as scanAgentDetection: it only ever touches a
 // window the auto-detector owns, and it only resumes one whose state is the idle
 // a source no stronger than the detector left behind, so a harness reporting for
 // itself is never overwritten. It reports whether it changed state.
@@ -941,6 +1022,7 @@ func (s *Session) reconcileAgentOnOutput(
 			}
 			delete(s.agentClaims, w.ID)
 			delete(s.agentHarnessPIDs, w.ID)
+			delete(s.agentSharedGuards, w.ID)
 			w.AgentState = AgentStateNone
 			clearAgentNote(w)
 			w.AgentHarness = ""

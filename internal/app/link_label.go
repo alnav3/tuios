@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
@@ -25,8 +26,44 @@ import (
 // explain the first.
 
 // linkLabelHint is what the label says about acting on the run. It is the only
-// place in the interface that names the gesture.
-const linkLabelHint = "shift+click to open"
+// place in the interface that names the gesture, so it follows
+// appearance.link_click. With both clicks on (the default) it names ctrl+click, because that
+// is the one most outer terminals pass on to tuios.
+//
+// The same holds on macOS. Ghostty, kitty, WezTerm and Terminal.app all pass
+// ctrl+click on to tuios, and none of them opens the OSC 8 link on cmd+click
+// while the program reports the mouse, so the label never names cmd+click.
+func linkLabelHint(s *config.Settings) string {
+	switch s.LinkClick {
+	case config.LinkClickOff:
+		return ""
+	case config.LinkClickShift:
+		return "shift+click to open"
+	case config.LinkClickCtrl:
+		return "ctrl+click to open"
+	}
+	return "ctrl+click to open"
+}
+
+// linkLabelHintFor names what the click does to the address. A tuios window
+// link is an order to this client, not a document, so "open" would describe
+// nothing: the hint says where the click lands instead. The close half
+// confirms before it acts, and the hint says that too, so the label under
+// the pointer and the dialog that follows tell the same story.
+func linkLabelHintFor(rawURL string, s *config.Settings) string {
+	if target, ok := parseTuiosLink(rawURL); ok {
+		verb := "jumps to that window"
+		if target.close {
+			verb = "asks to close that window"
+		}
+		if hint := linkLabelHint(s); hint != "" {
+			gesture := strings.TrimSuffix(hint, " to open")
+			return gesture + " " + verb
+		}
+		return ""
+	}
+	return linkLabelHint(s)
+}
 
 // linkLabelMax bounds the address. A URL can be thousands of characters and the
 // label is one row on a screen that is not; the end is trimmed rather than the
@@ -45,15 +82,20 @@ func (m *OS) renderLinkLabel() *lipgloss.Layer {
 	pal := theme.UI()
 	renderW := m.GetRenderWidth()
 
-	body := overlay.Truncate(sanitizeLinkText(link.URL), linkLabelMax)
-	text := body + "  " + linkLabelHint
+	body := overlay.Truncate(sanitizeLinkText(linkDisplayAddress(link.URL)), linkLabelMax)
+	text := body
+	if hint := linkLabelHintFor(link.URL, &m.Settings); hint != "" {
+		text += "  " + hint
+	}
 	label := tooltipLabel(text, max(renderW-2, 1), pal)
 
 	// The label sits one row under the pointer so it never covers the run it is
 	// naming, and flips above when there is no room below. tooltipLayer clamps
 	// it to the screen either way, which is what keeps a link near the right
-	// edge from pushing its own label off it.
-	x, y := m.LastMouseX, m.LastMouseY+1
+	// edge from pushing its own label off it. The two-column inset keeps the
+	// box's corner off the pointer cell itself: a label that starts exactly
+	// under the cursor reads as part of the thing being pointed at.
+	x, y := m.LastMouseX+2, m.LastMouseY+1
 	if y >= m.viewReserve().Top+m.ViewUsableHeight() {
 		y = m.LastMouseY - 1
 	}

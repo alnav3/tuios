@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
@@ -12,6 +13,9 @@ import (
 // optionDaemonLogLevel is the one option path that describes the daemon process
 // rather than a session. See verbSetOption.
 const optionDaemonLogLevel = "daemon.log_level"
+
+// optionAgentsEnabled is the agent switch, which only the person may set.
+const optionAgentsEnabled = "agents.enabled"
 
 // This file makes the configuration surface reachable and, more to the point,
 // findable. set-option would take any string at all: a misspelled path was
@@ -63,7 +67,7 @@ func (d *Daemon) verbListOptions(_ *connState, params json.RawMessage) (any, *ve
 			"type":        opt.Type,
 			"section":     opt.Section,
 			"description": opt.Description,
-			"default":     opt.Default,
+			"default":     config.EffectiveDefault(opt),
 		}
 		if len(opt.Accepted) > 0 {
 			row["accepted"] = opt.Accepted
@@ -71,6 +75,9 @@ func (d *Daemon) verbListOptions(_ *connState, params json.RawMessage) (any, *ve
 		if opt.Max > 0 {
 			row["min"] = opt.Min
 			row["max"] = opt.Max
+		}
+		if opt.Auto {
+			row["auto"] = true
 		}
 		if opt.Deprecated != "" {
 			row["deprecated"] = opt.Deprecated
@@ -190,6 +197,17 @@ func (d *Daemon) verbSetOption(cs *connState, params json.RawMessage) (any, *ver
 			Detail:    "call list-options for each path with its type, default and accepted values.",
 		})
 	}
+	// The agent switch is the person's. A pane that turned it off would
+	// hide its own state and the Inbox from them, and one that turned it on
+	// would undo their choice, so a pane may not set it. The settings page
+	// and the file are where the person sets it.
+	if path == optionAgentsEnabled && d.paneAuthority(cs) != nil {
+		return nil, hintedVerbError(ErrVerbForbidden, "only the person can change agents.enabled. A process in a pane cannot", &VerbHint{
+			Param:  "key",
+			Detail: "Nothing was changed. The person sets it on the settings page or in config.toml.",
+		})
+	}
+
 	// Validate by attempting the set against a throwaway config. Doing it this
 	// way rather than duplicating the type rules here means the check and the
 	// apply can never disagree about what a value means.
@@ -215,11 +233,11 @@ func (d *Daemon) verbSetOption(cs *connState, params json.RawMessage) (any, *ver
 	// daemon.log_level names a property of this daemon process, not of one
 	// session, so it is applied here and does not go on to the session record.
 	//
-	// The level used to be read once at startup, which made the only way to look
-	// at a fault in more detail a daemon restart, and a restart is what ends the
-	// run the fault was in. Now a caller raises the level, reproduces, reads
-	// `tuios logs -f`, and lowers it again. It answers with no session because a
-	// daemon serving none can still be the thing that is wrong.
+	// A level read once at startup would make a daemon restart the only way to
+	// look at a fault in more detail, and a restart is what ends the run the
+	// fault was in. So a caller raises the level, reproduces, reads `tuios logs
+	// -f`, and lowers it again. It answers with no session because a daemon
+	// serving none can still be the thing that is wrong.
 	if path == optionDaemonLogLevel {
 		previous := GetDebugLevel()
 		SetDebugLevel(ParseDebugLevel(p.Value))
@@ -284,10 +302,9 @@ func (d *Daemon) verbSetOption(cs *connState, params json.RawMessage) (any, *ver
 			reason = "the attached client refused the change"
 		}
 	} else {
-		// applied false used to mean both "nobody was attached" and "that key
-		// means nothing", which a caller could not tell apart and so could not
-		// act on. The key is now validated above, and this says which of the two
-		// remaining cases it is.
+		// A caller has to tell "nobody was attached" from "that key means
+		// nothing" to act on applied false. The key is validated above, and
+		// this says which of the two remaining cases it is.
 		// The file is only ever written by an attached client, because the
 		// client is what holds the config the writer marshals. So say that
 		// here: without the second sentence a caller reads "recorded" as
@@ -312,14 +329,14 @@ func (d *Daemon) verbSetOption(cs *connState, params json.RawMessage) (any, *ver
 	return out, nil
 }
 
-// verbGetOption reads an option, preferring what this session was told and
-// falling back to what the option does untold.
+// verbGetOption reads an option: what this session was told, then what
+// config.toml says, then what the option does untold. See sessionOptions.
 //
-// It used to read only the session's own overrides, so the ordinary question
-// (what is the dockbar position) failed on every session that had never set it,
-// which is most of them. A caller cannot act on "not set" when what it wanted
-// was the value in effect.
-func (d *Daemon) verbGetOption(_ *connState, params json.RawMessage) (any, *verbError) {
+// Reading only the session's own overrides would make the ordinary question
+// (what is the dockbar position) fail on every session that never set it,
+// which is most of them. A caller cannot act on "not set" when what it wants
+// is the value in effect.
+func (d *Daemon) verbGetOption(cs *connState, params json.RawMessage) (any, *verbError) {
 	var p struct {
 		Session string `json:"session"`
 		Key     string `json:"key"`
@@ -342,27 +359,36 @@ func (d *Daemon) verbGetOption(_ *connState, params json.RawMessage) (any, *verb
 			// which is not necessarily the built-in default.
 			return map[string]any{
 				"type": "option", "key": path, "value": d.windowSize,
-				"source": "config", "default": opt.Default, "option_type": opt.Type,
+				"source": "config", "default": config.EffectiveDefault(opt), "option_type": opt.Type,
 			}, nil
 		}
 	}
-	if value, ok := sess.GetOption(path); ok {
-		out := map[string]any{"type": "option", "key": path, "value": value, "source": "session"}
+	if path == optionAgentsEnabled {
+		// The switch is the daemon's, read from config.toml at start and on
+		// every reload, and not a session's. Reading the session's overrides
+		// and then the built-in default reported true with source default
+		// while [agents] enabled = false had every agent verb refused. A value
+		// the session holds counts only when the daemon agrees with it: one it
+		// does not agree with has not been applied.
+		value := strconv.FormatBool(d.agentsEnabled())
+		source := "default"
+		if held, ok := sess.GetOption(path); ok && held == value {
+			source = "session"
+		} else if value != config.EffectiveDefault(opt) {
+			source = "config"
+		}
+		return map[string]any{
+			"type": "option", "key": path, "value": value,
+			"source": source, "default": config.EffectiveDefault(opt), "option_type": opt.Type,
+		}, nil
+	}
+	if value, source, ok := d.optionsFor(cs, sess).lookup(path); ok {
+		out := map[string]any{"type": "option", "key": path, "value": value, "source": source}
 		if known {
-			out["default"] = opt.Default
+			out["default"] = config.EffectiveDefault(opt)
 			out["option_type"] = opt.Type
 		}
 		return out, nil
-	}
-	if known {
-		return map[string]any{
-			"type":        "option",
-			"key":         path,
-			"value":       opt.Default,
-			"source":      "default",
-			"default":     opt.Default,
-			"option_type": opt.Type,
-		}, nil
 	}
 
 	// Unknown to the registry and never set here. Both halves of that are worth

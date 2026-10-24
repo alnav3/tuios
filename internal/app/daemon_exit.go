@@ -32,8 +32,9 @@ func (m *OS) daemonExitChan() chan tea.Msg {
 	return m.DaemonExitChan
 }
 
-// ListenForDaemonExit waits for the daemon event that ends this client. It is
-// armed once and never re-armed, because every message it can deliver quits.
+// ListenForDaemonExit waits for the daemon event that ends this client. The
+// DaemonDisconnectedMsg handler arms it again whenever the client survives a
+// drop, such as a host link that reconnects, so the next drop is heard too.
 func ListenForDaemonExit(ch chan tea.Msg) tea.Cmd {
 	if ch == nil {
 		return nil
@@ -99,6 +100,14 @@ func (m *OS) ExitNotice() string {
 	case ExitNestedRefused:
 		if m.DaemonClient != nil {
 			return m.DaemonClient.NestedRefusal()
+		}
+		return ""
+
+	case ExitDetached:
+		if m.DaemonClient != nil {
+			return m.DaemonClient.DetachedReason() + "\n" +
+				"The session continues to run.\n" +
+				"Connect again to attach to it."
 		}
 		return ""
 

@@ -9,7 +9,7 @@ import (
 )
 
 // The rail's layout is an ordered list with a number on each entry, which is
-// the one shape a settings row cannot hold. It was a text field until now:
+// the one shape a settings row cannot hold. As a text field it would be
 // "sessions:25,terminals,files:25,agents:34", typed by hand, with a colon that
 // means one thing and a comma that means another, and no way to see what you
 // had done until you closed the panel.
@@ -21,12 +21,12 @@ import (
 //
 // # Membership lives here and nowhere else
 //
-// There used to be two ways to take a section off the rail: leave it out of the
-// layout, or set the boolean named after it. The layout won, and the spacer is
-// why. A layout may carry two spacers, in two different places, and a boolean
-// per section has nowhere to put the second one and no way to say which gap it
-// means. So the list owns order, share and membership together, the booleans
-// fold into it on load, and this editor is where a section is turned off.
+// The layout, not a boolean per section, says whether a section is on the rail,
+// and the spacer is why. A layout may carry two spacers, in two different
+// places, and a boolean per section has nowhere to put the second one and no
+// way to say which gap it means. So the list owns order, share and membership
+// together, the booleans fold into it on load, and this editor is where a
+// section is turned off.
 
 // railRowKind is what one line of the editor is.
 type railRowKind int
@@ -138,11 +138,20 @@ func (m *OS) sectionEditorRows() []railEditorRow {
 	if len(entries) == 0 {
 		rows = append(rows, railEditorRow{Kind: railRowEmpty, Name: railListOn, Index: -1})
 	}
+	// With the agent features off the agents section is not offered, and
+	// one already in the layout is not listed: the rail does not draw it.
+	hidden := func(name string) bool { return !m.agentsOn() && name == "agents" }
 	placed := map[string]bool{}
 	last := len(entries) - 1
+	for last >= 0 && hidden(entries[last].Name) {
+		last--
+	}
 	for i, e := range entries {
 		if !e.IsSpacer() {
 			placed[e.Name] = true
+		}
+		if hidden(e.Name) {
+			continue
 		}
 		rows = append(rows, railEditorRow{
 			Kind: railRowPlaced, Name: e.Name, Index: i, Share: e.Share,
@@ -152,7 +161,7 @@ func (m *OS) sectionEditorRows() []railEditorRow {
 
 	rows = append(rows, railEditorRow{Kind: railRowHeader, Name: railListOff, Index: -1})
 	for _, name := range config.SidebarSectionNames {
-		if placed[name] {
+		if placed[name] || hidden(name) {
 			continue
 		}
 		rows = append(rows, railEditorRow{Kind: railRowAvailable, Name: name, Index: -1})
@@ -220,7 +229,7 @@ func (m *OS) SectionEditorToggle() tea.Cmd {
 		if row.Index < 0 || row.Index >= len(entries) {
 			return nil
 		}
-		if !row.Spacer && sectionCount(entries) <= 1 {
+		if !row.Spacer && sectionCount(entries, m.agentsOn()) <= 1 {
 			// The rail has to draw something. An empty layout falls back to the
 			// shipped one on the next parse, so the edit would appear to undo
 			// itself, which is worse than being told no.
@@ -292,10 +301,10 @@ func (m *OS) SectionEditorRevert() tea.Cmd {
 
 // sectionCount is how many real sections a layout has. Spacers do not count:
 // a rail of nothing but empty blocks draws nothing at all.
-func sectionCount(entries []config.SidebarSectionShare) int {
+func sectionCount(entries []config.SidebarSectionShare, agentsOn bool) int {
 	n := 0
 	for _, e := range entries {
-		if !e.IsSpacer() {
+		if !e.IsSpacer() && (agentsOn || e.Name != "agents") {
 			n++
 		}
 	}

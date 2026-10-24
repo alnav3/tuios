@@ -17,7 +17,9 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
 	"github.com/Gaurav-Gosain/tuios/internal/hooks"
 	"github.com/Gaurav-Gosain/tuios/internal/layout"
+	"github.com/Gaurav-Gosain/tuios/internal/listnav"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
+	"github.com/Gaurav-Gosain/tuios/internal/pastebuf"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
 	"github.com/Gaurav-Gosain/tuios/internal/tape"
@@ -25,6 +27,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/ui"
 	"github.com/Gaurav-Gosain/tuios/pkg/applist"
 	"github.com/google/uuid"
+	"tuios.dev/swatch"
 )
 
 // Mode represents the current interaction mode of the application.
@@ -105,10 +108,32 @@ type WindowLayout struct {
 // OS represents the main application state and window manager.
 // It manages all windows, workspaces, and user interactions.
 type OS struct {
-	Dragging                 bool
-	Resizing                 bool
-	BorderResizing           bool // a pane-border drag is moving one edge
-	BorderResizeEdge         BorderResizeEdge
+	// tml holds the TML surfaces this client draws. See tml.go.
+	tml tmlClient
+
+	// ClientTitle is the title of the terminal this client runs in, set
+	// through herdr's client.window_title.set. Empty sets none.
+	ClientTitle string
+
+	// FullZoom makes every zoom take the whole pane region, as zoom_size = 100
+	// does, whatever the config says. A zoom of part of the screen is a camera
+	// over the whole layout, which resizes the hidden panes' PTYs for every
+	// client of the session. A renderer that draws the zoom itself (the GUI
+	// bridge) sets it, so a zoom there resizes the zoomed pane alone.
+	FullZoom bool
+
+	// frameRate drives the program's frame ticker from NormalFPS and finds the
+	// display's rate for max_fps = "auto". See frame_rate.go.
+	frameRate frameRate
+
+	Dragging         bool
+	Resizing         bool
+	BorderResizing   bool // a pane-border drag is moving one edge
+	BorderResizeEdge BorderResizeEdge
+	// BorderResizeGrab is how far the dragged edge lies from the cell the
+	// pointer pressed, along the axis it moves: a pane-border drag keeps the
+	// edge that far from the pointer, so the pane does not jump on the press.
+	BorderResizeGrab         int
 	ResizeCorner             ResizeCorner
 	PreResizeState           terminal.Window
 	ResizeStartX             int
@@ -133,9 +158,18 @@ type OS struct {
 	ScrollbarGrabOffset int
 	Windows             []*terminal.Window
 	FocusedWindow       int
-	Width               int
-	Height              int
-	Mode                Mode
+	// PrevFocusedID is the window focus came from most recently, for the
+	// last_pane toggle. A window ID, not an index: indices shift on close and
+	// reorder.
+	PrevFocusedID string
+	// lastFocusedID is the window reconcilePrevFocus last saw focused. Focus
+	// moves through FocusWindow, new panes, workspace switches, closes and
+	// the daemon, so the previous pane is read off the landed focus once a
+	// message, not written by every caller.
+	lastFocusedID string
+	Width         int
+	Height        int
+	Mode          Mode
 	// terminalMu guards the m.Windows slice and the per-window dirty flags and
 	// render caches against the UI goroutine's render pass. It does NOT guard
 	// emulator cell data; that is Window.ioMu.
@@ -166,6 +200,11 @@ type OS struct {
 	// pressInLayout says the button press now held was mapped to the layout
 	// frame, so the drag and the release that follow it are too.
 	pressInLayout bool
+	// pressInLeftover says the button press now held landed on the leftover,
+	// and pointerSwallowed that the mouse event being handled is one the
+	// leftover takes. See MapPointer.
+	pressInLeftover  bool
+	pointerSwallowed bool
 	// lastActivity is when the person last gave input at this client, and
 	// wasLatest whether the daemon named the session's window_size policy
 	// latest on the last message. activitySession is the session that was
@@ -177,6 +216,15 @@ type OS struct {
 	activitySince   time.Time
 	// viewMark is the last mark renderViewMark built. See viewMarkCache.
 	viewMark viewMarkCache
+	// leftoverRight and leftoverBottom are the last strips renderLeftover
+	// built. See pane_leftover.go.
+	leftoverRight, leftoverBottom leftoverCache
+	// sessionClients is how many clients the daemon last said the session
+	// has: from the attach reply, then from each join, leave and resize. It
+	// is 0 from a daemon that does not say. The leftover is drawn only while
+	// it is not 1: a client alone in its session sees a smaller session only
+	// for the moment between its own resize and the daemon's answer.
+	sessionClients int
 	// pointerSeenX/Y is where the host last reported the pointer, whether or
 	// not that motion reached Update. LastMouseX/Y is the position of the
 	// last motion that did reach it, which is what the filter's "moved a
@@ -194,17 +242,42 @@ type OS struct {
 	// DaemonExitChan carries the two daemon events that end this client: the
 	// session was destroyed, or the connection dropped. See daemon_exit.go.
 	DaemonExitChan chan tea.Msg
+	// daemonReconnect is the wait for a new daemon after the connection to
+	// this machine's daemon was lost. See daemon_reconnect.go.
+	daemonReconnect    *daemonReconnect
+	daemonReconnectGen int
+	// daemonWaiting is daemonReconnect != nil, for the panes' write funcs,
+	// which run off the Update goroutine too: input typed while the client
+	// waits is not sent to a connection that is gone.
+	daemonWaiting atomic.Bool
+	// restart is the restart dialog. See daemon_restart.go.
+	restart daemonRestart
+	// RestartExec is set with ExitRestarted: what the entry point runs to
+	// bring the client back. RestartFailure is set with ExitRestartFailed.
+	RestartExec    *RestartExec
+	RestartFailure *RestartFailure
+	// restartLater says the person put the version notice off for this run.
+	restartLater bool
+	// afterRestart is OSOptions.AfterRestart.
+	afterRestart   bool
 	Animations     []*ui.Animation // Active animations
 	CPUHistory     []float64       // CPU usage history for graph
 	LastCPUUpdate  time.Time       // Last time CPU was updated
 	RAMUsage       float64         // Cached RAM usage percentage
 	LastRAMUpdate  time.Time       // Last time RAM was updated
+	cpuLast        cpuTicks        // previous CPU reading, the baseline for the next sample
+	cpuHasLast     bool            // cpuLast holds a reading
+	cpuUnavailable bool            // the last CPU reading failed; the meter shows n/a
+	ramUnavailable bool            // the last RAM reading failed; the meter shows n/a
 	AutoTiling     bool            // Automatic tiling mode enabled
 	MasterRatio    float64         // Master window width ratio for tiling (0.1-0.9)
 	// TouchClient marks a session whose pointer is a finger. It is per session
 	// rather than a config global because one server holds several at once and
 	// a phone attaching must not change what the desktop beside it can hit.
 	TouchClient bool
+	// BrowserPaste says which keys make this session's browser paste. See
+	// OSOptions.BrowserPaste.
+	BrowserPaste BrowserPasteKeys
 
 	// RemoteClient marks a client process that is not on the user's machine.
 	// See OSOptions.RemoteClient.
@@ -289,6 +362,7 @@ type OS struct {
 	RenameBuffer           string                        // Buffer for new window name
 	RenameTargetID         string                        // Window the rename in flight applies to
 	renameHit              overlay.Rect                  // Where the dialog was drawn, in screen cells
+	renameClearHit         overlay.Rect                  // Where its clear hint was drawn, in screen cells
 	PrefixActive           bool                          // True when prefix key was pressed (tmux-style)
 	WorkspacePrefixActive  bool                          // True when Ctrl+B, w was pressed (workspace sub-prefix)
 	MinimizePrefixActive   bool                          // True when Ctrl+B, m was pressed (minimize sub-prefix)
@@ -307,6 +381,9 @@ type OS struct {
 	WorkspaceHasCustom     map[int]bool                  // Tracks if workspace has custom layout
 	WorkspaceMasterRatio   map[int]float64               // Stores master ratio per workspace
 	WorkspaceStackRatio    map[int]float64               // Stack ratio per workspace, the only copy (see setWorkspaceStackRatio)
+	WorkspaceMasterSplits  map[int]layout.MasterSplits   // Every other master-stack split per workspace, the only copy (see SyncMasterStackFromGeometry)
+	WorkspaceLayoutMode    map[int]string                // Layout mode chosen per workspace; no entry follows the session's
+	sessionLayoutMode      string                        // The mode the session was created with, the fallback for a workspace the state did not count
 	ShowLogs               bool                          // True when showing log overlay
 	LogMessages            []LogMessage                  // Store log messages
 	LogScrollOffset        int                           // first log row the viewer draws
@@ -359,7 +436,25 @@ type OS struct {
 	// SessionCloseWorkspace turns the dialog into close_workspace's: it asks
 	// about the panes of this workspace, not the session. 0 is the session.
 	SessionCloseWorkspace int
-	SessionCloseSelected  int
+	// SessionCloseWindow turns the dialog into a one-pane confirmation. It is
+	// how a tuios://window/<id>/close link closes: the pane a program in
+	// another pane named gets named back to the person holding the mouse
+	// before anything dies. It holds the pane's ID, not its index, because
+	// m.Windows can change while the dialog is open, and an index would then
+	// name another pane. "" is no pane.
+	SessionCloseWindow   string
+	SessionCloseSelected int
+	// SessionCloseWorktreeToll is what the delete-worktree row would take, read
+	// by a round trip after the dialog opened. Nil, or Loaded false, is a toll
+	// that has not landed yet, and the dialog says nothing about the worktree
+	// until it has: a count it does not have is a count it must not invent.
+	SessionCloseWorktreeToll *worktreeToll
+	// pendingWorktreeKill makes the next SessionKilledMsg a silent one: the
+	// worktree-deletion note is on screen and is the one record of where the
+	// stashed changes went, so the kill's own "Killed session" note would
+	// replace it with less news. Set only when KillOtherSession will actually
+	// post, and read once, by the kill handler.
+	pendingWorktreeKill bool
 	// Pending resize tracking for debouncing PTY resize during mouse drag
 	PendingResizes map[string][2]int // windowID -> [width, height] of pending PTY resize
 	// pendingCopy is text a settled multi-click selection will put on the
@@ -396,9 +491,20 @@ type OS struct {
 	cachedSeparatorColor color.Color // Rule colour the cached separator was styled in
 	cachedViewContent    string      // Cached full View() output to skip rendering on idle ticks
 	renderSkipped        bool        // True when frame-skip fired; View() returns cached content
+	quietFrame           bool        // The tick composes for the message block alone; see TickerMsg
 	// tickStats records how the maintenance tick spent itself so the idle
 	// benchmark and idle e2e can prove ticks stay cheap when nothing moves.
 	tickStats tickStats
+	// emulatorReleasedAt is when the maintenance tick last dropped the panes'
+	// spare emulator buffers. See emulator_release.go.
+	emulatorReleasedAt time.Time
+	// emulatorReleasePending says a frame changed since the last release, so
+	// the panes may hold buffers again. The release is armed only while it is
+	// set, so an idle client releases once and then sleeps.
+	emulatorReleasePending bool
+	// tick is the maintenance tick armed for the next job that is due. See
+	// tick_deadline.go.
+	tick tickTimer
 	// screensaver is the idle animation. It deliberately adds nothing to the
 	// maintenance tick: arming is one deferred timer and the running animation
 	// drives its own frames. See screensaver.go.
@@ -417,16 +523,18 @@ type OS struct {
 	// celebration is a short confetti burst drawn over the composed frame. It
 	// schedules frames only while particles are alive. See celebrate.go.
 	celebration celebrationState
-	// lastInteractionRender is when a drag/resize motion event last produced a
-	// frame. Motion events arrive faster than a frame can be composed, so this
+	// themeFx is the running theme transition, if any. See
+	// theme_transition.go.
+	themeFx themeTransition
+	// lastInteractionRender is when a motion event last produced a frame.
+	// Motion events arrive faster than a frame can be composed, so this
 	// bounds how often they are allowed to redraw.
 	lastInteractionRender time.Time
-	// spotlightMotionPending is set when a mouse-anchored spotlight dropped a
-	// motion frame to the frame budget. It is the one term that flushes that
-	// position, because the beam has no tick of its own. False whenever the
-	// beam is off or the pointer is at rest, which is what keeps the idle tick
-	// idle. See update.go.
-	spotlightMotionPending bool
+	// pointerMotionPending is set when a motion event dropped its frame to the
+	// frame budget. It is the term that flushes that position: hover and the
+	// mouse-anchored beam have no tick of their own. False whenever the pointer
+	// is at rest, which is what keeps the idle tick idle. See update.go.
+	pointerMotionPending bool
 	// viewportResizing is set while terminal sizes are still arriving. A retile
 	// it drives places panes directly instead of easing them into position, and
 	// resizes them visually only, exactly as a mouse resize drag does: a resize
@@ -474,6 +582,7 @@ type OS struct {
 	// reused so a mouse drag does not allocate a map per motion event.
 	bspResizeScratch map[int]layout.Rect
 	renderCanvas     *frameCanvas // Reused across frames; resized on change, cleared per frame
+	canvasIsFrame    bool         // renderCanvas holds the last frame drawn, which the fast path and the saver do not leave
 	// separatorMemo is the last divider overlay and the inputs it was drawn
 	// from. See renderSeparatorOverlay.
 	separatorMemo separatorMemo
@@ -495,9 +604,19 @@ type OS struct {
 	// paneReport the answer panes are given from it. See host_colors.go.
 	host       hostColors
 	paneReport paneReportMemo
+	// paneReportSent is the answer panes were last given, held while a theme
+	// is only previewed. See reportedToPanes in background.go.
+	paneReportSent    paneReport
+	paneReportSentSet bool
 	// hostPixel is the state of SGR-pixel mouse reports from this client's
 	// terminal. See host_pixel_mouse.go.
 	hostPixel hostPixelMouse
+	// splitMouse holds a pixel report the input decoder split at a minus
+	// sign while the rest of it arrives. See host_mouse_split.go.
+	splitMouse splitMouseReport
+	// hostPS is whether this client's terminal takes OSC 7501 reports and
+	// what was last sent to it. See host_program_status.go.
+	hostPS hostProgramStatus
 	// fastPaint is the buffer the fullscreen fast path paints its frame into
 	// while a background it draws is on. See background_fast.go.
 	fastPaint fastPainter
@@ -533,7 +652,12 @@ type OS struct {
 	// configReloads is this session's subscription to the config file, and
 	// stopConfigWatch ends it. See config_watch.go.
 	configReloads   <-chan tea.Msg
+	themeReloads    <-chan ThemeFilesReloadedMsg
 	stopConfigWatch func()
+	// omarchyChanges is this session's subscription to the Omarchy theme,
+	// and stopOmarchyFollow ends it. See omarchy_follow.go.
+	omarchyChanges    <-chan swatch.Palette
+	stopOmarchyFollow func()
 	// Client is where the person looking at this screen is sitting. The
 	// booleans around it are what it implies, kept because they are what the
 	// code reads and what the tests set. See ClientKind.
@@ -547,6 +671,10 @@ type OS struct {
 	IsDaemonSession bool               // True when running as part of a persistent daemon session
 	DaemonClient    *session.TUIClient // Client for daemon communication (nil in local mode)
 	SessionName     string             // Name of the daemon session (if attached)
+	// lastWorkspace and lastSession are where this client was before the
+	// current workspace and session, for last_workspace and last_session.
+	lastWorkspace int
+	lastSession   lastSession
 	// AttachedHost is the host DaemonClient reaches its daemon through, or ""
 	// for the daemon on this machine. See SwitchToHostSession.
 	AttachedHost string
@@ -585,6 +713,11 @@ type OS struct {
 	// is a pure function of the session names on screen, so every client
 	// computes the same map without saying anything to anyone.
 	sessionColors map[string]Accent
+	// sessionPoolCache remembers the theme's tell-apart hues and the key they
+	// were built from, so a render asking per row does not re-lift the
+	// palette each time.
+	sessionPoolCache []sessionHue
+	sessionPoolKey   sessionPoolKey
 	// SessionRestored is the attached session's daemon-owned restored mark. The
 	// daemon clears it on attach, so it is normally false here; it is carried
 	// anyway so the attached row reads from the same field every other row does.
@@ -596,6 +729,10 @@ type OS struct {
 	// session's arrives with the cached listing; this one comes down with the
 	// session state, the same way SessionRestored does.
 	SessionGlobal bool
+	// SessionSpace is the space the attached session is filed under, empty for
+	// none. It is daemon-owned and comes down with the session state, like
+	// SessionGlobal; every other session's arrives with the cached listing.
+	SessionSpace string
 	// The machines on this user's tailnet, offered as addresses on the Hosts
 	// settings page. Filled once by a goroutine, because the call behind it is
 	// a round trip and the row that shows them is drawn in the render path.
@@ -618,6 +755,27 @@ type OS struct {
 
 	// hints is hints mode while it is open, or nil. See hints.go.
 	hints *hintsState
+	// paneLabels is the display_panes labels while they are up, or nil. See
+	// pane_labels.go.
+	paneLabels *paneLabelsState
+	// dropZone is where the pane a drag holds would land if dropped where the
+	// pointer last was, or nil outside a drag: the press, the release and a
+	// lost release each clear it. See tiling_drop.go.
+	dropZone *Drop
+	// dropZoneShown is whether the highlight is drawn: the zone's delay has
+	// run out, or there is none. dropZoneGen moves on whenever the zone
+	// changes or is cleared, which cancels the delay armed for the last one.
+	dropZoneShown bool
+	dropZoneGen   uint64
+	// dropZoneX/Y is the point dropZone was worked out at, in the layout
+	// frame, so a retile can work it out again without a motion.
+	dropZoneX, dropZoneY int
+	// dropLook is the preview's colours and its memo of washed text colours,
+	// kept across a drag's frames. See drop_zone_render.go.
+	dropLook dropLook
+	// dropLayout is the map the landing rectangle of an edge drop is laid out
+	// into, kept so that working one out does not allocate a map each time.
+	dropLayout map[int]layout.Rect
 
 	// prefixRepeatUntil is when the prefix stops being armed after a
 	// repeatable prefix command. Zero when nothing is armed. See
@@ -627,25 +785,51 @@ type OS struct {
 	tailnetMu         sync.Mutex
 	tailnetAskedAt    time.Time
 	tailnetCandidates []string
+	// The [tailscale] table as last read, and the version of the config file
+	// it was read from. See tailnetOptionsCached.
+	tailnetOpt        federation.TailnetOptions
+	tailnetOptEnabled bool
+	tailnetOptKey     tailnetFileKey
+	tailnetOptValid   bool
 	// SessionWorktree is the attached session's daemon-owned worktree record,
 	// nil when its directory is not a linked git worktree. Every other
 	// session's arrives with the cached listing; this one comes down with the
 	// session state, so the rail reads the attached row from live state exactly
 	// as it reads the rest of that row.
 	SessionWorktree *session.WorktreeInfo
-	// WorkspaceNames maps a workspace number to its daemon-owned label. The
-	// number stays the workspace's identity and is what an unnamed workspace
-	// shows, so an absent entry is not a missing label but the normal case.
+	// WorkspaceNames maps a workspace number to its daemon-owned label. An
+	// unnamed workspace shows its number, so an absent entry is not a missing
+	// label but the normal case.
 	WorkspaceNames map[int]string
-	// WorkspaceOrder is the daemon-owned order the workspaces are shown in. It
-	// arranges and never addresses: the number stays the identity, so nothing
-	// keyed by one moves when this does. Empty is the plain ascending order.
-	WorkspaceOrder    []int
-	RestoredFromState bool // True after RestoreFromState, cleared after first resize
+	// pendingWorkspaceOrder is the order a drag of the dock's pills dropped
+	// them in, shown until the daemon's renumber arrives, so the strip does
+	// not snap back for the length of the round trip. See workspace_order.go.
+	pendingWorkspaceOrder []int
+	// workspaceTabKeys is the session's herdr tab keys as this client last
+	// adopted them, which is what a renumber is read against. See
+	// adoptWorkspaceRenumbering. workspaceTabKeysKnown is false until a state
+	// has been adopted.
+	workspaceTabKeys      map[int]int
+	workspaceTabKeysKnown bool
+	// workspaceMoveInFlight is set while a renumber this client asked for has
+	// not come back in a state. See RenumberWorkspaces.
+	workspaceMoveInFlight bool
+	RestoredFromState     bool // True after RestoreFromState, cleared after first resize
 	// DaemonStateVersion is the daemon state version this client last saw. It is
 	// echoed back on every state sync so the daemon can tell a snapshot built
 	// from its current state apart from one built before a mutation of its own.
 	DaemonStateVersion int
+	streamTap          StreamTap // See SetStreamTap; nil for every client but tuios gui-bridge
+	// ReloadFilter, when set, sees a config read from disk before it is put
+	// in force. tuios gui-bridge keeps its own chrome off with it: its
+	// renderer draws the dock and the rail itself, and a reload would bring
+	// them back above the panes for every client of the session.
+	ReloadFilter func(*config.UserConfig) *config.UserConfig
+	// SnapshotScrollback is how many history rows a pane's snapshot asks
+	// the daemon for; 0 is the daemon's default, 1000. tuios gui-bridge sets
+	// it to its renderer's own history, so a reopen shows as much as the
+	// renderer keeps.
+	SnapshotScrollback int
 	SubscribedPTYs     map[string]bool // Tracks which PTY IDs are currently subscribed (for visibility optimization)
 	// RestoredStreamSeq is the stream position each pane's snapshot was taken
 	// at, from the restore that precedes the subscribe on the attach path.
@@ -742,6 +926,10 @@ type OS struct {
 	// last push named. A session resize newer than the last push is pushed.
 	// See session/layout_gen.go.
 	layoutGenApplied, layoutGenPushed uint64
+	// focusGiven is the focus (focusKey) this client last pushed or was
+	// given by a sync. A push that still shows it is marked FocusUnmoved.
+	focusGiven    string
+	focusGivenSet bool
 
 	// lastConfigMaster is the configured master-stack shape as this OS last
 	// saw it. See adoptConfigMasterLayout.
@@ -791,6 +979,14 @@ type OS struct {
 	// placed. That is an answer to a question, not an echo of a layout, so it is
 	// sent once, after the sync has been applied and the guard is down.
 	syncAnswerOwed bool
+	// treeAnswerBase is the Version of the state being answered while the
+	// trees owed after applying it are sent, and zero otherwise.
+	// treeAnswerUser holds the workspaces whose tree the user had changed
+	// before that state arrived. Every other tree sent then is this client's
+	// reading of the state, and the daemon refuses it when a peer changed
+	// that workspace's tree after the state. See LayoutTreePayload.BaseVersion.
+	treeAnswerBase int
+	treeAnswerUser map[int]bool
 	// turnsWithinSync holds the panes whose finished turn a sync folded away
 	// (see noteAgentTurnWithin), until the sync has adopted its focus. The
 	// windows are updated before the focus, and a turn has to be judged by
@@ -802,6 +998,15 @@ type OS struct {
 	// holds describes a session that no longer exists and must not be pushed.
 	// See SyncStateToDaemon, AddWindow and DeleteWindow.
 	daemonWindowIntent bool
+	// windowIntentErr is why the last window request did not go out, read
+	// once by addWindowInChecked.
+	windowIntentErr error
+	// paneRequests is, by workspace, when this client asked the daemon for
+	// the pane a switch to that empty workspace opens. A switch back to the
+	// workspace before the pane arrives asks for nothing more. A sync that
+	// shows a window there clears the entry, and an entry older than
+	// paneRequestTimeout counts as gone. See openPaneOnEmptyWorkspace.
+	paneRequests map[int]time.Time
 	// Keyboard enhancement support (Kitty protocol)
 	KeyboardEnhancementsEnabled bool // True when terminal supports keyboard enhancements
 	// KeyboardFlags is the flag set the host answered the enhancement query
@@ -829,9 +1034,17 @@ type OS struct {
 	// ConfigWarnings holds the problems found in the loaded config, reported to
 	// the user once the TUI is up (see reportConfigWarnings).
 	ConfigWarnings []string
+	// ConfigNotices holds settings the file asks for that this client cannot
+	// carry out, such as desktop notifications in a browser. The file is not
+	// wrong, so they are logged and announced as notices, never counted as
+	// config problems.
+	ConfigNotices []string
 	// ConfigReadOnly stops the settings page writing the config file. Set by
 	// entrypoints that serve someone else's session; see OSOptions.
 	ConfigReadOnly bool
+	// ListKeys is the keys that move every list, from [keybindings.lists]. Nil
+	// reads the defaults.
+	ListKeys *listnav.Keymap
 	// BrowserClient says the far end is a browser tab. See browser_client.go
 	// for what that costs and what tuios says about it.
 	BrowserClient bool
@@ -849,6 +1062,9 @@ type OS struct {
 	// session, since it would otherwise fire on every keypress in the settings
 	// page.
 	configReadOnlyTold bool
+	// settingsSaves runs the config writes in the order they were made. See
+	// settings_save.go.
+	settingsSaves *settingsSaveQueue
 	// Showkeys overlay: a bottom-right, dock-aware keycast that shows the last
 	// few keypresses as styled pills and expires them after a short timeout. It
 	// renders purely from ShowKeys plus RecentKeys, gated on nothing else.
@@ -893,23 +1109,52 @@ type OS struct {
 	ScriptAwaitWindows  int
 	ScriptAwaitDeadline time.Time
 	// Tape manager UI
-	ShowTapeManager    bool              // True when showing tape manager overlay
-	TapeManager        *TapeManagerState // Tape manager state
-	TapeRecorder       *tape.Recorder    // Tape recorder for recording sessions
-	TapeRecordingName  string            // Name of current recording
-	TapePrefixActive   bool              // True when Ctrl+B, T was pressed (tape sub-prefix)
-	LayoutPrefixActive bool              // True when Ctrl+B, L was pressed (layout sub-prefix)
+	ShowTapeManager   bool              // True when showing tape manager overlay
+	TapeManager       *TapeManagerState // Tape manager state
+	TapeRecorder      *tape.Recorder    // Tape recorder for recording sessions
+	TapeRecordingName string            // Name of current recording
+	TapePrefixActive  bool              // True when Ctrl+B, T was pressed (tape sub-prefix)
+	TuiosPrefixActive bool              // True when the tuios menu is open (leader, then prefix_tuios's key)
+	// Menu is the declared menu open now (see config.MenuConfig), "" when none is.
+	Menu               string
+	LayoutPrefixActive bool // True when Ctrl+B, L was pressed (layout sub-prefix)
+	// MouseOff is set by toggle_mouse: the client stops asking the host for
+	// mouse reports, so the host terminal selects text itself, as tmux's
+	// mouse off does.
+	MouseOff bool
+	// MarkedPaneID is the pane mark_pane marked, for join_marked_*.
+	MarkedPaneID string
 	// Remote command processing
 	ProcessingRemoteKeys bool // True when processing remote send-keys (disables animations)
-	// Remote tape script progress (used instead of ScriptPlayer for tape exec)
-	RemoteScriptIndex int // Current command index (0-based)
-	RemoteScriptTotal int // Total commands in remote script
+	// ScriptWait is the WaitFor playback is holding for, nil when none is.
+	ScriptWait *scriptWait
+	// ScriptFailure says where and why the last tape stopped, empty when it
+	// ran to the end. It outlives script mode, so tuios tape play can exit
+	// with it after the person quits.
+	ScriptFailure string
+	// scriptInFlight is true from the tick that hands a tape command to
+	// Update until Update has run it, so the next command waits for the one
+	// before it. Without it a tick could send the next command before a
+	// NewWindow had armed the wait for its pane.
+	scriptInFlight bool
+	// scriptRequestID is the tuios tape exec waiting for this tape's result.
+	scriptRequestID string
+	// scriptRestoreAnimations is true when the running tape turned
+	// animations off and has to turn them back on when it ends.
+	scriptRestoreAnimations bool
+	// scriptCmds are the commands the current tape command's actions and keys
+	// returned, for Update to return. See queueScriptCmd.
+	scriptCmds []tea.Cmd
 	// Kitty Graphics Protocol passthrough for forwarding to host terminal
 	KittyPassthrough *KittyPassthrough
 	// Sixel Graphics passthrough for forwarding to host terminal
 	SixelPassthrough *SixelPassthrough
 	TextSizingState  *TextSizingState
 	PostRenderWriter *PostRenderWriter
+	// cursorPark keeps the host cursor hidden where tuios parks it for
+	// input methods, nil when the writer has no frame hook. See
+	// cursor_park.go.
+	cursorPark *cursorPark
 	// Hooks manager for shell-command hooks
 	HookManager *hooks.Manager
 	// PendingClipboardSet receives clipboard content from guest apps via OSC 52.
@@ -1015,6 +1260,15 @@ type OS struct {
 	// launcherIcons holds the decoded app icons and what is currently drawn on
 	// the host. Nil until the launcher first needs one.
 	launcherIcons *launcherIcons
+	// replyPreview draws the images of a reply's draft, nil until one does.
+	// See inbox_reply_preview.go.
+	replyPreview *replyPreview
+	// replyEditorDir is the private folder of the file $EDITOR has open for
+	// a draft, removed when it closes. See inbox_reply_history.go.
+	replyEditorDir string
+	// scrollbackEditorDir is the private folder of the scrollback file the
+	// editor has open, removed when it closes. See os_selection.go.
+	scrollbackEditorDir string
 	// launcherIconCells is where the last frame put each row's icon, in
 	// panel-relative cells, for the flush that follows the frame.
 	launcherIconCells []launcherIconPlacement
@@ -1046,6 +1300,12 @@ type OS struct {
 	// stopInbox ends the watcher. Both nil until the watcher starts.
 	inboxEvents chan tea.Msg
 	stopInbox   func()
+	// transfers is the mirror of the daemon's copies between machines, the
+	// Copies panel and its dialogs. See transfers.go.
+	transfers transfersState
+	// agentsSwitchedOff is the agent switch as applyAgentsSwitch last saw
+	// it, so a config change that did not touch it does nothing.
+	agentsSwitchedOff bool
 	// Session switcher overlay
 	ShowSessionSwitcher          bool
 	SessionSwitcherQuery         string
@@ -1059,6 +1319,9 @@ type OS struct {
 	// never writes it; it is refreshed by a Cmd, never inside Update. See
 	// sidebar_hosts.go.
 	FederationHosts []FederationHost
+	// LocalLoad is the load of the machine the client's daemon runs on, as
+	// the last host listing carried it: Cores is 0 until one did.
+	LocalLoad federation.Load
 	// federationGen counts snapshots, so the rail's render cache can tell one
 	// from the next without comparing them.
 	federationGen uint64
@@ -1070,6 +1333,20 @@ type OS struct {
 	// up and pushes each change, so the rail's poll drops to a slow backstop.
 	// See FederationHostsMsg.Pushed.
 	federationPushed bool
+	// hostSignInUntil is when the fast host poll that opening a Tailscale
+	// sign-in page started ends. See host_signin.go.
+	hostSignInUntil time.Time
+	// hostSignInPending holds the machines whose sign-in page the person
+	// asked for before the daemon had one, with when the request lapses.
+	hostSignInPending map[string]time.Time
+	// hostOpen is the session on another machine a rail click waits for, and
+	// hostOpenGen counts the clicks. See host_open.go.
+	hostOpen    *hostOpenPending
+	hostOpenGen uint64
+	// hostReconnectDeferred says the link to the attached host was lost, or
+	// its reconnect stopped, while a rail click waited. The reconnect starts
+	// when no click waits any more. See resumeAfterHostOpen.
+	hostReconnectDeferred bool
 	// federationTickGen is the generation of the host poll timer now armed. A
 	// tick from an older generation is dropped, so the snapshot's re-arm and
 	// the tick's own re-arm cannot leave two loops running.
@@ -1085,12 +1362,28 @@ type OS struct {
 	// since the last save. The daemon applies a file change that dials a
 	// new host only for the person, so the save asks it to (applyHostsCmd).
 	hostsToApply []string
+	// navigator is the pane navigator (choose_tree) while it is up. See
+	// navigator.go.
+	navigator navigatorState
+	// gotoPicker is the go-to picker (goto_picker), and the places the
+	// client has been. See goto_picker.go.
+	gotoPicker gotoPickerState
+	// navLayoutPick is the navigator layout the v key last chose, kept for
+	// the next time the navigator opens. Empty is the configured one.
+	navLayoutPick string
 	// Workspace switcher overlay, scoped to the attached session
 	ShowWorkspaceSwitcher     bool
 	WorkspaceSwitcherQuery    string
 	WorkspaceSwitcherSelected int
 	WorkspaceSwitcherScroll   int
 	WorkspaceSwitcherItems    []WorkspaceItem
+	// buffers is the paste buffer chooser, and pasteBufs the store of a
+	// client with no daemon. See paste_buffers.go.
+	buffers   bufferChooser
+	pasteBufs *pastebuf.Store
+	// buffersDaemonOld is set when the daemon answered unknown_verb to a
+	// buffer verb: it is too old, and pasteBufs keeps the buffers instead.
+	buffersDaemonOld bool
 	// Aggregate view overlay (all windows across workspaces)
 	ShowAggregateView     bool
 	AggregateViewQuery    string
@@ -1169,11 +1462,35 @@ type OS struct {
 	keybinds           keybindManager
 
 	// Theme picker overlay state.
-	ShowThemePicker     bool
+	ShowThemePicker bool
+	// presetPicker is the keybind preset picker, and presetHint the welcome
+	// row's suggestion, read from the home folder once.
+	presetPicker        presetPickerState
+	presetHint          *presetSuggestion
 	ThemePickerQuery    string
 	ThemePickerSelected int
 	ThemePickerScroll   int
 	ThemePickerOriginal string // theme active when the picker opened, for cancel
+	// ThemePickerShade lists all themes, only dark ones or only light ones.
+	ThemePickerShade int
+	// ThemePickerDelete is the theme a ctrl+d asked to delete, waiting for y.
+	ThemePickerDelete string
+	// ThemePickerPair is the theme a pick waits on while the picker asks
+	// whether it is for the dark theme, the light one or both. Empty when
+	// it asks nothing. See appearance.theme_light.
+	ThemePickerPair string
+	// schemeApplied is the theme followSchemeTheme last put in force.
+	schemeApplied string
+	// themeHook is what the after-theme-change hook last saw. See
+	// theme_hook.go.
+	themeHook themeHookState
+	// gradient is the focused border's gradient. See border_gradient.go.
+	gradient borderGradient
+	// themeEditor is the theme editor side sheet. See theme_editor.go.
+	themeEditor themeEditorState
+	// workspaceMarkSet holds the bell and activity marks of the workspaces
+	// not in view, as bits. See workspace_marks.go.
+	workspaceMarkSet map[int]uint8
 
 	// Glyph picker overlay state, the theme picker's opposite number.
 	ShowGlyphPicker     bool
@@ -1235,12 +1552,21 @@ type OS struct {
 	// wheel scrolls the one under the pointer and no header can be scrolled
 	// away; sidebarSectionY is where each section was drawn, which is how a
 	// wheel event finds its section. Scrolls are clamped by the next render.
-	SidebarHits    []sidebarRowHit
-	SidebarScrollS int
-	SidebarScrollT int
-	SidebarScrollA int
-	SidebarScrollF int
-	SidebarScrollG int
+	SidebarHits []sidebarRowHit
+	// A docked session owns its own daemon connection and terminal snapshot;
+	// neither is part of the center session's window list or state sync.
+	sidebarSessions           [2]sidebarSessionView
+	sidebarSessionEvents      chan sidebarSessionEvent
+	sidebarSessionStateEvents [2]chan sidebarSessionEvent // latest snapshot for each rail
+	sidebarSessionStateMu     [2]sync.Mutex               // serialize replacements from old/new clients
+	sidebarSessionDone        chan struct{}
+	sidebarSessionFocus       int // 0 none, 1 left, 2 right
+	SidebarScrollS            int
+	SidebarScrollT            int
+	SidebarScrollA            int
+	SidebarScrollF            int
+	SidebarScrollG            int
+	SidebarScrollC            int
 	// sidebarAgentAnchor keeps the agents section's viewport on the row it was
 	// left on rather than on the index that row happened to have, since that
 	// section resorts itself on live agent state. See sidebar_anchor.go.
@@ -1251,6 +1577,20 @@ type OS struct {
 	// or a pane is focused. See
 	// sidebarFoldAgents.
 	sidebarAgentsUnfolded bool
+	// sidebarSubagentFold is the open or shut state the person gave each
+	// pane's subagent heading on this rail, keyed by sidebarSubagentKey. A
+	// pane not in it takes appearance.sidebar.subagent_collapse. Client
+	// memory only: it lasts as long as the client.
+	sidebarSubagentFold map[string]bool
+	// sidebarSubagentFoldGen counts the toggles of any rail's headings, for
+	// the rails' signatures.
+	sidebarSubagentFoldGen int
+	// subagentHideDue is the earliest moment a finished subagent's row is
+	// due to go under appearance.sidebar.subagent_hide_finished, noted while
+	// the rail is drawn, and subagentHideArmed the moment a frame was last
+	// asked for. See subagentHideCmd.
+	subagentHideDue   time.Time
+	subagentHideArmed time.Time
 	// sidebarReveal is what the last frame was drawn for, so a focus change
 	// can scroll the terminals and sessions sections to the row that now
 	// matters and a frame with no change leaves them alone. See
@@ -1284,10 +1624,25 @@ type OS struct {
 	// and how far its branch has drifted. Derived state, never persisted and
 	// never synced, refreshed off the render path. See sidebar_git.go.
 	gitView gitView
+	// railCustom is the rail's custom section: whether its command is loaded
+	// in the dock engine, a generation the render cache keys on, and the
+	// per-run context last handed to the engine. See sidebar_custom.go.
+	railCustom railCustomState
 	// filePrompt is the file action dialog: the create prompt, the rename
 	// prompt, or the delete confirmation. Zero when none is up, which is every
 	// frame nobody has pressed a file action key on. See sidebar_file_ops.go.
 	filePrompt filePromptState
+	// worktreePrompt is the worktree dialog: a branch name asked over a
+	// repository, whose enter hands the daemon's new-worktree verb a command.
+	// Zero when it is closed, the way filePrompt is. See worktree_prompt.go.
+	worktreePrompt worktreePromptState
+	// pluginApproval is the dialog that asks the person about a native
+	// plugin that waits for approval. See plugin_approval.go.
+	pluginApproval pluginApprovalState
+	// pressingTapeKeys is true while a tape's Press runs keys through the
+	// input handler (PressKeys). Those keys are not the person's: the
+	// plugin approval dialog ignores them.
+	pressingTapeKeys bool
 	// fileClip is what a copy or a cut in the files section captured, waiting
 	// for a paste. It holds paths and no bytes, so it costs nothing to carry.
 	fileClip fileClipboard
@@ -1311,6 +1666,13 @@ type OS struct {
 	// agentIntegrationInstalled is set when a harness has tuios's hooks
 	// installed, read once at start off the UI goroutine. See agentsSeen.
 	agentIntegrationInstalled bool
+	// agentsPage is the settings page's Agents tab: the integration report it
+	// draws, the row whose actions are open, and the notices already shown.
+	// See settings_agents.go.
+	agentsPage agentsPageState
+	// agentNoticesDismissed holds the integration notices the person
+	// dismissed, by agentNoticeKey, persisted with the rail's state.
+	agentNoticesDismissed map[string]bool
 	// settingsAgentsOpen is the Alerts tab's agent group opened or closed by
 	// hand; nil follows agentsSeen.
 	settingsAgentsOpen *bool
@@ -1387,6 +1749,10 @@ type OS struct {
 	// window ID. A non-empty map is the only thing that keeps the maintenance
 	// tick awake for them, so an idle session with nothing parked pays nothing.
 	pendingAgentAlerts map[string]pendingAgentAlert
+	// programAlerts is, for each pane whose state comes from OSC 7501, when
+	// it last raised an alert outside tuios (a notification, a bell, a sound,
+	// a hook) and the alert held back since. See programAlertOutside.
+	programAlerts map[string]*programAlert
 	// Accent picker state: what is being accented (a pane or a session) and
 	// which one, the colour under the cursor and where that cursor is, and the
 	// hit geometry the renderer records as it draws the grid, the hue strip and
@@ -1492,6 +1858,19 @@ type OS struct {
 	// input that changes the rows, so a frame drawn for an unrelated reason (a
 	// pane printing output) does not rebuild and restyle the whole rail.
 	sidebarCache sidebarRenderCache
+	// The second edge keeps its render cache and recorded hits separate from
+	// the original rail. sidebarDrawing is set only during the synchronous
+	// render pass for that edge, never across an Update or background run.
+	secondarySidebarCache sidebarRenderCache
+	secondarySidebarHits  []sidebarRowHit
+	secondaryRailView     secondaryRailView
+	secondaryWidthPref    int
+	secondaryCollapsed    bool
+	sidebarFocusSecondary bool
+	sidebarDrawing        bool
+	sidebarDrawingWidth   int
+	sidebarDrawingEdge    sidebarEdge
+	railCustomSecond      railCustomState
 	// sidebarTitles debounces window titles for the rail so bursty title churn
 	// does not thrash the rows; sidebarTitlePending is set while an adopted title
 	// is still catching up, keeping the tick alive until it settles.
@@ -1528,6 +1907,10 @@ type OS struct {
 	CtrlDragPending bool
 	CtrlDragging    bool
 	CtrlDragIndex   int
+	// CtrlClickLink is the link under a ctrl + left press, when the press
+	// was on one and link_click allows ctrl. A release before the drag
+	// threshold opens it; a drag clears it. See handleMouseRelease.
+	CtrlClickLink string
 	// CtrlDragWasTerminal remembers that the grab started in terminal mode, so
 	// dropping the window puts the user back where they were instead of leaving
 	// them in window management. Moving a pane is not a request to stop typing.
@@ -1549,6 +1932,9 @@ type OS struct {
 	// menuSession carries the session a rail row's menu was opened on, the same
 	// way menuWorkspace carries a pill's. See TakeMenuSession.
 	menuSession string
+	// menuRepo carries the repository a rail group header's menu was opened
+	// on, the same way menuSession carries a session row's. See TakeMenuRepo.
+	menuRepo string
 	// menuFile carries the listing row a files-section menu was opened on, the
 	// same way menuSession carries a session row's. See fileMenuTarget.
 	menuFile fileMenuTarget
@@ -1574,6 +1960,9 @@ type OS struct {
 	// PiPPressed says the button that is down was pressed on the
 	// picture-in-picture view, so its release is the view's as well.
 	PiPPressed bool
+	// MiddleBindingPressed says a terminal-mode binding took the middle
+	// button press, so its release is the binding's as well.
+	MiddleBindingPressed bool
 	// scratchPending says the scratch terminal was asked for and has not
 	// arrived yet, and scratchPendingAt is when. See scratch.go.
 	scratchPending   string
@@ -1665,6 +2054,9 @@ type NotifTarget struct {
 	// ClipboardAsk, when set, names a pane's clipboard write that waits for
 	// the user: activating the message allows it. See clipboard_osc52.go.
 	ClipboardAsk uint64
+	// DaemonRestart marks the version notice: activating it opens the
+	// restart dialog. See warnOnBuildMismatch.
+	DaemonRestart bool
 	// ClipboardVersion counts the changes to that ask's text. It is part of
 	// the target, so a message drawn with one text is not the same message as
 	// one holding another. See clickVisibleNotification.
@@ -1724,6 +2116,9 @@ func (m *OS) SwitchToSession(targetSession string) error {
 	if targetSession == "" {
 		return fmt.Errorf("session name cannot be empty")
 	}
+	// A switch the person made ends a rail click that waits for another
+	// machine. See host_open.go.
+	m.cancelHostOpen()
 
 	m.LogInfo("[SWITCH] Starting: %s → %s", m.SessionName, targetSession)
 
@@ -1754,8 +2149,10 @@ func (m *OS) SwitchToSession(targetSession string) error {
 		// on its own session with every pane streaming.
 		return fmt.Errorf("switch to %q failed: %w; still on %q", targetSession, err, m.SessionName)
 	}
+	from := lastSession{host: m.attachedMachine(), name: m.SessionName}
 	m.SessionName = m.DaemonClient.SessionName()
 	m.rebuildForSession(state, savedWidth, savedHeight)
+	m.leftSession(from)
 	// The components tell their commands which session they are drawing for,
 	// and that answer just changed.
 	m.SyncDockContext()
@@ -1782,6 +2179,8 @@ func (m *OS) SwitchToSession(targetSession string) error {
 // It runs only once the daemon has confirmed which session this connection is
 // on, because every step of it is irreversible.
 func (m *OS) rebuildForSession(state *session.SessionState, savedWidth, savedHeight int) {
+	// The surfaces of the session left are not drawn here any more.
+	m.pruneTMLViews(state)
 	// The daemon already dropped these subscriptions when it took the detach.
 	// Unsubscribing again is what clears the client's own output, resize and
 	// exit handlers, so a pane from the session just left cannot fire into the
@@ -1810,12 +2209,36 @@ func (m *OS) rebuildForSession(state *session.SessionState, savedWidth, savedHei
 	// refuses to navigate to, leaving it permanently invisible.
 	m.CurrentWorkspace = 1
 	m.SubscribedPTYs = make(map[string]bool)
+	// Requests for panes were made in the session just left.
+	m.paneRequests = nil
 	// The pinned pane belongs to the session just left. Its stream was
 	// dropped above, and on a switch back the ids match again with nothing
 	// streaming the pane, so the view would show a frozen screen.
 	m.pip = pipState{occluder: m.pip.occluder[:0]}
+	// The agents view's live box has the same problem. A session the daemon
+	// restored keeps its window ids, so the box would see the same id after
+	// a reattach, prime nothing, and stop updating. Forget it, and let the
+	// next follow pick the pane again.
+	m.cockpitLiveForget()
+
+	// The box the panes go in is the new session's: its size under its own
+	// window_size policy and its clients, and the chrome reserve its clients
+	// agreed on, both from the attach reply. Neither is this client's own
+	// terminal, and neither is the session just left.
+	m.Width, m.Height = savedWidth, savedHeight
+	m.EffectiveWidth, m.EffectiveHeight = savedWidth, savedHeight
+	m.sessionClients = m.DaemonClient.AttachClientCount()
+	if state != nil && state.Width > 0 && state.Height > 0 {
+		m.EffectiveWidth, m.EffectiveHeight = state.Width, state.Height
+	}
+	if m.DaemonClient != nil {
+		m.SessionReserve = m.DaemonClient.SessionLayoutReserve()
+	}
 
 	if state == nil || len(state.Windows) == 0 {
+		// Nobody has arranged a session with no windows. RestoreFromState
+		// records this for a session with windows, and does not run here.
+		m.sessionUnarranged = true
 		m.adoptEmptySessionVersion(state)
 		// The labels are the session's, and RestoreFromState, which adopts
 		// them for a session with windows, does not run for one without. The
@@ -1833,11 +2256,10 @@ func (m *OS) rebuildForSession(state *session.SessionState, savedWidth, savedHei
 	if err := m.RestoreFromState(state); err != nil {
 		m.LogError("Failed to restore state: %v", err)
 	}
-	// Restore real screen dimensions (RestoreFromState may overwrite with saved values)
+	// RestoreFromState took the session's size for this client's screen too.
+	// The screen is this client's terminal.
 	m.Width = savedWidth
 	m.Height = savedHeight
-	m.EffectiveWidth = savedWidth
-	m.EffectiveHeight = savedHeight
 
 	m.rehydrateWindows()
 	m.TriggerAltScreenRedraws()
@@ -1868,9 +2290,16 @@ func (m *OS) Cleanup() {
 		m.FireDetached()
 	}
 
+	m.stopSidebarSessions()
+	// The copy of an image the desktop viewer was given.
+	m.replyPreview.removeOpened()
+	m.removeReplyEditorFile()
+	m.removeScrollbackEditorFile()
 	m.stopWindowExitDrain()
 	m.endConfigWatch()
+	m.endOmarchyFollow()
 	m.endInboxWatch()
+	m.endTransfersWatch()
 	m.stopFileWatch()
 	// The dock's components are subprocesses this client started, and a push
 	// component is a process that never exits on its own. An ephemeral SSH or

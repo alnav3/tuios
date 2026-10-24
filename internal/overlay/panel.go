@@ -1,6 +1,8 @@
 package overlay
 
 import (
+	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"image/color"
@@ -23,10 +25,10 @@ type Hint struct {
 // hints. Width is the inner content width; the rendered block is Width+4 cells
 // wide (a two-cell pad on each side).
 type Panel struct {
-	// Title is the chip's whole content. There is no icon in front of it:
-	// panels used to take one each, and they drifted into a mix of Nerd Font
-	// icons on some panels and none on most, which read as inconsistent and
-	// drew as boxes without a Nerd Font.
+	// Title is the chip's whole content. There is no icon in front of it: an
+	// icon per panel drifts into a mix of Nerd Font icons on some panels and
+	// none on most, which reads as inconsistent and draws as boxes without a
+	// Nerd Font.
 	Title     string
 	Width     int
 	Tabs      []string
@@ -267,7 +269,8 @@ func tabsRow(tabs []string, active int, bg color.Color, pal Palette, originX, or
 		}
 		r := Rect{}
 		if live {
-			b.WriteString(arrowStyle.Render(glyph) + Style(bg).Render(" "))
+			b.WriteString(arrowStyle.Render(glyph))
+			b.WriteString(Style(bg).Render(" "))
 			r = Rect{X0: x, Y0: originY, X1: x + tabArrowWidth, Y1: originY + 1}
 		} else {
 			b.WriteString(Style(bg).Render(strings.Repeat(" ", tabArrowWidth)))
@@ -318,8 +321,49 @@ func tabsRow(tabs []string, active int, bg color.Color, pal Palette, originX, or
 // footerRows renders the muted key-hint strip on one row, shortened in tiers
 // when the hints do not fit across it (see fitHints).
 func footerRows(hints []Hint, bg color.Color, pal Palette, width int) []string {
-	strip, _ := renderHints(fitHints(hints, width, footerSep), footerSep, bg, pal)
+	key := footerKey(hints, bg, pal, width)
+	footerMemo.Lock()
+	strip, ok := footerMemo.m[key]
+	footerMemo.Unlock()
+	if !ok {
+		strip, _ = renderHints(fitHints(hints, width, footerSep), footerSep, bg, pal)
+		footerMemo.Lock()
+		if footerMemo.m == nil || len(footerMemo.m) >= footerMemoMax {
+			footerMemo.m = make(map[string]string, footerMemoMax)
+		}
+		footerMemo.m[key] = strip
+		footerMemo.Unlock()
+	}
 	return []string{strip}
+}
+
+// footerMemo keeps the footer strips drawn lately. A panel is drawn again
+// whenever anything on it changes, and its footer, the same keys at the same
+// width, was most of the allocations of such a frame. A process that serves
+// several clients draws for each, so the memo is shared and locked.
+var footerMemo struct {
+	sync.Mutex
+	m map[string]string
+}
+
+// footerMemoMax bounds the memo. Past it the memo starts again.
+const footerMemoMax = 64
+
+// footerKey is everything a footer strip depends on: the keys and labels,
+// the width, the inks and the ground with their types (an ANSI colour and an
+// RGB one can print alike), the depth the inks are measured at, and the
+// glyphs a strip draws.
+func footerKey(hints []Hint, bg color.Color, pal Palette, width int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d|%d|%t|%s|%s|%T%v|%T%v|%T%v|", width, CurrentDepth(), UseASCII(), Ellipsis(), EnterKey(),
+		bg, bg, pal.AccentBright, pal.AccentBright, pal.FgDim, pal.FgDim)
+	for _, h := range hints {
+		b.WriteString(h.Key)
+		b.WriteByte(0)
+		b.WriteString(h.Label)
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // renderHints draws a fitted strip: keys bright and bold, labels in FgDim, sep
@@ -363,12 +407,27 @@ func (p Panel) Render(pal Palette) (string, Geometry) {
 	// Every row is padded out to the panel width and, as a backstop, cut down to
 	// it. A row that measures wider than the panel is a row drawn outside the
 	// panel's own box, which on a narrow screen means outside the screen.
-	line := func(content string) string {
-		s := pad + content
-		if lipgloss.Width(s) > totalW {
-			s = ansi.Truncate(s, totalW, "")
+	// The padding a row needs on its right is the same few strings on
+	// every row, so each length is rendered once per panel.
+	pads := map[int]string{}
+	fill := func(s string, width int) string {
+		w := lipgloss.Width(s)
+		if w > width {
+			s = ansi.Truncate(s, width, "")
+			w = lipgloss.Width(s)
 		}
-		return Fill(s, totalW, bg)
+		if w >= width {
+			return s
+		}
+		p, ok := pads[width-w]
+		if !ok {
+			p = Style(bg).Render(strings.Repeat(" ", width-w))
+			pads[width-w] = p
+		}
+		return s + p
+	}
+	line := func(content string) string {
+		return fill(pad+content, totalW)
 	}
 	top, bottom := blank, blank
 
@@ -376,17 +435,13 @@ func (p Panel) Render(pal Palette) (string, Geometry) {
 	// frame costs no geometry: the body, the tabs and every hit rectangle a
 	// host recorded are where they are on an unframed panel.
 	if pal.Framed && sidePad() >= 1 {
-		tl, tr, bl, br, h, v := dialogFrame()
+		tl, tr, bl, br, h, v := panelFrame(pal)
 		edge := Style(bg).Foreground(pal.Edge)
 		side := edge.Render(v)
 		inner := totalW - 2
 		innerPad := Style(bg).Render(strings.Repeat(" ", sidePad()-1))
 		line = func(content string) string {
-			s := innerPad + content
-			if lipgloss.Width(s) > inner {
-				s = ansi.Truncate(s, inner, "")
-			}
-			return side + Fill(s, inner, bg) + side
+			return side + fill(innerPad+content, inner) + side
 		}
 		blank = line("")
 		top = edge.Render(tl + strings.Repeat(h, inner) + tr)
@@ -439,7 +494,7 @@ func FrameBlock(rows []string, totalW int, bg color.Color, pal Palette) []string
 	if !pal.Framed || len(rows) < 2 || totalW < 2 {
 		return rows
 	}
-	tl, tr, bl, br, h, v := dialogFrame()
+	tl, tr, bl, br, h, v := panelFrame(pal)
 	edge := Style(bg).Foreground(pal.Edge)
 	side := edge.Render(v)
 	out := make([]string, len(rows))

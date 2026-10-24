@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 )
@@ -56,7 +57,7 @@ import (
 // herdrTargetVersion is the herdr release whose API this file follows, and
 // herdrTargetProtocol the protocol number that release reports.
 const (
-	herdrTargetVersion  = "0.9.3"
+	herdrTargetVersion  = "0.9.5"
 	herdrTargetProtocol = 22
 )
 
@@ -69,6 +70,7 @@ const (
 // herdrError is a failed method: herdr's error code and message.
 type herdrError struct{ code, msg string }
 
+//go:noinline
 func herdrErr(code, msg string) *herdrError { return &herdrError{code: code, msg: msg} }
 
 func (e *herdrIDError) herdr() *herdrError { return herdrErr(e.code, e.msg) }
@@ -114,6 +116,12 @@ type herdrIn struct {
 	Name          string              `json:"name"`
 	Kind          string              `json:"kind"`
 	Args          []string            `json:"args"`
+	Amount        *float64            `json:"amount"`
+	Destination   herdrMoveDest       `json:"destination"`
+	Title         string              `json:"title"`
+	Tokens        map[string]*string  `json:"tokens"`
+	Seq           *uint64             `json:"seq"`
+	TTLMS         *int64              `json:"ttl_ms"`
 }
 
 // label is the label, "" when there is none.
@@ -162,6 +170,14 @@ type herdrResult struct {
 	Swap          *herdrSwap             `json:"swap,omitempty"`
 	Zoom          *herdrZoom             `json:"zoom,omitempty"`
 	Argv          []string               `json:"argv,omitempty"`
+	Resize        *herdrResize           `json:"resize,omitempty"`
+	Status        string                 `json:"status,omitempty"`
+	Diagnostics   *[]string              `json:"diagnostics,omitempty"`
+	Explain       map[string]any         `json:"explain,omitempty"`
+	MoveResult    *herdrMove             `json:"move_result,omitempty"`
+	Changed       *bool                  `json:"changed,omitempty"`
+	Reason        string                 `json:"reason,omitempty"`
+	Manifests     *[]herdrManifestInfo   `json:"manifests,omitempty"`
 }
 
 // herdrAck is the result of a method that only acknowledges.
@@ -192,31 +208,33 @@ type herdrWorktreeSource struct {
 // under the verb's name. Name and Focus are pointers because the empty name
 // and focus false are values the verbs read.
 type herdrArgs struct {
-	Session   string  `json:"session,omitempty"`
-	Window    string  `json:"window,omitempty"`
-	Name      *string `json:"name,omitempty"`
-	Workspace int     `json:"workspace,omitempty"`
-	Focus     *bool   `json:"focus,omitempty"`
-	Cwd       string  `json:"cwd,omitempty"`
-	Text      string  `json:"text,omitempty"`
-	Keys      string  `json:"keys,omitempty"`
-	Literal   bool    `json:"literal,omitempty"`
-	Paste     bool    `json:"paste,omitempty"`
-	Submit    bool    `json:"submit,omitempty"`
-	Source    string  `json:"source,omitempty"`
-	Styled    bool    `json:"styled,omitempty"`
-	Lines     int     `json:"lines,omitempty"`
-	Direction string  `json:"direction,omitempty"`
-	Order     []int   `json:"order,omitempty"`
-	Condition string  `json:"condition,omitempty"`
-	Pattern   string  `json:"pattern,omitempty"`
-	Until     string  `json:"until,omitempty"`
-	Timeout   *int64  `json:"timeout,omitempty"`
-	Repo      string  `json:"repo,omitempty"`
-	Branch    string  `json:"branch,omitempty"`
-	Base      string  `json:"base,omitempty"`
-	Force     bool    `json:"force,omitempty"`
-	Command   string  `json:"command,omitempty"`
+	Session   string            `json:"session,omitempty"`
+	Window    string            `json:"window,omitempty"`
+	Name      *string           `json:"name,omitempty"`
+	Workspace int               `json:"workspace,omitempty"`
+	ToSession string            `json:"to_session,omitempty"`
+	Focus     *bool             `json:"focus,omitempty"`
+	Cwd       string            `json:"cwd,omitempty"`
+	Text      string            `json:"text,omitempty"`
+	Keys      string            `json:"keys,omitempty"`
+	Literal   bool              `json:"literal,omitempty"`
+	Paste     bool              `json:"paste,omitempty"`
+	Submit    bool              `json:"submit,omitempty"`
+	Source    string            `json:"source,omitempty"`
+	Styled    bool              `json:"styled,omitempty"`
+	Lines     int               `json:"lines,omitempty"`
+	Direction string            `json:"direction,omitempty"`
+	Order     []int             `json:"order,omitempty"`
+	Condition string            `json:"condition,omitempty"`
+	Pattern   string            `json:"pattern,omitempty"`
+	Until     string            `json:"until,omitempty"`
+	Timeout   *int64            `json:"timeout,omitempty"`
+	Repo      string            `json:"repo,omitempty"`
+	Branch    string            `json:"branch,omitempty"`
+	Base      string            `json:"base,omitempty"`
+	Force     bool              `json:"force,omitempty"`
+	Command   string            `json:"command,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
 }
 
 // herdrMethod answers one method for cs.
@@ -225,16 +243,27 @@ type herdrMethod struct {
 	required []string
 }
 
-// herdrMethods are the methods tuios answers besides the pane reports, with
-// the params each must have.
-var herdrMethods map[string]herdrMethod
+// herdrMethods returns the methods tuios answers besides the pane reports,
+// with the params each must have. It is built on first use and not in init,
+// for the reason verbRegistry gives: a table init builds keeps every handler
+// it names in every program that links this package.
+func herdrMethods() map[string]herdrMethod {
+	herdrMethodsOnce.Do(func() { herdrMethodsMap = buildHerdrMethods() })
+	return herdrMethodsMap
+}
 
-func init() {
+var (
+	herdrMethodsOnce sync.Once
+	herdrMethodsMap  map[string]herdrMethod
+)
+
+// buildHerdrMethods makes the table herdrMethods returns.
+func buildHerdrMethods() map[string]herdrMethod {
 	pane := []string{"pane_id"}
 	tab := []string{"tab_id"}
 	ws := []string{"workspace_id"}
 	target := []string{"target"}
-	herdrMethods = map[string]herdrMethod{
+	return map[string]herdrMethod{
 		"ping":             {run: (*Daemon).herdrPing},
 		"session.snapshot": {run: (*Daemon).herdrSnapshot},
 
@@ -281,14 +310,27 @@ func init() {
 
 		"events.wait": {run: (*Daemon).herdrEventsWait, required: []string{"match_event"}},
 
-		"pane.process_info":    {run: (*Daemon).herdrPaneProcessInfo},
-		"pane.neighbor":        {run: (*Daemon).herdrPaneNeighbor, required: []string{"direction"}},
-		"pane.edges":           {run: (*Daemon).herdrPaneEdges},
-		"pane.focus_direction": {run: (*Daemon).herdrPaneFocusDirection, required: []string{"direction"}},
-		"pane.swap":            {run: (*Daemon).herdrPaneSwap},
-		"pane.zoom":            {run: (*Daemon).herdrPaneZoom},
-		"workspace.focus":      {run: (*Daemon).herdrWorkspaceFocus, required: ws},
-		"agent.start":          {run: (*Daemon).herdrAgentStart, required: []string{"name", "kind", "pane_id"}},
+		"pane.process_info":         {run: (*Daemon).herdrPaneProcessInfo},
+		"pane.neighbor":             {run: (*Daemon).herdrPaneNeighbor, required: []string{"direction"}},
+		"pane.edges":                {run: (*Daemon).herdrPaneEdges},
+		"pane.focus_direction":      {run: (*Daemon).herdrPaneFocusDirection, required: []string{"direction"}},
+		"pane.swap":                 {run: (*Daemon).herdrPaneSwap},
+		"pane.zoom":                 {run: (*Daemon).herdrPaneZoom},
+		"workspace.focus":           {run: (*Daemon).herdrWorkspaceFocus, required: ws},
+		"agent.start":               {run: (*Daemon).herdrAgentStart, required: []string{"name", "kind", "pane_id"}},
+		"pane.resize":               {run: (*Daemon).herdrPaneResize, required: []string{"direction"}},
+		"server.reload_config":      {run: (*Daemon).herdrReloadConfig},
+		"server.agent_manifests":    {run: (*Daemon).herdrAgentManifests},
+		"agent.rename":              {run: (*Daemon).herdrAgentRename, required: target},
+		"pane.move":                 {run: (*Daemon).herdrPaneMove, required: []string{"pane_id", "destination"}},
+		"workspace.report_metadata": {run: (*Daemon).herdrWorkspaceReportMetadata, required: []string{"workspace_id", "source", "tokens"}},
+		"agent.explain":             {run: (*Daemon).herdrAgentExplain, required: target},
+
+		"client.window_title.set":   {run: herdrClientTitle(false), required: []string{"title"}},
+		"client.window_title.clear": {run: herdrClientTitle(true)},
+
+		"release_notes.dismiss":        {run: (*Daemon).herdrDismissReleaseNotes, required: []string{"version"}},
+		"product_announcement.dismiss": {run: (*Daemon).herdrDismissAnnouncement, required: []string{"version", "id"}},
 	}
 }
 
@@ -297,33 +339,36 @@ func init() {
 // method herdr does not have at all is answered as herdr answers it: code
 // invalid_request, "unknown variant".
 var herdrUnsupported = []string{
-	"server.stop", "server.live_handoff", "server.reload_config", "server.ssh_agent.register",
-	"server.agent_manifests", "server.reload_agent_manifests",
-	"product_announcement.dismiss", "release_notes.dismiss", "command.invoke",
-	"client.window_title.set", "client.window_title.clear", "client_shell.surface.set",
-	"workspace.move", "workspace.move_block", "workspace.report_metadata",
-	"agent.explain", "agent.rename", "agent.view.set", "agent.view.clear",
-	"pane.move",
+	"server.stop", "server.live_handoff", "server.ssh_agent.register",
+	"server.reload_agent_manifests",
+	"command.invoke",
+	"client_shell.surface.set",
+	"workspace.move", "workspace.move_block",
+	"agent.view.set", "agent.view.clear",
 	"layout.export", "layout.apply", "layout.set_split_ratio",
-	"pane.resize", "pane.scroll",
+	"pane.scroll",
 	"pane.clear", "pane.edit_scrollback", "pane.selection.read", "pane.copy_motion",
 	"pane.copy_search", "pane.input.set", "pane.link.activate", "pane.link.resolve",
-	"pane.clear_agent_authority", "popup.close",
 	"integration.list", "integration.install", "integration.uninstall",
-	"plugin.link", "plugin.list", "plugin.unlink", "plugin.enable", "plugin.disable",
-	"plugin.action.list", "plugin.action.invoke", "plugin.log.list",
-	"plugin.pane.open", "plugin.pane.focus", "plugin.pane.close",
 }
 
 // herdrAPICall answers a method that is not a pane report. handled is false
 // for a method herdr does not have.
 func (d *Daemon) herdrAPICall(cs *connState, method string, params json.RawMessage) (any, *herdrError, bool) {
-	m, ok := herdrMethods[method]
+	m, ok := herdrMethods()[method]
 	if !ok {
+		// The plugin methods are answered by the plugin host. See
+		// herdr_plugins.go.
+		if out, herr, handled := d.herdrPluginCall(cs, method, params); handled {
+			return out, herr, true
+		}
 		if slices.Contains(herdrUnsupported, method) {
 			return nil, herdrErr("unsupported", "tuios does not answer "+method+". See the herdr compatibility section of docs/AGENT_STATE.md for what it answers"), true
 		}
 		return nil, nil, false
+	}
+	if herr := d.herdrAllowed(cs, method); herr != nil {
+		return nil, herr, true
 	}
 	in := &herdrIn{}
 	if herr := herdrDecode(params, in, m.required...); herr != nil {
@@ -413,7 +458,7 @@ func herdrString(m map[string]any, key string) string {
 	return s
 }
 
-func ptr[T any](v T) *T { return &v }
+func ptr[T any](v T) *T { return new(v) }
 
 // herdrVersion is the version a pong and a snapshot report: the herdr
 // release whose API this follows, marked as tuios in semver build metadata,
@@ -524,10 +569,7 @@ func (d *Daemon) herdrWorkspaceInfo(cs *connState, id string) (*herdrResult, *he
 // workspace. tuios has no verb that moves an attached client to another
 // session, so focus is taken and does nothing.
 func (d *Daemon) herdrWorkspaceCreate(cs *connState, in *herdrIn) (*herdrResult, *herdrError) {
-	if len(in.Env) > 0 {
-		return nil, herdrErr("unsupported", "tuios does not set env for a new workspace. Leave env out")
-	}
-	return d.herdrNewSession(cs, herdrArgs{Cwd: in.Cwd}, in.label(), "workspace_create_failed", &herdrResult{Type: "workspace_created"})
+	return d.herdrNewSession(cs, herdrArgs{Cwd: in.Cwd, Env: in.Env}, in.label(), "workspace_create_failed", &herdrResult{Type: "workspace_created"})
 }
 
 // herdrNewSession runs new-session, names the session label when one is
@@ -629,7 +671,7 @@ func (d *Daemon) herdrTabInfo(cs *connState, id string) (*herdrResult, *herdrErr
 	if herr != nil {
 		return nil, herr
 	}
-	if t := v.tab(herdrTabID(sess.ID, ws)); t != nil {
+	if t := v.tab(herdrTabID(sess.ID, sess.GetState().WorkspaceTabKey(ws))); t != nil {
 		return &herdrResult{Type: "tab_info", Tab: t}, nil
 	}
 	return nil, herdrNotFound("tab", id).herdr()
@@ -638,9 +680,6 @@ func (d *Daemon) herdrTabInfo(cs *connState, id string) (*herdrResult, *herdrErr
 // herdrTabCreate puts a window on the first workspace of the session that is
 // not a tab yet, and names the workspace when a label is given.
 func (d *Daemon) herdrTabCreate(cs *connState, in *herdrIn) (*herdrResult, *herdrError) {
-	if len(in.Env) > 0 {
-		return nil, herdrErr("unsupported", "tuios does not set env for a new tab. Leave env out")
-	}
 	sess, herr := d.herdrSessionOrFocused(cs, in.WorkspaceID)
 	if herr != nil {
 		return nil, herr
@@ -665,10 +704,10 @@ func (d *Daemon) herdrTabCreate(cs *connState, in *herdrIn) (*herdrResult, *herd
 			return nil, herr
 		}
 	}
-	out, herr := d.herdrVerb(cs, "new-window", herdrArgs{Session: sess.Name(), Workspace: ws, Focus: &in.Focus, Cwd: in.Cwd}, fail)
+	out, herr := d.herdrVerb(cs, "new-window", herdrArgs{Session: sess.Name(), Workspace: ws, Focus: &in.Focus, Cwd: in.Cwd, Env: in.Env}, fail)
 	if herr != nil {
 		if label != "" {
-			_, _ = d.herdrVerb(cs, "set-workspace-name", herdrArgs{Session: sess.Name(), Workspace: ws, Name: ptr("")}, fail)
+			_, _ = d.herdrVerb(cs, "set-workspace-name", herdrArgs{Session: sess.Name(), Workspace: ws, Name: new("")}, fail)
 		}
 		return nil, herr
 	}
@@ -719,8 +758,10 @@ func (d *Daemon) herdrTabVerb(cs *connState, id, verb string, args herdrArgs, fa
 	return d.herdrTabInfo(cs, id)
 }
 
-// herdrTabMove is set-workspace-order. insert_index counts places in the
-// session's tab list before the tab is taken out, as herdr's does.
+// herdrTabMove is set-workspace-order, which renumbers the workspaces: the
+// tabs take the numbers they hold between them in their new order, and keep
+// their ids. insert_index counts places in the session's tab list before the
+// tab is taken out, as herdr's does.
 func (d *Daemon) herdrTabMove(cs *connState, in *herdrIn) (*herdrResult, *herdrError) {
 	if *in.InsertIndex < 0 {
 		return nil, herdrErr("invalid_request", "invalid request: insert_index must not be negative")
@@ -729,7 +770,7 @@ func (d *Daemon) herdrTabMove(cs *connState, in *herdrIn) (*herdrResult, *herdrE
 	if ierr != nil {
 		return nil, ierr.herdr()
 	}
-	order := herdrWorkspaceOrder(sess.GetState())
+	order := herdrOrderedTabs(sess.GetState())
 	from := slices.Index(order, ws)
 	at := min(*in.InsertIndex, len(order))
 	order = slices.Insert(order, at, ws)
@@ -760,7 +801,7 @@ func (d *Daemon) herdrTabClose(cs *connState, in *herdrIn) (*herdrResult, *herdr
 	// The name goes first: clearing it is admin, as closing is, and a pane
 	// refused here has closed nothing.
 	if st.WorkspaceNames[ws] != "" {
-		if _, herr := d.herdrVerb(cs, "set-workspace-name", herdrArgs{Session: sess.Name(), Workspace: ws, Name: ptr("")}, fail); herr != nil {
+		if _, herr := d.herdrVerb(cs, "set-workspace-name", herdrArgs{Session: sess.Name(), Workspace: ws, Name: new("")}, fail); herr != nil {
 			return nil, herr
 		}
 	}
@@ -991,7 +1032,7 @@ func (d *Daemon) herdrPaneRename(cs *connState, in *herdrIn) (*herdrResult, *her
 		return nil, ierr.herdr()
 	}
 	args := herdrWin(sess, win.ID)
-	args.Name = ptr(strings.TrimSpace(in.label()))
+	args.Name = new(strings.TrimSpace(in.label()))
 	if _, herr := d.herdrVerb(cs, "set-window", args, "pane_rename_failed"); herr != nil {
 		return nil, herr
 	}
@@ -1026,9 +1067,6 @@ func (d *Daemon) herdrPaneSplit(cs *connState, in *herdrIn) (*herdrResult, *herd
 	default:
 		return nil, herdrErr("invalid_request", "invalid request: unknown variant `"+in.Direction+"`, expected `right` or `down`")
 	}
-	if len(in.Env) > 0 {
-		return nil, herdrErr("unsupported", "tuios does not set env for a new pane. Leave env out")
-	}
 	target := in.TargetPaneID
 	if target == "" {
 		sess, herr := d.herdrSessionOrFocused(cs, in.WorkspaceID)
@@ -1047,7 +1085,9 @@ func (d *Daemon) herdrPaneSplit(cs *connState, in *herdrIn) (*herdrResult, *herd
 	}
 	const fail = "pane_split_failed"
 	newID, split := "", false
-	if in.Cwd == "" && d.findTUIClient(sess.ID) != nil {
+	// split-window takes no cwd or env, so a split that names either is a
+	// new window on the target's workspace, which the client tiles.
+	if in.Cwd == "" && len(in.Env) == 0 && d.findTUIClient(sess.ID) != nil {
 		args := herdrWin(sess, win.ID)
 		args.Direction = dir
 		out, verr := d.callVerb(cs, "split-window", args)
@@ -1064,7 +1104,7 @@ func (d *Daemon) herdrPaneSplit(cs *connState, in *herdrIn) (*herdrResult, *herd
 		}
 	}
 	if !split {
-		out, herr := d.herdrVerb(cs, "new-window", herdrArgs{Session: sess.Name(), Workspace: max(win.Workspace, 1), Focus: &in.Focus, Cwd: in.Cwd}, fail)
+		out, herr := d.herdrVerb(cs, "new-window", herdrArgs{Session: sess.Name(), Workspace: max(win.Workspace, 1), Focus: &in.Focus, Cwd: in.Cwd, Env: in.Env}, fail)
 		if herr != nil {
 			return nil, herr
 		}
@@ -1120,7 +1160,7 @@ func (d *Daemon) herdrPaneWaitForOutput(cs *connState, in *herdrIn) (*herdrResul
 	var matched *string
 	for line := range strings.SplitSeq(res.Read.Text, "\n") {
 		if re.MatchString(line) {
-			matched = ptr(line)
+			matched = new(line)
 		}
 	}
 	return &herdrResult{Type: "output_matched", PaneID: res.Read.PaneID, Revision: &res.Read.Revision, MatchedLine: matched, Read: res.Read}, nil
@@ -1351,10 +1391,10 @@ func (d *Daemon) herdrWorktreeList(cs *connState, in *herdrIn) (*herdrResult, *h
 func herdrWorktreeOf(e worktree.Entry, open map[string]string) herdrWorktreeRecord {
 	r := herdrWorktreeRecord{
 		Path: e.Path, IsBare: e.Bare, IsDetached: e.Detached, IsPrunable: e.Prunable,
-		IsLinkedWorktree: e.Linked, OpenWorkspaceID: open[filepath.Clean(e.Path)], Label: filepath.Base(e.Path),
+		IsLinkedWorktree: e.Linked, OpenWorkspaceID: open[herdrRealPath(e.Path)], Label: filepath.Base(e.Path),
 	}
 	if e.Branch != "" {
-		r.Branch, r.Label = ptr(e.Branch), e.Branch
+		r.Branch, r.Label = new(e.Branch), e.Branch
 	}
 	return r
 }
@@ -1368,7 +1408,7 @@ func (d *Daemon) herdrOpenCheckouts(cs *connState) map[string]string {
 		if w.Worktree == nil || w.Worktree.CheckoutPath == "" {
 			continue
 		}
-		if path := filepath.Clean(w.Worktree.CheckoutPath); open[path] == "" {
+		if path := herdrRealPath(w.Worktree.CheckoutPath); open[path] == "" {
 			open[path] = w.WorkspaceID
 		}
 	}
@@ -1393,8 +1433,18 @@ func (d *Daemon) herdrWorktreeCreate(cs *connState, in *herdrIn) (*herdrResult, 
 	if herr != nil {
 		return nil, herr
 	}
-	wt := &herdrWorktreeRecord{Path: herdrString(out, "path"), Branch: ptr(in.Branch), IsLinkedWorktree: true, Label: in.Branch}
+	wt := &herdrWorktreeRecord{Path: herdrString(out, "path"), Branch: new(in.Branch), IsLinkedWorktree: true, Label: in.Branch}
 	return d.herdrLabelled(cs, herdrString(out, "session"), herdrString(out, "window_id"), in.label(), fail, &herdrResult{Type: "worktree_created", Worktree: wt})
+}
+
+// herdrRealPath is a path with its symlinks resolved, or the cleaned path when
+// it cannot be. git reports a checkout by its real path, and a caller may know
+// it by a symlinked one: on macOS /tmp and /var are links into /private.
+func herdrRealPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
 }
 
 // herdrWorktreeOpen shows a checkout that exists: the session that already
@@ -1414,8 +1464,9 @@ func (d *Daemon) herdrWorktreeOpen(cs *connState, in *herdrIn) (*herdrResult, *h
 		return nil, herdrErr("not_git_worktree", err.Error())
 	}
 	var entry *worktree.Entry
+	want := herdrRealPath(in.Path)
 	for i, e := range entries {
-		if (in.Path != "" && filepath.Clean(e.Path) == filepath.Clean(in.Path)) || (in.Path == "" && in.Branch != "" && e.Branch == in.Branch) {
+		if (in.Path != "" && herdrRealPath(e.Path) == want) || (in.Path == "" && in.Branch != "" && e.Branch == in.Branch) {
 			entry = &entries[i]
 		}
 	}
@@ -1424,8 +1475,8 @@ func (d *Daemon) herdrWorktreeOpen(cs *connState, in *herdrIn) (*herdrResult, *h
 	}
 	open := d.herdrOpenCheckouts(cs)
 	rec := herdrWorktreeOf(*entry, open)
-	res := &herdrResult{Type: "worktree_opened", Worktree: &rec, AlreadyOpen: ptr(false)}
-	if id := open[filepath.Clean(entry.Path)]; id != "" {
+	res := &herdrResult{Type: "worktree_opened", Worktree: &rec, AlreadyOpen: new(false)}
+	if id := open[herdrRealPath(entry.Path)]; id != "" {
 		sess, ierr := d.herdrFindSession(id)
 		if ierr != nil {
 			return nil, ierr.herdr()
@@ -1435,7 +1486,7 @@ func (d *Daemon) herdrWorktreeOpen(cs *connState, in *herdrIn) (*herdrResult, *h
 		if root == "" && len(st.Windows) > 0 {
 			root = st.Windows[0].ID
 		}
-		res.AlreadyOpen = ptr(true)
+		res.AlreadyOpen = new(true)
 		return d.herdrCreated(cs, sess, root, res)
 	}
 	args := herdrArgs{Cwd: entry.Path}

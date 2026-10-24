@@ -12,12 +12,19 @@ import "strings"
 //	mode = "strict"
 //	grants = ["read", "write", "fan"]
 //
-// It is file-plane config, outside the option registry, for the same reason
-// [hosts] is: a list of harness names is not a scalar with one settable path.
-// The daemon reads it at start and again whenever the file changes.
+// Apart from enabled, it is file-plane config, outside the option registry,
+// for the same reason [hosts] is: a list of harness names is not a scalar
+// with one settable path. enabled is a plain bool, so it is in the registry
+// and on the settings page. The daemon reads the table at start and again
+// whenever the file changes.
 
 // AgentsConfig is the [agents] table.
 type AgentsConfig struct {
+	// Enabled turns every agent feature on or off: agent detection, the
+	// agent rows of the rail, the Inbox, agent mail, approvals, attention,
+	// the agent keys and start-agent. Nil means on, the default. False keeps
+	// only the multiplexer. See On.
+	Enabled *bool `toml:"enabled,omitempty"`
 	// Approvals is the [agents.approvals] table. See ApprovalsConfig.
 	Approvals ApprovalsConfig `toml:"approvals,omitempty"`
 	// Permissions is the [agents.permissions] table: what a process in a
@@ -29,6 +36,12 @@ type AgentsConfig struct {
 	// Queue is the [agents.queue] table: messages waiting to be typed to an
 	// agent when it comes to rest. See agents_work.go.
 	Queue QueueConfig `toml:"queue,omitempty"`
+	// Mail is the [agents.mail] table: how tuios tells an agent that mail
+	// waits for it. See agents_work.go.
+	Mail MailConfig `toml:"mail,omitempty"`
+	// Checkpoints is the [agents.checkpoints] table: the state of a pane's
+	// git work tree saved at the end of each agent turn. See agents_work.go.
+	Checkpoints CheckpointsConfig `toml:"checkpoints,omitempty"`
 	// HerdrProtocol says which panes are told about the socket tuios accepts
 	// herdr's pane state protocol on, which Crush and other harnesses report
 	// to by themselves: "always" (the default) for every pane, the way herdr
@@ -38,7 +51,25 @@ type AgentsConfig struct {
 	// HERDR_ENV, herdr itself included, which refuses to start inside one
 	// unless its own config allows nesting. See docs/AGENT_STATE.md.
 	HerdrProtocol string `toml:"herdr_protocol,omitempty"`
+	// HostProgramStatus says whether tuios reports its panes' agent states to
+	// the terminal it runs in, with OSC 7501 (the Program Status Protocol):
+	// "auto" (the default) asks the terminal at start and reports only when
+	// it answers, and "off" never asks. See docs/PROGRAM_STATUS.md.
+	HostProgramStatus string `toml:"host_program_status,omitempty"`
 }
+
+// On reports whether the agent features are on. They are unless the file
+// says enabled = false.
+func (a AgentsConfig) On() bool { return a.Enabled == nil || *a.Enabled }
+
+// AgentsOffMessage is the one line a command, a verb or a key prints when it
+// is an agent feature and the agent features are off.
+const AgentsOffMessage = "Agent features are off. Set agents.enabled = true in the config to use this command."
+
+// AgentsOffVerbMessage is what the daemon answers an agent verb with while
+// the agent features are off. A verb can come from the CLI, an MCP client or
+// a herdr client, so it names the machine and not a command.
+const AgentsOffVerbMessage = "Agent features are off on this machine. Set agents.enabled = true in its config.toml to turn them on."
 
 // The values of [agents] herdr_protocol.
 const (
@@ -46,6 +77,21 @@ const (
 	HerdrProtocolAlways = "always"
 	HerdrProtocolOff    = "off"
 )
+
+// The values of [agents] host_program_status.
+const (
+	HostProgramStatusAuto = "auto"
+	HostProgramStatusOff  = "off"
+)
+
+// NormalizeHostProgramStatus reads an [agents] host_program_status value.
+// Empty and anything unrecognised mean the default, "auto".
+func NormalizeHostProgramStatus(v string) string {
+	if strings.ToLower(strings.TrimSpace(v)) == HostProgramStatusOff {
+		return HostProgramStatusOff
+	}
+	return HostProgramStatusAuto
+}
 
 // NormalizeHerdrProtocol reads an [agents] herdr_protocol value. Empty and
 // anything unrecognised mean the default, "always".

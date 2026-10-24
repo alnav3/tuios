@@ -30,6 +30,10 @@ import (
 //	[agents.queue]
 //	max = 8
 //
+//	[agents.checkpoints]
+//	enabled = true
+//	keep = 50
+//
 // They are file-plane config like the rest of [agents]: read from the file and
 // again when it changes, and never settable with set-option, so a pane cannot
 // switch the risk rules off through tuios. Every field has a default, so a
@@ -152,6 +156,67 @@ func (c QueueConfig) MaxEntries() int {
 	return c.Max
 }
 
+// MailConfig is the [agents.mail] table.
+type MailConfig struct {
+	// Wake types a one-line prompt into an agent at rest that has mail it
+	// was not told about, through the delivery queue. Unset means true.
+	Wake *bool `toml:"wake,omitempty"`
+}
+
+// WakeOn reports whether an idle agent is told about its mail. It is unless
+// the file says wake = false.
+func (c MailConfig) WakeOn() bool { return c.Wake == nil || *c.Wake }
+
+// Checkpoint bounds: how many checkpoints one pane keeps.
+const (
+	DefaultCheckpointKeep = 50
+	MaxCheckpointKeep     = 1000
+)
+
+// CheckpointsConfig is the [agents.checkpoints] table.
+type CheckpointsConfig struct {
+	// Enabled saves a checkpoint of a pane's git work tree each time its
+	// agent finishes a turn. Unset means true.
+	Enabled *bool `toml:"enabled,omitempty"`
+	// Keep is how many checkpoints one pane keeps. Zero means the default,
+	// 50; values past 1000 read as 1000.
+	Keep int `toml:"keep,omitempty"`
+	// MaxUntrackedMB is the size past which an untracked file is left out
+	// of a checkpoint, in megabytes, and is not read by review, review-stage,
+	// fan compare or fan diff either. Zero means the default, 50. A negative
+	// value means no limit.
+	MaxUntrackedMB int `toml:"max_untracked_mb,omitempty"`
+}
+
+// DefaultCheckpointMaxUntrackedMB is the default of max_untracked_mb.
+const DefaultCheckpointMaxUntrackedMB = 50
+
+// MaxUntrackedBytes is MaxUntrackedMB in bytes with its default applied, and
+// zero for no limit.
+func (c CheckpointsConfig) MaxUntrackedBytes() int64 {
+	switch {
+	case c.MaxUntrackedMB < 0:
+		return 0
+	case c.MaxUntrackedMB == 0:
+		return DefaultCheckpointMaxUntrackedMB << 20
+	}
+	return int64(c.MaxUntrackedMB) << 20
+}
+
+// On reports whether checkpoints are taken.
+func (c CheckpointsConfig) On() bool { return c.Enabled == nil || *c.Enabled }
+
+// KeepCount is Keep with its default and bound applied.
+func (c CheckpointsConfig) KeepCount() int {
+	switch {
+	case c.Keep <= 0:
+		return DefaultCheckpointKeep
+	case c.Keep > MaxCheckpointKeep:
+		return MaxCheckpointKeep
+	}
+	return c.Keep
+}
+
 // validateAgentWork warns about the values of the tables above that read as
 // their default, and about risk rules that cannot be used.
 func validateAgentWork(cfg *UserConfig, result *ValidationResult) {
@@ -170,6 +235,13 @@ func validateAgentWork(cfg *UserConfig, result *ValidationResult) {
 	if h := strings.ToLower(strings.TrimSpace(cfg.Agents.HerdrProtocol)); h != "" && h != NormalizeHerdrProtocol(h) {
 		warn("agents", "herdr_protocol", fmt.Sprintf("'%s' is not a valid value (allowed: %s, %s, %s); read as %s",
 			cfg.Agents.HerdrProtocol, HerdrProtocolAlways, HerdrProtocolAgents, HerdrProtocolOff, HerdrProtocolAlways))
+	}
+	if h := strings.ToLower(strings.TrimSpace(cfg.Agents.HostProgramStatus)); h != "" && h != NormalizeHostProgramStatus(h) {
+		warn("agents", "host_program_status", fmt.Sprintf("'%s' is not a valid value (allowed: %s, %s); read as %s",
+			cfg.Agents.HostProgramStatus, HostProgramStatusAuto, HostProgramStatusOff, HostProgramStatusAuto))
+	}
+	if k := cfg.Agents.Checkpoints.Keep; k < 0 || k > MaxCheckpointKeep {
+		warn("agents.checkpoints", "keep", fmt.Sprintf("%d is outside 1 to %d, so it reads as %d", k, MaxCheckpointKeep, cfg.Agents.Checkpoints.KeepCount()))
 	}
 	if q := cfg.Agents.Queue.Max; q < 0 || q > MaxQueueMax {
 		warn("agents.queue", "max", fmt.Sprintf("%d is outside 1 to %d; read as %d", q, MaxQueueMax, cfg.Agents.Queue.MaxEntries()))
@@ -211,4 +283,13 @@ func ParseAgentRestFold(v string) (d time.Duration, ok bool) {
 		return DefaultAgentRestFold, false
 	}
 	return d, true
+}
+
+// checkAgentRestFold is the error for an agent_rest_fold value that is
+// neither a duration nor off.
+func checkAgentRestFold(v string) error {
+	if _, ok := ParseAgentRestFold(v); !ok {
+		return fmt.Errorf("%q is not a duration such as 1h, or off", v)
+	}
+	return nil
 }

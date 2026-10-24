@@ -40,9 +40,8 @@ func TestMacOptionChordsReachTheirBinding(t *testing.T) {
 	}{
 		// Option as Meta / Esc+: the terminal sends ESC n and nothing is composed.
 		{"esc-prefixed meta", tea.KeyPressMsg{Code: 'n', Mod: tea.ModAlt}, false, "terminal_next_window"},
-		// No Kitty protocol and no Option-as-Meta: the dead key spills its
-		// tilde with no modifier at all.
-		{"composed glyph, bare", tea.KeyPressMsg{Code: '˜', Text: "˜"}, false, "terminal_next_window"},
+		// A bare composed glyph, with no modifier at all, is in
+		// TestBareOptionGlyphsFollowTheConfig: by default it is text.
 		// Kitty protocol, no alternate-key reporting: Ghostty and kitty set the
 		// Alt bit but still report the composed codepoint.
 		{"composed glyph with alt", tea.KeyPressMsg{Code: '˜', Mod: tea.ModAlt}, false, "terminal_next_window"},
@@ -52,7 +51,7 @@ func TestMacOptionChordsReachTheirBinding(t *testing.T) {
 		// Num Lock is on by default on most keyboards and the Kitty protocol
 		// reports it in the modifier field.
 		{"composed glyph with a lock modifier", tea.KeyPressMsg{Code: '˜', Mod: tea.ModAlt | tea.ModNumLock}, false, "terminal_next_window"},
-		{"option+p composes pi", tea.KeyPressMsg{Code: 'π', Text: "π"}, false, "terminal_prev_window"},
+		{"option+p composes pi, with alt", tea.KeyPressMsg{Code: 'π', Mod: tea.ModAlt}, false, "terminal_prev_window"},
 		// Option+Shift+n composes the same tilde as the Option+n dead key. When
 		// the terminal reports the Shift bit they are still tellable apart, and
 		// the two are bound to different things.
@@ -73,9 +72,94 @@ func TestMacOptionChordsReachTheirBinding(t *testing.T) {
 		if tc.main {
 			lookup = registry.GetAction
 		}
-		if got := lookupAction(tc.msg, lookup); got != tc.want {
+		if got := lookupAction(nil, tc.msg, lookup); got != tc.want {
 			t.Errorf("%s (%q): resolved to %q, want %q", tc.what, tc.msg.String(), got, tc.want)
 		}
+	}
+}
+
+// A composed character with no modifier reported says nothing about Option:
+// £ is Option and 3 on a US layout and Shift and 3 on a UK one, where the
+// guess switched to workspace 3 instead of typing £ (issue #746). The default,
+// option_glyphs = "auto", guesses only on a US or ABC Mac layout, or when
+// keyboard_layout = "us" says so. "bind" always guesses, "alt" never does,
+// "type" turns the Alt-bit form off as well (issue #566), and
+// keyboard_layout = "other" turns off the US table behind all of them.
+func TestBareOptionGlyphsFollowTheConfig(t *testing.T) {
+	onDarwin(t)
+	keys := []struct {
+		msg  tea.KeyPressMsg
+		main bool
+		want string
+		bare bool
+	}{
+		{tea.KeyPressMsg{Code: '£', Text: "£"}, true, "switch_workspace_3", true},
+		{tea.KeyPressMsg{Code: '˜', Text: "˜"}, false, "terminal_next_window", true},
+		{tea.KeyPressMsg{Code: 'π', Text: "π"}, false, "terminal_prev_window", true},
+		{tea.KeyPressMsg{Code: '£', Mod: tea.ModAlt}, true, "switch_workspace_3", false},
+		{tea.KeyPressMsg{Code: 'π', Mod: tea.ModAlt}, false, "terminal_prev_window", false},
+	}
+	const us, uk = true, false
+	for _, tc := range []struct {
+		macUS          bool
+		layout, glyphs string
+		bare, alt      bool
+	}{
+		{uk, "", "", false, true},
+		{us, "", "", true, true},
+		{uk, "", config.OptionGlyphsAuto, false, true},
+		{us, "", config.OptionGlyphsAuto, true, true},
+		{uk, config.KeyboardLayoutUS, config.OptionGlyphsAuto, true, true},
+		{us, config.KeyboardLayoutOther, config.OptionGlyphsAuto, false, false},
+		{us, "", config.OptionGlyphsAlt, false, true},
+		{uk, "", config.OptionGlyphsBind, true, true},
+		{us, "", config.OptionGlyphsType, false, false},
+		{us, config.KeyboardLayoutOther, config.OptionGlyphsBind, false, false},
+	} {
+		restore := config.ForceMacLayoutUS(tc.macUS)
+		cfg := config.DefaultConfig()
+		cfg.Keybindings.KeyboardLayout = tc.layout
+		cfg.Keybindings.OptionGlyphs = tc.glyphs
+		registry := config.NewKeybindRegistry(cfg)
+		for _, k := range keys {
+			runs := tc.alt
+			if k.bare {
+				runs = tc.bare
+			}
+			want := ""
+			if runs {
+				want = k.want
+			}
+			lookup := registry.GetTerminalModeAction
+			if k.main {
+				lookup = registry.GetAction
+			}
+			if got := lookupAction(nil, k.msg, lookup); got != want {
+				t.Errorf("US Mac %v, layout %q, option_glyphs %q: %q (mod %v) resolved to %q, want %q",
+					tc.macUS, tc.layout, tc.glyphs, k.msg.String(), k.msg.Mod, got, want)
+			}
+			if got := optionGlyphsApply(k.msg, tc.layout, tc.glyphs); got != runs {
+				t.Errorf("US Mac %v, layout %q, option_glyphs %q: optionGlyphsApply(%q, mod %v) = %v, want %v",
+					tc.macUS, tc.layout, tc.glyphs, k.msg.String(), k.msg.Mod, got, runs)
+			}
+		}
+		// The leader follows the same rule: leader_key = "opt+1" on
+		// Terminal.app sends a bare ¡, and on a US Mac under "auto" that is
+		// the leader again.
+		s := &config.Settings{LeaderKey: "opt+1", KeyboardLayout: tc.layout, OptionGlyphs: tc.glyphs}
+		for _, l := range []struct {
+			msg  tea.KeyPressMsg
+			want bool
+		}{
+			{tea.KeyPressMsg{Code: '¡', Text: "¡"}, tc.bare},
+			{tea.KeyPressMsg{Code: '¡', Mod: tea.ModAlt}, tc.alt},
+		} {
+			if got := isLeaderKey(l.msg, s, 0); got != l.want {
+				t.Errorf("US Mac %v, layout %q, option_glyphs %q: %q (mod %v) is the opt+1 leader: %v, want %v",
+					tc.macUS, tc.layout, tc.glyphs, l.msg.String(), l.msg.Mod, got, l.want)
+			}
+		}
+		restore()
 	}
 }
 
@@ -96,7 +180,7 @@ func TestComposedGlyphsAreNotChordsOffDarwin(t *testing.T) {
 		{Code: 'π', Text: "π"},
 		{Code: '¬', Text: "¬"},
 	} {
-		if got := lookupAction(msg, registry.GetTerminalModeAction); got != "" {
+		if got := lookupAction(nil, msg, registry.GetTerminalModeAction); got != "" {
 			t.Errorf("%q resolved to %q off darwin, want no action", msg.String(), got)
 		}
 	}
@@ -108,7 +192,6 @@ func TestMacOptionChordSwitchesPaneInTerminalMode(t *testing.T) {
 	onDarwin(t)
 
 	for _, msg := range []tea.KeyPressMsg{
-		{Code: '˜', Text: "˜"},
 		{Code: '˜', Mod: tea.ModAlt},
 		{Code: 'n', Mod: tea.ModAlt},
 	} {

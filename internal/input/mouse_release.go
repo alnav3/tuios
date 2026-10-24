@@ -3,6 +3,8 @@ package input
 import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/app"
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 	uv "github.com/charmbracelet/ultraviolet"
 )
 
@@ -56,6 +58,19 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// Reset pointer shape on release
 	o.ResetPointerShape()
 
+	// A rail session's tracked mouse click needs its matching release. The
+	// center pane must not receive a release for a press it never saw.
+	if mouse := msg.Mouse(); mouse.Button != tea.MouseRight {
+		if w := o.SidebarSessionPaneAt(mouse.X, mouse.Y); w != nil {
+			if w.Terminal != nil && w.Terminal.HasMouseMode() {
+				if tx, ty, inside := w.ScreenToTerminal(mouse.X, mouse.Y); inside {
+					sendMouseToWindow(o, w, uv.MouseReleaseEvent{X: tx, Y: ty, Button: uv.MouseButton(mouse.Button), Mod: uv.KeyMod(mouse.Mod)})
+				}
+			}
+			return o, nil
+		}
+	}
+
 	// A sidebar session gesture resolves on release: commit a reorder drag, or
 	// deliver the plain click (switch / toggle) the press deferred.
 	if o.SidebarDragActive() {
@@ -92,6 +107,15 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// press. A committed ctrl-drag falls through to the normal window-drop below.
 	if o.CtrlDragPending {
 		o.CtrlDragPending = false
+		// The press was on a link and nothing moved far enough to be a
+		// drag, so this was a ctrl+click on the link.
+		if url := o.CtrlClickLink; url != "" {
+			o.CtrlClickLink = ""
+			if o.CtrlDragIndex >= 0 && o.CtrlDragIndex < len(o.Windows) {
+				o.FocusWindowFromClick(o.CtrlDragIndex, o.DragStartX, o.DragStartY)
+			}
+			return o, o.OpenLink(url)
+		}
 		return o, nil
 	}
 	o.CtrlDragging = false
@@ -105,24 +129,19 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 
 	// A plain right press on a pane arms a resize. Below the drag threshold it
 	// was a click: cancel the resize (restoring the few cells of jitter it may
-	// have applied) and open the pane menu at the press position. A pane whose
-	// app requested mouse tracking keeps the old contract, no menu without
-	// ctrl/shift, because the right button belongs to that app. At or past the
-	// threshold the resize completes below.
+	// have applied) and open the pane menu at the press position. At or past
+	// the threshold the resize completes below.
+	//
+	// That holds over a pane whose app tracks the mouse too. Its right button
+	// is the app's only in terminal mode, where the press is forwarded and
+	// never arms this. A press that got here reached no app, and leaving the
+	// menu shut made the click do nothing at all.
 	if o.RightClickPending {
 		o.RightClickPending = false
 		mouse := msg.Mouse()
 		if abs(mouse.X-o.RightPressX)+abs(mouse.Y-o.RightPressY) < rightClickDragThreshold {
-			pressX, pressY := o.RightPressX, o.RightPressY
-			appOwnsMouse := false
-			if idx := findClickedWindow(pressX, pressY, o); idx != -1 {
-				win := o.Windows[idx]
-				appOwnsMouse = win.Terminal != nil && win.Terminal.HasMouseMode()
-			}
 			cancelRightClickResize(o)
-			if !appOwnsMouse {
-				o.OpenContextMenu(pressX, pressY)
-			}
+			o.OpenContextMenu(o.RightPressX, o.RightPressY)
 			return o, nil
 		}
 	}
@@ -139,6 +158,12 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			abs(mouse.X-o.DragStartX)+abs(mouse.Y-o.DragStartY) < clickToTypeDragThreshold {
 			enterTerminalOnRelease = true
 		}
+	}
+	// A terminal-mode middle-button binding consumed the press, so its release
+	// is tuios's too. In particular, never send a mouse-tracking program an
+	// unmatched release after the paste binding took the press.
+	if terminalMouseBindingConsumesRelease(msg, o) {
+		return o, nil
 	}
 	// Forward mouse release to terminal if in terminal mode and window has mouse tracking
 	if o.Mode == app.TerminalMode {
@@ -194,8 +219,7 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		mouse := msg.Mouse()
 
 		// Calculate drag distance to determine if this was actually a drag or just a click
-		dragDistance := abs(mouse.X-o.DragStartX) + abs(mouse.Y-o.DragStartY)
-		const dragThreshold = 5 // pixels: must move at least this much to be considered a drag
+		dragDistance := tiledDragDistance(o, mouse.X, mouse.Y)
 
 		draggedWindow := o.Windows[o.DraggedWindowIndex]
 
@@ -209,98 +233,59 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			// branch below does; the strip is only re-laid when the columns
 			// really changed, so a dropped pane never scrolls the strip.
 			swapped := false
-			if dragDistance >= dragThreshold {
-				sl := o.GetOrCreateScrollingLayout()
-				draggedIntID := o.GetWindowIntID(draggedWindow.ID)
-				for i := range o.Windows {
-					if i == o.DraggedWindowIndex || o.Windows[i].Minimized || o.Windows[i].IsFloating || o.Windows[i].Workspace != o.CurrentWorkspace {
-						continue
-					}
-					w := o.Windows[i]
-					if mouse.X >= w.X && mouse.X < w.X+w.Width && mouse.Y >= w.Y && mouse.Y < w.Y+w.Height {
-						targetIntID := o.GetWindowIntID(w.ID)
-						dragCol, targetCol := -1, -1
-						for ci, col := range sl.Columns {
-							for _, wid := range col.WindowIDs {
-								if wid == draggedIntID {
-									dragCol = ci
-								}
-								if wid == targetIntID {
-									targetCol = ci
-								}
+			if dragDistance >= tiledDragThreshold {
+				if target := o.DropTargetAt(mouse.X, mouse.Y); target >= 0 {
+					sl := o.GetOrCreateScrollingLayout()
+					draggedIntID := o.GetWindowIntID(draggedWindow.ID)
+					targetIntID := o.GetWindowIntID(o.Windows[target].ID)
+					dragCol, targetCol := -1, -1
+					for ci, col := range sl.Columns {
+						for _, wid := range col.WindowIDs {
+							if wid == draggedIntID {
+								dragCol = ci
+							}
+							if wid == targetIntID {
+								targetCol = ci
 							}
 						}
-						if dragCol >= 0 && targetCol >= 0 && dragCol != targetCol {
-							sl.Columns[dragCol], sl.Columns[targetCol] = sl.Columns[targetCol], sl.Columns[dragCol]
-							sl.FocusedCol = targetCol
-							// The drop hands the pane back to the layout. With the
-							// manipulation mark still on it the strip would leave it
-							// at the pointer and only note its slot (see
-							// LiveWindowDrag); the cleanup below clears the mark on
-							// every pane in any case.
-							draggedWindow.IsBeingManipulated = false
-							o.ScrollingSetPositions()
-							swapped = true
-						}
-						break
+					}
+					if dragCol >= 0 && targetCol >= 0 && dragCol != targetCol {
+						sl.Columns[dragCol], sl.Columns[targetCol] = sl.Columns[targetCol], sl.Columns[dragCol]
+						sl.FocusedCol = targetCol
+						// The drop hands the pane back to the layout. With the
+						// manipulation mark still on it the strip would leave it
+						// at the pointer and only note its slot (see
+						// LiveWindowDrag); the cleanup below clears the mark on
+						// every pane in any case.
+						draggedWindow.IsBeingManipulated = false
+						o.ScrollingSetPositions()
+						swapped = true
 					}
 				}
 			}
 			if !swapped {
-				draggedWindow.X = o.TiledX
-				draggedWindow.Y = o.TiledY
-				draggedWindow.Width = o.TiledWidth
-				draggedWindow.Height = o.TiledHeight
-				draggedWindow.Resize(o.TiledWidth, o.TiledHeight)
-				draggedWindow.MarkPositionDirty()
-				draggedWindow.InvalidateCache()
+				snapBack(o, draggedWindow)
 			}
 			o.DraggedWindowIndex = -1
-		} else if dragDistance >= dragThreshold {
-			// This was an actual drag, check for swap
-			// Find which window is under the cursor (excluding the dragged window)
-			targetWindowIndex := -1
-			for i := range o.Windows {
-				if i == o.DraggedWindowIndex || o.Windows[i].Minimized || o.Windows[i].IsFloating {
-					continue
+		} else if dragDistance >= tiledDragThreshold {
+			// This was an actual drag. In BSP a drop on a pane's edge splits
+			// it (see app.TiledDropAt); anywhere else on a pane swaps the two.
+			// An edge drop that would leave the tree as it is snaps back
+			// rather than falling through to the swap.
+			if drop, ok := o.TiledDropAt(mouse.X, mouse.Y); ok && drop.Dir != layout.PreselectionNone {
+				if !o.MoveWindowIntoSplit(draggedWindow, drop.Target, drop.Dir) {
+					snapBack(o, draggedWindow)
 				}
-				// Only consider windows in current workspace
-				if o.Windows[i].Workspace != o.CurrentWorkspace {
-					continue
-				}
-
-				w := o.Windows[i]
-				if mouse.X >= w.X && mouse.X < w.X+w.Width &&
-					mouse.Y >= w.Y && mouse.Y < w.Y+w.Height {
-					targetWindowIndex = i
-					break
-				}
-			}
-
-			if targetWindowIndex >= 0 && targetWindowIndex != o.DraggedWindowIndex {
+			} else if target := o.DropTargetAt(mouse.X, mouse.Y); target >= 0 {
 				// Swap windows: dragged window goes to target's position, target goes to dragged window's original position
-				o.SwapWindowsWithOriginal(o.DraggedWindowIndex, targetWindowIndex, o.TiledX, o.TiledY, o.TiledWidth, o.TiledHeight)
+				o.SwapWindowsWithOriginal(o.DraggedWindowIndex, target, o.TiledX, o.TiledY, o.TiledWidth, o.TiledHeight)
 			} else {
-				// No swap: snap dragged window back to its original tiled position
-				// Immediately set window back to tiled position to prevent layout corruption
-				draggedWindow.X = o.TiledX
-				draggedWindow.Y = o.TiledY
-				draggedWindow.Width = o.TiledWidth
-				draggedWindow.Height = o.TiledHeight
-				draggedWindow.Resize(o.TiledWidth, o.TiledHeight)
-				draggedWindow.MarkPositionDirty()
-				draggedWindow.InvalidateCache()
+				snapBack(o, draggedWindow)
 			}
 		} else {
 			// Drag distance below threshold: snap back to prevent layout corruption from micro-drags
 			// Even small mouse movements can displace the window during motion events
-			draggedWindow.X = o.TiledX
-			draggedWindow.Y = o.TiledY
-			draggedWindow.Width = o.TiledWidth
-			draggedWindow.Height = o.TiledHeight
-			draggedWindow.Resize(o.TiledWidth, o.TiledHeight)
-			draggedWindow.MarkPositionDirty()
-			draggedWindow.InvalidateCache()
+			snapBack(o, draggedWindow)
 		}
 		o.DraggedWindowIndex = -1
 	}
@@ -348,7 +333,12 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 
 		// In scrolling mode, capture resized width into the column BEFORE retiling
 		if wasResizing && o.AutoTiling && o.UseScrollingLayout {
-			if resizedWindowIndex >= 0 && resizedWindowIndex < len(o.Windows) {
+			// Only when the width moved. A press and release with no motion
+			// between them is a click, and recording the width it left alone
+			// would turn a column sized as a share of the screen into a fixed
+			// one, which then stops following the screen's width.
+			if resizedWindowIndex >= 0 && resizedWindowIndex < len(o.Windows) &&
+				o.Windows[resizedWindowIndex].Width != o.PreResizeState.Width {
 				win := o.Windows[resizedWindowIndex]
 				sl := o.GetOrCreateScrollingLayout()
 				intID := o.GetWindowIntID(win.ID)
@@ -404,6 +394,7 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.DragStartX = 0
 		o.DragStartY = 0
 		o.DraggedWindowIndex = -1
+		o.ClearDropZone()
 
 		// Clear interaction mode with a delay to allow shell prompts to fully redraw.
 		// This gives shells like bash/zsh/starship time to:
@@ -440,6 +431,24 @@ func handleMouseRelease(msg tea.MouseReleaseMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	}
 
 	return o, settleCmd
+}
+
+// tiledDragThreshold is how far, in cells, a tiled pane must move from where
+// the press was before its release counts as a drop rather than a click. The
+// drop-zone highlight uses it too, so it never shows a drop the release would
+// not make.
+const tiledDragThreshold = 5
+
+// tiledDragDistance is how far the pointer at x, y is from where the drag
+// started, the distance tiledDragThreshold is measured in.
+func tiledDragDistance(o *app.OS, x, y int) int {
+	return abs(x-o.DragStartX) + abs(y-o.DragStartY)
+}
+
+// snapBack puts a dragged tiled pane back in the slot the drag took it from,
+// at once, so a drop that moves nothing leaves the layout as it was.
+func snapBack(o *app.OS, win *terminal.Window) {
+	o.ReturnToDragSlot(win)
 }
 
 // rightClickDragThreshold and clickToTypeDragThreshold separate a click from a

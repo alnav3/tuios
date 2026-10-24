@@ -18,10 +18,15 @@ import (
 
 // # File actions on the rail
 //
-// Six of them: create, rename, delete, copy, cut and paste. It is the set the
-// maintainer named and no more. There is no multi-select, no tree, no filter
-// and no drag and drop, because a twenty-six column rail beside a terminal is
-// not the place to grow a file manager and yeetui already is one.
+// Seven of them: create, rename, delete, copy, cut, paste, and send. The first
+// six are the set the maintainer named. Send is the seventh: it copies the row
+// to another machine through the daemon's transfers, after a small picker of
+// the machines whose link is up and a folder field (transfers_dialog.go).
+// There is no multi-select, no tree and no filter, because a twenty-six column
+// rail beside a terminal is not the place to grow a file manager and yeetui
+// already is one. Drag and drop is not in the rail either: files dropped on a
+// pane on another machine are a paste of their paths, and the pane's paste
+// handles them (DropPaste).
 //
 // # Where the prompts live
 //
@@ -39,7 +44,7 @@ import (
 //
 // # Nothing touches the disk on the update goroutine
 //
-// Every one of the six runs inside a tea.Cmd. This file decides what to do and
+// Every one of the seven runs inside a tea.Cmd. This file decides what to do and
 // writes down what was asked for; the command does it. A paste of a large tree
 // takes as long as the disk takes and the rail keeps drawing for all of it.
 //
@@ -304,6 +309,21 @@ func (m *OS) SidebarFileOpen() tea.Cmd {
 		return m.fileViewUpFrom(t.Dir)
 	}
 	return m.fileViewOpen(t.Dir, t.Name, t.IsDir)
+}
+
+// SidebarFileCopyPath puts the absolute path of the row the menu was opened
+// on, or of the row under the cursor, on the clipboard. It acts on a folder
+// row as on a file row. It reads nothing on disk, so like the open action it
+// asks only that the section is on screen.
+func (m *OS) SidebarFileCopyPath() tea.Cmd {
+	if !m.filesOn() {
+		return nil
+	}
+	_, path, ok := m.fileActionTarget()
+	if !ok {
+		return nil
+	}
+	return m.copyFilePath(path)
 }
 
 type fileEditMsg struct {

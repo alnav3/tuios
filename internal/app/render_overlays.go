@@ -44,7 +44,10 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	// the clock as well, which is why show_clock appeared to do nothing to the
 	// dock: the option drew this instead. The clock is a dock component now,
 	// placed beside the meters it behaves like, so the two cannot double up.
-	if isRecording || m.PrefixActive {
+	// An armed leader shows on the dock's mode pill when the dock has one.
+	// The badge stays the way to see it with the dock hidden.
+	prefixBadge := m.PrefixActive && !m.prefixPillShown()
+	if isRecording || prefixBadge {
 		// The reading comes from the clock component, so the badge and a clock
 		// cell on the dock can never disagree, and so the format is the one
 		// [dock.clock] asked for rather than the one that used to be spelled
@@ -54,7 +57,7 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 
 		if isRecording {
 			statusText = config.TapeRecordingIndicator + " | " + currentTime
-		} else if m.PrefixActive {
+		} else if prefixBadge {
 			statusText = "PREFIX | " + currentTime
 		} else {
 			statusText = currentTime
@@ -73,7 +76,7 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 		switch {
 		case isRecording:
 			timeStyle = timeStyle.Background(pal.Warn).Foreground(theme.ContrastText(pal.Warn))
-		case m.PrefixActive:
+		case prefixBadge:
 			timeStyle = timeStyle.Background(pal.Warning).Foreground(theme.ContrastText(pal.Warning))
 		}
 
@@ -157,7 +160,11 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 			{Key: "N", Label: "new session"},
 			{Key: "?", Label: "help"},
 			{Key: ",", Label: "settings"},
+			m.welcomePresetChip(),
 		} {
+			if h.Key == "" {
+				continue
+			}
 			hints = append(hints, overlay.KeyBadge(h.Key, ui)+
 				lipgloss.NewStyle().Foreground(ui.FgDim).Render(" "+h.Label))
 		}
@@ -217,14 +224,39 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 		layers = m.placeOverlayPanel(layers, "agentmail", content, geo, rows)
 	}
 
+	// The Inbox is the cockpit: the whole screen between the dock's rows,
+	// with its own click targets. See render_cockpit.go.
 	if m.ShowInbox {
-		content, geo, rows := m.renderInbox()
-		layers = m.placeOverlayPanel(layers, "inbox", content, geo, rows)
+		if content, y, w, h := m.renderCockpit(); content != "" {
+			z := m.overlayZ("inbox")
+			m.OverlayHits = append(m.OverlayHits, overlayPanelHit{Kind: "inbox", OriginY: y, Z: z, Geo: overlay.Geometry{Width: w, Height: h}})
+			layers = append(layers, lipgloss.NewLayer(content).X(0).Y(y).Z(z).ID("inbox"))
+		}
+	}
+
+	if m.gotoPicker.open {
+		content, geo, rows := m.renderGotoPicker()
+		layers = m.placeOverlayPanel(layers, "goto", content, geo, rows)
 	}
 
 	if m.ShowWorkspaceSwitcher {
 		content, geo, rows := m.renderWorkspaceSwitcher()
 		layers = m.placeOverlayPanel(layers, "workspace", content, geo, rows)
+	}
+
+	if m.buffers.open {
+		content, geo, rows := m.renderBufferChooser()
+		layers = m.placeOverlayPanel(layers, overlayKindBuffers, content, geo, rows)
+	}
+
+	if m.transfers.open {
+		content, geo, rows := m.renderTransfers()
+		layers = m.placeOverlayPanel(layers, overlayKindTransfers, content, geo, rows)
+	}
+
+	if m.navigator.open {
+		content, geo, rows := m.renderNavigator()
+		layers = m.placeOverlayPanel(layers, "navigator", content, geo, rows)
 	}
 
 	if m.ShowLayoutPicker {
@@ -250,6 +282,15 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	if m.ShowThemePicker {
 		content, geo, rows := m.renderThemePicker()
 		layers = m.placeOverlayPanel(layers, "themepicker", content, geo, rows)
+	}
+
+	if m.themeEditor.open {
+		layers = append(layers, m.renderThemeEditor())
+	}
+
+	if m.presetPicker.open {
+		content, geo, rows := m.renderPresetPicker()
+		layers = m.placeOverlayPanel(layers, "presetpicker", content, geo, rows)
 	}
 
 	if m.ShowDockEditor {
@@ -291,6 +332,11 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	// rather than through the overlay panel stack. It is centred like the rest.
 	if content, geo, x, y, ok := m.renderRenameDialog(); ok {
 		m.renameHit = overlay.Rect{X0: x, Y0: y, X1: x + geo.Width, Y1: y + geo.Height}
+		m.renameClearHit = overlay.Rect{}
+		if renameHintClear < len(geo.Hints) && !geo.Hints[renameHintClear].Empty() {
+			r := geo.Hints[renameHintClear]
+			m.renameClearHit = overlay.Rect{X0: x + r.X0, Y0: y + r.Y0, X1: x + r.X1, Y1: y + r.Y1}
+		}
 		layers = append(layers, lipgloss.NewLayer(content).
 			X(x).Y(y).Z(config.ZIndexOverlayBase).ID("rename"))
 	}
@@ -325,9 +371,22 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	// screen, and its marquee has to be visible on top of whatever is open.
 	layers = append(layers, m.renderCaptureMode()...)
 
+	// The wait for a new daemon is said in the dock. With the dock hidden it
+	// is said in the middle of the screen. See daemon_reconnect.go.
+	if m.daemonReconnect != nil && m.Settings.DockbarPosition == "hidden" {
+		pal := theme.UI()
+		box := overlay.Style(pal.Surface).Foreground(pal.Fg).Render("  " + daemonWaitNote + "  ")
+		layers = append(layers, m.centeredBoxLayer(box, config.ZIndexOverlayBase, "daemon-wait"))
+	}
+
 	if m.ShowQuitMenu {
 		content, geo, rows := m.renderQuitMenu()
 		layers = m.placeOverlayPanel(layers, "quit", content, geo, rows)
+	}
+
+	if m.DaemonRestartOpen() {
+		content, geo, rows := m.renderDaemonRestart()
+		layers = m.placeOverlayPanel(layers, overlayKindRestart, content, geo, rows)
 	}
 
 	if m.ShowSessionClose {
@@ -338,6 +397,21 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	if m.FilePromptOpen() {
 		content, geo, rows := m.renderFileDialog()
 		layers = m.placeOverlayPanel(layers, "filedialog", content, geo, rows)
+	}
+
+	if m.CopyDialogOpen() {
+		content, geo, rows := m.renderCopyDialog()
+		layers = m.placeOverlayPanel(layers, overlayKindCopyDialog, content, geo, rows)
+	}
+
+	if m.WorktreePromptOpen() {
+		content, geo, rows := m.renderWorktreePrompt()
+		layers = m.placeOverlayPanel(layers, "worktreeprompt", content, geo, rows)
+	}
+
+	if m.PluginApprovalOpen() {
+		content, geo, rows := m.renderPluginApproval()
+		layers = m.placeOverlayPanel(layers, overlayKindPluginApproval, content, geo, rows)
 	}
 
 	if m.ShowHelp {
@@ -410,7 +484,7 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	// The message view is drawn after the log viewer, which opens it.
 	layers = m.renderMessageView(layers)
 
-	showScriptIndicator := true
+	showScriptIndicator := m.tapeStatusShown()
 	if m.ScriptMode && !m.ScriptFinishedTime.IsZero() {
 		elapsed := time.Since(m.ScriptFinishedTime)
 		if elapsed > scriptDoneLinger {
@@ -421,20 +495,12 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	if m.ScriptMode && showScriptIndicator {
 		var scriptStatus string
 
-		// Check for remote script progress first (tape exec), then local player (tape play)
+		// tuios tape play, tuios tape exec and the tape manager all play
+		// through the one player.
 		var currentCmd, totalCmds, progress int
 		var isFinished bool
 
-		if m.RemoteScriptTotal > 0 {
-			// Remote script execution (tape exec)
-			currentCmd = m.RemoteScriptIndex
-			totalCmds = m.RemoteScriptTotal
-			if totalCmds > 0 {
-				progress = (currentCmd * 100) / totalCmds
-			}
-			isFinished = !m.ScriptFinishedTime.IsZero()
-		} else if player := m.ScriptPlayer; player != nil {
-			// Local script playback (tape play)
+		if player := m.ScriptPlayer; player != nil {
 			progress = player.Progress()
 			currentCmd = player.CurrentIndex()
 			totalCmds = player.TotalCommands()
@@ -442,7 +508,11 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 		}
 
 		if totalCmds > 0 {
-			if isFinished {
+			if isFinished && m.ScriptFailure != "" {
+				// Where it stopped. The notification carries why.
+				where, _, _ := strings.Cut(m.ScriptFailure, ": ")
+				scriptStatus = "FAILED • " + where
+			} else if isFinished {
 				scriptStatus = fmt.Sprintf("DONE • %d/%d commands", totalCmds, totalCmds)
 			} else {
 				barWidth := 15
@@ -610,7 +680,7 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 
 			dockOffset := 0
 			if m.Settings.DockbarPosition == "bottom" {
-				dockOffset = config.DockHeight
+				dockOffset = m.Settings.DockHeight()
 			}
 
 			x := max(m.GetRenderWidth()-contentWidth-rightMargin, 0)

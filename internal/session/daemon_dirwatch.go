@@ -17,8 +17,8 @@ import (
 //
 // The rail's files section keeps its listing true by asking the kernel when
 // the listed folder's names change (app/sidebar_files_watch.go). The client
-// can only ask its own kernel, so a folder on another machine stayed as it was
-// first read: a file deleted over there stayed on the list (issue #313).
+// can only ask its own kernel, so on its own a folder on another machine would
+// stay as it was first read: a file deleted over there would stay on the list.
 //
 // So the client asks its daemon, with MsgWatchDir, and the daemon pushes
 // MsgDirChanged when the names change. The daemon that answers is the one the
@@ -36,7 +36,7 @@ import (
 // changes, and a link connection that carries one costs nothing while it waits.
 // A wait that fails (the link is down, or the far daemon is too old to have
 // wait-dir) ends the watch, and the listing is read again when the pane changes
-// folder, as it was before this existed.
+// folder.
 
 // remoteDirWaitMS bounds one wait-dir asked of another machine. The wait is
 // asked again when it ends, so this only bounds how long a far daemon keeps a
@@ -103,7 +103,17 @@ func (d *Daemon) handleWatchDir(cs *connState, msg *Message) error {
 	if host != "" {
 		go d.runRemoteDirWatch(host, dir, done, notify)
 	} else {
-		go d.runLocalDirWatch(dir, done, notify)
+		go func() {
+			// Over a link a watch tells when a folder's names change, so it
+			// keeps to the read rules a listing and wait-dir keep to. The
+			// check is in here because it reads the path, which can be a
+			// mount that stopped answering. A refused watch never starts and
+			// nothing is sent.
+			if verr := d.checkLinkRead(cs, dir); verr != nil {
+				return
+			}
+			d.runLocalDirWatch(dir, done, notify)
+		}()
 	}
 	return nil
 }
@@ -208,12 +218,24 @@ func (d *Daemon) verbWaitDir(cs *connState, params json.RawMessage) (any, *verbE
 	}
 	dir := filepath.Clean(p.Dir)
 
+	// The watch starts before the read check. The check takes a few
+	// milliseconds on macOS, and a change in that time would be lost to a
+	// caller that listed the folder just before it asked to wait.
 	events := make(chan struct{}, 1)
 	w, err := dirwatch.Watch(dir, func() { dirwatch.Nudge(events) })
 	if err != nil {
+		if verr := d.checkLinkRead(cs, dir); verr != nil {
+			return nil, verr
+		}
 		return nil, newVerbError(ErrVerbInternal, "cannot watch "+echoName(dir)+": "+err.Error())
 	}
 	defer w.Close()
+	// Over a link a wait tells when a folder's names change, so it keeps to
+	// the read rules a listing keeps to. Nothing about the folder is sent
+	// before this check.
+	if verr := d.checkLinkRead(cs, dir); verr != nil {
+		return nil, verr
+	}
 
 	// The caller going away ends the wait. The watch on the connection
 	// sleeps in the poller, so a far daemon holding a wait for a near one

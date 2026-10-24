@@ -20,11 +20,31 @@ do not type into it. With no `-w` the report lands on the focused window, which
 is wrong when you are not the focused pane.
 
 `get-agent-state` and `list-agents` also report `needs_you` (true for
-`needs_input` and `errored`), `blocked_by` (`approval` or `question`, from
-`--kind`), `completion_seq` (turns the pane has finished), `finished_unread`
+`needs_input` and `errored`), `blocked_by` (`approval`, `question` or `auth`,
+from `--kind`), `completion_seq` (turns the pane has finished), `finished_unread`
 (true while a pane rests after a turn nobody has looked at since), `queued`
-(messages waiting to be typed to the agent when it comes to rest) and
-`subagents` (subagents its agent started that have not stopped).
+(messages waiting to be typed to the agent when it comes to rest),
+`subagents` (subagents its agent started that have not stopped) and
+`subagent_list`, one entry per subagent: `id`, `type`, `description` (what it
+was asked to do), `state` (`running`, `done`, `failed`, `stopped`), `now`
+(the tool it runs), `last`, `tools`, `result` (the first line it ended with,
+or the error), `started_at` and `ended_at`. An ended subagent stays on the
+list for a minute (five when `failed`).
+
+A pane whose main agent ended its turn reports `done` while its subagents
+work: `state` never says they run, and `wait-for agent-state` matches at once.
+The person sees it as waiting: the rail draws such a pane with `◊` and a row
+per subagent under it.
+To wait for the work itself, poll until `subagents` is 0, and read
+`subagent_list` for how each ended:
+
+```sh
+tuios get-agent-state -s work -w build --json
+```
+
+Claude Code fills it from its hooks (`tuios integration install claude-code`).
+A subagent's description comes from the call that launched it; two of one
+type launched together can show each other's description for a while.
 
 Facts that are not a state (model, context use, a one-line summary) go in
 metadata. The rail draws it under your row. It is display only. `key=` removes a
@@ -61,6 +81,30 @@ tuios integration install claude-code --statusline                        # opt 
 tuios integration install claude-code --statusline --then '~/.claude/sl.sh' # keep your own status line
 ```
 
+## OSC 7501 from any program
+
+A program can write the Program Status Protocol sequence itself, or call
+`tuios status`, which writes it to the terminal and handles the base64. The
+pane is the one the sequence is written in, so no `-s` or `-w` is needed:
+
+```sh
+tuios status working --app build --msg 'Compiling' --progress 40
+tuios status blocked --kind question --app build --msg 'Which target?'
+tuios status error --app build --msg 'Linker failed'
+tuios status working --id tests --title Tests --msg 'Running 40 tests'
+tuios status --clear --id tests
+```
+
+`blocked` reads as `needs_input` with `blocked_by` from `--kind`
+(`permission` is `approval`), `done` as `done`, `error` as `errored`. The
+source is `program`, which ranks just below `report`. Each report replaces its
+record, so send `--app` every time. A shell prompt ends `working`, `blocked`
+and `idle` records, and so does your exit when you reported from the
+foreground (not from a background job, and not in the same instant you exit). `done` and `error` stay until the person types in
+the pane. `get-agent-state` lists the records as `program_status`. Report
+`done` or `error` before you exit, or the person finds nothing. A harness
+already wired with a hook needs nothing more.
+
 ## What an agent has been doing
 
 With the Claude Code or Codex hooks installed, tuios keeps the pane's recent
@@ -83,7 +127,7 @@ For nineteen harnesses tuios writes the hooks for you:
 ```sh
 tuios integration install claude-code    # or any other harness, or --all
 tuios integration status                 # installed, current, and what it reports
-tuios doctor agents                      # also lists agent panes missing theirs
+tuios doctor agents                      # also lists agent panes whose integration is missing or out of date
 ```
 
 Claude Code, Codex, Copilot, Cursor Agent, Gemini CLI, opencode, Kilo, Amp,
@@ -162,8 +206,9 @@ state arrived. A file in `~/.config/tuios/harnesses` (or
 
 ## Who wins when reports disagree
 
-`--source` says where a state came from. Highest first, the ranks are `report`, `transcript`,
-`osc`, `screen`, `detect`, then `stall`. A source cannot overwrite a claim from
+`--source` says where a state came from. Highest first, the ranks are `report`,
+`program` (an OSC 7501 report), `transcript`, `osc`,
+`screen`, `detect`, then `stall`. A source cannot overwrite a claim from
 a higher-ranked one. Only `report`, `osc`, `screen` and `stall` are accepted
 over the socket. Leave `--source` alone unless you are writing a detector.
 
@@ -176,7 +221,11 @@ Not applied: a higher-ranked source owns this pane. It still reports working.
 
 A script that must know whether its report took should match that line. Over
 the socket the result carries `applied: false` and a `reason` of `outranked`,
-`if_state`, `foreign_session` or `foreign_harness`.
+`if_state`, `foreign_pane`, `foreign_session` or `foreign_harness`.
+`foreign_pane` is a hook whose harness inherited the pane's `TUIOS_PANE_ID`
+but runs outside the pane under a harness daemon, such as a Claude Code
+background session. A harness in tmux or a container inside the pane is taken
+for that pane.
 
 ## Reading state back
 

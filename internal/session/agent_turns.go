@@ -4,11 +4,10 @@ import "time"
 
 // Finished turns, counted.
 //
-// done used to be the only state that meant "the agent finished", and only an
-// explicit report or the Claude transcript produces it. A Codex or Gemini pane
-// with no hook went working, then unknown on the silence timer, and never told
-// anybody it was done. herdr's answer is that done is simply "back at rest and
-// not yet looked at", and it works for every agent.
+// Only an explicit report or the Claude transcript produces done, so a Codex
+// or Gemini pane with no hook goes working, then unknown on the silence timer,
+// and never tells anybody it finished. herdr's answer is that done is simply
+// "back at rest and not yet looked at", and it works for every agent.
 //
 // So the daemon counts turns. Every time a window goes from working to a rest
 // state (idle, done or unknown) after working for at least agentMinTurn, its
@@ -80,6 +79,12 @@ func (s *Session) noteAgentTurnsLocked(before lifecycleSnapshot, now int64) {
 			if w.AgentState == AgentStateDone || end-since >= int64(agentMinTurn) {
 				w.CompletionSeq++
 			}
+			delete(s.agentTurns, w.ID)
+		case w.AgentState == AgentStateDone && s.agentClaims[w.ID].source == AgentSourceProgram:
+			// An OSC 7501 done is the program saying a piece of work is
+			// ready to look at, whether or not it reported working first:
+			// a script that only reports at its end is finished and unread.
+			w.CompletionSeq++
 			delete(s.agentTurns, w.ID)
 		case w.AgentState != AgentStateNeedsInput:
 			delete(s.agentTurns, w.ID)

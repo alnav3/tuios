@@ -23,6 +23,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/app"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/served"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
@@ -37,8 +38,8 @@ type SSHServerConfig struct {
 	Ephemeral      bool   // If true, don't use daemon (old behavior)
 	Version        string // For daemon handshake
 	// AuthorizedKeysPath names the file of public keys allowed to connect.
-	// Empty searches ~/.config/tuios/authorized_keys, then
-	// ~/.ssh/authorized_keys. See auth.go.
+	// Empty reads tuios/authorized_keys under the XDG config home, and only
+	// that: ~/.ssh/authorized_keys is read only when named here. See auth.go.
 	AuthorizedKeysPath string
 	// ShowKeys turns the key display overlay on in every served session. It is
 	// the --show-keys flag `tuios ssh` registers with the rest of the interface
@@ -94,9 +95,9 @@ func StartSSHServer(ctx context.Context, cfg *SSHServerConfig) error {
 
 	// Apply the process-wide render globals once, at first server startup and
 	// single-threaded, so every per-connection session shares a consistent view
-	// of them. LoadUserConfig is pure and NewOS no longer re-applies per
-	// connection, so this replaces the old per-connection global writes that
-	// raced other sessions' render loops.
+	// of them. LoadUserConfig is pure and NewOS does not re-apply per
+	// connection: per-connection global writes would race other sessions'
+	// render loops.
 	//
 	// Frames need no global here: composeFrame hands the canvas to the
 	// bubbletea renderer unchanged, and wish configures that renderer per
@@ -177,7 +178,7 @@ func StartSSHServer(ctx context.Context, cfg *SSHServerConfig) error {
 	// hand it.
 	if authPlan.Authenticated() {
 		opts = append(opts, wish.WithPublicKeyAuth(publicKeyHandler(authPlan.Keys.Path)))
-		log.Printf("SSH authentication is on. %d key(s) from %s", len(authPlan.Keys.Keys), authPlan.Keys.Path)
+		log.Printf("SSH authentication is on. %s from %s", plural.Count(len(authPlan.Keys.Keys), "key"), authPlan.Keys.Path)
 	} else {
 		// Once, at startup. Not per connection: a line on every connect is a
 		// line nobody reads, and this one has to be read.
@@ -300,6 +301,7 @@ func tuiosSessionMiddleware() wish.Middleware {
 			opts := append(bubbletea.MakeOptions(sess), app.ProgramOptions()...)
 			opts = append(opts, tea.WithOutput(frames))
 			program := tea.NewProgram(model, opts...)
+			model.BindProgram(program)
 
 			ctx, cancel := context.WithCancel(sess.Context())
 			go func() {
@@ -321,6 +323,13 @@ func tuiosSessionMiddleware() wish.Middleware {
 			// the terminal state.
 			program.Kill()
 			cancel()
+			// An ssh client's terminal gets no reset when the session ends, so
+			// the OSC 7501 records this client left there are cleared here.
+			// A connection already gone takes the write as an error, and that
+			// is fine.
+			if seq := model.HostProgramStatusClear(); seq != "" {
+				_, _ = io.WriteString(sess, seq)
+			}
 
 			// Tear down after the program has fully stopped. In daemon mode
 			// this closes the daemon client, otherwise its read loop, socket,
@@ -389,7 +398,7 @@ func buildSessionModel(sshSession ssh.Session, graphicsOut io.Writer) (*app.OS, 
 		Caps: hostCaps,
 	}
 
-	// If ephemeral mode or daemon not available, use old behavior
+	// In ephemeral mode the model runs in-process, with no daemon
 	if cfg.Ephemeral {
 		return served.NewModel(opts, cfg.Overrides), nil
 	}
@@ -478,20 +487,20 @@ const DefaultSSHSessionName = "ssh-session"
 
 // chooseSSHSession picks the session for a connection that named none.
 //
-// The old rule took the first name the daemon listed when there were several,
-// which is an ordering and not a choice. Two operators connecting to one
+// Taking the first name the daemon lists when there are several would be an
+// ordering and not a choice. Two operators connecting to one
 // server could land in different sessions from one another, or in a colleague's
 // session, with nothing on screen saying which or why. The listing's order is
 // not part of any contract, so the same connection could answer differently
 // after a session was created or removed.
 //
-// The three cases are now three answers rather than two answers and a lottery:
+// The three cases are three answers rather than two answers and a lottery:
 //
 //   - No sessions. There is nothing to choose between, so the connection gets
-//     the default name and the daemon creates it. This is unchanged.
-//   - One session. There is no ambiguity, so it gets that one. Also unchanged,
-//     and the case that keeps a single-session server behaving the way someone
-//     would expect.
+//     the default name and the daemon creates it.
+//   - One session. There is no ambiguity, so it gets that one. This is the
+//     case that keeps a single-session server behaving the way someone would
+//     expect.
 //   - Several. The connection did not say, and neither did the person, so
 //     picking one of theirs is a guess wearing a fact's clothes. It gets the
 //     default name instead: deterministic, the same for every connection, and

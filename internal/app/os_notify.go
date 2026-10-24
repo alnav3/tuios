@@ -1,10 +1,10 @@
 package app
 
 import (
-	"charm.land/lipgloss/v2"
 	"fmt"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/hooks"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
@@ -59,6 +59,8 @@ func (m *OS) appendLog(entry LogMessage) {
 // LogInfo logs an informational message. INFO logs are skipped entirely unless
 // verbose logging is enabled, so the format string and args are never evaluated
 // into the ring buffer in the common (non-debug) case.
+//
+//go:noinline
 func (m *OS) LogInfo(format string, args ...any) {
 	if !verboseLog {
 		return
@@ -145,6 +147,8 @@ func (m *OS) LogWarn(format string, args ...any) {
 }
 
 // LogError logs an error message.
+//
+//go:noinline
 func (m *OS) LogError(format string, args ...any) {
 	m.Log("ERROR", format, args...)
 }
@@ -159,22 +163,21 @@ const maxLiveNotifications = 16
 //
 // The caller's duration is a floor, not the answer. Every call site passes some
 // duration it picked without much thought (config.NotificationDuration, that
-// same value doubled, a literal two seconds), and the old default of 1500ms
-// meant most of them were unreadable. Severity now decides the minimum, and a
-// caller that deliberately asked for longer than the severity's default still
-// gets the longer one.
+// same value doubled, a literal two seconds), and a default as short as 1500ms
+// leaves most of them unreadable. Severity decides the minimum, and a caller
+// that deliberately asked for longer than the severity's default still gets
+// the longer one.
 //
 // A non-positive duration means "do not show this", but only for info and
 // success. Copy mode pushes its state indicators that way ("VISUAL", a bare
-// "f", the pending count), and they have never been visible; promoting them to
-// six-second dock messages is a copy-mode decision and not this change's to
-// make.
+// "f", the pending count), and they stay invisible; promoting them to
+// six-second dock messages is a copy-mode decision.
 //
 // A warning or an error is shown whatever duration it was handed. Passing zero
-// for one of those was never a considered choice, it was a caller reaching for
+// for one of those is never a considered choice, it is a caller reaching for
 // "no timeout" and getting "no notification": os_selection asks for a sticky
-// error when a capture fails and got silence, which is the worst possible
-// outcome for the one message class the user cannot afford to miss.
+// error when a capture fails, and silence there is the worst possible outcome
+// for the one message class the user cannot afford to miss.
 func notificationLifetime(notifType string, requested time.Duration, s *config.Settings) (time.Duration, bool) {
 	switch notifType {
 	case "error":
@@ -194,9 +197,10 @@ func notificationLifetime(notifType string, requested time.Duration, s *config.S
 
 // ShowNotification puts a message in the dock's right-hand block.
 //
-// The signature is unchanged, so no call site had to be touched: severity comes
-// from notifType exactly as it always did, and duration is now a floor rather
-// than the whole answer (see notificationLifetime).
+// Severity comes from notifType, and duration is a floor rather than the whole
+// answer (see notificationLifetime).
+//
+//go:noinline
 func (m *OS) ShowNotification(message, notifType string, duration time.Duration) {
 	m.showNotification(message, notifType, "", duration, nil)
 }
@@ -323,12 +327,11 @@ func (n Notification) NotificationExpired(now time.Time) bool {
 // CleanupNotifications retires expired messages and reports whether it removed
 // any.
 //
-// The return value is what decouples dismissal from drawing. This used to be
-// called from inside render composition, so a message could only expire on a
-// frame that was being drawn for some other reason; when the session went quiet
-// the last frame was served from the render cache with the toast still painted
-// on it, once for seventeen seconds. It is now called from the tick, and the
-// tick that retires something uses this result to draw one more frame so the
+// The return value is what decouples dismissal from drawing. It is called from
+// the tick, not from render composition: there a message could only expire on
+// a frame drawn for some other reason, and a quiet session would serve the last
+// frame from the render cache with the message still painted on it. The tick
+// that retires something uses this result to draw one more frame so the
 // message actually leaves the screen.
 func (m *OS) CleanupNotifications() bool {
 	if len(m.Notifications) == 0 || m.notifPaused() {
@@ -360,8 +363,41 @@ func (m *OS) DismissNotifications() bool {
 	if len(m.Notifications) == 0 {
 		return false
 	}
+	for _, n := range m.Notifications {
+		if isRestartNotice(n.Target) {
+			m.restartLater = true
+		}
+	}
 	m.Notifications = nil
 	return true
+}
+
+// ClearNotification takes the live messages that read exactly message off the
+// dock and reports whether there were any.
+//
+// A notice that names a state, such as "ZOOM", has to leave when the state
+// does. ShowNotification with an empty message cannot do that: an empty
+// message draws nothing and removes nothing, so the notice stayed up for its
+// whole lifetime after the state had ended. Only matching entries go, so a
+// message that arrived in the meantime keeps its place.
+//
+// Only tuios's own notices match. A pane writes the text of its notifications
+// (OSC 9, tuios notify), so a pane that sent "ZOOM" carries a Target and keeps
+// its message when the user unzooms.
+func (m *OS) ClearNotification(message string) bool {
+	if len(m.Notifications) == 0 {
+		return false
+	}
+	kept := m.Notifications[:0]
+	for _, n := range m.Notifications {
+		if n.Target != nil || n.Message != message {
+			kept = append(kept, n)
+		}
+	}
+	removed := len(kept) != len(m.Notifications)
+	clear(m.Notifications[len(kept):])
+	m.Notifications = kept
+	return removed
 }
 
 // dismissVisibleNotification pops the message the block is currently drawing,
@@ -371,6 +407,10 @@ func (m *OS) DismissNotifications() bool {
 func (m *OS) dismissVisibleNotification() bool {
 	if len(m.Notifications) == 0 {
 		return false
+	}
+	// Dismissing the version notice is the "later" answer, for this run.
+	if isRestartNotice(m.Notifications[len(m.Notifications)-1].Target) {
+		m.restartLater = true
 	}
 	m.Notifications = m.Notifications[:len(m.Notifications)-1]
 	return true

@@ -164,7 +164,7 @@ func (m *OS) sidebarFilesHeaderCd(cw int, pal overlay.Palette, hoverX int, curso
 	}
 	tw := lipgloss.Width(fileTokenCd)
 	x0 := cw - 1 - tw
-	if x0 < sidebarHeaderLabelW(sidebarFilesLabel)+1 {
+	if x0 < sidebarHeaderLabelW(sidebarFilesLabel, &m.Settings)+sidebarHeaderGap {
 		return "", sidebarTokenSpan{}, false
 	}
 	span := sidebarTokenSpan{Kind: sidebarRowFileCd, X0: x0, X1: x0 + tw}
@@ -192,7 +192,7 @@ func (m *OS) sidebarFilesHeaderCd(cw int, pal overlay.Palette, hoverX int, curso
 // there is nothing to correct, but a remote viewer is not looking at their own
 // disk.
 func (m *OS) sidebarFilesHeaderRow(cdTok string, hasCd bool, cw int, pal overlay.Palette) string {
-	room := cw - sidebarHeaderLabelW(sidebarFilesLabel) - 2
+	room := sidebarHeaderRightRoom(cw, sidebarHeaderLabelW(sidebarFilesLabel, &m.Settings))
 	if hasCd {
 		room -= lipgloss.Width(fileTokenCd) + 1
 	}
@@ -208,16 +208,16 @@ func (m *OS) sidebarFilesHeaderRow(cdTok string, hasCd bool, cw int, pal overlay
 		}
 		right += cdTok
 	}
-	return sidebarHeaderRow(sidebarFilesLabel, right, cw, pal)
+	return sidebarHeaderRowRuled(sidebarFilesLabel, right, cw, pal, &m.Settings)
 }
 
 // sidebarFilesEmptyRow says why the section is listing nothing.
 //
 // The section has a directory or it does not, and when it does not the listing
 // is empty for exactly one reason: nothing has told tuios where the focused
-// pane is. That is worth a row. The alternative, which is what it used to do,
-// was to disappear, and a feature that disappears when it cannot answer is
-// indistinguishable from one that is broken.
+// pane is. That is worth a row. The alternative is to disappear, and a feature
+// that disappears when it cannot answer is indistinguishable from one that is
+// broken.
 func sidebarFilesEmptyRow(cw int, pal overlay.Palette) string {
 	return sidebarFit(sidebarStyle(nil, pal.FgMute).
 		Render(" "+overlay.Truncate("no directory yet", max(cw-2, 1))), cw, nil)

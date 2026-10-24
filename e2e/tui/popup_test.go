@@ -241,12 +241,13 @@ func TestPopupRunsAPickerAndTheSelectionLands(t *testing.T) {
 // That is exactly what a peer does to a float it has not been told about.
 //
 // The second client is started narrower than the first on purpose. The session
-// settles to the smaller of the two, so both end up rendering the same box here.
+// is smallest, set in the config, so it settles to the smaller of the two, and
+// both end up rendering the same box here.
 // The client-by-client arithmetic that box comes out of is not measured on its
 // own any more; the unit test that did so was removed.
 func TestPopupIsSharedBetweenClients(t *testing.T) {
 	base := t.TempDir()
-	writeConfig(t, base, "[startup]\nopen_default_window = true\ntiled = true\n")
+	writeConfig(t, base, "[daemon]\nwindow_size = \"smallest\"\n[startup]\nopen_default_window = true\ntiled = true\n")
 
 	wide := startIn(t, base, startOpts{cols: 120, rows: 40, args: []string{"new", "shared"}})
 	waitWindowCount(t, wide, 1, "the first client's pane")
@@ -383,4 +384,70 @@ func TestPopupCommandStartsAtItsSize(t *testing.T) {
 		t.Fatalf("the popup's command started at one size and was then given another:\n%s", out)
 	}
 	t.Logf("the popup's command read %s at start and after placement", first[1])
+}
+
+// TestPopupThatSwitchesSessionCloses is the sessionizer's popup (#479). Its
+// command moves the only client to another session and then exits. The popup
+// must leave the session it was opened from, although no client is attached
+// there to close it when its command exits.
+//
+// The positive half is the same kind of popup without a switch: it closes
+// too, so the check below is a check of the switch and not of a popup that
+// never closes.
+//
+// Negative control: cut the closeWindowOfPTY call from verbPopup's onExit in
+// internal/session/verb_handlers.go. The popup then stays in home's window
+// list, and switching back shows the empty box.
+func TestPopupThatSwitchesSessionCloses(t *testing.T) {
+	base := t.TempDir()
+	killDaemon(t, base)
+	writeConfig(t, base, "[startup]\nopen_default_window = true\n")
+	if out, err := tuiosCLI(t, base, "new", "home", "--detach"); err != nil {
+		t.Fatalf("create home: %v\n%s", err, out)
+	}
+	term := attachIn(t, base, "home", startOpts{cols: 110, rows: 32})
+	clientShows(t, base, "home")
+	waitWindowCount(t, term, 1, "home's first pane")
+
+	// The positive half: a popup that exits in place closes.
+	stay := openPopup(t, base, "-s", "home", "--", "sh", "-c", "printf 'STAY-POPUP\\n'; sleep 1")
+	if err := term.WaitForText("STAY-POPUP", uiTimeout); err != nil {
+		t.Fatalf("the popup never opened: %v\n%s", err, term.Snapshot())
+	}
+	popupGone(t, base, "home", stay.WindowID)
+
+	// The sessionizer: the popup's command switches the client away and exits.
+	away := openPopup(t, base, "-s", "home", "--", tuiosBin, "switch-session", "--create", "away")
+	if err := term.WaitForText("Session: away", uiTimeout); err != nil {
+		t.Fatalf("the popup's switch-session did not move the client: %v\n%s", err, term.Snapshot())
+	}
+	clientShows(t, base, "away")
+	popupGone(t, base, "home", away.WindowID)
+
+	// Back in home there is the one pane and no empty popup box.
+	if out, err := tuiosCLI(t, base, "switch-session", "-s", "away", "home"); err != nil {
+		t.Fatalf("switch back to home: %v\n%s", err, out)
+	}
+	if err := term.WaitForText("Session: home", uiTimeout); err != nil {
+		t.Fatalf("the client never came back to home: %v\n%s", err, term.Snapshot())
+	}
+	waitWindowCount(t, term, 1, "home after the popup switched away")
+	saveFrame(t, term, "popup-switch-session-home")
+	alive(t, term, "after a popup switched sessions")
+}
+
+// popupGone waits until the window list of session no longer has the popup.
+func popupGone(t *testing.T, base, session, id string) {
+	t.Helper()
+	var out string
+	deadline := time.Now().Add(uiTimeout)
+	for time.Now().Before(deadline) {
+		var err error
+		out, err = tuiosCLI(t, base, "list-windows", "-s", session, "--json")
+		if err == nil && !strings.Contains(out, id) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("ASSERTION: the popup %s is still in %s after its command exited\n%s", id, session, out)
 }

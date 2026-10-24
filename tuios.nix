@@ -2,7 +2,7 @@
 
 pkgs.buildGoModule rec {
   pname = "tuios";
-  version = "v0.8.5";
+  version = "v0.10.1";
 
   src = ./.;
 
@@ -14,8 +14,8 @@ pkgs.buildGoModule rec {
   ];
 
   # The build sandbox has no network, so Go cannot fetch a newer toolchain
-  # there: the nixpkgs Go must be at least the go line in go.mod (1.26.6).
-  # The pinned nixpkgs has 1.26.7. "local" makes a Go that is too old fail
+  # there: the nixpkgs Go must be at least the go line in go.mod (1.26.8).
+  # The pinned nixpkgs has 1.26.10. "local" makes a Go that is too old fail
   # with that plain message instead of a failed download.
   env.GOTOOLCHAIN = "local";
 
@@ -32,6 +32,20 @@ pkgs.buildGoModule rec {
     "-X main.builtBy=nix"
   ];
 
+  # go.work makes the app and the Go libraries in this repository (such as
+  # progstatus/) one workspace, so this build uses the library folders, as CI
+  # does. go mod vendor refuses a workspace, so the module derivation runs go
+  # work vendor. The e2e suite leaves the workspace first, so its test
+  # dependencies stay out of the vendor directory and out of vendorHash.
+  postPatch = ''
+    go work edit -dropuse=./e2e/tui
+  '';
+  modBuildPhase = ''
+    runHook preBuild
+    go work vendor
+    runHook postBuild
+  '';
+
   # This has to be updated each time dependencies are updated.
-  vendorHash = "sha256-mESjrddAANoY8wE7QNnzTLaxE6ESe5UoVfwsRU10hzM=";
+  vendorHash = "sha256-iUleQMdwok+/3KiVS/DxUzxI3vCY0g+eWc0+q8WNKsQ=";
 }

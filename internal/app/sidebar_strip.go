@@ -9,6 +9,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
@@ -18,25 +19,21 @@ import (
 // pointer. It carries the same lists the open rail does, in the same order:
 // sessions, then the terminals of the session being shown, then the panes with
 // something to say. Folding is a change of width, and a rail that dropped a
-// whole list when it folded was a different object at each width, which is what
-// made the folded one read as broken.
+// whole list when it folded would be a different object at each width, and the
+// folded one would read as broken.
 //
-// The terminals list is the one that used to be missing. It was left out on the
-// argument that the strip lists sessions across the daemon while terminals are
-// a within-session list, so the two could not share a column. That argument was
-// about grammar and the open rail already answers it: it stacks the same
-// daemon-wide list over the same session-scoped one and tells them apart with a
-// header. The strip now does the same thing with the same header, cut to the
-// one column it has: "sessions" becomes s, "terminals" becomes t, "agents"
-// becomes a, each with its section's own add control beside it. What was kept
-// from the old reasoning is the rest of it: no digits outside the badge, one
-// mark vocabulary across every list, and severity inked once.
+// The strip lists sessions across the daemon and terminals within a session,
+// and the open rail already shows how the two share a column: it stacks the
+// daemon-wide list over the session-scoped one and tells them apart with a
+// header. The strip does the same thing with the same header, cut to the one
+// column it has: "sessions" becomes s, "terminals" becomes t, "agents" becomes
+// a, each with its section's own add control beside it. No digits outside the
+// badge, one mark vocabulary across every list, and severity inked once.
 //
-// The void is gone because nothing is spread any more. The lists are one
-// contiguous stack under the badge at a one-row interval, and the empty rail
-// below them is a list that ended rather than a list with holes in it. The
-// agents group used to be pinned to the bottom so the alarm held a screen
-// position; the badge is what holds that position now, and it always did.
+// Nothing is spread. The lists are one contiguous stack under the badge at a
+// one-row interval, and the empty rail below them is a list that ended rather
+// than a list with holes in it. The badge is what holds the alarm's screen
+// position, so the agents group is not pinned to the bottom.
 //
 // A pane wanting a human is therefore said three times over, each in its own
 // voice: the badge counts it and goes to the worst of them, the session
@@ -95,9 +92,9 @@ type sidebarStripBadgeInfo struct {
 	Count int
 	State string
 	// SessionID and WindowID address the pane the badge is counting from, so a
-	// click on the alarm goes to what is alarming. The badge used to be a pure
-	// readout, which made the strip's largest, loudest object the one thing on it
-	// that did nothing.
+	// click on the alarm goes to what is alarming. A pure readout would make
+	// the strip's largest, loudest object the one thing on it that does
+	// nothing.
 	SessionID string
 	WindowID  string
 }
@@ -461,7 +458,7 @@ func (m *OS) sidebarStripLines(sessions []sessiontree.Node, w, cw, height, topMa
 					record(g.add, g.addSession, "", y)
 				} else {
 					// A header with no control is a label, so it takes no band.
-					note(sidebarStripHeader, "", "", plural(g.noun, 2), y)
+					note(sidebarStripHeader, "", "", g.noun+"s", y)
 					lit = false
 				}
 				bg := stripRowBg(lit, pal)
@@ -495,7 +492,7 @@ func (m *OS) sidebarStripLines(sessions []sessiontree.Node, w, cw, height, topMa
 				// The tail names what it cut, and expanding is the only way to see
 				// it, so that is what a click on it does.
 				hidden := g.total - g.shown()
-				note(sidebarStripMore, "", "", strconv.Itoa(hidden)+" more "+plural(g.noun, hidden), y)
+				note(sidebarStripMore, "", "", plural.Count(hidden, "more "+g.noun), y)
 				record(sidebarRowCollapse, "", "", y)
 				bg := stripRowBg(lit, pal)
 				lines = append(lines, m.sidebarStripBand(sidebarStripMoreCell(cw, pal, bg, lit), cw, edgeLeft, bg, nil, pal))
@@ -533,15 +530,15 @@ func stripRowBg(lit bool, pal overlay.Palette) color.Color {
 // left.
 //
 // The rule shares the line's ground rather than keeping Panel under it, so a
-// hover band is one unbroken rectangle three columns wide. It used to stop a
-// column short of the rectangle it was standing for, on the pane-facing side the
-// pointer arrives from. edgeFg overrides the hairline's colour for a line whose
-// ground is inked, where a hairline mixed for Panel would not show at all.
+// hover band is one unbroken rectangle three columns wide, with no column
+// missing on the pane-facing side the pointer arrives from. edgeFg overrides
+// the hairline's colour for a line whose ground is inked, where a hairline
+// mixed for Panel would not show at all.
 func (m *OS) sidebarStripBand(content string, cw int, edgeLeft bool, bg, edgeFg color.Color, pal overlay.Palette) string {
 	rule := edgeFg
 	switch {
 	case rule != nil:
-	case m.SidebarFocused:
+	case m.sidebarRailFocused():
 		// Measured against the band: the accent is the theme's and read 2.76:1
 		// unlifted, on a rail whose whole job when focused is to look focused.
 		rule = theme.ReadableAt(pal.Accent, bg, theme.MarkFloor)
@@ -611,7 +608,7 @@ func (m *OS) sidebarStripTerminalCell(e sidebarTerminalEntry, peeked bool, cw in
 		lead, leadFg = m.Settings.GetRailFocusMark(), railFocusTint(m.sessionTint(e.SessionID, bg), pal)
 	}
 	return sidebarFit(sidebarStyle(bg, leadFg).Render(lead)+
-		stripStateMark(e.State, e.DoneSeen, pal, bg, lit, &m.Settings), cw, bg)
+		stripStateMark(e.State, e.DoneSeen, e.Subagents, pal, bg, lit, &m.Settings), cw, bg)
 }
 
 // sidebarStripAgentCell is one pane of the last group in two cells: the gutter
@@ -628,16 +625,16 @@ func (m *OS) sidebarStripAgentCell(e sidebarAgentEntry, cw int, pal overlay.Pale
 		lead, leadFg = m.Settings.GetRailFocusMark(), railFocusTint(m.agentIdentityTint(e, bg), pal)
 	}
 	return sidebarFit(sidebarStyle(bg, leadFg).Render(lead)+
-		stripStateMark(e.State, e.DoneSeen, pal, bg, lit, &m.Settings), cw, bg)
+		stripStateMark(e.State, e.DoneSeen, e.Subagents, pal, bg, lit, &m.Settings), cw, bg)
 }
 
 // stripStateMark is a pane's one cell on the spine: the quiet dot every list on
 // this rail rests at, or the pane's state glyph in its own colour when it has
 // something to say. One vocabulary across the lists is what lets the stack be
 // read as one object at two cells wide.
-func stripStateMark(state string, doneSeen bool, pal overlay.Palette, bg color.Color, lit bool, s *config.Settings) string {
+func stripStateMark(state string, doneSeen bool, running int, pal overlay.Palette, bg color.Color, lit bool, s *config.Settings) string {
 	mark, markFg := s.GetRailBullet(), stripRestingInk(lit, pal)
-	if g, fg := agentMark(state, doneSeen, pal); g != "" && s.SidebarShowGlyphs {
+	if g, fg := agentMark(state, doneSeen, running, pal); g != "" && s.SidebarShowGlyphs {
 		mark, markFg = g, fg
 	}
 	return sidebarStyle(bg, markFg).Render(mark)
@@ -730,7 +727,7 @@ func sidebarStripControlCell(glyph string, cw int, edgeLeft, lit bool, bg color.
 // which is the state worth designing for. A session wanting a human swaps the
 // dot for its own state glyph in its severity colour; an unread finish keeps its
 // square. Working does not mark at all: it is not an alarm, the terminals group
-// under it already shows it, and spending the list on it was what made every row
+// under it already shows it, and spending the list on it would make every row
 // a different shape.
 func (m *OS) sidebarStripCell(node sessiontree.Node, cw int, pal overlay.Palette, bg color.Color, lit bool) string {
 	lead, leadFg := " ", color.Color(nil)

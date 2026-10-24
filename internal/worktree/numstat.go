@@ -5,10 +5,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/Gaurav-Gosain/tuios/internal/childproc"
 )
 
 // Comparing the attempts of a fan: how much each one changed against its
@@ -20,6 +21,12 @@ import (
 // were: what the agent staged stays staged and nothing is added. The objects
 // the tree needs are written to the repository's object store as loose
 // objects, which git gc collects like any other unreferenced object.
+//
+// An untracked file larger than the caller's limit is left out and never
+// read. Staging a file copies it into the object store, and a clean filter
+// such as Git LFS's copies it again into its own store, so a multi-gigabyte
+// data file the repository does not track would otherwise be copied on every
+// read, and a read cut off by its timeout would leave a partial copy behind.
 
 // Numstat is how much a worktree changed against a base: the files that
 // differ and the lines added and removed in them. A binary file counts as a
@@ -31,14 +38,30 @@ type Numstat struct {
 }
 
 // SnapshotTree writes the working state of the worktree at path as a git tree
-// and returns its hash.
+// and returns its hash, with the untracked files larger than maxUntracked
+// bytes left out and never read. It returns their paths, relative to path and
+// sorted. Zero or less is no limit.
 //
 // The temporary index starts as a copy of the worktree's own, so git's stat
 // cache holds and only the files that changed since the agent last touched
 // the index are hashed again. A worktree with no index, or one git cannot use
 // from a copy (a split index keeps part of itself beside the original), starts
 // from HEAD instead, which hashes every tracked file.
-func SnapshotTree(ctx context.Context, path string) (string, error) {
+func SnapshotTree(ctx context.Context, path string, maxUntracked int64) (string, []string, error) {
+	skipped, err := largeUntracked(ctx, path, maxUntracked)
+	if err != nil {
+		return "", nil, err
+	}
+	tree, err := snapshotTreeExcluding(ctx, path, skipped)
+	if err != nil {
+		return "", nil, err
+	}
+	return tree, skipped, nil
+}
+
+// snapshotTreeExcluding is SnapshotTree with the paths in exclude, relative
+// to path, left out. They are never read, so a large file costs nothing.
+func snapshotTreeExcluding(ctx context.Context, path string, exclude []string) (string, error) {
 	tmp, err := os.CreateTemp("", "tuios-index-*")
 	if err != nil {
 		return "", err
@@ -48,7 +71,7 @@ func SnapshotTree(ctx context.Context, path string) (string, error) {
 	defer func() { _ = os.Remove(index) }()
 	env := []string{"GIT_INDEX_FILE=" + index}
 	if copyIndex(ctx, path, index) {
-		if tree, err := addAndWriteTree(ctx, path, env); err == nil {
+		if tree, err := addAndWriteTree(ctx, path, env, exclude); err == nil {
 			return tree, nil
 		} else if ctx.Err() != nil {
 			return "", err
@@ -63,7 +86,7 @@ func SnapshotTree(ctx context.Context, path string) (string, error) {
 			return "", err
 		}
 	}
-	return addAndWriteTree(ctx, path, env)
+	return addAndWriteTree(ctx, path, env, exclude)
 }
 
 // copyIndex copies the index of the worktree at path over dest, and reports
@@ -100,9 +123,22 @@ func copyIndex(ctx context.Context, path, dest string) bool {
 
 // addAndWriteTree stages every file of the worktree at path into the index env
 // names and writes it as a tree.
-func addAndWriteTree(ctx context.Context, path string, env []string) (string, error) {
-	if _, err := runCtx(ctx, path, env, "add", "--all", "--", "."); err != nil {
-		return "", err
+func addAndWriteTree(ctx context.Context, path string, env []string, exclude []string) (string, error) {
+	if len(exclude) == 0 {
+		if _, err := runCtx(ctx, path, env, "add", "--all", "--", "."); err != nil {
+			return "", err
+		}
+	} else {
+		// The exclusions go on standard input, so any number of them fits,
+		// each matched literally.
+		specs := []string{"."}
+		for _, p := range exclude {
+			specs = append(specs, ":(exclude,literal)"+p)
+		}
+		stdin := strings.Join(specs, "\x00") + "\x00"
+		if _, err := runStdin(ctx, path, env, stdin, "add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
+			return "", err
+		}
 	}
 	out, err := runCtx(ctx, path, env, "write-tree")
 	if err != nil {
@@ -112,12 +148,13 @@ func addAndWriteTree(ctx context.Context, path string, env []string) (string, er
 }
 
 // WorkingNumstat counts what the worktree at path changed against base, a
-// commit or ref: its commits and its uncommitted work together.
-func WorkingNumstat(ctx context.Context, path, base string) (Numstat, error) {
+// commit or ref: its commits and its uncommitted work together. Untracked
+// files larger than maxUntracked bytes are not counted, as in SnapshotTree.
+func WorkingNumstat(ctx context.Context, path, base string, maxUntracked int64) (Numstat, error) {
 	if strings.HasPrefix(base, "-") {
 		return Numstat{}, fmt.Errorf("base %q is not a ref", base)
 	}
-	tree, err := SnapshotTree(ctx, path)
+	tree, _, err := SnapshotTree(ctx, path, maxUntracked)
 	if err != nil {
 		return Numstat{}, err
 	}
@@ -151,13 +188,14 @@ func ParseNumstat(out string) Numstat {
 // DiffWorking is what the worktree at b has that the worktree at a does not:
 // a unified diff of their working states, from a to b. Both must be worktrees
 // of one repository, which share its object store. With stat it is the
-// summary form.
-func DiffWorking(ctx context.Context, a, b string, stat bool) (string, error) {
-	ta, err := SnapshotTree(ctx, a)
+// summary form. Untracked files larger than maxUntracked bytes are left out
+// on both sides, as in SnapshotTree.
+func DiffWorking(ctx context.Context, a, b string, stat bool, maxUntracked int64) (string, error) {
+	ta, _, err := SnapshotTree(ctx, a, maxUntracked)
 	if err != nil {
 		return "", err
 	}
-	tb, err := SnapshotTree(ctx, b)
+	tb, _, err := SnapshotTree(ctx, b, maxUntracked)
 	if err != nil {
 		return "", err
 	}
@@ -217,7 +255,7 @@ func ChangesCtx(ctx context.Context, path string) (int, error) {
 // runCtx is runEnv bounded by ctx: a git that takes longer than the caller
 // can wait is killed.
 func runCtx(ctx context.Context, dir string, env []string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := childproc.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_EDITOR=true")
 	cmd.Env = append(cmd.Env, env...)

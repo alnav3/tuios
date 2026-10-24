@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 	"github.com/spf13/cobra"
@@ -108,7 +111,7 @@ func runFanCompare(target string, changes, jsonOutput bool) error {
 // a short list, and the two commands that come next.
 func renderFanCompare(res fanCompareResult, on string, now time.Time) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s in %s%s, %d %s against %s\n", res.Group, res.Repo, on, len(res.Rows), pluralWord(len(res.Rows), "attempt", "attempts"), res.Base)
+	fmt.Fprintf(&b, "%s in %s%s, %d %s against %s\n", res.Group, res.Repo, on, len(res.Rows), plural.Word(len(res.Rows), "attempt", "attempts"), res.Base)
 	cells := make([][]string, 0, len(res.Rows))
 	for _, r := range res.Rows {
 		agent := r.Agent
@@ -117,7 +120,7 @@ func renderFanCompare(res fanCompareResult, on string, now time.Time) string {
 		}
 		files, lines := "-", "-"
 		if r.Files != nil {
-			files = fmt.Sprintf("%d %s", *r.Files, pluralWord(*r.Files, "file", "files"))
+			files = fmt.Sprintf("%d %s", *r.Files, plural.Word(*r.Files, "file", "files"))
 			lines = fmt.Sprintf("+%d -%d", derefInt(r.Added), derefInt(r.Removed))
 		}
 		if r.Gone {
@@ -139,9 +142,11 @@ func renderFanCompare(res fanCompareResult, on string, now time.Time) string {
 				b.WriteString(cell)
 			case i == 3 || i == 4:
 				// Counts line up on the right.
-				b.WriteString(strings.Repeat(" ", widths[i]-len(cell)) + cell)
+				b.WriteString(strings.Repeat(" ", widths[i]-len(cell)))
+				b.WriteString(cell)
 			default:
-				b.WriteString(cell + strings.Repeat(" ", widths[i]-len(cell)))
+				b.WriteString(cell)
+				b.WriteString(strings.Repeat(" ", widths[i]-len(cell)))
 			}
 		}
 		b.WriteString("\n")
@@ -281,7 +286,11 @@ func runFanDiff(a, b string, stat bool) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	diff, err := worktree.DiffWorking(ctx, ra.Path, rb.Path, stat)
+	cfg, err := config.LoadUserConfig()
+	if err != nil {
+		cfg = config.DefaultConfig()
+	}
+	diff, err := worktree.DiffWorking(ctx, ra.Path, rb.Path, stat, cfg.Agents.Checkpoints.MaxUntrackedBytes())
 	if err != nil {
 		return err
 	}
@@ -315,11 +324,11 @@ after -- is a shell line, so it can hold && and pipes. Several are one
 command and its arguments, each quoted for the shell as you gave it. It is always
 the command you give: tuios never reads one from the repository. The window
 holds no grants, so the check cannot drive tuios. A window whose check passed
-closes; one whose check failed stays open so you can read the output, until
+closes. A window whose check failed stays open so you can read the output, until
 you press enter in it or the next check starts. A check still running in an attempt is stopped first.
 
 The command waits for every check and exits 1 when any failed. --no-wait
-returns once they are started; 'tuios fan compare' shows how they end.`,
+returns once they are started. 'tuios fan compare' shows how they end.`,
 		Example: `  tuios fan verify api-fan-retry -- go test ./...
   tuios fan verify api-fan-retry --timeout 10m -- 'make lint && make test'
   tuios fan verify api-fan-retry --no-wait -- go vet ./...`,
@@ -408,7 +417,7 @@ func runFanVerify(target, command string, timeout time.Duration, wait, jsonOutpu
 			return printVerbResultOn(t, raw, true)
 		}
 		fmt.Printf("Started %q in %d %s of %s%s. See how they end with 'tuios fan compare %s'.\n",
-			command, len(started.Sessions), pluralWord(len(started.Sessions), "attempt", "attempts"), started.Group, t.on(), target)
+			command, len(started.Sessions), plural.Word(len(started.Sessions), "attempt", "attempts"), started.Group, t.on(), target)
 		for _, s := range started.Skipped {
 			fmt.Printf("  %s: not started, %s\n", s.Session, s.Reason)
 		}
@@ -418,7 +427,7 @@ func runFanVerify(target, command string, timeout time.Duration, wait, jsonOutpu
 		return reportVerbError(errors.New("no check was started"), jsonOutput)
 	}
 	if !jsonOutput {
-		fmt.Printf("Running %q in %d %s of %s%s.\n", command, len(started.Sessions), pluralWord(len(started.Sessions), "attempt", "attempts"), started.Group, t.on())
+		fmt.Printf("Running %q in %d %s of %s%s.\n", command, len(started.Sessions), plural.Word(len(started.Sessions), "attempt", "attempts"), started.Group, t.on())
 	}
 	rows, err := waitFanVerify(t, started.Sessions[0], started.Sessions)
 	if err != nil {
@@ -509,4 +518,68 @@ func waitFanVerify(t *verbTarget, anySession string, sessions []string) ([]fanCo
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// newFanVerdictCommand is tuios fan verdict: how a judge reports its pick.
+func newFanVerdictCommand() *cobra.Command {
+	var pick, summary string
+	var reasons, notes []string
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "verdict <session>",
+		Short: "Record a judge's pick among the attempts of a fan-out",
+		Long: `Record which attempt of a fan-out a judge recommends, and why. The agents
+view shows the verdict on the fan's row and in its comparison, where the
+person keeps an attempt. Nothing is kept or removed here: 'tuios fan keep'
+does that.
+
+Name any session of the fan-out, the attempt to pick with --pick, and the
+verdict with --summary. Give each reason with --reason, and a note on one
+attempt with --note SESSION=TEXT. Each flag can repeat. A new verdict
+replaces the last one.
+
+Only the judge tuios started for the fan ('j' in the agents view), or a
+call from outside every pane, records a verdict. A pane of an attempt is
+refused.`,
+		Example: `  tuios fan verdict api-fan-retry --pick api-fan-retry-2 \
+    --summary "Keep B. It is the smallest change and passes the tests." \
+    --reason "A reads hits without the lock." \
+    --note "api-fan-retry=Adds a test for eviction."`,
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeWorktreeSessions,
+		RunE: func(_ *cobra.Command, args []string) error {
+			byAttempt := map[string][]string{}
+			for _, n := range notes {
+				s, text, ok := strings.Cut(n, "=")
+				if !ok || s == "" {
+					return fmt.Errorf("--note %q is not SESSION=TEXT", n)
+				}
+				byAttempt[s] = append(byAttempt[s], text)
+			}
+			host, name := splitHostSession(args[0])
+			t, err := dialHost(host)
+			if err != nil {
+				return err
+			}
+			defer t.Close()
+			params := map[string]any{"session": name, "pick": pick, "summary": summary, "reasons": reasons, "notes": byAttempt}
+			raw, err := t.client.Call("set-fan-verdict", params)
+			if err != nil {
+				return reportVerbError(t.explain("set-fan-verdict", err), jsonOut)
+			}
+			if jsonOut {
+				return printVerbResultOn(t, raw, true)
+			}
+			fmt.Printf("The verdict picks %s. It is on every attempt of the fan-out.\n", pick)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&pick, "pick", "", "The session of the attempt the judge recommends (required)")
+	cmd.Flags().StringVar(&summary, "summary", "", "The verdict in a sentence or two (required)")
+	cmd.Flags().StringArrayVar(&reasons, "reason", nil, "One reason. Repeatable")
+	cmd.Flags().StringArrayVar(&notes, "note", nil, "A note on one attempt, as SESSION=TEXT. Repeatable")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output result as JSON")
+	_ = cmd.MarkFlagRequired("pick")
+	_ = cmd.MarkFlagRequired("summary")
+	return cmd
 }

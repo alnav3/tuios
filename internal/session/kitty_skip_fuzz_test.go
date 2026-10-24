@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	"tuios.dev/vt"
 )
 
 // FuzzFrameSkipping drives broadcast with a generated pane stream and three
@@ -99,13 +99,13 @@ func frameSkipping(ops []byte, slowEvery, readSize, joinAt uint8) error {
 	slowCh := p.Subscribe("slow", 0)
 	fast, slow := p.subscriberFor("fast"), p.subscriberFor("slow")
 	var fastOut, slowOut, lateOut []byte
-	var lateCh <-chan ptyChunk
+	var lateCh *ptyQueue
 	var late *ptySubscriber
 	var lateFrom int64
 
-	drain := func(ch <-chan ptyChunk, sub *ptySubscriber, out []byte) []byte {
-		for len(ch) > 0 {
-			out = takeChunk(out, <-ch, sub)
+	drain := func(ch *ptyQueue, sub *ptySubscriber, out []byte) []byte {
+		for ch.len() > 0 {
+			out = takeChunk(out, ch.take(), sub)
 		}
 		return out
 	}
@@ -165,7 +165,7 @@ func frameSkipping(ops []byte, slowEvery, readSize, joinAt uint8) error {
 func genPaneStream(ops []byte) []byte {
 	var b bytes.Buffer
 	n := 0
-	for i := 0; i < len(ops); i++ {
+	for i := range ops {
 		arg := 0
 		if i+1 < len(ops) {
 			arg = int(ops[i+1])
@@ -233,7 +233,7 @@ func genPaneStream(ops []byte) []byte {
 
 func writeFrame(b *bytes.Buffer, keys, payload string, chunks int) {
 	per := (len(payload) + chunks - 1) / chunks
-	for c := 0; c < chunks; c++ {
+	for c := range chunks {
 		part := payload[min(c*per, len(payload)):min((c+1)*per, len(payload))]
 		m := 0
 		if c < chunks-1 {

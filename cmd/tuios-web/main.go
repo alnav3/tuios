@@ -22,7 +22,9 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/fang"
 	"github.com/Gaurav-Gosain/tuios/internal/netutil"
+	"github.com/Gaurav-Gosain/tuios/internal/release"
 	"github.com/Gaurav-Gosain/tuios/internal/served"
+	"github.com/Gaurav-Gosain/tuios/internal/serverscope"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/charmbracelet/colorprofile"
 	"github.com/spf13/cobra"
@@ -47,6 +49,7 @@ var (
 	webAutoTLS        bool
 	webInsecure       bool
 	webTouch          string
+	webCtrlVToProgram bool
 	// Who may open a session. See access.go.
 	webUser           string
 	webPasswordFile   string
@@ -116,8 +119,9 @@ Client features:
   # Same, with a certificate and a password you already have
   tuios-web --host 0.0.0.0 --cert cert.pem --key key.pem --password-file ~/.config/tuios/web-password
 
-  # Same, on a network you trust, with nothing encrypted and no password
-  tuios-web --host 0.0.0.0 --insecure --no-auth
+  # Same, on a network you trust, with nothing encrypted and no password.
+  # --no-auth needs the address of one interface. It does not work with 0.0.0.0
+  tuios-web --host 192.168.1.20 --insecure --no-auth
 
   # Behind a reverse proxy on this machine that sends its own host name.
   # --allow-host needs a password or --no-auth
@@ -157,12 +161,13 @@ Client features:
 	rootCmd.Flags().BoolVar(&webAutoTLS, "auto-tls", false, "Serve HTTPS from a self-signed certificate tuios-web generates and keeps (see `tuios-web cert`)")
 	rootCmd.Flags().BoolVar(&webInsecure, "insecure", false, "Serve a non-loopback host over plain HTTP, sending every keystroke unencrypted (trusted networks only)")
 	rootCmd.Flags().StringVar(&webUser, "user", defaultWebUser, "User name the browser must give with the password")
-	rootCmd.Flags().StringVar(&webPasswordFile, "password-file", "", "Read the password from the first line of this file. The file must be yours, with mode 600 or 400")
+	rootCmd.Flags().StringVar(&webPasswordFile, "password-file", "", "Read the password from the first line of this file. The file must be yours, with mode 600 or 400 (on Windows, only you, SYSTEM and Administrators may read it)")
 	rootCmd.Flags().BoolVar(&webRandomPassword, "random-password", false, "Make a new password at start and print it")
-	rootCmd.Flags().BoolVar(&webNoAuth, "no-auth", false, "Serve a non-loopback host with no password. Anyone who reaches the port gets a shell (trusted networks only)")
+	rootCmd.Flags().BoolVar(&webNoAuth, "no-auth", false, "Serve a non-loopback host with no password. Anyone who reaches the port gets a shell (trusted networks only). Not with 0.0.0.0 or ::")
 	rootCmd.Flags().StringSliceVar(&webAllowHosts, "allow-host", nil, "On a loopback --host, also accept this host name (no port) in the Host header, for example for a reverse proxy. Needs a password or --no-auth (repeatable)")
 	registerCertFlags(rootCmd)
 	rootCmd.Flags().StringVar(&webTouch, "touch", "auto", "Touch input mode: auto, on, off. Touch widens the gestures aimed at a single cell")
+	rootCmd.Flags().BoolVar(&webCtrlVToProgram, "ctrl-v-to-program", false, "Send Ctrl+V to the program in the pane. By default Ctrl+V pastes")
 
 	// Daemon mode flags
 	rootCmd.Flags().StringVar(&defaultSession, "default-session", "", "Default session name for all connections (creates shared session)")
@@ -177,9 +182,20 @@ Client features:
 }
 
 func main() {
+	// A `go install ...@vX` build has no ldflags; its module version stands in
+	// for them before anything below reads the stamps.
+	applyModuleVersion()
+
 	// See cmd/tuios/main.go: a crash report names the build it came from, and
 	// internal/app cannot read these vars itself.
 	app.SetBuildStamp(version, commit)
+
+	// The server TUIOS_SERVER names, as tuios applies it, so tuios-web started
+	// from a pane of a named server serves that server's daemon.
+	if err := serverscope.ApplyEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "tuios-web: %v.\n", err)
+		os.Exit(1)
+	}
 
 	rootCmd := newRootCmd()
 
@@ -196,7 +212,7 @@ func main() {
 // accessFlags collects the command line that decides who may connect.
 func accessFlags() webAccessFlags {
 	return webAccessFlags{
-		host:           webHost,
+		host:           webBindAddr,
 		port:           webPort,
 		tls:            webTLSCert != "" || webAutoTLS,
 		user:           webUser,
@@ -227,6 +243,14 @@ func runWebServer() error {
 	// anything is started, so the user gets the answer instead of a daemon
 	// and a half-open port. The password comes first: it is read and removed
 	// from the environment before the daemon starts, so no pane inherits it.
+	// Resolve --host once. The checks read the address it binds, and sip
+	// binds that address, so the two cannot disagree. See bindhost.go.
+	bind, err := resolveBindHost(context.Background(), netResolver, webHost)
+	if err != nil {
+		return err
+	}
+	webBindAddr = bind
+
 	access, err := planWebAccess(os.Stderr, accessFlags())
 	if err != nil {
 		return err
@@ -345,7 +369,7 @@ func runWebServer() error {
 
 	// Create sip server
 	sipConfig := sip.DefaultConfig()
-	sipConfig.Host = webHost
+	sipConfig.Host = webBindAddr
 	sipConfig.Port = webPort
 	sipConfig.ReadOnly = webReadOnly
 	sipConfig.MaxConnections = webMaxConnections
@@ -353,6 +377,8 @@ func runWebServer() error {
 	sipConfig.TLSCert = tlsCert
 	sipConfig.TLSKey = tlsKey
 	sipConfig.AllowInsecureNoTLS = webInsecure
+	sipConfig.MaxWindowDims = sip.WindowSize{Width: webMaxCols, Height: webMaxRows}
+	sipConfig.MaxWindowCells = webMaxCells
 	access.apply(&sipConfig)
 
 	// How the page looks. Read after the config file and the flags have both
@@ -383,7 +409,13 @@ func runWebServer() error {
 	if !ok {
 		return fmt.Errorf("--touch is %q: it takes auto, on or off", webTouch)
 	}
-	sipConfig.ConnectMiddleware = append(sipConfig.ConnectMiddleware, touchMiddleware(touch))
+	sipConfig.ConnectMiddleware = append(sipConfig.ConnectMiddleware, touchMiddleware(touch), appleMiddleware())
+	// Ctrl+V pastes in the page unless the operator gives it to the pane.
+	// See paste_keys.go.
+	sipConfig.CtrlVToProgram = webCtrlVToProgram
+
+	// A notification's link opens the Inbox on its item. See inboxlink.go.
+	installInboxLink(&sipConfig)
 
 	server := sip.NewServer(sipConfig)
 
@@ -393,7 +425,7 @@ func runWebServer() error {
 		mode = "ephemeral"
 	}
 	log.Printf("Starting web server on %s (mode: %s)", serverURL(), mode)
-	if webInsecure && !isLoopbackHost(webHost) {
+	if webInsecure && !isLoopbackHost(webBindAddr) {
 		log.Printf("Insecure: %s is served over plain HTTP, so anyone on this network can read what you type", serverURL())
 	}
 
@@ -435,6 +467,7 @@ func createTUIOSProgram(sess sip.Session) *tea.Program {
 		opts = append(opts, tea.WithOutput(frames))
 	}
 	program := tea.NewProgram(started, opts...)
+	model.BindProgram(program)
 	// Tear down after the program has fully stopped, the way the SSH server
 	// does. Closing on the session context instead ran Cleanup while the last
 	// frames were still going out.
@@ -570,7 +603,7 @@ func checkTransportSecurity(w io.Writer) error {
 		// error rendering.
 		return errors.New("pass both --cert and --key, or neither: a certificate is no use without its key")
 	}
-	if webTLSCert != "" || webAutoTLS || webInsecure || isLoopbackHost(webHost) {
+	if webTLSCert != "" || webAutoTLS || webInsecure || isLoopbackHost(webBindAddr) {
 		return nil
 	}
 
@@ -619,15 +652,35 @@ func checkTransportSecurity(w io.Writer) error {
 	return fmt.Errorf("refusing to serve %s in clear text: pass --auto-tls, or --cert and --key, or --insecure to accept it", webHost)
 }
 
+// webMaxCols, webMaxRows and webMaxCells are the largest window a browser may
+// ask for.
+//
+// Each cell costs tuios-web about 1.3 KB: one session resized to 2000x1000
+// took the process from 41 MB to 2.6 GB. sip clamps every resize to these
+// limits, the first one too, and the browser gets the clamped size. A resize
+// past webMaxCols or webMaxRows is cut to them. When columns times rows is
+// still past webMaxCells, the columns stay and the rows shrink: a 1200 column
+// window gets 208 rows. A 5120 pixel wide screen at a 5 pixel cell is 1024
+// columns, so real windows fit.
+//
+// webMaxCells is set here and not left to sip's default, because sip sizes
+// its default for a Bubble Tea cell of about 230 bytes. At 1.3 KB a cell,
+// 250000 cells bound one session near 325 MB. The limit bounds one window and
+// not the process: sip has no cap on the number of sessions yet.
+const (
+	webMaxCols  = 1200
+	webMaxRows  = 500
+	webMaxCells = 250_000
+)
+
 // createTUIOSHandler creates a TUIOS instance for each web session.
 //
-// Graphics: starting with sip v0.1.12, the bundled xterm.js loads
-// @xterm/addon-image 0.10.0-beta.196 with kittySupport and sixelSupport
-// enabled (from xtermjs/xterm.js#5619). We force-enable the kitty/sixel
-// passthroughs and route their output through the sip session's PTY slave
-// so APC sequences emitted by child processes (chafa -f kitty, kitten
-// icat, etc.) flow through the same pipe as bubbletea's text output and
-// get rendered by the browser's image addon.
+// Graphics: sip's page runs webterm, which draws kitty graphics in its own
+// overlay and sixel through @xterm/addon-image (sip's static/terminal.js asks
+// for both with graphics: { kitty, sixel }). The kitty and sixel passthroughs
+// are forced on here, and their output goes through the sip session's PTY
+// slave, so APC sequences from child processes (chafa -f kitty, kitten icat
+// and the rest) flow through the same pipe as bubbletea's text output.
 func createTUIOSHandler(sess sip.Session) *app.OS {
 	pty := sess.Pty()
 	graphicsOut := sess.PtySlave()
@@ -650,10 +703,14 @@ func createTUIOSHandler(sess sip.Session) *app.OS {
 		Height:         pty.Height,
 		GraphicsOutput: graphicsOut,
 		TouchClient:    touch,
-		Caps:           hostCaps,
+		BrowserPaste: app.BrowserPasteKeys{
+			Apple:          sessionIsApple(sess.Context()),
+			CtrlVToProgram: webCtrlVToProgram,
+		},
+		Caps: hostCaps,
 	}
 
-	// If ephemeral mode or daemon not available, use old behavior
+	// In ephemeral mode the model runs in-process, with no daemon
 	if webServerConfig.ephemeral {
 		return served.NewModel(opts, webAppearanceOverrides())
 	}
@@ -666,11 +723,12 @@ func createTUIOSHandler(sess sip.Session) *app.OS {
 	// Try to connect to daemon. The daemon is told this browser's own cell
 	// size, measured from the canvas it reports beside its grid (see
 	// cellSize), and hands it to every guest as the pixel size of its window.
-	// A hardcoded 10x20 there made a tool that asks how big a cell is before
-	// drawing, kitty icat being the usual one, draw at the wrong scale.
+	// A tool that asks how big a cell is before drawing, kitty icat being the
+	// usual one, draws at the wrong scale with any fixed size.
 	daemonOpts := opts
 	daemonOpts.SessionName = webServerConfig.defaultSession
 	daemonOpts.ViewOnly = webReadOnly
+	daemonOpts.OpenInboxItem = sessionInboxItem(sess.Context())
 	model, err := served.Attach(daemonOpts, webAppearanceOverrides(), version, app.ClientCapabilitiesOf(hostCaps), pickWebSession)
 	if err != nil {
 		log.Printf("Warning: Failed to connect to daemon, using ephemeral mode: %v", err)
@@ -685,12 +743,12 @@ func createTUIOSHandler(sess sip.Session) *app.OS {
 // went. The session switcher reaches the others from inside tuios.
 func pickWebSession([]string) string { return "web" }
 
-// webHostCaps is the browser terminal one connection draws to. sip's bundled
-// xterm.js loads the image addon with kitty and sixel support, so both
-// protocols render. KittyAnimation stays false because the browser overlay has
-// no a=f frame-edit path, and KittyFileTransfer stays false because the browser
-// cannot read server-local paths. The palette is the one the browser draws
-// with; see browserPalette.
+// webHostCaps is the browser terminal one connection draws to. sip's page
+// draws kitty graphics in webterm's overlay and sixel through the xterm.js
+// image addon, so both protocols render. KittyAnimation stays false because
+// the browser overlay has no a=f frame-edit path, and KittyFileTransfer stays
+// false because the browser cannot read server-local paths. The palette is the
+// one the browser draws with; see browserPalette.
 func webHostCaps(cellWidth, cellHeight int) *app.HostCapabilities {
 	caps := &app.HostCapabilities{
 		KittyGraphics: true,
@@ -742,4 +800,11 @@ func cellSize(pty sip.Pty) (cellWidth, cellHeight int) {
 // file the server loaded when it started. See config.AppearanceFrom.
 func webAppearanceOverrides() config.Overrides {
 	return interfaceFlags.Overrides()
+}
+
+// applyModuleVersion replaces the placeholder stamps of a `go install` build
+// with its module version. See release.Stamps.WithModuleVersion.
+func applyModuleVersion() {
+	s := release.Stamps{Version: version, Commit: commit, Date: date, BuiltBy: builtBy}.WithModuleVersion()
+	version, commit, date, builtBy = s.Version, s.Commit, s.Date, s.BuiltBy
 }

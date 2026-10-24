@@ -1,14 +1,13 @@
 package app
 
 // ClientKind names where the person looking at the screen is sitting. It is
-// the one fact the three entry points differ on, and everything below that
-// used to be a boolean each of them set by hand.
+// the one fact the three entry points differ on, and everything below is
+// derived from it.
 //
 // A client is built with a kind and NewOS derives the rest: whether the
 // settings page may write the config file, whether the process shares a desktop
 // with the user, how graphics reach the terminal. A flag derived from the kind
-// cannot be set on one client and forgotten on another, which is how the same
-// server shipped read-only for the browser and writable over SSH once.
+// cannot be set on one client and forgotten on another.
 //
 // The zero value is a client nobody named. The tests and the benchmarks build
 // those, and they get no derivation and no watcher: exactly the struct the
@@ -45,6 +44,14 @@ func (k ClientKind) String() string {
 func (k ClientKind) Remote() bool {
 	return k == ClientSSH || k == ClientBrowser
 }
+
+// previewsLive reports whether a picker may preview by applying what it
+// highlights. The theme and the glyph set are process-wide, and a tuios ssh or
+// tuios-web process serves many clients, so a preview there repainted every
+// other guest and the operator too. A served client previews inside the
+// picker instead, and Enter still applies. The Learn tour is a browser client
+// in a process of its own, one page per process, so it previews as before.
+func (m *OS) previewsLive() bool { return !m.Client.Remote() || m.LearnMode }
 
 // applyClientKind fills the per-client flags a kind implies. Each is OR-ed
 // with what the caller set, so a test that sets one flag directly keeps it and

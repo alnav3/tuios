@@ -69,23 +69,42 @@ the requested percentage wherever the layout allows it.
 How a resize is kept depends on the layout:
 
 - **BSP** writes the resize into the split ratios of the tree.
-- **Master-stack** writes it into the workspace's ratios: the master ratio
+- **Master-stack** writes it into the workspace's splits: the master ratio
   (the width of the master column, or the height of the master row when the
-  master is at the top or the bottom) and, when the stack holds two panes, the
-  stack ratio (how the stack splits its space between them). This works on
-  every side the master can take. The keyboard resizes, the percentage resizes
-  and a mouse drag on a divider all do this, so the resize survives a retile.
-  With the master in the center, a resize moves one divider, and the next
-  retile puts the master back in the middle at its new width. Both ratios are
-  session state, so every client attached to the session lays the workspace
-  out the same way. The default grid (four or more panes, one master on the
-  left) has no ratio to keep, so a resize there lasts only until the next
-  retile.
+  master is at the top or the bottom) and the share of every other pane: each
+  master, each stack pane, and each row and pane of the default grid (four or
+  more panes, one master on the left). This works on every side the master can
+  take. The keyboard resizes, the percentage resizes and a mouse drag on a
+  divider all do this, so the resize survives a retile, and a terminal resize
+  is a retile. With the master in the center, a resize moves one divider, and
+  the next retile puts the master back in the middle at its new width. The
+  splits are session state, so every client attached to the session lays the
+  workspace out the same way. When a pane opens or closes, the part of the
+  layout it changes goes back to equal shares. Equalize splits (`Ctrl+B =`) puts the
+  master back at the configured ratio and gives every other pane an equal
+  share.
 - **Scrolling layout: width only.** The width actions reach the focused
   column through the scrolling column resizer, which clamps to the column
   width range; the height actions have no scrolling branch, so
   `Shift+5`..`Shift+9` do nothing there (column heights are recomputed as
   equal spans on the next layout pass).
+
+### Moving a pane with the mouse
+
+A tiled pane is moved by dragging its title bar, or by `Ctrl+click` anywhere in it and dragging. Both drop the same way.
+
+In BSP, where the pane is dropped decides what happens:
+
+| Drop on another pane | Result |
+|---|---|
+| Its middle | The two panes swap places. |
+| Its left, right, top or bottom edge (the outer quarter of that side) | That pane is split in two, and the dragged pane takes the half toward the edge. The pane that shared a split with the dragged pane fills the space it left. The new split takes the layout's default ratio. |
+
+While the button is down, the rectangle the pane will land in is highlighted: a frame in the accent colour, drawn with the pane border characters, with a tint inside. On a 16-colour terminal the frame is reverse video. The highlight shows once the pointer has stayed on one zone for a moment, and `appearance.drop_preview` and `appearance.drop_preview_delay` change how it looks and how long it waits, or turn it off; see [CONFIGURATION.md](CONFIGURATION.md#drop-preview). A pane too small to hold two panes of the minimum size across one axis offers no edges on that axis. An edge drop that would leave the layout as it is (dropping a pane on the edge it already sits beside) highlights the pane's own slot and changes nothing, so a divider you have moved stays where it is.
+
+A drop that lands on no other pane puts the pane back where it was. Master-stack and the scrolling layout place panes by their own rules, so a drop there always swaps (the scrolling layout swaps columns), and nothing is highlighted. A floating pane stays where it is dropped. A zoomed pane cannot be dragged, and while any pane is zoomed, or a scratch group is shown, drops swap as in the other layouts.
+
+The new arrangement is session state: it reaches every client attached to the session and survives a reattach.
 
 ## Master-Stack Layout
 
@@ -225,7 +244,8 @@ action names yourself in `[keybindings]`:
 
 | Palette command | Action name | What it does |
 |---|---|---|
-| Scroll: Cycle Column Width | `scroll_cycle_width` | Cycles the focused column through 33%, 50%, 55%, 67% and 90% of the screen width |
+| Scroll: Cycle Column Width | `scroll_cycle_width` | Cycles the focused column through 33%, 50%, 55%, 67% and 90% (and 100% when `appearance.scroll_column_max` is 100) of the screen width |
+| Scroll: Maximize Column Width | `scroll_maximize` | Widens the focused column to the configured ceiling, the widest the strip will give it |
 | Scroll: Stack Window Below (consume) | `scroll_consume` | Pulls the window from the next column into the focused column, stacking it below |
 | Scroll: Split to New Column (expel) | `scroll_expel` | Pushes the bottom window of the focused column out into its own new column |
 | (none) | `scroll_focus_left`, `scroll_focus_right` | Focus the column left/right |
@@ -234,7 +254,8 @@ action names yourself in `[keybindings]`:
 A column's width is a proportion of the screen until you resize it with `<` or
 `>`, which pins it to a fixed cell count; cycling the width with
 `scroll_cycle_width` unpins it again. Each press of `<` or `>` changes the width
-by four cells, within a floor of 20 cells and a ceiling of 90% of the screen.
+by four cells, within a floor of 20 cells and a ceiling set by
+`appearance.scroll_column_max` (90% by default, up to 100%).
 
 Windows stacked in one column split its height evenly, less `appearance.gap`
 between them.
@@ -243,11 +264,18 @@ A new column is `appearance.scroll_column_width` percent of the screen wide.
 The default of 55% is deliberately over half, so two columns never quite fit
 side by side and the strip reads as something you scroll.
 
+### Shared borders
+
+With `appearance.shared_borders` on, the columns do not draw their own borders.
+One divider stands between two columns, as it does between tiled panes in the
+other layouts. Drag the divider to set the width of the column on its left.
+The columns after it move with it.
+
+Windows stacked in one column have a divider between them too. Dragging it
+does nothing, because the windows in a column always share its height evenly.
+
 ### Limitations
 
-- **Shared borders are not drawn in scrolling mode.** `shared_borders` applies
-  to BSP and master-stack tiling only; scrolling columns always draw their own
-  borders.
 - **Column widths and the strip order are not shared or saved.** The layout mode
   and the scroll offset are session state; the column arrangement is not, and is
   rebuilt from the window list on reattach and on each client.

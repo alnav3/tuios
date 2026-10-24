@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
-	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/mcp"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/spf13/cobra"
@@ -34,8 +32,13 @@ table. Every call opens its own connection and restricts it with
 restrict-connection before anything else, so the daemon holds the call to
 what this server was started with:
 
-  default        read-only, and only the session of the pane the server runs
-                 in, its fan group and the sessions a fan from it started
+  default        tools that read panes and wait on them, and four that
+                 change state: set_agent_state and set_agent_meta change the
+                 caller's own record, send_agent_message sends mail, and
+                 read_agent_messages marks the mail it returns as read. No
+                 default tool types into a pane. The server reaches only the
+                 session of the pane it runs in, its fan group and the
+                 sessions a fan from it started.
   --write        also list send_text, send_keys, ask_agent, respond and fan,
                  still inside that session and fan group
   --scope all    reach every session, for a harness that runs outside tuios
@@ -63,6 +66,7 @@ tuios integration install <harness> --mcp registers it with a harness.`,
 				PaneToken: os.Getenv("TUIOS_PANE_TOKEN"),
 				Dial:      dialMCPConn,
 				Verbs:     mcpVerbDocs(),
+				Leave:     mcpLeaveAgentTools(),
 				Log: func(format string, args ...any) {
 					fmt.Fprintf(os.Stderr, "tuios mcp: "+format+"\n", args...)
 				},
@@ -91,27 +95,14 @@ func mcpVerbDocs() []mcp.VerbDoc {
 }
 
 // mcpSocketPath finds the daemon's socket. A harness may start its MCP servers
-// with a pared-down environment, and XDG_RUNTIME_DIR is one of the variables
-// such a harness drops, which would send the server to the /tmp fallback while
-// the daemon listens under /run/user. So TUIOS_SOCKET, which every pane
-// exports, comes first, and when XDG_RUNTIME_DIR is unset the systemd default
-// is tried before the fallback.
+// with a pared-down environment, so TUIOS_SOCKET, which every pane exports,
+// comes first. Without it, the socket is the one every command uses, which
+// finds the daemon under /run/user when XDG_RUNTIME_DIR is unset.
 func mcpSocketPath() (string, error) {
 	if s := os.Getenv("TUIOS_SOCKET"); s != "" {
 		return s, nil
 	}
-	path, err := session.GetSocketPath()
-	if err != nil {
-		return "", err
-	}
-	if _, statErr := os.Stat(path); statErr == nil || os.Getenv("XDG_RUNTIME_DIR") != "" || runtime.GOOS != "linux" {
-		return path, nil
-	}
-	alt := filepath.Join("/run/user", strconv.Itoa(os.Getuid()), "tuios", "tuios.sock")
-	if _, err := os.Stat(alt); err == nil {
-		return alt, nil
-	}
-	return path, nil
+	return session.GetSocketPath()
 }
 
 func dialMCPConn() (mcp.Conn, error) {
@@ -146,3 +137,14 @@ func (m mcpConn) ReadEventLine(timeout time.Duration) ([]byte, error) {
 }
 
 func (m mcpConn) Close() error { return m.c.Close() }
+
+// mcpLeaveAgentTools leaves the agent tools out of tools/list while this
+// machine's config has the agent features off: each would only answer
+// agents_disabled. It is read when the server starts.
+func mcpLeaveAgentTools() func(verb string) bool {
+	cfg, err := config.LoadUserConfig()
+	if err != nil || cfg == nil || cfg.Agents.On() {
+		return nil
+	}
+	return func(verb string) bool { return session.AgentOnlyCall(verb, nil) }
+}

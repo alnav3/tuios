@@ -23,14 +23,12 @@ import (
 // program marks the rows that would be live if it were running, without
 // promoting them out of the reference tier.
 func keybindsDoctor(asJSON bool, guest string) error {
-	userConfig, err := config.LoadUserConfig()
-	if err != nil {
-		// A config the validator rejects is still the one to report on: the
-		// keys it cannot read are the finding. Only a file that does not
-		// parse at all falls back to the defaults.
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		userConfig = loadKeybindConfig()
-	}
+	// The config as the running app has it: the keys tuios cannot read are
+	// dropped and the defaults are back, so the leader, the conflicts and the
+	// keys taken from the pane match what the app does. The dropped keys are
+	// the report's key problems. Only a file that does not parse at all falls
+	// back to the defaults.
+	userConfig := loadKeybindConfig()
 	registry := config.NewKeybindRegistry(userConfig)
 	report := registry.Report(config.PaneFacts{Command: guest})
 
@@ -60,9 +58,44 @@ func printKeybindReport(rep config.KeybindReport) {
 
 	if len(rep.KeyProblems) > 0 {
 		fmt.Printf("\nKEYS TUIOS CANNOT READ (%s)\n", config.EvidenceCertain)
-		fmt.Println("  No key press matches these keys. Correct them in config.toml.")
+		fmt.Println("  tuios ignores these keys.")
+		var files []string
+		byFile := map[string][]config.KeyProblem{}
 		for _, p := range rep.KeyProblems {
-			fmt.Printf("  %-22s %s [%s.%s]\n", p.Key, p.Problem, p.Section, p.Action)
+			if _, ok := byFile[p.File]; !ok {
+				files = append(files, p.File)
+			}
+			byFile[p.File] = append(byFile[p.File], p)
+		}
+		for _, file := range files {
+			fmt.Printf("  Correct them in %s.\n", file)
+			for _, p := range byFile[file] {
+				fmt.Printf("    %-22s %s [%s.%s]. %s\n", p.Key, p.Problem, p.Section, p.Action, p.Outcome)
+			}
+		}
+	}
+
+	if len(rep.OptionKeys) > 0 {
+		fmt.Printf("\nOPT KEYS READ AS ALT (%s)\n", config.EvidenceCertain)
+		fmt.Println("  For information. tuios reads opt+ as alt+ on this system. Nothing needs a change.")
+		for _, k := range rep.OptionKeys {
+			fmt.Printf("  %-22s read as %s [%s.%s]\n", k.Key, k.ReadAs, k.Section, k.Action)
+		}
+	}
+
+	if len(rep.CommandProblems) > 0 {
+		fmt.Printf("\nCOMMAND ENTRIES (%s)\n", config.EvidenceCertain)
+		fmt.Println("  These [[keybindings.command]] entries need a change in config.toml.")
+		for _, p := range rep.CommandProblems {
+			fmt.Printf("  entry %-3d %-22s %s\n", p.Entry, p.Key, p.Problem)
+		}
+	}
+
+	if len(rep.CopyModeProblems) > 0 {
+		fmt.Printf("\nCOPY MODE KEYS (%s)\n", config.EvidenceCertain)
+		fmt.Println("  Another copy-mode key also uses these keys. Change them in config.toml.")
+		for _, p := range rep.CopyModeProblems {
+			fmt.Printf("  %-22s %s [copy_mode.%s]\n", p.Key, p.Problem, p.Action)
 		}
 	}
 
@@ -129,13 +162,44 @@ func printKeybindReport(rep config.KeybindReport) {
 		}
 	}
 
-	if len(rep.Yielded) > 0 {
+	var fresh, preset []config.YieldedDefault
+	for _, y := range rep.Yielded {
+		if y.Preset != "" {
+			preset = append(preset, y)
+		} else {
+			fresh = append(fresh, y)
+		}
+	}
+	if len(fresh) > 0 {
 		fmt.Printf("\nNEW ACTIONS WITH NO KEY (%s)\n", config.EvidenceCertain)
 		fmt.Println("  The default key of a new action is already yours for another action.")
 		fmt.Println("  tuios kept your binding and left the new action without a key.")
-		for _, y := range rep.Yielded {
+		for _, y := range fresh {
 			fmt.Printf("  %-22s %s runs %s. To use %s, bind it to a free key in [keybindings.%s].\n",
 				y.Action, y.Key, y.TakenBy, y.Action, y.Section)
+		}
+	}
+	if len(preset) > 0 {
+		fmt.Printf("\nPRESET KEYS YOUR BINDINGS TAKE (%s)\n", config.EvidenceCertain)
+		fmt.Printf("  The %s preset gives these keys to other actions. Your bindings keep them.\n", preset[0].Preset)
+		for _, y := range preset {
+			fmt.Printf("  %-22s %s runs %s. To give %s to %s, bind %s to another key in [keybindings.%s].\n",
+				y.Action, y.Key, y.TakenBy, y.Key, y.Action, y.TakenBy, y.Section)
+		}
+	}
+
+	if len(rep.Retired) > 0 {
+		fmt.Printf("\nDROPPED BINDINGS (%s)\n", config.EvidenceCertain)
+		fmt.Println("  tuios dropped these bindings when it loaded the config.")
+		for _, r := range rep.Retired {
+			use := " tuios no longer has this action."
+			switch {
+			case r.Note != "":
+				use = " " + r.Note
+			case r.Use != "":
+				use += fmt.Sprintf(" To keep the keys, bind them to %s.", r.Use)
+			}
+			fmt.Printf("  %-22s %s in [keybindings.%s].%s\n", r.Action, strings.Join(r.Keys, ", "), r.Section, use)
 		}
 	}
 
@@ -178,6 +242,12 @@ func keybindsExplain(key string, asJSON bool, guest string) error {
 			dead = fmt.Sprintf("  (dead: %s owns the key)", a.ShadowedBy)
 		}
 		fmt.Printf("  %-16s %s [%s]%s\n", a.Scope, a.Desc, a.Section, dead)
+	}
+	for _, a := range fate.USLayoutActs {
+		fmt.Printf("  %-16s %s [%s] (as %s, on a US layout)\n", a.Scope, a.Desc, a.Section, a.Key)
+	}
+	if len(fate.USLayoutActs) > 0 {
+		fmt.Println("  To stop this on another layout, set keybindings.keyboard_layout = \"other\".")
 	}
 	if fate.SwallowedInTerminal {
 		fmt.Printf("  %-16s kept from the pane: %s\n", "pane", fate.SwallowReason)

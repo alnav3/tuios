@@ -52,11 +52,12 @@ import (
 // # What it is not
 //
 // It is not a file manager. It lists, it walks in and out, it hands a path to
-// the clipboard and a directory to a shell, and it does the six file actions
-// named in sidebar_file_ops.go: create, rename, delete, copy, cut and paste.
-// That is the whole set. There is no multi-select, no tree, no filter and no
-// drag and drop, because yeetui does all of that far better than twenty-six
-// columns ever will, and it runs in a pane.
+// the clipboard and a directory to a shell, and it does the seven file actions
+// named in sidebar_file_ops.go: create, rename, delete, copy, cut, paste and
+// send. That is the whole set. There is no multi-select, no tree and no
+// filter, because yeetui does all of that far better than twenty-six columns
+// ever will, and it runs in a pane. A drop of files is not the rail's: see
+// DropPaste.
 
 // fileEntry is one row of a listing. Only what the rail draws and what a click
 // needs is kept: the rest of an os.DirEntry costs a stat per file and answers
@@ -219,7 +220,7 @@ func (m *OS) filesSectionEnabled() bool {
 	// from Update, so it is on the idle path of every client; SidebarEnabled is
 	// false for most of them and answering there costs a load and a branch,
 	// where filesOn takes the layout mutex.
-	if !m.Settings.SidebarEnabled || !m.filesOn() {
+	if (!m.Settings.SidebarEnabled && !m.sidebarDrawing) || !m.filesOn() {
 		return false
 	}
 	w := m.GetSidebarWidth()
@@ -619,7 +620,7 @@ func spoofCheckApplies(attachedHost string) bool { return attachedHost == "" }
 // # What it costs to be wrong
 //
 // A false positive is a read-only listing: the names, the navigation and the
-// path copy all still work, and only the six file actions go. A file manager
+// path copy all still work, and only the seven file actions go. A file manager
 // running in a pane and reporting its own browsing over OSC 7 is the one honest
 // program this will refuse, and refusing it is the same answer as for the
 // dishonest one, because from here they are the same event.
@@ -724,6 +725,9 @@ func (m *OS) recordWindowCwd(windowID, raw string) {
 	}
 	if w.Pty != nil {
 		w.CwdHost = host
+		if host != "" {
+			w.CwdElsewhereDir = dir
+		}
 	}
 	if host == "" {
 		w.Cwd = dir
@@ -877,6 +881,12 @@ func (m *OS) fileViewOpen(dir, name string, isDir bool) tea.Cmd {
 		}
 		return cmd
 	}
+	return m.copyFilePath(full)
+}
+
+// copyFilePath puts a path from the listing on the clipboard. A file row's
+// open and the copy_path action both end here, so the two copy the same way.
+func (m *OS) copyFilePath(full string) tea.Cmd {
 	m.ShowNotification("Copied the path.", "success", m.Settings.NotificationDuration)
 	return tea.SetClipboard(full)
 }
@@ -984,16 +994,6 @@ func paneBusyReason(window *terminal.Window) (string, bool) {
 	return "", true
 }
 
-// shellQuote wraps a path in single quotes for a POSIX shell, escaping any
-// single quote in it the way a shell requires: close, escape, reopen.
-//
-// The path came off a filesystem, so it may hold a space, a quote, a newline or
-// a semicolon, and the string is about to be typed at a prompt. Quoting is
-// what keeps a directory called "; rm -rf ~" from being two commands.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 // cdRefusedMessage is what the dock says when cdLine refuses a folder.
 const cdRefusedMessage = "tuios did not type a cd. The folder name holds a quote, a backslash or a control character."
 
@@ -1058,7 +1058,7 @@ const cdUnseenMessage = "tuios did not type a cd. It can not see that the shell 
 // cdLine is the cd command tuios types to move a shell to dir, or false when
 // dir must not be typed at all.
 //
-// shellQuote is correct for a POSIX shell, and the shell in a pane is not
+// Single quoting is correct for a POSIX shell, and the shell in a pane is not
 // always one. fish reads \' inside single quotes as an escaped quote, so the
 // POSIX escape for a quote ends the quoting there, and the rest of the name
 // runs as commands. No single quoting is right for every shell, so a folder

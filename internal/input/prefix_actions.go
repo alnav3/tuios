@@ -51,23 +51,30 @@ func (d *ActionDispatcher) registerPrefixHandlers() {
 	d.Register("prefix_command_palette", handleOpenCommandPalette)
 	d.Register("prefix_file_search", handleOpenFileSearch)
 	d.Register("prefix_toggle_sidebar", handlePrefixToggleSidebar)
+	d.Register("prefix_toggle_other_rail", handlePrefixToggleOtherSidebar)
 	d.Register("prefix_session_switcher", handlePrefixSessionSwitcher)
 	d.Register("prefix_workspace_switcher", handlePrefixWorkspaceSwitcher)
+	d.Register("choose_tree", handleChooseTree)
+	d.Register("goto_picker", handleGotoPicker)
 	d.Register("prefix_explore", handleToggleFocusSidebar)
 	d.Register("prefix_jump_notif", handlePrefixJumpNotif)
 	d.Register("prefix_last_message", handlePrefixLastMessage)
 	d.Register("prefix_mail", handlePrefixMail)
 	d.Register("prefix_inbox", handlePrefixInbox)
+	d.Register("prefix_transfers", handlePrefixTransfers)
 	d.Register("prefix_next_attention", handlePrefixNextAttention)
 	d.Register("prefix_review", handlePrefixReview)
 	d.Register("prefix_next_finished", handlePrefixNextFinished)
+	d.Register("prefix_agents_settings", handlePrefixAgentsSettings)
 	d.Register("prefix_detach", handlePrefixDetach)
 	d.Register("prefix_close_session", handlePrefixCloseSession)
 	d.Register("prefix_exit_mode", handlePrefixExitMode)
 	d.Register("prefix_quit", handlePrefixQuit)
 	d.Register("hints", handleOpenHints)
 	d.Register("toggle_scratch", handleToggleScratch)
+	d.Register(config.ActionEditScrollback, handleEditScrollback)
 	d.Register("hints_all_panes", handleOpenHintsAllPanes)
+	d.Register("display_panes", handleDisplayPanes)
 	d.Register(config.ActionCopyModeSearchForward, handleCopyModeSearchForward)
 	d.Register(config.ActionCopyModeSearchBackward, handleCopyModeSearchBackward)
 
@@ -79,6 +86,7 @@ func (d *ActionDispatcher) registerPrefixHandlers() {
 	d.Register("prefix_debug", makeSubPrefixHandler(func(o *app.OS) { o.DebugPrefixActive = true }))
 	d.Register("prefix_tape", makeSubPrefixHandler(func(o *app.OS) { o.TapePrefixActive = true }))
 	d.Register("prefix_layout", makeSubPrefixHandler(func(o *app.OS) { o.LayoutPrefixActive = true }))
+	d.Register("prefix_tuios", makeSubPrefixHandler(func(o *app.OS) { o.TuiosPrefixActive = true }))
 
 	// Window prefix (leader, t, ...)
 	d.Register("window_prefix_new", handleNewWindow)
@@ -88,6 +96,7 @@ func (d *ActionDispatcher) registerPrefixHandlers() {
 	d.Register("window_prefix_prev", handlePrefixPrevWindow)
 	d.Register("window_prefix_tiling", handleToggleTiling)
 	d.Register("window_prefix_cancel", handlePrefixCancel)
+	d.registerPrefixTreeHandlers()
 
 	// Minimize prefix (leader, m, ...)
 	d.Register("minimize_prefix_focused", handleMinimizeFocused)
@@ -188,6 +197,12 @@ func handlePrefixCancel(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 }
 
 func handlePrefixCloseWindow(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarSessionFocused() {
+		if w := o.SidebarSessionWindow(); w != nil {
+			o.SidebarSessionIntent("CloseWindow", w.ID)
+		}
+		return o, nil
+	}
 	if len(o.Windows) == 0 || o.FocusedWindow < 0 {
 		return o, nil
 	}
@@ -268,6 +283,10 @@ func handlePrefixKeybinds(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 }
 
 func handlePrefixNextWindow(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarSessionFocused() {
+		o.SidebarSessionIntent("NextWindow")
+		return o, nil
+	}
 	prev := o.FocusedWindow
 	if len(o.Windows) > 0 {
 		o.CycleToNextVisibleWindow()
@@ -277,6 +296,10 @@ func handlePrefixNextWindow(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 }
 
 func handlePrefixPrevWindow(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if o.SidebarSessionFocused() {
+		o.SidebarSessionIntent("PrevWindow")
+		return o, nil
+	}
 	prev := o.FocusedWindow
 	if len(o.Windows) > 0 {
 		o.CycleToPreviousVisibleWindow()
@@ -324,6 +347,8 @@ func handlePrefixFullscreen(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	o.ToggleZoom()
 	if fw := o.GetFocusedWindow(); fw != nil && fw.Zoomed {
 		o.ShowNotification("ZOOM", "info", o.Settings.NotificationDuration)
+	} else {
+		o.ClearNotification("ZOOM")
 	}
 	return o, nil
 }
@@ -338,6 +363,11 @@ func handlePrefixSelection(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 func handlePrefixScrollback(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	OpenScrollbackBrowser(o)
 	return o, nil
+}
+
+// handleEditScrollback opens the focused pane's scrollback in the editor.
+func handleEditScrollback(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	return o, o.EditScrollbackInEditor()
 }
 
 // handlePrefixScreenshot opens capture mode from the leader. The entry is
@@ -356,6 +386,15 @@ func handlePrefixToggleSidebar(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) 
 		state = "on"
 	}
 	o.ShowNotification("Sidebar "+state, "success", o.Settings.NotificationDuration)
+	return o, nil
+}
+
+func handlePrefixToggleOtherSidebar(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	state := "off"
+	if o.ToggleOtherSidebar() {
+		state = "on"
+	}
+	o.ShowNotification("Opposite sidebar "+state, "success", o.Settings.NotificationDuration)
 	return o, nil
 }
 
@@ -385,6 +424,12 @@ func handlePrefixMail(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 
 func handlePrefixInbox(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	o.OpenInbox("")
+	return o, nil
+}
+
+// handlePrefixAgentsSettings opens the settings page on its Agents tab.
+func handlePrefixAgentsSettings(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.OpenAgentsSettings()
 	return o, nil
 }
 
@@ -441,8 +486,7 @@ func handlePrefixDetach(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // It raises the same confirmation rather than closing outright, so the two
 // devices cannot disagree about how much warning the action carries.
 func handlePrefixCloseSession(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
-	o.OpenSessionClose()
-	return o, nil
+	return o, o.OpenSessionClose()
 }
 
 func handlePrefixExitMode(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {

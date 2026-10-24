@@ -8,7 +8,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// Dialog is a hairline micro-dialog: a rounded muted frame with its title set
+// Dialog is a hairline micro-dialog: a muted frame with its title set
 // into the top border, its key hints set into the bottom border, and an
 // interior on bare canvas.
 //
@@ -42,12 +42,38 @@ func DialogFitWidth(preferred, screenW int) int {
 	return max(min(preferred, screenW-2), 1)
 }
 
-// dialogFrame returns the corner, horizontal and vertical border glyphs.
+// dialogFrame returns the corner, horizontal and vertical border glyphs: the
+// pushed Frame (see SetFrame), or the rounded built-in when none is pushed.
 func dialogFrame() (tl, tr, bl, br, h, v string) {
 	if UseASCII() {
 		return "+", "+", "+", "+", "-", "|"
 	}
+	if f := frame.Load(); f != nil {
+		return f.TopLeft, f.TopRight, f.BottomLeft, f.BottomRight, f.Horizontal, f.Vertical
+	}
 	return "╭", "╮", "╰", "╯", "─", "│"
+}
+
+// edgeFrame is dialogFrame for a frame that is the only edge its surface has:
+// a Box inside a panel, or a panel at 16 colours, whose ground is the
+// terminal's own. A blank frame (the hidden border style) would leave such a
+// surface with no edge at all, so it draws the rounded frame instead. A dialog
+// and a filled panel keep the blank frame, because their fill is an edge.
+func edgeFrame() (tl, tr, bl, br, h, v string) {
+	tl, tr, bl, br, h, v = dialogFrame()
+	if strings.TrimSpace(tl+tr+bl+br+h+v) == "" {
+		return "╭", "╮", "╰", "╯", "─", "│"
+	}
+	return tl, tr, bl, br, h, v
+}
+
+// panelFrame is the frame a framed panel draws: edgeFrame at 16 colours,
+// where the frame is the panel's only edge, else dialogFrame.
+func panelFrame(pal Palette) (tl, tr, bl, br, h, v string) {
+	if pal.Depth == Depth16 {
+		return edgeFrame()
+	}
+	return dialogFrame()
 }
 
 // DashRule returns a dashed internal separator, the micro-dialog's answer to a
@@ -128,21 +154,22 @@ func Cursor(ch string, bg, fg color.Color) string {
 	return Style(bg).Foreground(fg).Reverse(true).Render(ch)
 }
 
-// hintStrip renders key hints for a border: keys bright and bold, labels muted,
-// two cells between pairs.
-func hintStrip(hints []Hint, bg color.Color, pal Palette) (string, int) {
-	if len(hints) == 0 {
+// FitHintStrip renders key hints as one line on the given background, in the
+// shape every footer uses, no wider than width. It fits the hints by the
+// tiers a panel footer uses (see fitHints): modifier names shortened, then
+// whole hints dropped by priority. A key or a label is never cut in the
+// middle, and the esc hint stays. It returns the strip and its width. It is
+// for a surface with a fixed room for a mode's keys, such as the dock.
+func FitHintStrip(hints []Hint, width int, bg color.Color, pal Palette) (string, int) {
+	if len(hints) == 0 || width <= 0 {
 		return "", 0
 	}
-	return renderHints(fittedHints{Hints: hints}, dialogSep, bg, pal)
+	return renderHints(fitHints(hints, width, dialogSep), dialogSep, bg, pal)
 }
 
-// HintStrip renders key hints as one line on the given background, in the shape
-// every footer uses. It is for the surfaces that carry hints outside a panel of
-// their own, so they say what a key does the same way the panels do.
-func HintStrip(hints []Hint, bg color.Color, pal Palette) string {
-	s, _ := hintStrip(hints, bg, pal)
-	return s
+// HintStripWidth is the width FitHintStrip draws hints at, with none dropped.
+func HintStripWidth(hints []Hint) int {
+	return hintsWidth(hints, dialogSep, false)
 }
 
 // Render assembles the dialog and returns the rendered string plus the geometry

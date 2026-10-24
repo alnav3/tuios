@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -99,6 +100,12 @@ func (f *fakeDaemon) Call(verb string, params any) (json.RawMessage, error) {
 			return json.Marshal(map[string]any{"pane": false})
 		}
 		return json.Marshal(f.grants)
+	}
+	switch verb {
+	case "list-buffers", "show-buffer", "set-buffer", "delete-buffer":
+		// The fake is a daemon from before the buffer verbs, so the shim
+		// keeps its own buffers. The e2e suite covers the daemon's.
+		return nil, codedErr{code: "unknown_verb"}
 	}
 	if verb == "list-sessions" {
 		if f.noAdmin {
@@ -321,9 +328,9 @@ func (f *fakeDaemon) verbs() []string {
 // last returns the last call of verb, failing the test when there is none.
 func (f *fakeDaemon) last(verb string) map[string]any {
 	f.t.Helper()
-	for i := len(f.calls) - 1; i >= 0; i-- {
-		if f.calls[i].verb == verb {
-			return f.calls[i].params
+	for _, v := range slices.Backward(f.calls) {
+		if v.verb == verb {
+			return v.params
 		}
 	}
 	f.t.Fatalf("no %s call; calls were %v", verb, f.verbs())

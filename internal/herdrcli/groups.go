@@ -6,7 +6,7 @@ import (
 )
 
 // herdr's tab, workspace, agent, worktree, notification, api and server
-// commands, from src/cli at v0.9.3.
+// commands, from src/cli at v0.9.5.
 
 // valueFlags reads flags that each take one value into p under the flag's
 // name less "--" with "-" made "_", and --focus and --no-focus into focus.
@@ -305,10 +305,8 @@ func agentWait(args []string) (*Call, *UsageError) {
 	if len(args) == 0 {
 		return nil, usage(usageLine)
 	}
-	for _, a := range args[1:] {
-		if a == "help" {
-			return nil, &UsageError{Msg: usageLine, Code: 0}
-		}
+	if slices.Contains(args[1:], "help") {
+		return nil, &UsageError{Msg: usageLine, Code: 0}
 	}
 	p := map[string]any{"target": args[0]}
 	if err := untilTimeout(args[1:], p, nil); err != nil {
@@ -584,7 +582,7 @@ func parseServer(sub string, args []string, _ Env, _ string) (*Call, *UsageError
 	return nil, &UsageError{Msg: groupHelp["server"], Code: 2}
 }
 
-// herdrAgentKinds are the agent names herdr 0.9.3 starts (lookup_agent in
+// herdrAgentKinds are the agent names herdr 0.9.5 starts (lookup_agent in
 // src/detect/mod.rs). herdr refuses any other kind before it sends anything.
 var herdrAgentKinds = []string{
 	"pi", "claude", "claude-code", "codex", "gemini", "cursor", "cursor-agent",
@@ -609,4 +607,82 @@ func herdrAgentKind(kind string) bool {
 		return true
 	}
 	return slices.Contains(herdrAgentKinds, name)
+}
+
+// terminalTitleUsage is herdr's usage of terminal title.
+const terminalTitleUsage = "usage: herdr terminal title set <title>\n       herdr terminal title clear"
+
+// parseTerminal is herdr's terminal command. title sets the title of the
+// terminal the tuios client runs in. attach and session use herdr's client
+// protocol, which tuios does not serve.
+func parseTerminal(sub string, args []string, _ Env, _ string) (*Call, *UsageError) {
+	switch sub {
+	case "title":
+		switch {
+		case len(args) == 2 && args[0] == "set":
+			return call("cli:terminal:title:set", "client.window_title.set", map[string]any{"title": args[1]}), nil
+		case len(args) == 1 && args[0] == "clear":
+			return call("cli:terminal:title:clear", "client.window_title.clear", nil), nil
+		case len(args) == 1 && (args[0] == "help" || args[0] == "--help" || args[0] == "-h"):
+			return nil, &UsageError{Msg: terminalTitleUsage, Code: 0}
+		}
+		return nil, usage(terminalTitleUsage)
+	case "attach", "session":
+		return local("cli:terminal:"+sub, "herdr terminal "+sub+" uses herdr's client protocol, which tuios does not serve. Use tuios attach"), nil
+	}
+	return nil, &UsageError{Msg: groupHelp["terminal"], Code: 2}
+}
+
+// statusUsage is herdr's help for status.
+const statusUsage = "herdr status commands:\n  herdr status [--json]         show local client and running server status\n  herdr status server [--json]  show running server status\n  herdr status client [--json]  show local client binary status"
+
+// parseStatus is herdr's status command. Tools run `herdr status server` to
+// learn whether a server answers, so the front pings tuios's herdr socket
+// and reports what it finds in herdr's words.
+func parseStatus(sub string, args []string, _ Env, _ string) (*Call, *UsageError) {
+	return statusCall(append([]string{sub}, args...))
+}
+
+// statusCall reads status's arguments, after the command name.
+func statusCall(all []string) (*Call, *UsageError) {
+	scope, json := "", false
+	switch {
+	case len(all) == 0:
+	case len(all) == 1 && all[0] == "--json":
+		json = true
+	case all[0] == "server" || all[0] == "client":
+		scope = all[0]
+		switch {
+		case len(all) == 1:
+		case len(all) == 2 && all[1] == "--json":
+			json = true
+		default:
+			return nil, usage("usage: herdr status " + scope + " [--json]")
+		}
+	case len(all) == 1 && (all[0] == "help" || all[0] == "--help" || all[0] == "-h"):
+		return nil, &UsageError{Msg: statusUsage, Code: 0}
+	default:
+		return nil, usage(statusUsage)
+	}
+	return &Call{ID: "cli:status", Method: "ping", Params: map[string]any{"json": json}, Output: OutStatus, Text: scope}, nil
+}
+
+// parseSession is herdr's session command. Tools run `herdr session list
+// --json` to find the socket of each herdr server. tuios has one daemon, so
+// the list holds one session, default, at the socket the front talks to.
+// The other subcommands start, stop or delete herdr's own servers.
+func parseSession(sub string, args []string, _ Env, _ string) (*Call, *UsageError) {
+	switch sub {
+	case "list":
+		switch {
+		case len(args) == 0:
+			return &Call{ID: "cli:session:list", Method: "ping", Params: map[string]any{"json": false}, Output: OutSessions}, nil
+		case len(args) == 1 && args[0] == "--json":
+			return &Call{ID: "cli:session:list", Method: "ping", Params: map[string]any{"json": true}, Output: OutSessions}, nil
+		}
+		return nil, usage("usage: herdr session list [--json]")
+	case "attach", "stop", "delete":
+		return local("cli:session:"+sub, "herdr session "+sub+" acts on herdr's own servers. tuios runs one daemon: use tuios attach, tuios kill-server and tuios kill-session"), nil
+	}
+	return nil, &UsageError{Msg: groupHelp["session"], Code: 2}
 }

@@ -265,12 +265,8 @@ func (kp *KittyPassthrough) RefreshAllPlacements(getAllWindows func() map[string
 			kp.heldGeom[windowID] = g
 		}
 		if info == nil {
-			for _, p := range placements {
-				if !p.Hidden {
-					kp.deleteOnePlacement(p)
-				}
-			}
-			delete(kp.placements, windowID)
+			kp.deleteWindowImages(windowID, true)
+			kp.dropWindowPlacements(windowID)
 			delete(kp.resizeFreezeSize, windowID)
 			continue
 		}
@@ -314,14 +310,22 @@ func (kp *KittyPassthrough) RefreshAllPlacements(getAllWindows func() map[string
 		// room for the pieces it can add, so a marquee dragged across an
 		// image keeps the whole picture outside its edges rather than falling
 		// back to the largest single rectangle.
-		sliceLimit := maxVisibleSlices + 3*len(kp.chromeOccluders)
+		// A placement has placementStride host ids for its slices.
+		sliceLimit := min(maxVisibleSlices+3*len(kp.chromeOccluders), int(placementStride))
 		// Reused for every image in this window, and across frames.
 		slices := kp.sliceScratch[:0]
 
 		// Collect IDs to delete (for altscreen cleanup)
-		var idsToDelete []uint32
+		var idsToDelete []placementKey
 
-		for hostID, p := range placements {
+		for key, p := range placements {
+			hostID := key.host
+			// An a=p record whose rows a reflow moved above the oldest
+			// line of history can never be on screen again.
+			if key.slot != 0 && p.AbsoluteLine+max(p.Rows, 1) <= 0 {
+				kp.evictPlacement(windowID, key)
+				continue
+			}
 			// Handle screen mode mismatch:
 			// - Images placed on normal screen should be hidden when altscreen is active
 			// - Images placed on altscreen should be DELETED when back to normal screen
@@ -337,7 +341,7 @@ func (kp *KittyPassthrough) RefreshAllPlacements(getAllWindows func() map[string
 				// This cleans up images from TUI apps like yazi when they exit
 				if !info.IsAltScreen && p.PlacedOnAltScreen {
 					kittyPassthroughLog("RefreshPlacement: cleaning up altscreen placement hostID=%d", hostID)
-					idsToDelete = append(idsToDelete, hostID)
+					idsToDelete = append(idsToDelete, key)
 				}
 				continue
 			}
@@ -545,6 +549,20 @@ func (kp *KittyPassthrough) RefreshAllPlacements(getAllWindows func() map[string
 				// DataDirty is the streaming case: the position is unchanged
 				// but the image behind it was replaced, and the host will not
 				// redraw a placement whose image was swapped underneath it.
+				// forwardPlace sent this one already. If that is what
+				// this pass would draw, it is not sent again.
+				if p.sentAsIs {
+					p.sentAsIs = false
+					if !p.Hidden && !p.DataDirty && len(slices) == 1 &&
+						clipTop == 0 && clipBottom == 0 && clipLeft == 0 &&
+						newHostX == p.HostX && newHostY == p.HostY &&
+						maxShowableCols == p.Cols && maxShowableRows == p.DisplayRows {
+						p.Slices = append(p.Slices[:0], slices...)
+						p.MaxShowable, p.MaxShowableCols = maxShowableRows, maxShowableCols
+						p.placedSlices = 1
+						continue
+					}
+				}
 				posChanged := p.Hidden || p.DataDirty || p.HostX != newHostX || p.HostY != newHostY ||
 					p.ClipTop != clipTop || p.ClipBottom != clipBottom || p.ClipLeft != clipLeft ||
 					p.MaxShowable != maxShowableRows || p.MaxShowableCols != maxShowableCols ||
@@ -573,7 +591,7 @@ func (kp *KittyPassthrough) RefreshAllPlacements(getAllWindows func() map[string
 
 		// Clean up altscreen placements that are no longer needed
 		for _, id := range idsToDelete {
-			delete(placements, id)
+			kp.dropPlacement(windowID, id)
 		}
 	}
 }
@@ -651,6 +669,19 @@ func (kp *KittyPassthrough) SetChromeOccluders(rects []cellRect) {
 	kp.chromeOccluders = append(kp.chromeOccluders[:0], rects...)
 }
 
+// replaceChromeOccluders sets the chrome occluders as SetChromeOccluders does,
+// and reports whether the placements need laying out again for it: the set
+// changed and images are showing.
+func (kp *KittyPassthrough) replaceChromeOccluders(rects []cellRect) bool {
+	kp.mu.Lock()
+	defer kp.mu.Unlock()
+	if slices.Equal(kp.chromeOccluders, rects) {
+		return false
+	}
+	kp.chromeOccluders = append(kp.chromeOccluders[:0], rects...)
+	return kp.enabled && !kp.overlayActive
+}
+
 // overlapsChrome reports whether a rectangle touches any chrome occluder.
 func (kp *KittyPassthrough) overlapsChrome(r cellRect) bool {
 	return slices.ContainsFunc(kp.chromeOccluders, r.overlaps)
@@ -681,8 +712,15 @@ func (kp *KittyPassthrough) HideAllPlacements() {
 	kp.flushToHost()
 }
 
-// deleteOnePlacement removes the image and all its placements from graphics memory.
+// deleteOnePlacement takes a placement down. A placement that shares its
+// image with others takes down only its own host placement ids. The image's
+// own placement, alone, takes down every placement of the image, which also
+// clears one the host was given without a p=.
 func (kp *KittyPassthrough) deleteOnePlacement(p *PassthroughPlacement) {
+	if p.slot != 0 || kp.sharesImage(p) {
+		kp.deletePlacementIDs(p)
+		return
+	}
 	if !kp.guestCapture {
 		// tuios is hiding this image itself; a held placement must not
 		// show it again. See kitty_sync_hold.go.
@@ -717,10 +755,7 @@ func (kp *KittyPassthrough) placeSlices(p *PassthroughPlacement) {
 		return
 	}
 
-	base := p.PlacementID
-	if base == 0 {
-		base = 1
-	}
+	base := kp.placementBaseFor(p)
 	// Saved because placeOne reads the placement's own fields, and the slices
 	// are what is being drawn this pass rather than what the image is.
 	saved := placementSlice{
@@ -764,9 +799,7 @@ func (kp *KittyPassthrough) placeOne(p *PassthroughPlacement) {
 	// Use a stable, non-zero placement ID so we can delete the previous
 	// placement unambiguously before creating a new one. Kitty's a=p with
 	// the same (i, p) replaces. Without p, kitty can stack placements.
-	if p.PlacementID == 0 {
-		p.PlacementID = 1
-	}
+	kp.placementBaseFor(p)
 
 	var buf bytes.Buffer
 	buf.WriteString("\x1b7") // Save cursor position

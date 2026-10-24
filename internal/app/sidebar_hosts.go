@@ -28,16 +28,13 @@ import (
 // The daemon pushes MsgHostsChanged when its table changes, which is what
 // starts the poll again when the first host is added.
 //
-// The second rule is that a row stays where it is. Switching onto a session on
-// build used to make build the main group at the top of the section and push
-// this machine's sessions down into a group of their own, so the row the user
-// had just clicked moved out from under the pointer and every other row moved
-// with it. Now the machine groups keep one order whatever the client is
-// attached to: this machine first, then the other machines in the daemon's
-// sorted order, overlaid with the order the user dragged them into. The
-// attached session is marked current in place, under whichever machine holds
-// it, which is the same promise BuildSessionTree makes for a session switch on
-// one machine.
+// The second rule is that a row stays where it is, so the row the user has just
+// clicked never moves out from under the pointer. The machine groups keep one
+// order whatever the client is attached to: this machine first, then the other
+// machines in the daemon's sorted order, overlaid with the order the user
+// dragged them into. The attached session is marked current in place, under
+// whichever machine holds it, which is the same promise BuildSessionTree makes
+// for a session switch on one machine.
 
 const (
 	// hostRefreshActive is the poll interval while the rail or the switcher is
@@ -74,6 +71,20 @@ type FederationHost struct {
 	// Queued is how many messages the daemon holds for the machine until its
 	// link is back.
 	Queued int
+	// ApprovalURL is the Tailscale sign-in page the link waits on, set only
+	// while Status is federation.StatusApproval and the link has one.
+	ApprovalURL string
+	// ApprovalRefused says the banner named a sign-in address that is not a
+	// Tailscale login origin, so there is no page to open.
+	ApprovalRefused bool
+	// Cores and Load1 are the machine's CPUs and one-minute load from the
+	// last hello on its link, and RTTMillis that hello's round trip. Cores is
+	// 0 until a hello carried a load.
+	Cores int
+	Load1 float64
+	// LoadOK says Load1 was read: false when the machine reads no load.
+	LoadOK    bool
+	RTTMillis int64
 }
 
 // FederationSession is one session on another machine, as that machine
@@ -92,6 +103,23 @@ type FederationSession struct {
 	// machine that is not there is not evidence about what its agents are
 	// doing now.
 	AgentState string
+	// Agents are the session's agent panes, which the agents view draws as
+	// rows of their own. Empty from a daemon that does not send them.
+	Agents []FederationAgent
+}
+
+// FederationAgent is one agent pane of a session on another machine, as the
+// daemon passed it on.
+type FederationAgent struct {
+	ID        string                  `json:"id"`
+	Title     string                  `json:"title"`
+	State     string                  `json:"state"`
+	StateAt   int64                   `json:"state_at"`
+	Harness   string                  `json:"harness"`
+	Message   string                  `json:"message"`
+	Kind      string                  `json:"kind"`
+	Meta      []sessiontree.MetaToken `json:"meta"`
+	Subagents int                     `json:"subagents"`
 }
 
 // FederationHostsMsg carries a fresh snapshot back to the Update goroutine.
@@ -104,6 +132,8 @@ type FederationHostsMsg struct {
 	// live. The rail then waits for the push instead of polling. A host whose
 	// tuios is too old to stream, or a daemon too old to push, keeps the poll.
 	Pushed bool
+	// Local is the load of the daemon's own machine, from list-hosts.
+	Local federation.Load
 }
 
 // FederationRefreshTickMsg re-arms the poll.
@@ -138,6 +168,17 @@ func (m *OS) federationRefreshPlan() (after time.Duration, refresh bool) {
 	if !m.federationPolling {
 		return hostRefreshIdle, false
 	}
+	// The person just opened a Tailscale sign-in page. The link comes up
+	// when they sign in, and the rail must say so in seconds. A status change
+	// is pushed, so this is the backstop for a push that does not arrive.
+	if m.hostSignInWatching() {
+		return hostRefreshActive, true
+	}
+	// A rail click waits for this machine's link. The session opens on the
+	// snapshot that says the link is up, so the poll runs fast until then.
+	if m.hostOpen != nil && !m.hostOpen.dialing {
+		return hostOpenPoll, true
+	}
 	// The push arrives on the attach connection. While the client is attached
 	// to another machine that connection goes to the far daemon, not to the
 	// one that pushes, so the rail keeps its poll.
@@ -162,8 +203,7 @@ func refreshFederationCmd() tea.Cmd {
 		client, err := session.DialVerbClient()
 		if err != nil {
 			// The daemon is the only thing that knows about hosts. If it cannot
-			// be reached the rail simply shows no host groups, which is what it
-			// showed before this existed.
+			// be reached the rail simply shows no host groups.
 			return FederationHostsMsg{}
 		}
 		defer func() { _ = client.Close() }()
@@ -178,12 +218,13 @@ func refreshFederationCmd() tea.Cmd {
 				Status   string `json:"status"`
 				Reason   string `json:"reason"`
 				Sessions []struct {
-					Name        string `json:"name"`
-					DisplayName string `json:"display_name"`
-					WindowCount int    `json:"window_count"`
-					Attached    bool   `json:"attached"`
-					Global      bool   `json:"global"`
-					AgentState  string `json:"agent_state"`
+					Name        string            `json:"name"`
+					DisplayName string            `json:"display_name"`
+					WindowCount int               `json:"window_count"`
+					Attached    bool              `json:"attached"`
+					Global      bool              `json:"global"`
+					AgentState  string            `json:"agent_state"`
+					Agents      []FederationAgent `json:"agents"`
 				} `json:"sessions"`
 			} `json:"hosts"`
 		}
@@ -199,11 +240,18 @@ func refreshFederationCmd() tea.Cmd {
 		msg := FederationHostsMsg{}
 		lastOK := map[string]int64{}
 		queued := map[string]int{}
-		reports, pushes := hostStatusReports(client)
+		signIn := map[string]string{}
+		signInRefused := map[string]bool{}
+		reports, pushes, local := hostStatusReports(client)
+		msg.Local = local
+		loads := map[string]federation.HostReport{}
 		msg.Pushed = pushes
 		for _, h := range reports {
 			lastOK[h.Host] = h.LastOK
+			loads[h.Host] = h
 			queued[h.Host] = h.Queued
+			signIn[h.Host] = h.ApprovalURL
+			signInRefused[h.Host] = h.ApprovalRefused
 			if h.Status == federation.StatusUp && h.Events != "live" {
 				msg.Pushed = false
 			}
@@ -212,7 +260,10 @@ func refreshFederationCmd() tea.Cmd {
 			if h.Host != federation.LocalHostName {
 				msg.Configured++
 			}
-			fh := FederationHost{Name: h.Host, Status: h.Status, Reason: h.Reason, LastOK: lastOK[h.Host], Queued: queued[h.Host]}
+			fh := FederationHost{Name: h.Host, Status: h.Status, Reason: h.Reason, LastOK: lastOK[h.Host], Queued: queued[h.Host], ApprovalURL: signIn[h.Host], ApprovalRefused: signInRefused[h.Host]}
+			if r := loads[h.Host]; r.Cores > 0 {
+				fh.Cores, fh.Load1, fh.RTTMillis, fh.LoadOK = r.Cores, r.Load1, r.RTTMillis, r.LoadKnown()
+			}
 			for _, s := range h.Sessions {
 				fh.Sessions = append(fh.Sessions, FederationSession{
 					Name:        s.Name,
@@ -221,6 +272,7 @@ func refreshFederationCmd() tea.Cmd {
 					Attached:    s.Attached,
 					Global:      s.Global,
 					AgentState:  s.AgentState,
+					Agents:      s.Agents,
 				})
 			}
 			msg.Snapshot.Hosts = append(msg.Snapshot.Hosts, fh)
@@ -233,19 +285,24 @@ func refreshFederationCmd() tea.Cmd {
 // session listing does not carry, and whether the daemon pushes host changes. A
 // failure here costs the rail a relative time and its push, and it polls as it
 // always did.
-func hostStatusReports(client *session.VerbClient) ([]federation.HostReport, bool) {
+func hostStatusReports(client *session.VerbClient) ([]federation.HostReport, bool, federation.Load) {
 	raw, err := client.Call("list-hosts", nil)
 	if err != nil {
-		return nil, false
+		return nil, false, federation.Load{}
 	}
 	var res struct {
 		Hosts      []federation.HostReport `json:"hosts"`
 		EventsPush bool                    `json:"events_push"`
+		Load       *federation.Load        `json:"load"`
 	}
 	if json.Unmarshal(raw, &res) != nil {
-		return nil, false
+		return nil, false, federation.Load{}
 	}
-	return res.Hosts, res.EventsPush
+	var load federation.Load
+	if res.Load != nil {
+		load = *res.Load
+	}
+	return res.Hosts, res.EventsPush, load
 }
 
 // applyFederationSnapshot stores a snapshot the poll returned. It runs on the
@@ -254,6 +311,7 @@ func (m *OS) applyFederationSnapshot(msg FederationHostsMsg) {
 	m.federationPolling = msg.Configured > 0
 	m.federationPushed = msg.Pushed
 	m.FederationHosts = msg.Snapshot.Hosts
+	m.LocalLoad = msg.Local
 	m.federationGen++
 }
 
@@ -730,7 +788,7 @@ func (m *OS) drawHostRow(
 		st.Cursor = st.Cursor || isCursor(sidebarRowHost, GlobalSessionName, "")
 		add := ""
 		if !collapsed {
-			labelW := sidebarHeaderLabelW(m.Settings.GetRailFoldOpenGlyph() + " " + node.Title)
+			labelW := sidebarHeaderLabelW(m.Settings.GetRailFoldOpenGlyph()+" "+node.Title, nil)
 			if tok, span, ok := sidebarHeaderAdd(sidebarRowGlobalNew, cw, labelW, pal,
 				headerHoverX, isCursor(sidebarRowGlobalNew, GlobalSessionName, ""), &m.Settings,
 				sidebarRowBg(st, pal)); ok {
@@ -754,7 +812,7 @@ func (m *OS) drawHostRow(
 			if node.Host == m.attachedMachine() {
 				kind, id = sidebarRowNewSession, ""
 			}
-			labelW := sidebarHeaderLabelW(m.Settings.GetRailFoldOpenGlyph() + " " + node.Title)
+			labelW := sidebarHeaderLabelW(m.Settings.GetRailFoldOpenGlyph()+" "+node.Title, nil)
 			if kind != sidebarRowNewSession || canCreate {
 				if tok, span, ok := sidebarHeaderAdd(kind, cw, labelW, pal,
 					headerHoverX, isCursor(kind, id, ""), &m.Settings,
@@ -764,35 +822,35 @@ func (m *OS) drawHostRow(
 				}
 			}
 		}
+		lit := false
+		if node.HostStatus == string(federation.StatusApproval) {
+			// The "sign in" label is a control of its own, as the "+" is on
+			// a host that is up: it opens the sign-in page, and the rest of
+			// the header still folds the group.
+			figure, _ := hostDownFigure(node, lipgloss.Width(printableTitle(node.Title)), cw)
+			if w := lipgloss.Width(figure); w > 0 && cw-1-w > 0 {
+				span := sidebarTokenSpan{Kind: sidebarRowHostSignIn, X0: cw - 1 - w, X1: cw - 1}
+				lit = isCursor(sidebarRowHostSignIn, node.Host, "") || (headerHoverX >= span.X0 && headerHoverX < span.X1)
+				recordToken(span, node.Host)
+			}
+		}
 		recordHit(sidebarRowHost, node.Host, "", -1, 1)
-		*lines = append(*lines, compose(st.mark(pal, m.sidebarHostRow(node, cw, pal, add, st, collapsed))))
+		*lines = append(*lines, compose(st.mark(pal, m.sidebarHostRowLit(node, cw, pal, add, st, collapsed, lit))))
 		return
 	}
 
-	// A session row. It is a target only when its host is up.
-	if m.hostIsUp(node.Host) {
-		st.Cursor = st.Cursor || isCursor(sidebarRowHostSession, node.Host, remoteSessionName(node))
-		recordHit(sidebarRowHostSession, node.Host, remoteSessionName(node), -1, 1)
-	}
+	// A session row. It is a target in every link state: a click on a host
+	// that is not up asks for the link and opens the session when it comes
+	// up. See host_open.go.
+	st.Cursor = st.Cursor || isCursor(sidebarRowHostSession, node.Host, remoteSessionName(node))
+	recordHit(sidebarRowHostSession, node.Host, remoteSessionName(node), -1, 1)
 	*lines = append(*lines, compose(st.mark(pal, m.sidebarRemoteSessionRow(node, cw, variant, pal, st, showCounts))))
-}
-
-// openRemoteSession attaches a session that lives on another machine, in this
-// client. The connection goes through this machine's daemon over its link,
-// and the session is drawn here with this machine's theme and config. See
-// SwitchToHostSession.
-func (m *OS) openRemoteSession(host, sessionName string) {
-	if !m.hostIsUp(host) {
-		m.reportSwitchFailure(&hostUnavailableError{host: host})
-		return
-	}
-	m.clearSidebarReturn() // opening the session is where the user asked to end up
-	m.openSession(host, sessionName)
 }
 
 // createRemoteSession creates a session on another machine and attaches it in
 // this client. The host's daemon creates it under the first free name.
 func (m *OS) createRemoteSession(host string) {
+	m.cancelHostOpen()
 	if !m.hostIsUp(host) {
 		m.ShowNotification(host+" is unavailable", "warning", m.Settings.NotificationWarningDuration)
 		return
@@ -802,7 +860,18 @@ func (m *OS) createRemoteSession(host string) {
 		m.ShowNotification(hostAttachRefusal(host, err), "error", m.Settings.NotificationDuration*3)
 		return
 	}
-	m.applyStartupTiling()
+	m.applyStartupToUnarranged()
+}
+
+// localSessionIndexes maps a local session's id to its 1-based position in the
+// local rail, the number switch_session_N opens. Remote sessions are absent:
+// no number on this machine reaches them.
+func localSessionIndexes(nodes []sessiontree.Node) map[string]int {
+	indexes := make(map[string]int, len(nodes))
+	for i, s := range localSessionNodes(nodes) {
+		indexes[s.ID] = i + 1
+	}
+	return indexes
 }
 
 // localSessionNodes drops the other machines' rows from a tree's session list.
@@ -837,6 +906,10 @@ func hostStatusLabel(status string) string {
 		return "connecting"
 	case federation.StatusReconnecting:
 		return "reconnecting"
+	case federation.StatusApproval:
+		// Tailscale SSH waits for the person to sign in in a browser. A
+		// click or Enter on the header opens the page. See host_signin.go.
+		return "sign in"
 	default:
 		return "offline"
 	}
@@ -850,7 +923,7 @@ func hostStatusLabel(status string) string {
 func hostDownLabel(status string, lastOK int64, now time.Time) string {
 	label := hostStatusLabel(status)
 	switch federation.Status(status) {
-	case federation.StatusNoDaemon, federation.StatusNoBinary, federation.StatusIncompatible, federation.StatusConnecting:
+	case federation.StatusNoDaemon, federation.StatusNoBinary, federation.StatusIncompatible, federation.StatusConnecting, federation.StatusApproval:
 		return label
 	}
 	if lastOK > 0 {
@@ -889,6 +962,10 @@ func hostDownFigure(node sessiontree.Node, nameW, cw int) (figure string, nameRo
 	case federation.StatusConnecting, federation.StatusReconnecting:
 		// On its way up, not down: the mark would say the wrong thing.
 		last = ""
+	case federation.StatusApproval:
+		// Nothing is wrong with the machine. It waits for the person, so it
+		// keeps the mark an agent that needs you wears.
+		last = agentStateIndicator("needs_input")
 	}
 	if node.HostQueued > 0 {
 		queued := strconv.Itoa(node.HostQueued) + " queued"
@@ -923,6 +1000,13 @@ func hostDownFigure(node sessiontree.Node, nameW, cw int) (figure string, nameRo
 // host that is not answering keeps its row with one word saying why, because a
 // machine that vanished from the rail reads as a machine nobody configured.
 func (m *OS) sidebarHostRow(node sessiontree.Node, cw int, pal overlay.Palette, add string, st sidebarRowState, collapsed bool) string {
+	return m.sidebarHostRowLit(node, cw, pal, add, st, collapsed, false)
+}
+
+// sidebarHostRowLit is sidebarHostRow with the "sign in" control under the
+// keyboard cursor or the pointer when lit is true. It is then underlined, as
+// a link is, and keeps its colour.
+func (m *OS) sidebarHostRowLit(node sessiontree.Node, cw int, pal overlay.Palette, add string, st sidebarRowState, collapsed, lit bool) string {
 	rowBg := sidebarRowBg(st, pal)
 	up := node.HostStatus == string(federation.StatusUp)
 
@@ -939,7 +1023,17 @@ func (m *OS) sidebarHostRow(node sessiontree.Node, cw int, pal overlay.Palette, 
 		// hostDownFigure for how the word gives way on a narrow rail.
 		var label string
 		label, nameRoom = hostDownFigure(node, lipgloss.Width(title), cw)
-		right = sidebarStyle(rowBg, pal.FgMute).Render(label)
+		ink := pal.FgMute
+		if node.HostStatus == string(federation.StatusApproval) {
+			// A sign-in waits for the person, so it wears the colour of an
+			// agent that needs you, not the colour of an error.
+			ink = sidebarSeverityColor("needs_input", pal)
+		}
+		style := sidebarStyle(rowBg, ink)
+		if lit {
+			style = style.Underline(true)
+		}
+		right = style.Render(label)
 	case blocked > 0:
 		// How many of this machine's sessions want a person, in the strip
 		// badge's language. It outranks both the session count and the add
@@ -950,8 +1044,7 @@ func (m *OS) sidebarHostRow(node sessiontree.Node, cw int, pal overlay.Palette, 
 		// It is in this slot rather than in the fold mark's cell because that
 		// cell says which way the group is folded, and that has to keep
 		// working. A folded group is exactly when this figure matters most, so
-		// taking the mark's place would have hidden it in the one state it was
-		// added for.
+		// taking the mark's place would hide it in the one state it is for.
 		fig := strconv.Itoa(blocked) + agentStateIndicator(worst)
 		right = sidebarStyle(rowBg, sidebarSeverityColor(worst, pal)).Render(fig)
 		rightW = lipgloss.Width(fig)
@@ -967,18 +1060,16 @@ func (m *OS) sidebarHostRow(node sessiontree.Node, cw int, pal overlay.Palette, 
 	// A machine's name is secondary ink, and a machine that does not answer is
 	// muted with its rows.
 	//
-	// This used to be the full ink and bold, which made the heading the loudest
-	// thing on the rail. It is also the least actionable thing on the rail: you
-	// do not act on a machine, you act on a session under it. Emphasis should
-	// drain downward, so the session names are now the brightest ink and the
-	// heading sits one step under them.
+	// A heading is the least actionable thing on the rail: you do not act on a
+	// machine, you act on a session under it. Emphasis should drain downward,
+	// so the session names are the brightest ink and the heading sits one step
+	// under them.
 	//
-	// The objection to demoting it was real: FgDim on a machine and FgDim on
-	// the session under it are the same ink, and an ink step alone could not
-	// carry the distinction. It is not carried by ink now. The rule that runs
-	// out of the name to the right spine carries it, which is a different kind
-	// of mark rather than a louder one, so a heading still reads as a heading
-	// with colour switched off entirely.
+	// FgDim on a machine and FgDim on the session under it are the same ink,
+	// and an ink step alone cannot carry the distinction, so it is not carried
+	// by ink. The rule that runs out of the name to the right spine carries it,
+	// which is a different kind of mark rather than a louder one, so a heading
+	// still reads as a heading with colour switched off entirely.
 	here := node.Host == m.attachedMachine()
 	ink := pal.FgDim
 	if !up {
@@ -998,7 +1089,17 @@ func (m *OS) sidebarHostRow(node sessiontree.Node, cw int, pal overlay.Palette, 
 	// cost the name: the alarm outranks a label, a shut group's count is the
 	// only sign the fold is not empty, and the add control's click span is
 	// worked out before this row is drawn.
+	// A machine with a copy shows its progress at the end of the row,
+	// "→ 61%", in front of whatever else the row shows there.
 	if up {
+		if fig, w := m.transfersHostFigure(node.Host, rowBg, pal); w > 0 {
+			if right != "" {
+				right = fig + sidebarStyle(rowBg, nil).Render(" ") + right
+				rightW += w + 1
+			} else {
+				right, rightW = fig, w
+			}
+		}
 		nameRoom = sidebarNameAvail(cw, rightW)
 	}
 	name := sidebarStyle(rowBg, ink).Render(overlay.Truncate(title, nameRoom))
@@ -1059,7 +1160,7 @@ func (m *OS) sidebarRemoteSessionRow(node sessiontree.Node, cw, variant int, pal
 	// sessions you can reach.
 	glyph := sidebarStyle(rowBg, pal.FgMute).Render(m.Settings.GetRailBullet())
 	if m.hostIsUp(node.Host) && agentStateIndicator(node.AgentState) != "" {
-		glyph = sidebarGlyph(node.AgentState, node.DoneSeen, rowBg, pal, &m.Settings)
+		glyph = sidebarGlyph(node.AgentState, node.DoneSeen, node.Subagents, rowBg, pal, &m.Settings)
 	}
 	return sidebarComposeGroupRow(indent, gutter, glyph, name, right, cw, rowBg)
 }

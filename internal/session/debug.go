@@ -251,11 +251,15 @@ func logRaw(level DebugLevel, message string) {
 }
 
 // LogError logs an error message (always logged if level >= DebugErrors).
+//
+//go:noinline
 func LogError(format string, args ...any) {
 	ProtocolLog(DebugErrors, "[ERROR] "+format, args...)
 }
 
 // LogBasic logs a basic message (connections, disconnections).
+//
+//go:noinline
 func LogBasic(format string, args ...any) {
 	ProtocolLog(DebugBasic, format, args...)
 }
@@ -303,7 +307,7 @@ var messageTypeNames = [...]string{
 	MsgKill:              "Kill",
 	MsgInput:             "Input",
 	MsgResize:            "Resize",
-	MsgPing:              "Reserved(Ping)",
+	MsgPing:              "Ping",
 	MsgCreatePTY:         "CreatePTY",
 	MsgClosePTY:          "ClosePTY",
 	MsgListPTYs:          "Reserved(ListPTYs)",
@@ -323,7 +327,7 @@ var messageTypeNames = [...]string{
 	MsgSessionList:       "SessionList",
 	MsgOutput:            "Reserved(Output)",
 	MsgError:             "Error",
-	MsgPong:              "Reserved(Pong)",
+	MsgPong:              "Pong",
 	MsgSessionEnded:      "SessionEnded",
 	MsgWindowChanged:     "Reserved(WindowChanged)",
 	MsgPTYList:           "Reserved(PTYList)",
@@ -359,9 +363,13 @@ var messageTypeNames = [...]string{
 	MsgClientGraphics:    "ClientGraphics",
 	MsgMasterLayout:      "MasterLayout",
 	MsgSidebarVisibility: "SidebarVisibility",
+	MsgSessionUsed:       "SessionUsed",
 	MsgClientActivity:    "ClientActivity",
 	MsgWatchDir:          "WatchDir",
 	MsgDirChanged:        "DirChanged",
+	MsgSessionsChanged:   "SessionsChanged",
+	MsgPaneMark:          "PaneMark",
+	MsgPluginApprovals:   "PluginApprovals",
 }
 
 // MessageTypeName returns a human-readable name for a message type.

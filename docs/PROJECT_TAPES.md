@@ -92,6 +92,7 @@ never steals focus because you typed `cd`. It shows:
 [tape]
 autorun = "ask"        # off | ask | auto
 auto_review = false    # auto-open the review dialog on detection
+show_status = true     # show the RUNNING pill while any tape plays
 ```
 
 - **`off`**: no scanning, no indicators, feature invisible.
@@ -128,6 +129,15 @@ once-per-directory rule as the banner), only for the focused window, and never
 while a tape is running. An ineligible tape keeps its passive one-line notice
 rather than popping a dialog you cannot act on.
 
+
+### `show_status` (default on)
+
+While a tape plays, tuios shows a RUNNING pill with the progress, and
+`tuios tape exec` shows the message "Remote: running a tape". Set
+`show_status = false` to hide both. Use it when you record the screen with a
+tape, so the recording shows the app and not the player. A tape that fails
+still shows its error.
+
 ## The tape header
 
 A project tape has an optional declarative header at the very top, before any
@@ -156,7 +166,7 @@ line, keyword case-insensitive:
 | `Type "text" [Enter]` | Type text into the focused pane; optional `Enter` submits it |
 | `Run "cmd"` | Shorthand for `Type "cmd" Enter` |
 | `Enter` | Submit a line in the focused pane |
-| `Split vertical\|horizontal` | Split the focused pane into a new tiled pane (`v`/`h` accepted) |
+| `Split vertical\|horizontal\|left\|right\|up\|down` | Split the focused pane into a new tiled pane (`v`/`h` accepted). A side names where the new pane goes |
 | `NewWindow ["name"]` | Create a new tiled pane |
 | `RenameWindow "name"` | Name the focused pane (`Rename` is an alias) |
 | `Focus "name"` | Focus a pane by name |

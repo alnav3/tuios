@@ -7,14 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
-	"os/user"
-	"slices"
 	"strings"
 
 	"github.com/Gaurav-Gosain/sip"
+	"github.com/Gaurav-Gosain/tuios/internal/netutil"
 )
 
 // Who may open a session.
@@ -29,8 +27,14 @@ import (
 //
 //   - A bind outside this machine needs a password, or --no-auth. TLS alone
 //     is not enough: it hides the traffic but does not say who is connecting.
+//   - --no-auth is refused on an unspecified bind (0.0.0.0, ::). Such a bind
+//     also listens on loopback, so with no password a page in a browser on
+//     this machine reaches the server by DNS rebinding. sip v0.9.4 checks the
+//     Host header on that bind when it has no TLS and no password, but that
+//     check lets every IP address through, and TLS turns it off. tuios-web
+//     keeps its own refusal so the rule does not depend on sip's.
 //   - A loopback bind may run with no password, for a browser on this
-//     machine. It checks the Host header, because a web page whose name the
+//     machine. sip checks the Host header, because a web page whose name the
 //     attacker points at 127.0.0.1 (DNS rebinding) passes the same-origin
 //     check: its Origin and its Host both carry the attacker's name.
 //     --allow-host adds names for a reverse proxy, and needs a password or
@@ -68,16 +72,19 @@ type webAccessFlags struct {
 type webAccess struct {
 	user     string
 	password string
-	// hosts is the Host allowlist for the session handshake. Nil turns the
-	// check off, which only a network bind with no --allow-host does: such a
-	// server answers on names this process cannot know.
-	hosts []string
+	// allowHosts holds the names that --allow-host adds to sip's Host check.
+	// The check runs on a loopback bind only. A network bind answers on
+	// names this process cannot know, and its password keeps strangers out.
+	allowHosts []string
 	// loopback is whether the bind stays on this machine.
 	loopback bool
 	// announce holds the text that shows a generated password. It is printed
 	// by announcePassword, after every other startup check has passed.
 	announce string
 }
+
+// errNoAuthWildcard is the refusal for --no-auth on an unspecified bind.
+var errNoAuthWildcard = errors.New("refusing --no-auth on an address that listens on every interface")
 
 // errNoWebAuth is the refusal for a network bind with no password. The menu
 // of answers is printed beside it.
@@ -128,6 +135,11 @@ func planWebAccess(w io.Writer, f webAccessFlags) (*webAccess, error) {
 		a.password = pw
 	}
 
+	if f.noAuth && isUnspecifiedHost(f.host) {
+		return nil, fmt.Errorf("%w, such as %s. A web page in a browser on this machine can then open a shell. Use --host localhost, or set a password with --random-password or --password-file",
+			errNoAuthWildcard, f.host)
+	}
+
 	loopback := isLoopbackHost(f.host)
 	a.loopback = loopback
 	if len(f.allowHosts) > 0 {
@@ -135,12 +147,7 @@ func planWebAccess(w io.Writer, f webAccessFlags) (*webAccess, error) {
 			return nil, err
 		}
 	}
-	// The Host check is for loopback binds only. A network bind answers on
-	// names and addresses this process cannot list, and its password is
-	// what keeps strangers out.
-	if loopback {
-		a.hosts = append([]string{"localhost"}, f.allowHosts...)
-	}
+	a.allowHosts = f.allowHosts
 
 	switch {
 	case a.password != "":
@@ -149,7 +156,7 @@ func planWebAccess(w io.Writer, f webAccessFlags) (*webAccess, error) {
 		}
 	case f.noAuth:
 		fmt.Fprintf(w, "\nWarning: tuios-web does not ask for a password. %s can open a shell as %s.\n\n",
-			whoCanReach(f.host), currentAccount())
+			whoCanReach(f.host), netutil.CurrentAccount())
 	case loopback:
 		fmt.Fprintln(w, "Note: other users on this machine can connect. Use --random-password to stop this.")
 	default:
@@ -169,6 +176,11 @@ func checkAllowHosts(f webAccessFlags, hasPassword bool) error {
 	for _, h := range f.allowHosts {
 		if h == "" {
 			return errors.New("an --allow-host value is empty. Give a host name, such as term.example.com")
+		}
+		// sip reads "*" as "turn the Host check off". --allow-host only adds
+		// names, so tuios-web does not pass that switch through.
+		if h == "*" {
+			return errors.New("the allowed host * is not a host name. Give --allow-host a host name only, such as term.example.com")
 		}
 		if _, _, err := net.SplitHostPort(h); err == nil {
 			return fmt.Errorf("the allowed host %s has a port. Give it to --allow-host with no port", h)
@@ -196,46 +208,10 @@ func (a *webAccess) apply(cfg *sip.Config) {
 			cfg.AllowInsecureNoTLS = true
 		}
 	}
-	if a.hosts != nil {
-		cfg.ConnectMiddleware = append(cfg.ConnectMiddleware, hostCheckMiddleware(a.hosts))
-	}
-}
-
-// hostCheckMiddleware refuses a session handshake whose Host header is not on
-// the list. Loopback addresses always pass. It runs on the WebSocket and the
-// WebTransport handshake, which are the only ways to a session. The page and
-// its static files carry nothing a rebinding page could use.
-func hostCheckMiddleware(allowed []string) sip.ConnectMiddleware {
-	return func(next sip.ConnectHandler) sip.ConnectHandler {
-		return func(r *http.Request) error {
-			if !hostAllowed(r.Host, allowed) {
-				return &sip.ConnectError{
-					Status: http.StatusForbidden,
-					Body:   "tuios-web does not answer to this host name. Start it with --allow-host to add the name.",
-				}
-			}
-			return next(r)
-		}
-	}
-}
-
-// hostAllowed reports whether a Host header names this machine or a name on
-// the list. The port is ignored.
-func hostAllowed(hostHeader string, allowed []string) bool {
-	host := hostHeader
-	if h, _, err := net.SplitHostPort(hostHeader); err == nil {
-		host = h
-	}
-	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
-	if host == "" {
-		return false
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		return true
-	}
-	return slices.ContainsFunc(allowed, func(a string) bool {
-		return strings.EqualFold(strings.TrimSuffix(strings.Trim(a, "[]"), "."), host)
-	})
+	// sip checks the Host header of every session handshake on a loopback
+	// bind, and allows localhost, loopback addresses and the bind host.
+	// --allow-host adds the names a reverse proxy forwards.
+	cfg.AllowedHosts = a.allowHosts
 }
 
 // readPasswordFile reads the password from the first line of path. A file
@@ -243,8 +219,8 @@ func hostAllowed(hostHeader string, allowed []string) bool {
 //
 // The checks run on the open file, not on the path, so the file cannot be
 // swapped between the check and the read. The file must belong to the
-// current user and must not be readable or writable by anyone else. Windows
-// has no such mode bits, so there it is not checked.
+// current user and must not be readable or writable by anyone else. On
+// Windows the same rule is read from the file's owner and DACL.
 func readPasswordFile(path string) (string, error) {
 	f, err := os.Open(path) //nolint:gosec // the path is the operator's own configuration
 	if err != nil {
@@ -258,7 +234,7 @@ func readPasswordFile(path string) (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("the password file %s is not a regular file", path)
 	}
-	if err := checkPasswordFileMode(path, info, os.Getuid()); err != nil {
+	if err := checkPasswordFileMode(f, path, info, os.Getuid()); err != nil {
 		return "", err
 	}
 	data, err := io.ReadAll(io.LimitReader(f, 4096))
@@ -329,18 +305,30 @@ func printNoAuthMenu(w io.Writer, f webAccessFlags) {
 
        ssh -L %s:localhost:%s <this-machine>
 
-  5. Let anyone who reaches the port in. Only on a network you trust.
-
-       tuios-web --host %s --port %s%s --no-auth
-
 `,
-		f.host, currentAccount(),
+		f.host, netutil.CurrentAccount(),
 		f.host, f.port, f.tlsArgs,
 		f.host, f.port, f.tlsArgs,
 		webPasswordEnv,
-		f.port, f.port,
-		f.host, f.port, f.tlsArgs)
+		f.port, f.port)
+	// planWebAccess refuses --no-auth on 0.0.0.0 and ::, so the menu does not
+	// offer it there.
+	if !isUnspecifiedHost(f.host) {
+		fmt.Fprintf(w, `  5. Let anyone who reaches the port in. Only on a network you trust.
+
+       tuios-web --host %s --port %s%s --no-auth
+
+`, f.host, f.port, f.tlsArgs)
+	}
 }
+
+// isUnspecifiedHost reports whether host is an unspecified IP address, such
+// as 0.0.0.0, :: or ::%lo, which listens on every interface, loopback
+// included.
+//
+// The empty host also listens on every interface, but sip counts it as
+// loopback and checks the Host header for it, so it is not refused here.
+func isUnspecifiedHost(host string) bool { return netutil.IsUnspecifiedHost(host) }
 
 // whoCanReach names who can reach a bind address.
 func whoCanReach(host string) string {
@@ -348,17 +336,6 @@ func whoCanReach(host string) string {
 		return "Anyone on this machine"
 	}
 	return "Anyone who reaches this port"
-}
-
-// currentAccount names the account a session's shells run as.
-func currentAccount() string {
-	if u, err := user.Current(); err == nil && u.Username != "" {
-		return u.Username
-	}
-	if name := os.Getenv("USER"); name != "" {
-		return name
-	}
-	return "the user running this server"
 }
 
 // authFlagsForMenu is the password part of the command line, repeated in the

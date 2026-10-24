@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"image/color"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,10 @@ type DockItem struct {
 	WindowIndex int
 	Label       string
 	Width       int // Total width including circles
+	// Number and Name are what the label was built from, so the layout can
+	// rebuild it at a shorter length when the bar runs out of room.
+	Number int
+	Name   string
 }
 
 // DockLayout contains calculated layout information for the dock
@@ -33,6 +38,10 @@ type DockLayout struct {
 	TapeText   string
 	LeftWidth  int
 	RightWidth int
+	// CenterRightReserve is the room a custom center keeps on its right: the
+	// right block's resting width, and at least a notification's mark and
+	// opening gap, so a message never resizes or moves the center.
+	CenterRightReserve int
 	// CustomLeft, CustomCenter and CustomRight are the room the custom cells on each side asked for, so the
 	// layout pass and the draw pass reserve against the same number.
 	CustomLeft     int
@@ -62,9 +71,16 @@ type dockWorkspaceTab struct {
 	// no way to tell which one they are holding.
 	Dragged bool
 	Width   int
+	// Gap is the width of what is drawn in front of this tab when another tab
+	// precedes it: the bare column between pills, or the [dock.tabs] separator
+	// between flat tabs.
+	Gap int
 	// Add marks the trailing "+" tab, which opens the next free workspace rather
 	// than switching to an existing one.
 	Add bool
+	// Attention is a workspace with a pane that waits for a person, drawn in
+	// [dock.tabs] attention_fg when it is set.
+	Attention bool
 }
 
 // dockWorkspaceHit is where a tab was drawn on the last frame. Recorded by the
@@ -127,10 +143,44 @@ func workspacePillWidth(label string, s *config.Settings) int {
 	return lipgloss.Width(lc) + lipgloss.Width(rc) + lipgloss.Width(label) + 2
 }
 
-// workspacePillLabelMax caps a name on a pill. The dock strip sits beside the
-// mode pill and the minimized entries, and a workspace called after a branch
-// would otherwise push both off the bar.
-const workspacePillLabelMax = 12
+// dockTabs is the [dock.tabs] table, or its zero value when there is no config.
+// It copies the table, so a pass over the strip reads it once and hands the
+// result down rather than asking again per tab.
+func (m *OS) dockTabs() config.DockTabsConfig {
+	if m.UserConfig == nil {
+		return config.DockTabsConfig{}
+	}
+	return m.UserConfig.Dock.Tabs
+}
+
+// dockTabWidth is the column span of a tab carrying label: a pill's (see
+// workspacePillWidth), or a flat tab's label and its column of padding either
+// side.
+func (m *OS) dockTabWidth(t *config.DockTabsConfig, label string) int {
+	if t.Flat() {
+		return lipgloss.Width(label) + 2
+	}
+	return workspacePillWidth(label, &m.Settings)
+}
+
+// dockTabGap is the width drawn between two tabs.
+func dockTabGap(t *config.DockTabsConfig) int {
+	if t.Flat() && t.Separator != "" {
+		return lipgloss.Width(t.Separator)
+	}
+	return dockWorkspacePillGap
+}
+
+// workspaceTabText is workspace n's label through the tab format, before the
+// label cap. {zoom} is only ever filled on the current workspace, the one whose
+// zoom state the session tracks.
+func (m *OS) workspaceTabText(tabs *config.DockTabsConfig, n int) string {
+	zoom := ""
+	if n == m.dockWorkspace() && tabs.ZoomMarker != "" && m.zoomedWindow() != nil {
+		zoom = tabs.ZoomMarker
+	}
+	return m.Settings.FormatWorkspaceTab(m.workspacePillName(n), n, tabs.Icon(n), zoom)
+}
 
 // workspacePillName is the whole name a pill stands for: the workspace's name
 // when it has one, else its number, laundered as chrome and uncapped. This is
@@ -145,10 +195,26 @@ func (m *OS) workspacePillName(n int) string {
 }
 
 // workspacePillLabel is what a pill prints: the name through the configured
-// tab format (so {index} and {name} can be combined), capped.
+// tab format, capped by appearance.dock_workspace_label_max. A cap of 0 draws
+// the whole name; the strip's scroll arithmetic is what handles a bar that no
+// longer fits it.
 func (m *OS) workspacePillLabel(n int) string {
-	label := m.Settings.FormatWorkspaceTab(m.workspacePillName(n), n)
-	return overlay.Truncate(label, workspacePillLabelMax)
+	tabs := m.dockTabs()
+	return m.workspacePillLabelWith(&tabs, n)
+}
+
+// workspacePillLabelWith is workspacePillLabel for a caller that has already
+// read [dock.tabs].
+func (m *OS) workspacePillLabelWith(tabs *config.DockTabsConfig, n int) string {
+	label := m.workspaceTabText(tabs, n)
+	if limit := m.Settings.DockWorkspaceLabelMax; limit > 0 {
+		label = overlay.Truncate(label, limit)
+	}
+	// The marks ride after the cap, so a long name never cuts them.
+	if mark := m.workspaceMarks(tabs, n); mark != "" {
+		label += mark
+	}
+	return label
 }
 
 // workspacePillClipped reports whether the pill had to cut its label short,
@@ -156,7 +222,29 @@ func (m *OS) workspacePillLabel(n int) string {
 // through the tab format, because that is what the pill draws: a short name can
 // still be clipped once the format lengthens it.
 func (m *OS) workspacePillClipped(n int) bool {
-	return lipgloss.Width(m.Settings.FormatWorkspaceTab(m.workspacePillName(n), n)) > workspacePillLabelMax
+	limit := m.Settings.DockWorkspaceLabelMax
+	if limit <= 0 {
+		return false
+	}
+	tabs := m.dockTabs()
+	return lipgloss.Width(m.workspaceTabText(&tabs, n)) > limit
+}
+
+// workspacePillHidesName reports whether the pill does not show workspace n's
+// whole name, which is when the hover label has something to say: the pill cut
+// the name short, or the tab format has no {name}. An unnamed workspace's name
+// is its number, so it has nothing to add when the format shows {index}. A
+// format with neither, such as "{icon}", shows no number at all, so the label
+// gives it.
+func (m *OS) workspacePillHidesName(n int) bool {
+	if m.workspacePillClipped(n) {
+		return true
+	}
+	format := m.Settings.DockWorkspaceTabFormat
+	if format == "" || strings.Contains(format, "{name}") {
+		return false
+	}
+	return printableTitle(m.WorkspaceNames[n]) != "" || !strings.Contains(format, "{index}")
 }
 
 // occupiedWorkspaceNumbers lists the workspaces worth showing: those holding a
@@ -187,24 +275,31 @@ func (m *OS) buildDockWorkspaceTabs() []dockWorkspaceTab {
 	if !m.Settings.DockWorkspaceTabs {
 		return nil
 	}
+	style := m.dockTabs()
 	tabs := make([]dockWorkspaceTab, 0, m.NumWorkspaces)
+	gap := dockTabGap(&style)
 	for _, n := range m.occupiedWorkspaces() {
-		label := m.workspacePillLabel(n)
+		label := m.workspacePillLabelWith(&style, n)
 		tabs = append(tabs, dockWorkspaceTab{
 			Workspace: n,
 			Label:     label,
 			Active:    n == m.dockWorkspace(),
 			Dragged:   m.dockWorkspaceDrag.Dragging && n == m.dockWorkspaceDrag.Workspace,
-			Width:     workspacePillWidth(label, &m.Settings),
+			Width:     m.dockTabWidth(&style, label),
+			Gap:       gap,
+			Attention: style.AttentionFg != "" && n != m.dockWorkspace() && m.workspaceWantsAttention(n),
 		})
 	}
 	// A trailing "+" opens the next empty workspace, so making one is a click
 	// rather than a remembered keybind. With it appended even a single-workspace
 	// session has two tabs, which is what makes the strip worth showing at all.
-	if next := m.nextFreeWorkspace(); next > 0 {
-		tabs = append(tabs, dockWorkspaceTab{Add: true, Label: "+", Width: workspacePillWidth("+", &m.Settings)})
+	// Flat tabs are a status line rather than a control strip: they drop the
+	// "+" unless asked for it, and show even a lone workspace.
+	flat := style.Flat()
+	if next := m.nextFreeWorkspace(); next > 0 && (!flat || style.ShowAdd) {
+		tabs = append(tabs, dockWorkspaceTab{Add: true, Label: "+", Width: m.dockTabWidth(&style, "+"), Gap: gap})
 	}
-	if len(tabs) < 2 {
+	if len(tabs) < 2 && (!flat || len(tabs) == 0) {
 		return nil
 	}
 	return tabs
@@ -232,7 +327,7 @@ func dockWorkspaceTabsWidth(tabs []dockWorkspaceTab) int {
 	w := 1
 	for i, t := range tabs {
 		if i > 0 {
-			w += dockWorkspacePillGap
+			w += t.Gap
 		}
 		w += t.Width
 	}
@@ -264,7 +359,7 @@ func pillsSpan(tabs []dockWorkspaceTab, from, to int) int {
 	w := 0
 	for i := from; i < to; i++ {
 		if i > from {
-			w += dockWorkspacePillGap
+			w += tabs[i].Gap
 		}
 		w += tabs[i].Width
 	}
@@ -324,26 +419,11 @@ func (m *OS) planDockWorkspaceStrip(room, barWidth int) dockWorkspaceStrip {
 	// one.
 	addSpan := 0
 	if strip.Add != nil {
-		addSpan = dockWorkspacePillGap + strip.Add.Width
+		addSpan = strip.Add.Gap + strip.Add.Width
 	}
-	// What a strip with no room for a pill draws: the "+" against the leading
-	// column, and nothing if there is not even room for that. The gap between
-	// pills goes with the pills.
-	addOnly := func() dockWorkspaceStrip {
-		strip.Pills, strip.Scrolls, strip.Width = nil, false, 0
-		switch {
-		case strip.Add == nil:
-		case budget >= 1+strip.Add.Width:
-			strip.Width = 1 + strip.Add.Width
-		default:
-			strip.Add = nil
-		}
-		return strip
-	}
-
 	avail := budget - 1 - addSpan
 	if avail <= 0 || len(strip.Pills) == 0 {
-		return addOnly()
+		return m.addOnlyStrip(strip, budget)
 	}
 
 	if natural := pillsSpan(strip.Pills, 0, len(strip.Pills)); natural <= avail {
@@ -356,7 +436,7 @@ func (m *OS) planDockWorkspaceStrip(room, barWidth int) dockWorkspaceStrip {
 	if inner < 1 {
 		// Room for the gutters and nothing to put between them: the arrows would
 		// scroll a strip with no pills in it.
-		return addOnly()
+		return m.addOnlyStrip(strip, budget)
 	}
 	strip.Scrolls, strip.Inner = true, inner
 
@@ -375,13 +455,52 @@ func (m *OS) planDockWorkspaceStrip(room, barWidth int) dockWorkspaceStrip {
 
 	count := pillsFitting(all, first, inner)
 	if count == 0 {
-		// Not even the narrowest pill fits between the gutters. Arrows over an
-		// empty track scroll nothing, so the strip falls back to the "+" alone.
-		return addOnly()
+		// Not even the narrowest pill fits between the gutters — an uncapped
+		// label on a narrow bar is how. Arrows over an empty track scroll
+		// nothing, so the strip falls back to the "+" and the current pill cut
+		// to whatever the viewport holds: a strip with no pill leaves the
+		// workspaces nothing to see or click.
+		return m.pinCurrentPill(strip, inner, addSpan, budget)
 	}
 	strip.Pills = all[first : first+count]
 	strip.MoreLeft = first > 0
 	strip.MoreRight = first+count < len(all)
+	strip.Width = 1 + 2*dockWorkspaceArrowWidth + inner + addSpan
+	return strip
+}
+
+// addOnlyStrip is what a strip with no room for a pill draws: the "+" against
+// the leading column, and nothing if there is not even room for that. The gap
+// between pills goes with the pills.
+func (m *OS) addOnlyStrip(strip dockWorkspaceStrip, budget int) dockWorkspaceStrip {
+	strip.Pills, strip.Scrolls, strip.Width = nil, false, 0
+	switch {
+	case strip.Add == nil:
+	case budget >= 1+strip.Add.Width:
+		strip.Width = 1 + strip.Add.Width
+	default:
+		strip.Add = nil
+	}
+	return strip
+}
+
+// pinCurrentPill draws the current workspace's pill alone, cut to the room a
+// scrolling viewport would have had. It is the fallback for a strip whose
+// every pill is wider than that room. The geometry is the scrolled strip's:
+// the gutters hold their columns and the "\+" stays pinned at the end, so a
+// dock that narrows further degrades the same way it already does.
+func (m *OS) pinCurrentPill(strip dockWorkspaceStrip, inner, addSpan, budget int) dockWorkspaceStrip {
+	style := m.dockTabs()
+	labelBudget := inner - m.dockTabWidth(&style, "")
+	if labelBudget < 1 || len(strip.Pills) == 0 {
+		return m.addOnlyStrip(strip, budget)
+	}
+	active := m.activePillIndex(strip.Pills)
+	pill := strip.Pills[active]
+	pill.Label = overlay.Truncate(pill.Label, labelBudget)
+	pill.Width = m.dockTabWidth(&style, pill.Label)
+	strip.Pills = []dockWorkspaceTab{pill}
+	strip.MoreLeft, strip.MoreRight = false, false
 	strip.Width = 1 + 2*dockWorkspaceArrowWidth + inner + addSpan
 	return strip
 }
@@ -512,11 +631,43 @@ func (m *OS) CalculateDockLayout() DockLayout {
 	// carried no hit rectangle at all. So the readouts yield their columns
 	// before the entries do. A live message is exempt: it is an event that just
 	// happened, not metering, and it already holds the block for its duration.
+	//
+	// The entries degrade in steps before the readouts lose anything: full
+	// names, then names sharing the bar, then the readouts' columns, then the
+	// entries themselves.
 	room := max(barWidth-layout.LeftWidth, 0)
 	want, yields := m.dockRightWidth()
+	if layout.CustomCenter > 0 {
+		// A popup must not resize the centered group by shortening its panes.
+		// Reserve custom cells first; the renderer fits the right block beside it.
+		// The reserve is what the right block holds with no message up (the
+		// meters and the right-hand custom cells), so a crowded bar clamps the
+		// center left of them instead of cutting them.
+		persistent := want
+		if !yields {
+			persistent = m.calculateDockRightWidth()
+		}
+		if m.dockPlan.Has(config.DockComponentNotifications) {
+			persistent = max(persistent, notifChromeWidth+1)
+		}
+		layout.CenterRightReserve = min(persistent, room)
+		items := layout
+		items.LeftWidth += layout.CustomCenter
+		items.RightWidth = layout.CenterRightReserve
+		items.calculateItemPositions(barWidth, allItems)
+		layout.VisibleItems, layout.TruncatedCount = items.VisibleItems, items.TruncatedCount
+		layout.RightWidth = min(want, room)
+		return layout
+	}
 	if yields {
+		if dockItemsWidth(allItems) > max(room-want, 0) &&
+			!shortenDockItemNames(max(room-want, 0), allItems) {
+			want = 0
+		}
 		room = max(room-dockItemsWidth(allItems), 0)
 	}
+	// With a live message, the right block keeps its full width, and the
+	// position pass shortens the entries' names into what the block leaves.
 	layout.RightWidth = min(want, room)
 
 	// Calculate how many items fit and their positions
@@ -527,11 +678,34 @@ func (m *OS) CalculateDockLayout() DockLayout {
 
 // ModeInfo contains mode display information
 type ModeInfo struct {
-	Block     string // The character to display (e.g., "█")
-	Color     string // Hex color for the block
-	CursorPos string // Cursor position for copy mode (empty otherwise)
-	IsTiling  bool   // Whether tiling mode is active
-	NextSplit string // Next split direction when tiling ("V" or "H")
+	Block     string      // The character to display (e.g., "█")
+	Color     color.Color // The pill's fill: a slot at 16 colours, so its ink is picked by slot
+	CursorPos string      // Cursor position for copy mode (empty otherwise)
+	IsTiling  bool        // Whether tiling mode is active
+	NextSplit string      // Next split direction when tiling ("V" or "H")
+}
+
+// prefixArmed reports whether the leader, or one of its menus, waits for a key.
+func (m *OS) prefixArmed() bool {
+	return m.PrefixActive || m.WorkspacePrefixActive || m.MinimizePrefixActive ||
+		m.TilingPrefixActive || m.DebugPrefixActive || m.TapePrefixActive ||
+		m.LayoutPrefixActive || m.TuiosPrefixActive || m.Menu != ""
+}
+
+// prefixOnPill reports whether the dock's mode pill shows the armed leader.
+// The floating badge takes over when the dock is hidden, when the plan has
+// no mode pill, or when appearance.dock_prefix_indicator is "badge".
+func (m *OS) prefixOnPill() bool {
+	return m.prefixArmed() && m.prefixPillShown()
+}
+
+// prefixPillShown reports whether an armed leader would go on the pill.
+func (m *OS) prefixPillShown() bool {
+	if m.Settings.DockPrefixIndicator == "badge" || m.Settings.DockbarPosition == "hidden" {
+		return false
+	}
+	m.ensureDockPlan()
+	return m.dockPlan.Has(config.DockComponentMode)
 }
 
 // buildDockLeftText builds the dock's left region: the mode pill's label, the
@@ -547,38 +721,50 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 		IsTiling: m.AutoTiling,
 	}
 
-	// Get next split direction if tiling is active
-	if m.AutoTiling {
+	// Get next split direction if tiling is active and the pill shows it.
+	if m.AutoTiling && m.Settings.DockModeSplitLetter {
 		modeInfo.NextSplit = m.nextSplitIndicator(focusedWindow)
 	}
 
 	switch {
+	case m.prefixOnPill():
+		// The leader is armed and waits for a key. The pill says so in the
+		// warning colour, where the eye already looks for the mode, in place
+		// of the floating badge. It comes first: the leader works from the rail
+		// too. See renderOverlays.
+		modeInfo.Color = theme.UI().Warning
+		modeLabel = m.Settings.GetDockModeIconPrefix()
 	case m.SidebarFocused:
 		// The rail owns the keyboard: the mode pill is the authoritative "who has
 		// input" indicator, so it says so in accent, outranking the pane mode.
-		modeInfo.Color = theme.ColorToString(theme.UI().Accent)
+		modeInfo.Color = theme.UI().Accent
 		modeLabel = "SIDEBAR"
 	case m.HoldModeActive():
 		// A momentary mode has to read differently from the mode it borrows.
 		// Window mode entered by holding a key ends the moment the key is let
 		// go, and the pill is the only place that says so.
-		modeInfo.Color = theme.ColorToString(theme.DockColorWindow())
+		modeInfo.Color = theme.DockColorWindow()
 		modeLabel = m.Settings.GetDockModeIconWindow() + " HOLD"
+	case m.hints != nil:
+		// Hints mode owns the keyboard, so the pill names it. The legend at
+		// the dock's other end says what its keys do.
+		modeInfo.Color = theme.DockColorCopy()
+		modeLabel = "HINTS"
 	case focusedWindow != nil && m.MultiCopy.Has(focusedWindow.ID):
 		// Multi copy mode is held from either mode, so it names itself in
 		// both: how many panes it drives, and after a search how many matched.
-		modeInfo.Color = theme.ColorToString(theme.DockColorCopy())
+		modeInfo.Color = theme.DockColorMultifocus()
 		modeLabel, _ = m.multiCopyPill()
 	case m.Mode == TerminalMode:
 		if focusedWindow.CopyModeVisible() {
 			// Copy mode
-			modeInfo.Color = theme.ColorToString(theme.DockColorCopy())
+			modeInfo.Color = theme.DockColorCopy()
 			modeInfo.CursorPos = fmt.Sprintf("%d:%d", focusedWindow.CopyMode.CursorY, focusedWindow.CopyMode.CursorX)
 			modeLabel = " " + modeInfo.CursorPos + " "
 
 		} else {
 			// Terminal mode
-			modeInfo.Color = theme.ColorToString(theme.DockColorTerminal())
+			modeInfo.Color = theme.DockColorTerminal()
 			// Add tiling indicator for terminal mode (with split direction)
 			if m.AutoTiling {
 				modeLabel = m.Settings.GetDockModeIconTiling() + modeInfo.NextSplit
@@ -588,7 +774,7 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 		}
 	default:
 		// Window mode
-		modeInfo.Color = theme.ColorToString(theme.DockColorWindow())
+		modeInfo.Color = theme.DockColorWindow()
 		// Add tiling indicator for window mode (with split direction)
 		if m.AutoTiling {
 			modeLabel = m.Settings.GetDockModeIconTiling() + modeInfo.NextSplit
@@ -609,7 +795,15 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 	// split direction, the zoom flag) landed after the trailing space, leaving
 	// the fill flush against the last glyph; the rail's label had none at all.
 	// One cell either side, applied once, whatever the label ended up being.
-	modeLabel = " " + strings.TrimSpace(modeLabel) + " "
+	//
+	// A label with nothing in it draws no pill at all: a person who set the
+	// mode's icon to the empty string asked for no icon, and an empty filled
+	// pill with caps would be an icon of its own.
+	if trimmed := strings.TrimSpace(modeLabel); trimmed != "" {
+		modeLabel = " " + trimmed + " "
+	} else {
+		modeLabel = ""
+	}
 
 	// What is left of the "2:3 • 5  3 " stats blob. The totals went: the strip
 	// two cells to the right names every occupied workspace and marks the
@@ -633,7 +827,7 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 	// Only the components the plan placed claim any room. Rendered width, not
 	// byte length: Nerd Font glyphs and the caps are wider than their bytes.
 	// The +4 is the margins and padding the block has always carried.
-	if m.dockPlan.Has(config.DockComponentMode) {
+	if m.dockPlan.Has(config.DockComponentMode) && modeLabel != "" {
 		width += lipgloss.Width(m.Settings.GetDockModeCapLeft()) +
 			lipgloss.Width(modeLabel) +
 			lipgloss.Width(m.Settings.GetDockModeCapRight())
@@ -660,71 +854,12 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 	} else {
 		tape = ""
 	}
+	// The spotlight chip rides after the mode pill whether or not the plan
+	// lists the mode: it is the way out of a dimmed screen, not a component.
+	width += m.spotlightChipWidth()
 	width += 4
 
 	return modeLabel, trail, tape, width, modeInfo
-}
-
-// copyModeHelpTiers returns the dock's copy-mode help for a sub-state, longest
-// first. The renderer takes the longest tier that fits the room the dock has;
-// on a narrow screen that is the shortest of them, which still names the keys
-// that matter. Shared with the width calculation so the space reserved matches
-// the line actually drawn.
-//
-// They are key/label pairs rather than a "hjkl:move" string because the dock is
-// the one place left saying what a key does in its own format. Rendered through
-// the same strip a panel footer uses, copy mode reads like the rest of the app.
-func copyModeHelpTiers(state terminal.CopyModeState) [][]overlay.Hint {
-	switch state {
-	case terminal.CopyModeNormal:
-		return [][]overlay.Hint{
-			{
-				{Key: "hjkl", Label: "move"}, {Key: "w/b/e", Label: "word"},
-				{Key: "f/t", Label: "char"}, {Key: "/", Label: "search"},
-				{Key: "n/N", Label: "next"}, {Key: "v", Label: "visual"},
-				{Key: "y", Label: "yank"}, {Key: "q", Label: "quit"},
-			},
-			{
-				{Key: "hjkl", Label: "move"}, {Key: "/", Label: "search"},
-				{Key: "v", Label: "visual"}, {Key: "y", Label: "yank"},
-				{Key: "q", Label: "quit"},
-			},
-			{{Key: "hjkl", Label: "move"}, {Key: "y", Label: "yank"}, {Key: "q", Label: "quit"}},
-		}
-	case terminal.CopyModeSearch:
-		return [][]overlay.Hint{
-			{
-				{Key: "type", Label: "search"}, {Key: "n/N", Label: "next"},
-				{Key: overlay.EnterKey(), Label: "done"}, {Key: "esc", Label: "cancel"},
-			},
-			{{Key: "n/N", Label: "next"}, {Key: overlay.EnterKey(), Label: "done"}, {Key: "esc", Label: "cancel"}},
-		}
-	case terminal.CopyModeVisualChar:
-		return [][]overlay.Hint{
-			{
-				{Key: "hjkl", Label: "extend"}, {Key: "w/b/e", Label: "word"},
-				{Key: "%", Label: "bracket"}, {Key: "y", Label: "yank"},
-				{Key: "esc", Label: "cancel"},
-			},
-			{{Key: "hjkl", Label: "extend"}, {Key: "y", Label: "yank"}, {Key: "esc", Label: "cancel"}},
-		}
-	case terminal.CopyModeVisualLine:
-		return [][]overlay.Hint{
-			{{Key: "jk", Label: "extend"}, {Key: "y", Label: "yank"}, {Key: "esc", Label: "cancel"}},
-			{{Key: "jk", Label: "extend"}, {Key: "y", Label: "yank"}},
-		}
-	}
-	return nil
-}
-
-// renderCopyModeHelp draws one tier as the dock's help block: the footer's own
-// strip, on the Panel step the block rests on, with a column either side.
-func renderCopyModeHelp(hints []overlay.Hint, pal overlay.Palette) string {
-	if len(hints) == 0 {
-		return ""
-	}
-	pad := overlay.Style(pal.Panel).Render(" ")
-	return pad + overlay.HintStrip(hints, pal.Panel, pal) + pad
 }
 
 // dockItemsWidth is the room every minimized entry needs laid out at once,
@@ -759,27 +894,32 @@ func (m *OS) dockRightWidth() (width int, yields bool) {
 	if block, ok := m.dockNotificationBlock(m.GetRenderWidth(), 0); ok {
 		return block.Width, false
 	}
+	// A mode's legend does not yield either. It is up only while the mode is,
+	// and it says how to get out of the mode, which a minimized entry does
+	// not. It asks for the room of every key, and the draw fits it to the
+	// room it gets (see renderModeLegend).
+	if legend := m.dockModeLegend(); len(legend) > 0 {
+		return modeLegendWidth(legend), false
+	}
 	return m.calculateDockRightWidth(), true
 }
 
+// dockModeLegend is the mode legend the dock draws (see mode_legend.go), or
+// nil when the dock does not list the copy-help component, which is the one
+// that carries every mode's keys.
+func (m *OS) dockModeLegend() []overlay.Hint {
+	m.ensureDockPlan()
+	if !m.dockPlan.Has(config.DockComponentCopyHelp) {
+		return nil
+	}
+	return m.modeLegend()
+}
+
 // calculateDockRightWidth calculates the width of the right side of the dock
-// when no message holds it: the copy-mode help line or the system meters.
+// when neither a message nor a mode legend holds it: the system meters and
+// the custom cells.
 func (m *OS) calculateDockRightWidth() int {
 	m.ensureDockPlan()
-
-	focusedWindow := m.GetFocusedWindow()
-
-	if focusedWindow.CopyModeVisible() && m.dockPlan.Has(config.DockComponentCopyHelp) {
-		// In copy mode the help line is the right-hand block. Measure the
-		// longest variant rather than guessing at it, so a terminal with room
-		// for it reserves exactly enough and one without falls to a shorter
-		// line instead of being one cell short of the full one.
-		tiers := m.copyModeHelp(focusedWindow)
-		if len(tiers) == 0 {
-			return 0
-		}
-		return lipgloss.Width(renderCopyModeHelp(tiers[0], m.groundUI()))
-	}
 
 	// The meters reserve the room they will draw in, and nothing when they are
 	// off, which is the default. A flat 32 columns held for a readout the user
@@ -824,16 +964,17 @@ func (m *OS) dockNotificationBlock(barWidth, room int) (notifBlock, bool) {
 // applied by the render style as a right margin.
 const dockSysInfoMargin = 2
 
-// dockItemNameCells is how much of a window's name a dock pill shows.
-const dockItemNameCells = 12
+// dockItemMinNameCells is the fewest name cells an entry keeps when the names
+// have to share the bar. Below it the entries are dropped instead, which is
+// what the overflow marker stands for.
+const dockItemMinNameCells = 6
 
-// dockItemLabel is the text inside a dock pill. The minimize animation has to
-// fly to the pill it is aiming at, so it measures the same label this builds
-// rather than keeping its own copy of the format, which it did in bytes and got
-// wrong the moment a name held a wide rune.
+// dockItemLabel is the text inside a dock pill, with the name at full length.
+// Fitting happens in the layout: a bar with room draws the whole name, a
+// crowded bar shortens the names together, and only then drops an entry.
 func dockItemLabel(number int, name string) string {
 	if name = printableTitle(name); name != "" {
-		return fmt.Sprintf(" %d:%s ", number, overlay.Truncate(name, dockItemNameCells))
+		return fmt.Sprintf(" %d:%s ", number, name)
 	}
 	return fmt.Sprintf(" %d ", number)
 }
@@ -877,6 +1018,8 @@ func (m *OS) getDockItems() []DockItem {
 			WindowIndex: windowIndex,
 			Label:       labelText,
 			Width:       itemWidth,
+			Number:      itemNumber,
+			Name:        printableTitle(window.CustomName),
 		})
 
 		itemNumber++
@@ -887,17 +1030,89 @@ func (m *OS) getDockItems() []DockItem {
 
 // calculateItemPositions determines which items fit and their X positions
 func (layout *DockLayout) calculateItemPositions(screenWidth int, allItems []DockItem) {
-	// Calculate available space for dock items
-	availableSpace := screenWidth - layout.LeftWidth - layout.RightWidth - dockItemsWidth(allItems)
-	if availableSpace < 0 {
-		// Items don't fit, so truncate them.
-		layout.truncateItems(screenWidth, allItems)
+	if dockItemsWidth(allItems) <= max(screenWidth-layout.LeftWidth-layout.RightWidth, 0) {
+		// All items fit.
+		layout.VisibleItems = allItems
+		layout.TruncatedCount = 0
+		return
+	}
+	if shortenDockItemNames(max(screenWidth-layout.LeftWidth-layout.RightWidth, 0), allItems) {
+		layout.VisibleItems = allItems
+		layout.TruncatedCount = 0
 		return
 	}
 
-	// All items fit.
-	layout.VisibleItems = allItems
-	layout.TruncatedCount = 0
+	// Items don't fit, so truncate them.
+	layout.truncateItems(screenWidth, allItems)
+}
+
+// shortenDockItemNames spreads the spare cells across the entries' names,
+// rebuilding each label from its full name, and reports whether every entry
+// fit at a length still worth reading. A name cut to the floor is the step
+// before an entry is dropped.
+//
+// The even split this pass used to compute was a prediction, not a check: it
+// subtracted each entry's padding as if that were the room a name gives up,
+// then divided the rest evenly. The label's own chrome — the " 1: " around
+// the name — was never subtracted, and a name shorter than the budget never
+// uses its share, so the drawn labels came out wider than the room the pass
+// was handed, and whatever sat to the right — the live message, mostly —
+// paid the difference. The budget is now searched for real: the largest one
+// whose drawn total fits.
+func shortenDockItemNames(available int, allItems []DockItem) bool {
+	// entryWidthAt is what the entry draws with its name held to b cells: the
+	// circles it cannot lose plus a label rebuilt at that budget.
+	entryWidthAt := func(item DockItem, b int) int {
+		name := overlay.Truncate(item.Name, b)
+		return item.Width - lipgloss.Width(item.Label) + lipgloss.Width(dockItemLabel(item.Number, name))
+	}
+	named := 0
+	for _, item := range allItems {
+		if item.Name != "" {
+			named++
+		}
+	}
+	if named == 0 {
+		return false
+	}
+	longest := 0
+	for _, item := range allItems {
+		longest = max(longest, lipgloss.Width(item.Name))
+	}
+	totalAt := func(b int) int {
+		total := 0
+		for i, item := range allItems {
+			if i > 0 {
+				total++ // Space before item
+			}
+			total += entryWidthAt(item, b)
+		}
+		return total
+	}
+	// A name cut to more cells is never drawn narrower, so the total only
+	// grows with the budget, and the largest budget that fits is found by
+	// bisection. Trying every budget from the longest name down cost 3.5 ms
+	// a frame with twelve named entries on a bar too narrow for them.
+	lo, hi := dockItemMinNameCells, longest
+	if hi < lo || totalAt(lo) > available {
+		return false
+	}
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if totalAt(mid) <= available {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	budget := lo
+	for i := range allItems {
+		item := &allItems[i]
+		label := dockItemLabel(item.Number, overlay.Truncate(item.Name, budget))
+		item.Width += lipgloss.Width(label) - lipgloss.Width(item.Label)
+		item.Label = label
+	}
+	return true
 }
 
 // truncateItems calculates which items fit when space is limited

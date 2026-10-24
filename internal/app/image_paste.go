@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/composer"
 
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 )
@@ -113,6 +114,8 @@ type imageProbeMsg struct {
 	// keyProbeOff says the type ask was too slow or cannot work here, so the
 	// paste key stops making it.
 	keyProbeOff bool
+	// reply is the reply draft the image is for, nil for a pane.
+	reply *composer.Model
 }
 
 // ImagePastedMsg is the daemon's answer: the path to paste into window.
@@ -220,6 +223,9 @@ func probeImageCmd(clip *imageClipboard, window string, mode imagePasteMode) tea
 
 // applyImageProbe acts on what the clipboard held.
 func (m *OS) applyImageProbe(msg imageProbeMsg) tea.Cmd {
+	if msg.reply != nil {
+		return m.applyReplyImageProbe(msg)
+	}
 	if msg.keyProbeOff {
 		m.imagePaste.keyProbeOff = true
 	}
@@ -313,7 +319,15 @@ func (m *OS) deliverImageCmd(window string, data []byte) tea.Cmd {
 func (m *OS) applyImagePasted(msg ImagePastedMsg) {
 	if msg.Err != nil {
 		if callErr, ok := errors.AsType[*session.VerbCallError](msg.Err); ok && callErr.Code == session.ErrVerbUnknownVerb {
-			m.ShowNotification("This daemon cannot take a pasted image. Restart it with a newer tuios: tuios kill-server", "error", m.Settings.NotificationDuration*2)
+			m.ShowNotification("This daemon cannot take a pasted image. "+m.restartHint(), "error", m.Settings.NotificationDuration*2)
+			return
+		}
+		if callErr, ok := errors.AsType[*session.VerbCallError](msg.Err); ok && callErr.Code == session.ErrVerbUnknownHost && callErr.Hint != nil && callErr.Hint.Detail != "" {
+			m.ShowNotification("Cannot paste the image. "+callErr.Hint.Detail, "error", m.Settings.NotificationDuration*3)
+			return
+		}
+		if text := m.imagePasteRefusal(msg.Window, msg.Err); text != "" {
+			m.ShowNotification(text, "error", m.Settings.NotificationDuration*3)
 			return
 		}
 		m.ShowNotification("The image was not pasted: "+msg.Err.Error(), "error", m.Settings.NotificationDuration*2)
@@ -366,4 +380,19 @@ func pastePathText(path string) string {
 		return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
 	}
 	return path
+}
+
+// imagePasteRefusal is the message for a paste the pane's machine refused by
+// its link policy, or "" for any other error. That machine names the
+// capabilities it lacks and its config table that grants them. The pane's
+// machine is the window's host, or the host this client is attached through.
+func (m *OS) imagePasteRefusal(window string, err error) string {
+	host := m.AttachedHost
+	if w := m.windowByID(window); w != nil && w.Host != "" {
+		host = w.Host
+	}
+	if refusal := linkRefusal(host, err); refusal != "" {
+		return "Cannot paste the image. " + refusal
+	}
+	return ""
 }

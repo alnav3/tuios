@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"image/color"
@@ -12,6 +13,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/table"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"golang.org/x/term"
 )
@@ -24,23 +26,27 @@ import (
 
 // hostReport is one row of the list-hosts result.
 type hostReport struct {
-	Host          string `json:"host"`
-	Addr          string `json:"addr"`
-	Status        string `json:"status"`
-	Reason        string `json:"reason"`
-	Detail        string `json:"detail"`
-	DaemonVersion string `json:"daemon_version"`
-	Protocol      int    `json:"protocol"`
-	MinProtocol   int    `json:"min_protocol"`
-	Sessions      int    `json:"sessions"`
-	LastOK        int64  `json:"last_ok"`
-	LastTry       int64  `json:"last_try"`
-	Drops         int    `json:"drops"`
-	DropReason    string `json:"drop_reason"`
-	Stalls        int    `json:"stalls"`
-	Events        string `json:"events"`
-	EventsNote    string `json:"events_note"`
-	Queued        int    `json:"queued"`
+	Host          string  `json:"host"`
+	Addr          string  `json:"addr"`
+	Status        string  `json:"status"`
+	Reason        string  `json:"reason"`
+	Detail        string  `json:"detail"`
+	DaemonVersion string  `json:"daemon_version"`
+	Protocol      int     `json:"protocol"`
+	MinProtocol   int     `json:"min_protocol"`
+	Sessions      int     `json:"sessions"`
+	LastOK        int64   `json:"last_ok"`
+	LastTry       int64   `json:"last_try"`
+	Drops         int     `json:"drops"`
+	DropReason    string  `json:"drop_reason"`
+	Stalls        int     `json:"stalls"`
+	Events        string  `json:"events"`
+	EventsNote    string  `json:"events_note"`
+	Queued        int     `json:"queued"`
+	Cores         int     `json:"cores"`
+	Load1         float64 `json:"load1"`
+	LoadOK        *bool   `json:"load_ok"`
+	RTTMillis     int64   `json:"rtt_ms"`
 }
 
 // runListHosts prints the configured hosts and the state of each link.
@@ -93,13 +99,24 @@ func printHostList(w io.Writer, raw json.RawMessage) error {
 		if h.Status == string(federation.StatusUp) {
 			sessions = strconv.Itoa(h.Sessions)
 		}
+		load := "-"
+		if h.Cores > 0 {
+			load = strconv.FormatFloat(h.Load1, 'f', 2, 64) + " on " + strconv.Itoa(h.Cores) + " cores"
+			if h.LoadOK != nil && !*h.LoadOK {
+				load = "not known, " + strconv.Itoa(h.Cores) + " cores"
+			}
+			if h.RTTMillis > 0 {
+				load += ", " + strconv.FormatInt(h.RTTMillis, 10) + " ms"
+			}
+		}
 		rows = append(rows, []string{
 			h.Host,
 			h.Addr,
-			h.Status,
+			hostStatusWord(h.Status),
 			version,
 			protocol,
 			sessions,
+			load,
 			formatTimeAgo(h.LastOK),
 		})
 	}
@@ -107,7 +124,7 @@ func printHostList(w io.Writer, raw json.RawMessage) error {
 	t := table.New().
 		Border(lipgloss.RoundedBorder()).
 		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("8"))).
-		Headers("HOST", "ADDRESS", "STATUS", "VERSION", "PROTO", "SESSIONS", "LAST OK").
+		Headers("HOST", "ADDRESS", "STATUS", "VERSION", "PROTO", "SESSIONS", "LOAD", "LAST OK").
 		Rows(rows...).
 		StyleFunc(func(row, col int) lipgloss.Style {
 			base := lipgloss.NewStyle().Padding(0, 1)
@@ -126,7 +143,7 @@ func printHostList(w io.Writer, raw json.RawMessage) error {
 			}
 		})
 	lipgloss.Fprintln(w, t.Render())
-	fmt.Fprintf(w, "\n%d host(s). Attach a session on a host with 'tuios attach --host NAME SESSION'.\n", res.Total)
+	fmt.Fprintf(w, "\n%s. Attach a session on a host with 'tuios attach --host NAME SESSION'.\n", plural.Count(res.Total, "host"))
 
 	// The reason a host is not usable is the only thing the table cannot say in
 	// a column, so it goes below, one line per host that has one.
@@ -142,6 +159,9 @@ func printHostList(w io.Writer, raw json.RawMessage) error {
 		}
 		if h.Status == string(federation.StatusNoBinary) {
 			fmt.Fprintf(w, "  Run 'tuios hosts test %s' to see where the link looked.\n", h.Host)
+		}
+		if h.Status == string(federation.StatusApproval) {
+			fmt.Fprintf(w, "  Run 'tuios hosts signin %s' to open the sign-in page.\n", h.Host)
 		}
 	}
 
@@ -174,7 +194,7 @@ func printHostList(w io.Writer, raw json.RawMessage) error {
 	// Mail kept here for a machine whose link is down goes when it is back.
 	for _, h := range res.Hosts {
 		if h.Queued > 0 {
-			fmt.Fprintf(w, "%s: %d message(s) wait here for the link. The Inbox shows them; dismissing the item there discards them.\n", h.Host, h.Queued)
+			fmt.Fprintf(w, "%s: %s here for the link. The Inbox shows %s; dismissing the item there discards %s.\n", h.Host, plural.Count(h.Queued, "message")+" "+plural.Word(h.Queued, "waits", "wait"), plural.Word(h.Queued, "it", "them"), plural.Word(h.Queued, "it", "them"))
 		}
 	}
 	printConfigProblems(w, res.ConfigProblems)
@@ -193,7 +213,7 @@ func hostStatusColor(status string) color.Color {
 		return lipgloss.Color("2")
 	case federation.StatusUnreachable:
 		return lipgloss.Color("1")
-	case federation.StatusIncompatible, federation.StatusNoBinary, federation.StatusReconnecting:
+	case federation.StatusIncompatible, federation.StatusNoBinary, federation.StatusReconnecting, federation.StatusApproval:
 		return lipgloss.Color("3")
 	default:
 		return lipgloss.Color("8")
@@ -216,13 +236,16 @@ type hostSessionsEntry struct {
 		WindowCount int    `json:"window_count"`
 		Attached    bool   `json:"attached"`
 		Restored    bool   `json:"restored"`
+		Space       string `json:"space"`
 		LastActive  int64  `json:"last_active"`
 		Created     int64  `json:"created"`
 	} `json:"sessions"`
 }
 
 // runListSessionsAllHosts is `tuios ls --all-hosts`. One dead host costs its own
-// row and nothing else.
+// row and nothing else. Each host's sessions are grouped by space under the
+// host's line, as ls on that host groups them. A space is a label on one
+// machine, so two hosts' spaces of the same name are two groups.
 func runListSessionsAllHosts(host string, jsonOutput bool) error {
 	client, err := dialVerb()
 	if err != nil {
@@ -268,7 +291,7 @@ func runListSessionsAllHosts(host string, jsonOutput bool) error {
 			fmt.Println()
 			continue
 		}
-		rows := make([][]string, 0, len(h.Sessions))
+		rowsBySpace := map[string][][]string{}
 		for _, s := range h.Sessions {
 			if !h.Stale {
 				total++
@@ -284,7 +307,7 @@ func runListSessionsAllHosts(host string, jsonOutput bool) error {
 			if s.DisplayName != "" {
 				name = s.DisplayName
 			}
-			rows = append(rows, []string{
+			rowsBySpace[s.Space] = append(rowsBySpace[s.Space], []string{
 				name,
 				strconv.Itoa(s.WindowCount),
 				status,
@@ -292,10 +315,10 @@ func runListSessionsAllHosts(host string, jsonOutput bool) error {
 				formatTimeAgo(s.LastActive),
 			})
 		}
-		fmt.Println(renderSessionTable(rows))
+		fmt.Println(renderSpaceGroups(rowsBySpace))
 		fmt.Println()
 	}
-	fmt.Printf("%d session(s) on %d host(s).\n", total, reachable)
+	fmt.Printf("%s on %s.\n", plural.Count(total, "session"), plural.Count(reachable, "host"))
 	return nil
 }
 
@@ -382,7 +405,7 @@ func runListAgentsAllHosts(host string, all bool, selector string, jsonOutput bo
 			}
 			// Every name here was written on another machine.
 			rows = append(rows, []string{
-				plainLine(firstNonEmptyString(a.Session, h.Session)),
+				plainLine(cmp.Or(a.Session, h.Session)),
 				shortWindowID(a.WindowID),
 				plainLine(a.Name),
 				plainLine(a.State),
@@ -406,7 +429,7 @@ func runListAgentsAllHosts(host string, all bool, selector string, jsonOutput bo
 		lipgloss.Println(t.Render())
 		fmt.Println()
 	}
-	fmt.Printf("%d agent pane(s). A pane on another host is read only in this release.\n", total)
+	fmt.Printf("%s. A pane on another host is read only in this release.\n", plural.Count(total, "agent pane"))
 	return nil
 }
 

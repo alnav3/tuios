@@ -166,7 +166,7 @@ func (d *Daemon) registerHostedPane(spec hostedPaneSpec, grace time.Duration) (*
 		hp.grace = grace
 		hp.resumeToken = newHostedCallsToken()
 	}
-	if hostedWindowIDPattern.MatchString(spec.Window) {
+	if hostedWindowIDPattern().MatchString(spec.Window) {
 		hp.window = spec.Window
 		hp.callsToken = newHostedCallsToken()
 	}
@@ -175,8 +175,10 @@ func (d *Daemon) registerHostedPane(spec hostedPaneSpec, grace time.Duration) (*
 	pty, cmd, err := ptyspawn.Spawn(width, height, func() *exec.Cmd {
 		var cmd *exec.Cmd
 		if len(spec.Command) > 0 {
+			//tuios:allow-exec ptyspawn starts the pane program on a pseudo console
 			cmd = exec.Command(spec.Command[0], spec.Command[1:]...)
 		} else {
+			//tuios:allow-exec ptyspawn starts the pane program on a pseudo console
 			cmd = exec.Command(shell)
 		}
 		cmd.Env = env
@@ -208,6 +210,13 @@ func (d *Daemon) registerHostedPane(spec hostedPaneSpec, grace time.Duration) (*
 	}
 
 	d.hostedPanesMu.Lock()
+	if d.hostedPanesShut {
+		d.hostedPanesMu.Unlock()
+		_ = cmd.Process.Kill()
+		_ = pty.Close()
+		_ = cmd.Wait()
+		return nil, errHandoffHostedOpen
+	}
 	if d.hostedPanes == nil {
 		d.hostedPanes = make(map[string]*hostedPane)
 	}
@@ -275,10 +284,9 @@ func clampHostedDim(v int) int {
 func hostedPaneEnv(d *Daemon, spec hostedPaneSpec, hp *hostedPane) []string {
 	env := guestenv.WithoutHostMultiplexer(os.Environ())
 
-	term := spec.Term
-	if term == "" {
-		term = "xterm-256color"
-	}
+	// The owner's TERM, checked against this machine's terminfo, which is
+	// the one the pane's programs read. See guestenv.PaneTerm.
+	term := guestenv.PaneTerm(spec.Term)
 	colorTerm := spec.ColorTerm
 	if colorTerm == "" {
 		colorTerm = "truecolor"

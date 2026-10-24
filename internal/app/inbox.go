@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/composer"
+
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
@@ -70,7 +72,7 @@ type InboxState struct {
 	// selectEditing, selectDraft and selectErr are the selector line: open,
 	// what is typed on it, and why it did not parse.
 	selectEditing bool
-	selectDraft   string
+	selectEd      *composer.Model
 	selectErr     string
 	// Selected is the overlay's cursor, an index into its rows. It is always
 	// on an item row, never on a group heading, unless there are no items.
@@ -101,6 +103,11 @@ type InboxState struct {
 	// its reply line too.
 	pendingThread uint64
 	pendingReply  bool
+	// pendingItem is an item to put the cursor on once a listing holds it:
+	// a notification's link opened tuios-web before the first listing
+	// arrived. It is cleared when the cursor lands on it, or when the
+	// person moves the cursor first. See OpenInboxOn.
+	pendingItem string
 
 	// Peek is the prompt read over the list, nil when the list shows. See
 	// inbox_peek.go.
@@ -136,6 +143,13 @@ type InboxState struct {
 	// recap is the away recap shown for the selected finished turn. See
 	// inbox_recap.go.
 	recap inboxRecapView
+	// agents is the agents view, which tab switches to. See
+	// inbox_agents.go.
+	agents inboxAgentsState
+	// threads are the agents' threads the view shows. See inbox_thread.go.
+	threads threadsState
+	// ck is the cockpit's own state. See cockpit.go.
+	ck cockpitState
 }
 
 // InboxSnapshotMsg is a fresh listing from the watcher.
@@ -216,7 +230,7 @@ func (m *OS) watchesInbox() bool {
 // its first delivery. The queue is this machine's daemon's, whichever session
 // the client is attached to.
 func (m *OS) startInboxWatch() tea.Cmd {
-	if !m.watchesInbox() || m.inboxEvents != nil {
+	if !m.watchesInbox() || m.inboxEvents != nil || !m.agentsOn() {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -435,6 +449,10 @@ func inboxWatchOnce(ctx context.Context, dial inboxDial, out chan<- tea.Msg) (bo
 
 // handleInboxWatch applies one delivery and re-arms the listener.
 func (m *OS) handleInboxWatch(msg inboxWatchMsg) tea.Cmd {
+	// A delivery that was on its way when the features went off.
+	if !m.agentsOn() {
+		return nil
+	}
 	var cmd tea.Cmd
 	switch inner := msg.msg.(type) {
 	case InboxSnapshotMsg:
@@ -522,7 +540,7 @@ func (m *OS) announceResumes(items []session.AttentionItem) {
 	if len(fresh) > 1 {
 		text = strconv.Itoa(len(fresh)) + " agent conversations can be resumed"
 	}
-	text += agentAlertSep() + "open the Inbox with " + m.pressFor("prefix_inbox", "the prefix key then i") +
+	text += agentAlertSep() + "open the agents view with " + m.pressFor("prefix_inbox", "the prefix key then i") +
 		", and press " + m.inboxKeyOr(config.ActionInboxResume, "y")
 	m.ShowNotificationFrom(text, "info", m.Settings.NotificationDuration,
 		NotifTarget{SessionID: fresh[0].Session, WindowID: fresh[0].Window})
@@ -662,7 +680,7 @@ func (m *OS) inboxPopAsk(it session.AttentionItem) bool {
 		return false
 	}
 	m.OpenInbox(session.AttentionAsk)
-	m.Inbox.SelectedID = it.ID
+	m.inboxLandOn(it.ID)
 	m.Inbox.poppedAt = now
 	return true
 }
@@ -1049,6 +1067,14 @@ func (m *OS) clampInboxSelection() {
 		st.Selected = 0
 		return
 	}
+	if st.pendingItem != "" {
+		for i, r := range rows {
+			if r.item != nil && r.item.ID == st.pendingItem {
+				st.Selected, st.pendingItem = i, ""
+				return
+			}
+		}
+	}
 	if st.SelectedID != "" {
 		for i, r := range rows {
 			if r.item != nil && r.item.ID == st.SelectedID {
@@ -1086,8 +1112,15 @@ func (m *OS) syncInboxSelectedID() {
 
 // OpenInbox shows the Inbox, narrowed to one kind or to none.
 func (m *OS) OpenInbox(filter string) {
+	if m.refuseAgentsOff() {
+		return
+	}
 	st := &m.Inbox
 	m.ShowInbox = true
+	// The cockpit is the agents view: the selector line searches the
+	// agents as well as narrowing the items.
+	st.agents.on = true
+	st.ck.needsOnly = false
 	st.Filter = filter
 	st.Selected, st.SelectedID = 0, ""
 	st.Scroll = 0
@@ -1096,34 +1129,84 @@ func (m *OS) OpenInbox(filter string) {
 	st.shown = inboxShown{}
 	st.poppedAt = time.Time{}
 	m.clampInboxSelection()
+	// The cockpit opens on its first row, which is the oldest wait in
+	// Needs you, or back on the agent ctrl+] left from.
+	st.ck.key, st.ck.akey, st.ck.idx, st.ck.scroll, st.ck.follow = "", "", 0, 0, true
+	if b := st.ck.back; b != nil && filter == "" {
+		st.ck.key, st.ck.akey, st.ck.scroll, st.ck.follow = b.key, b.akey, b.scroll, false
+	}
+	st.ck.back = nil
+	// Rows open in their groups; a hold is for a flip seen while open.
+	st.ck.placed, st.ck.holdUntil = nil, time.Time{}
+	st.threads.open = false
+	m.cockpitTouch()
+	m.cockpitRows()
+	m.cockpitClamp()
+	m.cockpitSync()
+}
+
+// OpenInboxOn shows the Inbox with the cursor on the item with this id, as
+// soon as a listing holds it. A notification's link opens tuios-web this way.
+// An item already gone leaves the cursor where OpenInbox puts it.
+func (m *OS) OpenInboxOn(id string) {
+	m.OpenInbox("")
+	if !m.ShowInbox || id == "" {
+		return
+	}
+	m.inboxLandOn(id)
+}
+
+// inboxLandOn puts the cockpit's cursor on the item with this id, now if the
+// rows hold it, or as soon as a listing brings it.
+func (m *OS) inboxLandOn(id string) {
+	ck := &m.Inbox.ck
+	ck.pending = id
+	m.cockpitTouchRows()
+	m.cockpitRows()
+	m.cockpitSync()
+	m.cockpitReplyFollow()
 }
 
 // CloseInbox hides the Inbox, and the peek with it.
 func (m *OS) CloseInbox() {
 	m.ShowInbox = false
+	// The live pane goes back to being streamed as its workspace has it.
+	m.cockpitLiveFollow()
+	m.cockpitLiveRelease()
+	m.stopInboxAgentsTick()
+	m.stopThreadWatch()
+	m.Inbox.threads.open = false
 	m.Inbox.Peek = nil
 	m.Inbox.life.pickFor, m.Inbox.life.closeAfterPick = "", false
 	m.Inbox.reply.editor = nil
+	// The image view and its image bytes go with the editor.
+	m.Inbox.ck.img = nil
+	// The spawn sheet is kept as the draft the next n opens.
+	m.spawnClose()
+	m.Inbox.ck.spawnBg = nil
+	// A bulk allow's sheet is never there when the Inbox opens again: its
+	// settle time was spent on a screen the person may not have read.
+	m.Inbox.agents.sheet = nil
+	// Nor are marks: the next view may show other agents, and a bulk key
+	// must not act on a mark the person cannot see.
+	m.Inbox.agents.marks = nil
+	m.Inbox.agents.marksGen++
 }
 
-// InboxMove moves the cursor by delta items, stepping over group headings.
+// InboxMove moves the cockpit's cursor by delta rows, and points the Inbox's
+// own cursors at the row it lands on.
 func (m *OS) InboxMove(delta int) {
-	rows := m.inboxRows()
-	st := &m.Inbox
-	if len(rows) == 0 || delta == 0 {
-		return
-	}
-	st.Selected = m.listStepSkip(st.Selected, delta, len(rows),
-		func(i int) bool { return rows[i].item != nil })
-	m.syncInboxSelectedID()
+	m.CockpitMove(delta)
+	m.cockpitSync()
 }
 
-// InboxSelect puts the cursor on row idx, when it is an item.
+// InboxSelect puts the cursor on the item of row idx of the Inbox's rows.
 func (m *OS) InboxSelect(idx int) {
 	rows := m.inboxRows()
 	if idx >= 0 && idx < len(rows) && rows[idx].item != nil {
-		m.Inbox.Selected = idx
-		m.syncInboxSelectedID()
+		m.cockpitSelectKey("i:" + rows[idx].item.ID)
+		m.Inbox.ck.pending = ""
+		m.cockpitSync()
 	}
 }
 
@@ -1135,28 +1218,6 @@ func (m *OS) inboxSelected() (session.AttentionItem, bool) {
 		return session.AttentionItem{}, false
 	}
 	return *rows[i].item, true
-}
-
-// InboxCycleFilter steps the filter through every kind and back to none.
-func (m *OS) InboxCycleFilter() {
-	st := &m.Inbox
-	next := ""
-	if st.Filter == "" {
-		next = session.AttentionKindNames[0]
-	} else if i := session.AttentionKindRank(st.Filter); i+1 < len(session.AttentionKindNames) {
-		next = session.AttentionKindNames[i+1]
-	}
-	// A question put with ask-human is shown under Questions, so the filter
-	// steps over it and Questions shows both.
-	if next == session.AttentionAsk {
-		if i := session.AttentionKindRank(next); i+1 < len(session.AttentionKindNames) {
-			next = session.AttentionKindNames[i+1]
-		}
-	}
-	st.Filter = next
-	st.Selected, st.SelectedID = 0, ""
-	st.Scroll = 0
-	m.clampInboxSelection()
 }
 
 // InboxActivate jumps to the selected item's pane, switching session and
@@ -1239,6 +1300,10 @@ func (m *OS) InboxAnswerAsk(n int) tea.Cmd {
 	}
 	if !inboxShowsWhole(it) {
 		m.ShowNotification("This question has characters this terminal cannot show, so it is not answered here", "info", m.Settings.NotificationDuration)
+		return nil
+	}
+	if m.inboxCut(it) {
+		m.ShowNotification("This question cannot be shown whole here. Enter answers it in the pane", "info", m.Settings.NotificationDuration)
 		return nil
 	}
 	if !m.inboxAnswerSettled(it, time.Now()) {
@@ -1337,14 +1402,14 @@ func (m *OS) InboxReplyApproval(decision string) tea.Cmd {
 		return nil
 	}
 	if !inboxHeld(it) {
-		m.ShowNotification("1, 2 and 3 answer an approval the Inbox is holding. Enter goes to the pane.", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("1, 2 and 3 answer a held approval. Enter goes to the pane.", "info", m.Settings.NotificationDuration)
 		return nil
 	}
 	if !slices.Contains(it.Options, decision) {
 		m.ShowNotification("This prompt does not offer "+inboxDecisionWords(decision), "info", m.Settings.NotificationDuration)
 		return nil
 	}
-	if !inboxShowsWhole(it) {
+	if !inboxShowsWhole(it) || m.inboxCut(it) {
 		m.ShowNotification("This prompt cannot be shown whole here. Enter answers it in the pane", "info", m.Settings.NotificationDuration)
 		return nil
 	}
@@ -1406,6 +1471,11 @@ func (m *OS) noteInboxShown(it session.AttentionItem, held bool, now time.Time) 
 	if key := inboxShownKey(it); st.shown.key != key {
 		st.shown = inboxShown{key: key, since: now}
 	}
+}
+
+// inboxCut reports whether the card showed it cut, too long for the screen.
+func (m *OS) inboxCut(it session.AttentionItem) bool {
+	return m.Inbox.ck.cutKey != "" && m.Inbox.ck.cutKey == inboxShownKey(it)
 }
 
 // inboxAnswerSettled reports whether it is the held approval last drawn under
@@ -1510,7 +1580,7 @@ func inboxDecisionWords(decision string) string {
 	case session.ApprovalAlways:
 		return "always allowed"
 	case session.ApprovalDeny:
-		return "denied"
+		return "rejected"
 	case session.ApprovalAsk:
 		return "handed back to the pane"
 	}
@@ -1627,7 +1697,7 @@ func (m *OS) inboxOpenMail(it session.AttentionItem, reply bool) tea.Cmd {
 func (m *OS) openMailThread(thread uint64, reply bool) tea.Cmd {
 	cmd := m.OpenAgentMailThread(thread)
 	if len(m.agentMailThreadMessages(thread)) == 0 {
-		m.AgentMail.Error = "This thread is no longer in the ring. Dismiss it from the Inbox with d."
+		m.AgentMail.Error = "This thread is no longer in the ring. Dismiss it in the agents view with d."
 		return cmd
 	}
 	if reply {
@@ -1839,6 +1909,9 @@ func inboxNeedsYou(it session.AttentionItem) bool {
 // it starts over, so a run of presses walks everything waiting. It reports
 // whether there was anywhere to go.
 func (m *OS) JumpToNextAttention() tea.Cmd {
+	if m.refuseAgentsOff() {
+		return nil
+	}
 	st := &m.Inbox
 	var todo []session.AttentionItem
 	for _, it := range st.Items {
@@ -1849,7 +1922,7 @@ func (m *OS) JumpToNextAttention() tea.Cmd {
 	if len(todo) == 0 {
 		msg := "Nothing is waiting for you"
 		if !st.Live {
-			msg = "The Inbox is not connected to the daemon"
+			msg = "The agents view is not connected to the daemon"
 		}
 		m.ShowNotification(msg, "info", m.Settings.NotificationDuration)
 		return nil
@@ -1915,7 +1988,7 @@ func inboxSeen(seenAt int64, now time.Time) string {
 // A kind that stands for an agent state wears that state's mark, in both
 // glyph modes, so an approval here is the same mark as the pane's row on the
 // rail. The ASCII forms of the other kinds are chosen not to collide with any
-// state's: finished used to be "*", which is working's.
+// state's: finished is not "*", because that is working's.
 func inboxKindGlyph(kind string) string {
 	switch kind {
 	case session.AttentionOutbox:

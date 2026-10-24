@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Gaurav-Gosain/tuios/internal/overlay"
+	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
 
 // The agent row's tokens and how each is drawn, from [appearance.sidebar.agent_row].
@@ -18,7 +18,7 @@ import (
 // ordered text and numeric rules:
 //
 //	[appearance.sidebar.agent_row]
-//	tokens = ["session", "need", "harness", "name", "elapsed", "context", "subagents", "meta", "now", "message"]
+//	tokens = ["session", "need", "harness", "name", "progress", "elapsed", "context", "subagents", "pr", "meta", "now", "message"]
 //
 //	[appearance.sidebar.agent_row.name]
 //	fg = "text"
@@ -56,9 +56,12 @@ import (
 // context draws "ctx 84%" only once the context is SidebarContextWarnAt
 // percent full or more, in the warning ink unless its table says otherwise,
 // and subagents says how many subagents the agent is running ("2 subagents")
-// on any row, and nothing while there are none. $now, $prompt and $context
-// draw the raw value on any row.
-var SidebarAgentRowTokens = []string{"harness", "name", "state", "elapsed", "need", "now", "prompt", "context", "subagents", "meta", "message", "session", "host"}
+// on any row, and nothing while there are none. pr is the pull request of the
+// session's worktree branch ("PR #12 open pass"), which the daemon reads from
+// gh, and nothing when there is none. $now, $prompt and $context draw the raw
+// value on any row. progress draws "40%", the progress of the pane's OSC 7501
+// report, while the program works or waits, on the identity line.
+var SidebarAgentRowTokens = []string{"harness", "name", "state", "progress", "elapsed", "need", "now", "prompt", "context", "subagents", "pr", "meta", "message", "session", "host"}
 
 // SidebarAgentRowDefaultTokens is the row as it ships. state and host are left
 // out because both have a value on every row and the glyph already says the
@@ -66,12 +69,13 @@ var SidebarAgentRowTokens = []string{"harness", "name", "state", "elapsed", "nee
 // need says what a row wants from you ("approval", "question", "errored",
 // "finished"), context how full the agent's context is once that is worth a
 // look, subagents how many subagents the agent still has at work, which on a
-// row at rest is the one sign that work goes on, meta whatever else the pane
+// row at rest is the one sign that work goes on, pr the pull request of the
+// session's branch and its checks, meta whatever else the pane
 // reported through set-agent-meta, which is nothing unless a hook or
 // statusline feed writes it, and now what a working agent is doing ("Bash: go
 // test ./..."). now comes last because the line cuts its last token first,
 // and a long command is what can best lose its tail.
-var SidebarAgentRowDefaultTokens = []string{"session", "need", "harness", "name", "elapsed", "context", "subagents", "meta", "now", "message"}
+var SidebarAgentRowDefaultTokens = []string{"session", "need", "harness", "name", "progress", "elapsed", "context", "subagents", "pr", "meta", "now", "message"}
 
 // SidebarContextWarnAt is the percent of its context window an agent must be
 // using before the context token draws. Below it the figure is noise on a
@@ -119,10 +123,6 @@ func sidebarKnownToken(name string) bool {
 func sidebarTokenNames() string {
 	return strings.Join(SidebarAgentRowTokens, ", ") + ", or $key for one metadata key"
 }
-
-// SidebarTokenColors are the palette names a token's fg may take, beside a
-// #rrggbb literal. They are the rail's own tiers and the four status inks.
-var SidebarTokenColors = []string{"text", "dim", "muted", "accent", "warning", "error", "success", "info"}
 
 // sidebarTokenTests are the tests a rule may carry, exactly one per rule.
 var sidebarTokenTests = []string{"equals", "contains", "starts_with", "gt", "lt"}
@@ -368,12 +368,13 @@ func parseLook(where string, table map[string]any, problem func(string, ...any))
 		s = strings.ToLower(strings.TrimSpace(s))
 		switch {
 		case !isString:
-			problem("%s.fg must be a colour name or #rrggbb in quotes, so it is ignored", where)
-		case slices.Contains(SidebarTokenColors, s), isHexColor(s):
+			problem("%s.fg must be a colour in quotes. The row ignores it", where)
+		case theme.IsColor(s):
+			// A role such as text or accent is read off the rail's own
+			// palette when the row is drawn, so it is the rail's ink.
 			look.Fg = s
 		default:
-			problem("%s.fg is %s, which is not a colour the row knows. Use one of %s, or #rrggbb",
-				where, strconv.Quote(s), strings.Join(SidebarTokenColors, ", "))
+			problem("%s.fg: %s. The row ignores it", where, ColourProblem(s))
 		}
 	}
 	for _, key := range []string{"bold", "dim"} {
@@ -485,15 +486,6 @@ func lookString(l SidebarTokenLook) string {
 		return strconv.FormatBool(*p)
 	}
 	return l.Fg + "/" + tri(l.Bold) + "/" + tri(l.Dim)
-}
-
-// isHexColor reports whether s is #rgb or #rrggbb.
-func isHexColor(s string) bool {
-	if !strings.HasPrefix(s, "#") {
-		return false
-	}
-	_, ok := overlay.ParseHex(s)
-	return ok
 }
 
 // stringList reads a TOML array of strings.

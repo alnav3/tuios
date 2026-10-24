@@ -285,8 +285,9 @@ func TestHerdrUnknownAndUnsupportedMethods(t *testing.T) {
 		params any
 		code   string
 	}{
-		{"plugin.list", map[string]any{}, "unsupported"},
-		{"pane.resize", map[string]any{}, "unsupported"},
+		{"plugin.enable", map[string]any{}, "invalid_request"},
+		{"layout.apply", map[string]any{}, "unsupported"},
+		{"pane.resize", map[string]any{}, "invalid_request"},
 		{"no.such_method", map[string]any{}, "invalid_request"},
 		{"pane.get", map[string]any{}, "invalid_request"},
 		{"pane.get", map[string]any{"pane_id": "w1:p1"}, "pane_not_found"},
@@ -369,6 +370,9 @@ func TestHerdrStructureMethods(t *testing.T) {
 
 // TestHerdrGrantsHoldAPane: a herdr client in a pane is held to the pane's
 // grants exactly as a verb call is.
+//
+// Negative control: with agent.start naming the pane as the daemon
+// (verbSetWindow with no caller), its rename passes without admin.
 func TestHerdrGrantsHoldAPane(t *testing.T) {
 	d, sp, a1, a2, b1 := scopeFixture(t)
 	sa, sb := d.manager.GetSession("a"), d.manager.GetSession("b")
@@ -402,6 +406,8 @@ func TestHerdrGrantsHoldAPane(t *testing.T) {
 		{"tab.create", map[string]any{"workspace_id": herdrWorkspaceID(sa.ID)}},
 		{"workspace.create", map[string]any{}},
 		{"workspace.close", map[string]any{"workspace_id": herdrWorkspaceID(sb.ID)}},
+		// agent.start names the pane, and a rename needs admin.
+		{"agent.start", map[string]any{"name": "helper", "kind": "claude", "pane_id": herdrPaneID(sa.ID, a2)}},
 	} {
 		if _, e := herdrCallAs(t, sp, m.method, m.params); !strings.HasPrefix(e, "forbidden") {
 			t.Errorf("%s without admin answered %q", m.method, e)
@@ -409,6 +415,9 @@ func TestHerdrGrantsHoldAPane(t *testing.T) {
 	}
 	if len(sa.GetState().Windows) != 2 || d.manager.GetSession("b") == nil {
 		t.Fatal("a refused call changed something")
+	}
+	if w, _ := findWindowState(sa.GetState(), a2); w.CustomName != "" {
+		t.Errorf("a refused agent.start named the pane %q", w.CustomName)
 	}
 
 	// A pane waiting on a prompt answers what is typed into it: that needs

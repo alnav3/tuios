@@ -7,20 +7,15 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 )
 
-// The settings page used to be a hand-written list. It reached 54 rows against
-// a registry of 91 options, and every option added after a row was last written
-// was reachable by an agent through set-config and by a person only by editing
-// the file. Nothing failed when the two drifted, because nothing tied them
-// together.
-//
-// A row is now derived from its registry entry. The registry already carries
-// the type, the accepted set, the range, the description and the default, which
-// is every question the panel was asking of each hand-written row: a bool is a
-// toggle, an option with Accepted is a cycler, an int with a Min and Max is a
-// stepper, and a string is a field. What is left hand-written is the handful of
-// rows that genuinely behave differently (a picker, a value the config does not
-// spell the way the row does), and TestSettingsPanelReachesEveryOption fails the
-// build if an option has neither.
+// A settings row is derived from its registry entry, so an option an agent can
+// reach through set-config is one a person can reach on the page too. The
+// registry already carries the type, the accepted set, the range, the
+// description and the default, which is every question the panel asks of a row:
+// a bool is a toggle, an option with Accepted is a cycler, an int with a Min
+// and Max is a stepper, and a string is a field. What is left hand-written is
+// the handful of rows that genuinely behave differently (a picker, a value the
+// config does not spell the way the row does), and
+// TestSettingsPanelReachesEveryOption fails the build if an option has neither.
 
 // settingsRow declares one row of a category: a registry path to derive from,
 // or a row written by hand. Exactly one is set.
@@ -43,78 +38,119 @@ func custom(covers string, item settingItem) settingsRow {
 // settingLabels overrides the label derived from a path's last segment, for the
 // paths where the derived one reads worse than the name the row has always had.
 var settingLabels = map[string]string{
-	"appearance.sidebar.editor":         "File editor",
-	"appearance.dockbar_position":       "Dock position",
-	"appearance.glyphs":                 "Glyph set",
-	"appearance.hide_clock":             "Clock in the badge",
-	"appearance.hide_scrollbar":         "Scrollbar",
-	"appearance.hide_window_buttons":    "Window buttons",
-	"appearance.scrollbar.style":        "Scrollbar style",
-	"appearance.show_clock":             "Clock",
-	"appearance.show_cpu":               "CPU meter",
-	"appearance.show_ram":               "RAM meter",
-	"appearance.sidebar.enabled":        "Sidebar",
-	"spotlight.shake":                   "Shake to toggle",
-	"appearance.sidebar.position":       "Position",
-	"appearance.sidebar.width":          "Width",
-	"appearance.window_title_position":  "Window title",
-	"appearance.whichkey_enabled":       "Which-key",
-	"appearance.whichkey_position":      "Which-key position",
-	"appearance.wrap_lists":             "Wrap lists at the ends",
-	"appearance.gap":                    "Pane gap",
-	"appearance.niri_reverse_scroll":    "Reverse scroll",
-	"appearance.niri_scroll_cells":      "Strip scroll step",
-	"appearance.scroll_column_max":      "Column width cap",
-	"appearance.niri_click_reveals":     "Click reveals column",
-	"appearance.niri_hover_reveals":     "Hover reveals column",
-	"appearance.motion":                 "Motion",
-	"appearance.modal_dim":              "Dim behind panels",
-	"appearance.confirm_quit":           "Confirm quit",
-	"appearance.session_colors":         "Session colors",
-	"appearance.session_border":         "Session border",
-	"appearance.global_session":         "Global session",
-	"appearance.git_dirty":              "Git dirty counts",
-	"appearance.links":                  "Links",
-	"appearance.right_click_opens_menu": "Right-click menu",
-	"appearance.new_window_inherit_cwd": "Inherit directory",
-	"appearance.kitty_placeholders":     "Kitty placeholders",
-	"appearance.dock_pill_caps":         "Pill caps",
-	"appearance.dock_workspace_tabs":    "Workspace tabs",
-	"appearance.dock_workspace_tooltip": "Workspace name on hover",
-	"dock.clock.format":                 "Dock clock format",
-	"debug.show_key_events":             "Show keys",
-	"daemon.log_level":                  "Log level",
-	"daemon.window_size":                "Session size",
-	"tape.auto_review":                  "Auto-open review",
-	"hints.builtins":                    "Hint patterns",
-	"hints.alphabet":                    "Hint letters",
-	"hints.open":                        "Ctrl opens a hint",
-	"hints.dim":                         "Dim around hints",
-	"hints.all_panes":                   "Hints on all panes",
-	"scratch.width":                     "Scratch width",
-	"pip.width":                         "Picture-in-picture width",
-	"pip.height":                        "Picture-in-picture height",
-	"pip.corner":                        "Picture-in-picture corner",
-	"scratch.height":                    "Scratch height",
-	"launcher.gui_command":              "Launcher GUI command",
+	"agents.enabled":                      "Agent features",
+	"appearance.sidebar.editor":           "File editor",
+	"appearance.dock_workspace_label_max": "Workspace label cap",
+	"appearance.dock_mode_icon_window":    "Window mode icon",
+	"appearance.dock_mode_icon_terminal":  "Terminal mode icon",
+	"appearance.dock_mode_icon_tiling":    "Tiling mode icon",
+	"appearance.dockbar_position":         "Dock position",
+	"appearance.glyphs":                   "Glyph set",
+	"appearance.frame_panels":             "Frame panels",
+	"appearance.theme_light":              "Light theme",
+	"appearance.sidebar.row_style":        "Current row",
+	"appearance.sidebar.header_style":     "Section headers",
+	"appearance.sidebar.density":          "Section spacing",
+	"appearance.window_title_style":       "Title style",
+	"appearance.window_title_align":       "Title place",
+	"appearance.border_focused_gradient":  "Focused border gradient",
+	"appearance.border_gradient_angle":    "Gradient angle",
+	"appearance.hide_clock":               "Clock in the badge",
+	"appearance.hide_scrollbar":           "Scrollbar",
+	"appearance.hide_window_buttons":      "Window buttons",
+	"appearance.scrollbar.style":          "Scrollbar style",
+	"appearance.show_clock":               "Clock",
+	"appearance.show_cpu":                 "CPU meter",
+	"appearance.show_ram":                 "RAM meter",
+	"appearance.sidebar.enabled":          "Sidebar",
+	"spotlight.shake":                     "Shake to toggle",
+	"appearance.sidebar.position":         "Position",
+	"appearance.sidebar.width":            "Width",
+	"appearance.window_title_position":    "Window title",
+	"appearance.whichkey_enabled":         "Which-key",
+	"appearance.whichkey_position":        "Which-key position",
+	"appearance.wrap_lists":               "Wrap lists at the ends",
+	"appearance.gap":                      "Pane gap",
+	"appearance.drop_preview":             "Drop preview",
+	"appearance.drop_preview_delay":       "Drop preview delay",
+	"appearance.niri_reverse_scroll":      "Reverse scroll",
+	"appearance.niri_scroll_cells":        "Strip scroll step",
+	"appearance.scroll_column_max":        "Column width cap",
+	"appearance.niri_click_reveals":       "Click reveals column",
+	"appearance.niri_hover_reveals":       "Hover reveals column",
+	"appearance.motion":                   "Motion",
+	"appearance.modal_dim":                "Dim behind panels",
+	"appearance.popup_dim":                "Dim behind popups",
+	"appearance.confirm_quit":             "Confirm quit",
+	"appearance.session_colors":           "Session colors",
+	"appearance.session_border":           "Session border",
+	"appearance.global_session":           "Global session",
+	"appearance.git_dirty":                "Git dirty counts",
+	"appearance.links":                    "Links",
+	"appearance.link_click":               "Link click",
+	"appearance.link_opener":              "Link opener",
+	"appearance.right_click_opens_menu":   "Right-click menu",
+	"appearance.new_window_inherit_cwd":   "Inherit directory",
+	"appearance.new_window_follow_ssh":    "Follow ssh",
+	"appearance.kitty_placeholders":       "Kitty placeholders",
+	"appearance.image_symbols":            "Images as text",
+	"appearance.dock_pill_caps":           "Pill caps",
+	"appearance.dock_mode_split_letter":   "Split letter",
+	"appearance.dock_prefix_indicator":    "Prefix indicator",
+	"appearance.dock_compact":             "Compact dock",
+	"appearance.dock_workspace_tabs":      "Workspace tabs",
+	"appearance.dock_workspace_tooltip":   "Workspace name on hover",
+	"dock.clock.format":                   "Dock clock format",
+	"debug.show_key_events":               "Show keys",
+	"daemon.log_level":                    "Log level",
+	"daemon.window_size":                  "Session size",
+	"tape.auto_review":                    "Auto-open review",
+	"tape.show_status":                    "Show tape status",
+	"hints.builtins":                      "Hint patterns",
+	"hints.alphabet":                      "Hint letters",
+	"panes.label_keys":                    "Pane label keys",
+	"panes.navigator_layout":              "Navigator layout",
+	"hints.open":                          "Ctrl opens a hint",
+	"hints.dim":                           "Dim around hints",
+	"hints.all_panes":                     "Hints on all panes",
+	"scratch.width":                       "Scratch width",
+	"pip.width":                           "Picture-in-picture width",
+	"pip.height":                          "Picture-in-picture height",
+	"pip.corner":                          "Picture-in-picture corner",
+	"scratch.height":                      "Scratch height",
+	"launcher.gui_command":                "Launcher GUI command",
+	"workspaces.return_when_empty":        "Go back from an empty workspace",
+	"workspaces.new_window_when_empty":    "Open a pane on an empty workspace",
+	"paste_buffers.limit":                 "Paste buffers to keep",
+	"paste_buffers.max_kb":                "Paste buffer size limit",
 
-	"appearance.sidebar.sections":             "Sections",
-	"appearance.sidebar.file_icons":           "File icons",
-	"appearance.sidebar.file_icon_colors":     "File icon colors",
-	"appearance.sidebar.folder_click":         "Click a folder",
-	"appearance.sidebar.file_actions":         "File actions",
-	"appearance.sidebar.file_delete":          "Delete sends to",
-	"appearance.sidebar.agent_rest_fold":      "Fold agents at rest after",
-	"appearance.dock_workspace_tab_format":    "Workspace tab format",
-	"appearance.zoom_size":                    "Zoom size",
-	"appearance.zoom_animation":               "Zoom animates",
-	"appearance.zoom_follows_focus":           "Zoom follows focus",
-	"appearance.window_button_zoom":           "Tiled zoom button",
-	"appearance.zoom_max_width":               "Zoom width",
-	"appearance.alt_drag":                     "Alt-drag to move",
-	"appearance.auto_enter_terminal_on_focus": "Type in a pane when focus moves to it",
-	"startup.tiled":                           "Start tiled",
-	"startup.daemon":                          "Daemon by default",
+	"appearance.sidebar.sections":               "Sections",
+	"appearance.sidebar.file_icons":             "File icons",
+	"appearance.sidebar.file_icon_colors":       "File icon colors",
+	"appearance.sidebar.folder_click":           "Click a folder",
+	"appearance.sidebar.file_actions":           "File actions",
+	"appearance.sidebar.file_delete":            "Delete sends to",
+	"appearance.sidebar.agent_rest_fold":        "Fold agents at rest after",
+	"appearance.sidebar.subagent_rows":          "Show subagents as",
+	"appearance.sidebar.subagent_collapse":      "Subagent heading",
+	"appearance.sidebar.subagent_fields":        "Subagent fields",
+	"appearance.sidebar.subagent_max_rows":      "Subagent row limit",
+	"appearance.sidebar.subagent_hide_finished": "Hide finished subagents after",
+	"appearance.dock_workspace_tab_format":      "Workspace tab format",
+	"appearance.zoom_size":                      "Zoom size",
+	"appearance.zoom_animation":                 "Zoom animates",
+	"appearance.animation_speed":                "Animation speed",
+	"appearance.theme_transition":               "Theme transition",
+	"appearance.theme_transition_duration":      "Theme transition time (ms)",
+	"appearance.zoom_borderless":                "Borderless zoom",
+	"appearance.zoom_follows_focus":             "Zoom follows focus",
+	"appearance.window_button_zoom":             "Tiled zoom button",
+	"appearance.zoom_max_width":                 "Zoom width",
+	"appearance.alt_drag":                       "Alt-drag to move",
+	"appearance.auto_enter_terminal_on_focus":   "Type in a pane when focus moves to it",
+	"appearance.focus_follows_mouse_pause":      "Key that pauses focus follows mouse",
+	"startup.tiled":                             "Start tiled",
+	"startup.daemon":                            "Daemon by default",
 
 	// The [notifications] rows sit under one tab, where a row called "Duration"
 	// or "Sound" does not say which of the three durations or whose sound.
@@ -175,17 +211,23 @@ var settingUnset = map[string]string{
 	"appearance.preferred_shell":           "(auto-detect)",
 	"appearance.clock_format":              config.DefaultClockFormat,
 	"dock.clock.format":                    "(appearance.clock_format)",
+	"appearance.dock_mode_icon_window":     "(no icon)",
+	"appearance.dock_mode_icon_terminal":   "(no icon)",
+	"appearance.dock_mode_icon_tiling":     "(no icon)",
 }
 
 // settingSteps is the stride an int row moves by, for the ranges where one is
 // too fine to arrow through. Anything absent steps by one.
 var settingSteps = map[string]int{
-	"appearance.scrollback_lines": 1000,
-	"appearance.zoom_max_width":   10,
-	"appearance.dim_unfocused":    5,
-	"appearance.modal_dim":        5,
-	"hints.dim":                   5,
-	"appearance.sidebar.width":    2,
+	"appearance.scrollback_lines":          1000,
+	"appearance.zoom_max_width":            10,
+	"appearance.dim_unfocused":             5,
+	"appearance.modal_dim":                 5,
+	"appearance.popup_dim":                 5,
+	"appearance.animation_speed":           25,
+	"appearance.theme_transition_duration": 50,
+	"hints.dim":                            5,
+	"appearance.sidebar.width":             2,
 }
 
 // settingLabel is the row's name: an override where there is one, otherwise the
@@ -362,10 +404,9 @@ func (m *OS) registryItem(path string) settingItem {
 		}
 		item.numMin, item.numMax = lo, hi
 		// A gauge only on a proportion, where both ends of the range are places
-		// the value would really sit. It used to be drawn on any option with a
-		// ceiling, which put one beside every count and timeout in the panel,
-		// where it sat empty whatever the value was, because those ceilings are
-		// guards against a silly number and not the top of a scale.
+		// the value would really sit. On a count or a timeout the ceiling is a
+		// guard against a silly number and not the top of a scale, so a gauge
+		// there would sit empty whatever the value is.
 		if o.Percent {
 			item.meter = func(m *OS) float64 {
 				if hi <= lo {

@@ -124,11 +124,15 @@ reports it under `problems` with the reason.
   disc), `pill_left`, `pill_right`
 - **Rules and separators:** `rule` (the hairline, repeated), `separator` (the
   dock's gap between groups), `arrow_left`, `arrow_right` (overflow chevrons)
-- **Rail marks:** `focus` ("you are here"), `attention` ("this one wants a
+- **Rail marks:** `focus` ("you are here"), `marker` ("you are here" with
+  `appearance.sidebar.row_style = "marker"`), `attention` ("this one wants a
   human"), `bullet` (a resting row), `add`, `collapse`, `expand`,
   `tree_branch` and `tree_last` (in front of a worktree session under its
   repository), `fold_open` and `fold_shut` (on a machine's group header in the
   sessions section, saying whether its rows are on screen under it)
+- **Rail section icons:** `section_sessions`, `section_terminals`,
+  `section_agents`, `section_files`, `section_git`, in front of the section
+  headers with `appearance.sidebar.header_style = "icon"`
 - **Files section:** `folder`, `parent` (the `..` row), `file`. These are what
   the rail's listing draws when `appearance.sidebar.file_icons` is off or the
   terminal is in ASCII mode; with icons on, a nerd font codepoint per file type
@@ -147,6 +151,12 @@ strip.
 
 `appearance.scrollbar.thumb` and `appearance.scrollbar.track` still exist and
 still win over the set, because they are the narrower statement.
+
+`scrollbar_thumb` also draws the scroll thumb of a rail section that
+overflows, in the rail's edge rule, with no track. `appearance.scrollbar.thumb`
+does not reach it: it is the pane bar's. With no set, the rail's thumb is `┃`,
+and `#` under `--ascii-only`. A thumb that is the same glyph as the rule is
+drawn as `█` instead (`#` under `--ascii-only`), so it still shows.
 
 ## Cell Widths
 

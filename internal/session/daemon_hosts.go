@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
@@ -30,8 +31,8 @@ import (
 // tear down a working link.
 
 // startHostsWatch begins following the config file for changes to the [hosts]
-// table. A watcher that cannot be opened is logged once, and the daemon then
-// behaves as it did before this existed: the table is what it was at start.
+// table. A watcher that cannot be opened is logged once, and the table then
+// stays what it was at start.
 func (d *Daemon) startHostsWatch() {
 	if d.configPath == "" {
 		return
@@ -71,11 +72,14 @@ func (d *Daemon) stopHostsWatch() {
 }
 
 // onConfigReload runs on the watcher goroutine. It applies the [hosts] table,
-// appearance.preferred_shell, [agents] herdr_protocol, the
+// [notify], appearance.preferred_shell, workspaces.return_when_empty,
+// [paste_buffers], [agents] enabled and herdr_protocol, [daemon]
+// single_client and ssh_agent, the
 // [agents.approvals], [agents.permissions] and [agents.queue] tables and
 // [agents.recap] test_patterns, and reads nothing else out of the file. A new
-// approval policy applies to the next request; a hold already running keeps
-// the length it started with. A new permission default that narrows applies
+// approval policy applies to the next request, except a risk rule it drops or
+// a panes_may_allow it sets, which wait (narrowApprovalPolicy); a hold
+// already running keeps the length it started with. A new permission default that narrows applies
 // to the next call from every pane that holds the default; one that widens
 // waits for a restart (reloadPanePermissions).
 func (d *Daemon) onConfigReload(cfg *config.UserConfig, err error) {
@@ -90,17 +94,66 @@ func (d *Daemon) onConfigReload(cfg *config.UserConfig, err error) {
 // runs. The file is the user's, and a process in a pane runs as the user and
 // can write it. So from a file change (byPerson false) the parts that bound
 // panes and links apply only where they narrow: [agents.permissions], the
-// link policies of [hosts], and the hosts the daemon dials, since ssh runs
+// risk rules of [agents.approvals], the link policies of [hosts], and the hosts the daemon dials, since ssh runs
 // what a host entry or ~/.ssh/config says as the daemon's child. What widens
 // waits for tuios config apply from outside every pane (byPerson true), or a
 // daemon restart.
 func (d *Daemon) applyUserConfig(cfg *config.UserConfig, byPerson bool) {
+	// The agent switch applies from a file change too, in both directions.
+	// Off is the stricter state (see agents_switch.go), and on is the state
+	// every daemon runs in by default, so neither widens what a pane may do
+	// beyond what the shipped daemon allows.
+	d.SetAgentsEnabled(cfg.Agents.On())
+	// It narrows who is attached and widens nothing, so a file change
+	// applies it at once.
+	d.singleClient.Store(cfg.Daemon.SingleClient)
+	// The link only ever names a socket of the person's own client, so
+	// following it widens nothing a pane may do, and a file change applies.
+	d.SetSSHAgent(cfg.Daemon.SSHAgent)
+	// The display only ever comes from the person's own local client, so a
+	// file change applies at once, like the agent.
+	d.SetDisplay(cfg.Daemon.Display)
+	// [hosts] or ~/.ssh/config may forward the agent differently now, and a
+	// host that left the table leaves no agent link behind.
+	d.forgetHostForwards()
+	d.agentPruneHosts(HostsFromConfig(cfg))
 	d.manager.SetPreferredShell(cfg.Appearance.PreferredShell)
 	d.manager.SetHerdrProtocol(cfg.Agents.HerdrProtocol)
-	d.SetApprovalPolicy(ApprovalPolicyFromConfig(cfg.Agents.Approvals))
+	d.manager.SetReturnWhenEmpty(cfg.Workspaces.ReturnsWhenEmpty())
+	if d.buffers != nil {
+		d.buffers.SetLimits(cfg.PasteBuffers.Resolved())
+	}
+	// The risk rules and panes_may_allow bound what a pane may allow, so a
+	// file change only narrows them, like [agents.permissions].
+	approvals, approvalsWait := ApprovalPolicyFromConfig(cfg.Agents.Approvals), false
+	if !byPerson {
+		approvals, approvalsWait = narrowApprovalPolicy(d.approvalPolicy(), approvals)
+		if approvalsWait {
+			log.Printf("The new [agents.approvals.risk] gives panes more than before. The risk rules in force stay, and panes may not allow a risky call. The rest applies after tuios config apply from outside tuios, or a daemon restart.")
+		}
+	}
+	d.SetApprovalPolicy(approvals)
+	d.approvalsWaiting.Store(approvalsWait)
 	d.SetRecapTestPatterns(cfg.Agents.Recap.Resolved().TestPatterns)
 	d.SetQueueMax(cfg.Agents.Queue.MaxEntries())
+	// A file change only turns the wake off. A process in a pane can write
+	// the file, and the wake types into panes, so turning it on waits for
+	// tuios config apply from outside tuios, or a daemon restart, as a wider
+	// [agents.permissions] does.
+	wake := cfg.Agents.Mail.WakeOn()
+	if wake && !byPerson && !d.mailWake.on.Load() {
+		wake = false
+		log.Printf("[agents.mail] wake = true in the file waits for tuios config apply from outside tuios, or a daemon restart. The wake stays off.")
+	}
+	d.SetMailWake(wake)
+	d.SetCheckpoints(cfg.Agents.Checkpoints)
+	// A new notification destination waits like a new host does.
+	d.notify.reload(cfg.Notify, byPerson)
 	perms := PanePermissionsFromConfig(cfg.Agents.Permissions)
+	// A plugin put on the enabled list waits for the person, like a new
+	// host. One taken off stops now. See plugin_host.go.
+	pluginsWait := d.plugins != nil && d.plugins.apply(cfg.Plugins, byPerson)
+	d.pluginsWaiting.Store(pluginsWait)
 	if byPerson {
 		d.manager.SetPanePermissions(perms)
 		// A policy change applies to the next call on every link, including
@@ -132,7 +185,7 @@ func (d *Daemon) noteConfigWaiting() {
 // configWaiting reports whether config.toml holds a change that widens what
 // panes or links may do and waits for tuios config apply or a restart.
 func (d *Daemon) configWaiting() bool {
-	return d.manager.grants.restartNeeded.Load() || d.hostsWaiting.Load()
+	return d.manager.grants.restartNeeded.Load() || d.hostsWaiting.Load() || d.notify.waitingApply() || d.pluginsWaiting.Load() || d.approvalsWaiting.Load()
 }
 
 // reloadHosts applies a changed host table only where it dials less: a host
@@ -210,15 +263,92 @@ func (d *Daemon) reloadLinkPolicies(next map[string]config.HostConfig) (waits bo
 		if now.HostedGrace > was.HostedGrace {
 			widened = true
 		}
+		roots, rootsWiden := narrowFilesRoots(was, now)
+		if rootsWiden {
+			widened = true
+		}
+		readRoots, readWiden := narrowReadRoots(was, now)
+		if readWiden {
+			widened = true
+		}
+		minFree := max(was.FilesMinFree, now.FilesMinFree)
+		if now.FilesMinFree < was.FilesMinFree {
+			widened = true
+		}
 		h := next[key]
-		h.Allow, h.HoldMail, h.HostedGrace = allow, &hold, grace.String()
+		h.Allow, h.HoldMail, h.HostedGrace, h.FilesRoots = allow, &hold, grace.String(), roots
+		h.FilesReadRoots, h.FilesMinFree = readRoots, strconv.FormatInt(minFree, 10)
 		merged[key] = h
 	}
 	d.SetLinkPolicies(merged)
+	// A machine that lost relay or files stops the copies it started here.
+	if d.transfers != nil {
+		d.transfers.failRevoked()
+	}
 	if widened {
 		log.Printf("[FEDERATION] A link policy in config.toml gives another machine more than before. That part applies after tuios config apply from outside tuios, or a daemon restart.")
 	}
 	return widened
+}
+
+// narrowFilesRoots is the write roots both policies allow: each root of one
+// that lies inside a root of the other. widens reports whether now names a
+// folder that was not allowed before, which waits for tuios config apply.
+func narrowFilesRoots(was, now config.LinkPolicy) (roots []string, widens bool) {
+	a, b := linkRootPaths(was), linkRootPaths(now)
+	roots = []string{}
+	add := func(r string) {
+		if !slices.Contains(roots, r) {
+			roots = append(roots, r)
+		}
+	}
+	for _, r := range b {
+		if slices.ContainsFunc(a, func(w string) bool { return pathUnder(r, w) }) {
+			add(r)
+		} else {
+			widens = true
+		}
+	}
+	for _, r := range a {
+		if slices.ContainsFunc(b, func(n string) bool { return pathUnder(r, n) }) {
+			add(r)
+		}
+	}
+	return roots, widens
+}
+
+// narrowReadRoots is the read roots both policies allow. Nil is no limit, so
+// a limit that was not there before applies at once, and dropping one waits
+// for tuios config apply like any other widening.
+func narrowReadRoots(was, now config.LinkPolicy) (roots []string, widens bool) {
+	switch {
+	case now.FilesReadRoots == nil && was.FilesReadRoots == nil:
+		return nil, false
+	case was.FilesReadRoots == nil:
+		return linkPathsOf(now.FilesReadRoots), false
+	case now.FilesReadRoots == nil:
+		return linkPathsOf(was.FilesReadRoots), true
+	}
+	a, b := linkPathsOf(was.FilesReadRoots), linkPathsOf(now.FilesReadRoots)
+	roots = []string{}
+	add := func(r string) {
+		if !slices.Contains(roots, r) {
+			roots = append(roots, r)
+		}
+	}
+	for _, r := range b {
+		if slices.ContainsFunc(a, func(w string) bool { return pathUnder(r, w) }) {
+			add(r)
+		} else {
+			widens = true
+		}
+	}
+	for _, r := range a {
+		if slices.ContainsFunc(b, func(n string) bool { return pathUnder(r, n) }) {
+			add(r)
+		}
+	}
+	return roots, widens
 }
 
 // ApplyHosts swaps the daemon's host table for a new one and reconciles the

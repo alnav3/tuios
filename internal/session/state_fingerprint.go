@@ -100,6 +100,10 @@ func StateFingerprint(s *SessionState) uint64 {
 		str(w.PTYID)
 		flag(w.IsAltScreen)
 		flag(w.IsFloating)
+		str(w.Stack)
+		num(w.StackIndex)
+		str(w.Kind)
+		str(w.URI)
 		flag(w.Zoomed)
 		num(w.PreZoomX)
 		num(w.PreZoomY)
@@ -122,13 +126,48 @@ func StateFingerprint(s *SessionState) uint64 {
 		}
 		num(w.AgentQueued)
 		num(w.AgentSubagents)
+		num(len(w.AgentSubagentList))
+		for _, sa := range w.AgentSubagentList {
+			str(sa.ID)
+			str(sa.Type)
+			str(sa.Description)
+			str(sa.State)
+			num(int(sa.StartedAt))
+			num(int(sa.EndedAt))
+			str(sa.Now)
+			str(sa.Last)
+			num(sa.Tools)
+			str(sa.Result)
+		}
+		num(len(w.ProgramStatus))
+		for _, r := range w.ProgramStatus {
+			str(r.ID)
+			str(r.State)
+			str(r.Kind)
+			num(r.Progress)
+			str(r.App)
+			str(r.Title)
+			str(r.Msg)
+			num(int(r.At))
+		}
 		flag(w.Popup)
 		str(w.PopupWidth)
 		str(w.PopupHeight)
+		flag(w.PopupDim != nil)
+		if w.PopupDim != nil {
+			num(w.PopupDim.Percent)
+		}
 		flag(w.Scratch)
 		str(w.ScratchName)
 		str(w.ForegroundCmd)
 		num(w.ShellPID)
+		if w.StartedBy != nil {
+			str(w.StartedBy.Session)
+			str(w.StartedBy.Window)
+		} else {
+			str("")
+			str("")
+		}
 		num(len(w.Grants))
 		for _, g := range w.Grants {
 			str(g)
@@ -167,6 +206,17 @@ func StateFingerprint(s *SessionState) uint64 {
 		num(k)
 		f64(s.WorkspaceStackRatio[k])
 	}
+	num(len(s.WorkspaceMasterSplits))
+	for _, k := range sortedIntKeys(s.WorkspaceMasterSplits) {
+		num(k)
+		sp := s.WorkspaceMasterSplits[k]
+		for _, list := range [][]float64{sp.Masters, sp.Stack, sp.Rows, sp.Cells} {
+			num(len(list))
+			for _, v := range list {
+				f64(v)
+			}
+		}
+	}
 	num(len(s.WorkspaceMasterLayout))
 	for _, k := range sortedIntKeys(s.WorkspaceMasterLayout) {
 		num(k)
@@ -184,6 +234,11 @@ func StateFingerprint(s *SessionState) uint64 {
 		num(k)
 		flag(s.WorkspaceHasCustom[k])
 	}
+
+	// The per-workspace layout modes, folded in for the same reason: a push that
+	// changes only the map has to reach the peer, and without it the push came
+	// out with the same fingerprint as the last one and was dropped as a repeat.
+	hashIntStr(s.WorkspaceLayoutModes)
 
 	num(len(s.WorkspaceOrder))
 	for _, v := range s.WorkspaceOrder {

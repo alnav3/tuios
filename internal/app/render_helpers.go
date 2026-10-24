@@ -13,6 +13,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/ansi/parser"
 )
 
 // agentStateIndicator returns the one-cell glyph that marks a pane's agent state
@@ -57,6 +58,12 @@ var agentStateMarks = map[session.AgentState]struct{ glyph, ascii string }{
 	// anything is there. It reads as the same family as idle's hollow circle,
 	// which is the nearest thing to what it means.
 	session.AgentStateUnknown: {"□", "?"},
+	// Display only, never a pane's state: the agent is at rest and
+	// subagents it started still run (see displayState). A lozenge in the
+	// working ink: a shape none of the states uses, and one Go Mono, which
+	// tuios shot draws with when no font is given, has. The half-filled
+	// circle the design named draws as a missing glyph there.
+	agentStateWaiting: {"◊", "%"},
 }
 
 // agentMark is the mark and the colour one pane's agent state wears, and every
@@ -70,15 +77,21 @@ var agentStateMarks = map[session.AgentState]struct{ glyph, ascii string }{
 // sense that matters; an unread one keeps the filled square in the success
 // colour. The two used to differ only in colour on some surfaces and in shape
 // on others.
-func agentMark(state string, doneSeen bool, pal overlay.Palette) (string, color.Color) {
-	return agentStateIndicator(sidebarGlyphState(state, doneSeen)), sidebarStateColor(state, doneSeen, pal)
+//
+// running is how many subagents the pane's agent is running: a pane at rest
+// with some draws waiting (see displayState). A surface that does not know
+// passes 0 and draws the state as it is.
+func agentMark(state string, doneSeen bool, running int, pal overlay.Palette) (string, color.Color) {
+	shown := displayState(state, doneSeen, running)
+	return agentStateIndicator(shown), agentGlyphColor(shown, pal)
 }
 
 // windowMarkState is the state whose mark a pane's title bar draws: the rail's
-// reading of the pane, with the unread bit folded in, so a title bar and the
-// rail row beside it never disagree.
+// reading of the pane, with the unread bit and the subagents folded in, so a
+// title bar and the rail row beside it never disagree.
 func (m *OS) windowMarkState(w *terminal.Window) string {
-	return sidebarGlyphState(m.railAgentState(w.ID, w.AgentState, w.AgentCompletionSeq))
+	state, seen := m.railAgentState(w.ID, w.AgentState, w.AgentCompletionSeq)
+	return displayState(state, seen, w.AgentSubagents)
 }
 
 // badgeStyle is the ink a window's title badge is written in. The colour is
@@ -133,12 +146,52 @@ func borderRowGlyphs(isTop bool, s *config.Settings) (fill, cornerLeft, cornerRi
 
 // windowTitleBadge wraps a window's name in the pill caps the title bar shows
 // it in.
+//
+// appearance.window_title_style picks the shape: pill (the caps and the
+// fill), tab (the fill alone) or plain (the name in the border's colour on
+// the border's ground, with no fill).
 func windowTitleBadge(windowName, agentState string, col color.Color, s *config.Settings) string {
+	switch s.WindowTitleStyle {
+	case "tab":
+		return titleBadgeText(windowName, agentState, col)
+	case "plain":
+		return titlePlainText(windowName, agentState, col)
+	}
 	style := lipgloss.NewStyle()
 	render := style.Foreground(col).Render
 	return render(s.GetWindowPillLeft()) +
 		titleBadgeText(windowName, agentState, col) +
 		render(s.GetWindowPillRight())
+}
+
+// titlePlainText is the plain title: the name in the border's colour with a
+// space each side, and a leading agent glyph in its state's colour.
+func titlePlainText(windowName, agentState string, col color.Color) string {
+	nameStyle := lipgloss.NewStyle().Foreground(col)
+	glyph := agentStateIndicator(agentState)
+	if glyph == "" || !strings.HasPrefix(windowName, glyph) {
+		return nameStyle.Render(" " + windowName + " ")
+	}
+	rest := strings.TrimPrefix(windowName, glyph)
+	glyphStyle := lipgloss.NewStyle().Foreground(agentGlyphColor(agentState, theme.UI())).Bold(true)
+	return nameStyle.Render(" ") + glyphStyle.Render(glyph) + nameStyle.Render(rest+" ")
+}
+
+// titleFill splits padding cells of border fill into the run before the
+// title and the run after it, for appearance.window_title_align. auto keeps
+// the old place, given as autoBefore.
+func titleFill(align string, padding, autoBefore int) (before, after int) {
+	switch align {
+	case "left":
+		before = min(1, padding)
+	case "center":
+		before = padding / 2
+	case "right":
+		before = padding - min(1, padding)
+	default:
+		before = autoBefore
+	}
+	return before, padding - before
 }
 
 // buttonBorderRow is a drawn title-bar row together with the column its control
@@ -179,10 +232,14 @@ func layoutBorderRow(badge, pill string, width int, col color.Color, isTop bool,
 		return buttonBorderRow{pillStart: -1}
 	}
 
-	middle := render(strings.Repeat(fill, padding))
 	// A bar with no controls leaves the badge where it has always been, since
 	// there is nothing for it to make room for.
-	if pill != "" && s.WindowButtonPosition == config.WindowButtonPositionLeft {
+	pillLeft := pill != "" && s.WindowButtonPosition == config.WindowButtonPositionLeft
+	if s.WindowTitleAlign != "" && s.WindowTitleAlign != "auto" {
+		return alignedBorderRow(badge, pill, padding, pillLeft, render, fill, cornerLeft, cornerRight, s.WindowTitleAlign)
+	}
+	middle := render(strings.Repeat(fill, padding))
+	if pillLeft {
 		return buttonBorderRow{
 			text:      render(cornerLeft) + pill + middle + badge + render(cornerRight),
 			pillStart: 1,
@@ -194,6 +251,30 @@ func layoutBorderRow(badge, pill string, width int, col color.Color, isTop bool,
 	}
 }
 
+// alignedBorderRow is layoutBorderRow for a title aligned left, centre or
+// right in the room the controls leave. An empty run of fill is left out,
+// since a styled empty string still writes its colour codes.
+func alignedBorderRow(badge, pill string, padding int, pillLeft bool, render func(...string) string,
+	fill, cornerLeft, cornerRight, align string) buttonBorderRow {
+	before, after := titleFill(align, padding, 0)
+	run := func(n int) string {
+		if n <= 0 {
+			return ""
+		}
+		return render(strings.Repeat(fill, n))
+	}
+	if pillLeft {
+		return buttonBorderRow{
+			text:      render(cornerLeft) + pill + run(before) + badge + run(after) + render(cornerRight),
+			pillStart: 1,
+		}
+	}
+	return buttonBorderRow{
+		text:      render(cornerLeft) + run(before) + badge + run(after) + pill + render(cornerRight),
+		pillStart: 1 + before + lipgloss.Width(badge) + after,
+	}
+}
+
 // isDefaultTitle checks if the title is the auto-generated default (e.g., "Terminal 8bf1c038").
 func isDefaultTitle(title, windowID string) bool {
 	if len(windowID) < 8 {
@@ -202,22 +283,22 @@ func isDefaultTitle(title, windowID string) bool {
 	return title == "Terminal "+windowID[:8]
 }
 
-// getWindowTitle returns the display name for a window, truncated to fit within maxWidth.
-// Returns empty string if title should be hidden or doesn't fit.
-// position is the window's 1-based place in its workspace, used by the {index}
-// placeholder of appearance.window_title_format.
-func getWindowTitle(window *terminal.Window, position int, maxWidth int, s *config.Settings) string {
-	return windowTitleText(window, window.AgentState, position, maxWidth, s)
-}
-
-// windowTitleText is getWindowTitle with the state whose mark the title wears
-// given explicitly: the render passes windowMarkState, which knows whether a
-// finished pane has been looked at.
+// windowTitleText returns the display name for a window, truncated to fit
+// within maxWidth, or an empty string if the title should be hidden or does
+// not fit. position is the window's 1-based place in its workspace, used by
+// the {index} placeholder of appearance.window_title_format. markState is the
+// state whose mark the title wears: the render passes windowMarkState, which
+// knows whether a finished pane has been looked at.
 func windowTitleText(window *terminal.Window, markState string, position int, maxWidth int, s *config.Settings) string {
 	// Titles reach the badge as chrome, so launder the same decorative junk the
 	// sidebar and palette drop; our own state glyph is added below, untouched.
 	windowName := ""
-	if window.CustomName != "" {
+	if _, title, ok := tmlWindowParts(window); ok && s.WindowTitlePosition == "top" {
+		// A TML window's pill holds the document's title. The owner goes
+		// after the pill, where the title cannot push it out (tmlOwnerTag).
+		// Elsewhere the bar shows the whole name, owner first.
+		windowName = printableTitle(title)
+	} else if window.CustomName != "" {
 		windowName = printableTitle(window.CustomName)
 	} else if t := window.Title(); t != "" && !isDefaultTitle(t, window.ID) {
 		// Only show terminal-set title if it's not the default "Terminal <id>" format
@@ -347,8 +428,26 @@ func (m *OS) windowBorderRows(width int, color color.Color, window *terminal.Win
 
 	markState := m.windowMarkState(window)
 	windowName := ""
+	// A TML window says who opened it after its title, and the title gives
+	// way first.
+	ownerTag, ownerW := "", 0
+	if titlePos == "top" {
+		ownerTag, ownerW = m.tmlOwnerTag(window, &m.Settings, titleMaxWidth)
+		titleMaxWidth = max(titleMaxWidth-ownerW, 0)
+	}
 	if titlePos != "hidden" {
+		// The pane mark_pane marked carries a badge after its name. Its room
+		// is taken before the name is cut, so a long name gives up its tail
+		// and never the badge. It goes last so the agent glyph stays first,
+		// where titleBadgeText looks for it.
+		marked := m.MarkedPaneID != "" && window.ID == m.MarkedPaneID
+		if marked {
+			titleMaxWidth -= len(markedPaneBadge) + 1
+		}
 		windowName = windowTitleText(window, markState, position, titleMaxWidth, &m.Settings)
+		if marked {
+			windowName = strings.TrimSpace(windowName + " " + markedPaneBadge)
+		}
 	}
 
 	borderStyle := style.Foreground(color)
@@ -358,8 +457,9 @@ func (m *OS) windowBorderRows(width int, color color.Color, window *terminal.Win
 	// are the ones it drew on.
 	badge := ""
 	if titlePos == "top" && windowName != "" {
-		badge = windowTitleBadge(windowName, markState, color, &m.Settings)
+		badge = windowTitleBadge(windowName, markState, m.titleInk(window, color), &m.Settings)
 	}
+	badge += ownerTag
 	row := layoutBorderRow(badge, buttons, width, color, true, &m.Settings)
 	topBorder = row.text
 	m.recordWindowButtons(window.ID, placeWindowButtons(hits, window, row.pillStart))
@@ -378,7 +478,7 @@ func (m *OS) windowBorderRows(width int, color color.Color, window *terminal.Win
 	}
 
 	if titlePos == "bottom" && windowName != "" {
-		bottomBorder = renderTitleBadge(windowName, markState, width, color, false, &m.Settings)
+		bottomBorder = renderTitleBadge(windowName, markState, width, color, m.titleInk(window, color), false, &m.Settings)
 	} else if scrollIndicator != "" {
 		// Bottom border with scrollback position indicator on the right
 		indicatorStyle := lipgloss.NewStyle().Foreground(theme.ScrollIndicator()).Bold(true)
@@ -393,8 +493,21 @@ func (m *OS) windowBorderRows(width int, color color.Color, window *terminal.Win
 	return topBorder, bottomBorder
 }
 
-// renderTitleBadge renders a border with a centered title badge.
-func renderTitleBadge(windowName, agentState string, width int, color color.Color, isTop bool, s *config.Settings) string {
+// titleInk is the colour a title badge is drawn from. A pill or a tab is
+// filled with the border's colour. A plain title is text on the border row:
+// the border's colour on the focused pane, and the dim text colour on the
+// others, since an unfocused border is drawn to recede and a title in it
+// could not be read.
+func (m *OS) titleInk(window *terminal.Window, border color.Color) color.Color {
+	if m.Settings.WindowTitleStyle != "plain" || m.GetFocusedWindow() == window {
+		return border
+	}
+	return theme.UI().FgDim
+}
+
+// renderTitleBadge renders a border with a centered title badge. ink is the
+// colour the badge is drawn from; see titleInk.
+func renderTitleBadge(windowName, agentState string, width int, color, ink color.Color, isTop bool, s *config.Settings) string {
 	style := lipgloss.NewStyle()
 	borderStyle := style.Foreground(color)
 
@@ -404,7 +517,7 @@ func renderTitleBadge(windowName, agentState string, width int, color color.Colo
 		return borderStyle.Render(cornerLeft + strings.Repeat(borderChar, width) + cornerRight)
 	}
 
-	nameBadge := windowTitleBadge(windowName, agentState, color, s)
+	nameBadge := windowTitleBadge(windowName, agentState, ink, s)
 	badgeWidth := lipgloss.Width(nameBadge)
 	totalPadding := width - badgeWidth
 
@@ -412,8 +525,7 @@ func renderTitleBadge(windowName, agentState string, width int, color color.Colo
 		return borderStyle.Render(cornerLeft + strings.Repeat(borderChar, width) + cornerRight)
 	}
 
-	leftPadding := totalPadding / 2
-	rightPadding := totalPadding - leftPadding
+	leftPadding, rightPadding := titleFill(s.WindowTitleAlign, totalPadding, totalPadding/2)
 
 	return borderStyle.Render(cornerLeft+strings.Repeat(borderChar, leftPadding)) +
 		nameBadge +
@@ -601,18 +713,84 @@ func buildCellStyle(cell *uv.Cell, isCursor bool) lipgloss.Style {
 // are rendered into the window chrome, so this is reachable input, not a
 // theoretical one. Re-measure and keep cutting until the result really fits.
 func truncateToWidth(line string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	out := ansi.Truncate(line, width, "")
-	// The overshoot is a cell or two in practice; the loop is bounded by width
-	// regardless so a pathological line cannot spin here.
-	for target := width; ansi.StringWidth(out) > width && target > 0; {
-		target--
-		out = ansi.Truncate(line, target, "")
-	}
+	out, _ := truncateMeasured(line, width)
 	return out
 }
+
+// truncateMeasured is truncateToWidth that also returns the width of the
+// result, which it has measured anyway. The result can be narrower than width
+// when the cut falls inside a wide grapheme.
+func truncateMeasured(line string, width int) (string, int) {
+	if width <= 0 {
+		return "", 0
+	}
+	out := ansi.Truncate(line, width, "")
+	got := ansi.StringWidth(out)
+	// The overshoot is a cell or two in practice; the loop is bounded by width
+	// regardless so a pathological line cannot spin here.
+	for target := width; got > width && target > 0; {
+		target--
+		out = ansi.Truncate(line, target, "")
+		got = ansi.StringWidth(out)
+	}
+	return out, got
+}
+
+// skipCells drops the first n cells of a rendered line and returns the rest,
+// followed by an SGR reset. It measures exactly as ansi.StringWidth does, one
+// grapheme cluster at a time, so the result is StringWidth(line)-n cells wide.
+// Every escape sequence in the dropped part is kept, so the colours and styles
+// in force at the cut carry over.
+//
+// A wide grapheme that the cut splits leaves its visible cells as spaces. The
+// old cut counted one position per rune, so each wide grapheme it dropped took
+// one cell too many with it, and the row came out short by one cell per wide
+// grapheme. The pane's right border, the last cell of the row, then moved left
+// on exactly the rows that held CJK text or emoji (issue #743).
+func skipCells(line string, n int) string {
+	var b strings.Builder
+	b.Grow(len(line) + len(sgrReset))
+	pos := 0
+	pstate := parser.GroundState
+	i := 0
+	for i < len(line) && pos < n {
+		c := line[i]
+		state, action := parser.Table.Transition(pstate, c)
+		if action != parser.PrintAction && state != parser.Utf8State {
+			// Part of an escape sequence or a control: kept, and no width.
+			b.WriteByte(c)
+			pstate = state
+			i++
+			continue
+		}
+		pstate = parser.GroundState
+		var size, width int
+		if c < 0x80 && (i+1 == len(line) || line[i+1] < 0x80) {
+			// Printable ASCII followed by ASCII is a cluster of its own, one
+			// cell wide. This skips segmentation for the common row.
+			size, width = 1, 1
+		} else {
+			cluster, w := ansi.FirstGraphemeCluster(line[i:], ansi.GraphemeWidth)
+			size, width = max(len(cluster), 1), w
+		}
+		i += size
+		if pos+width > n {
+			// Cut in the middle: the cells right of the cut are blank.
+			for range pos + width - n {
+				b.WriteByte(' ')
+			}
+		}
+		pos += width
+	}
+	// Past the cut everything is kept as it is.
+	b.WriteString(line[i:])
+	b.WriteString(sgrReset)
+	return b.String()
+}
+
+// sgrReset ends a clipped row, so a style left open by the cut does not run
+// into whatever is drawn next.
+const sgrReset = "\x1b[0m"
 
 func clipWindowContent(content string, x, y, viewportWidth, viewportHeight int) (string, int, int) {
 	lines := strings.Split(content, "\n")
@@ -680,72 +858,35 @@ func clipWindowContent(content string, x, y, viewportWidth, viewportHeight int) 
 			}
 
 			tempLine := line
+			short := 0
 			if w > maxWidth+clipLeft {
-				tempLine = truncateToWidth(line, maxWidth+clipLeft)
+				var kept int
+				tempLine, kept = truncateMeasured(line, maxWidth+clipLeft)
+				// A wide grapheme cut by the right edge is dropped whole by
+				// the truncation. Its visible cell becomes a space, added
+				// after the row's reset so no open sequence can swallow it.
+				short = maxWidth + clipLeft - kept
 			}
 
 			if clipLeft > 0 {
-				result := strings.Builder{}
-				pos := 0
-				skipCount := clipLeft
-
-				runes := []rune(tempLine)
-				runeIdx := 0
-				for runeIdx < len(runes) {
-					if runes[runeIdx] == '\x1b' {
-						seqStart := runeIdx
-						runeIdx++
-
-						if runeIdx < len(runes) && runes[runeIdx] == '[' {
-							runeIdx++
-							for runeIdx < len(runes) && (runes[runeIdx] < 0x40 || runes[runeIdx] > 0x7E) {
-								runeIdx++
-							}
-							if runeIdx < len(runes) {
-								runeIdx++
-							}
-						} else if runeIdx < len(runes) && runes[runeIdx] == ']' {
-							runeIdx++
-							for runeIdx < len(runes) {
-								if runes[runeIdx] == '\x07' || (runes[runeIdx] == '\x1b' && runeIdx+1 < len(runes) && runes[runeIdx+1] == '\\') {
-									runeIdx++
-									if runeIdx < len(runes) && runes[runeIdx-1] == '\x1b' {
-										runeIdx++
-									}
-									break
-								}
-								runeIdx++
-							}
-						}
-
-						// Always include escape sequences. They set terminal state (colors, styles)
-						result.WriteString(string(runes[seqStart:runeIdx]))
-						continue
-					}
-
-					if pos >= skipCount {
-						result.WriteRune(runes[runeIdx])
-					}
-					pos++
-					runeIdx++
-				}
-
-				clippedLines[lineIdx] = result.String() + "\x1b[0m"
+				clippedLines[lineIdx] = skipCells(tempLine, clipLeft)
 			} else {
 				clippedLines[lineIdx] = tempLine
 				if w > maxWidth {
-					clippedLines[lineIdx] += "\x1b[0m"
+					clippedLines[lineIdx] += sgrReset
 				}
+			}
+			if short > 0 {
+				clippedLines[lineIdx] += strings.Repeat(" ", short)
 			}
 		}
 
 		// Enforce the width contract on the finished rows rather than trusting
-		// the arithmetic that built them. The left-skip above walks runes and
-		// counts one position per rune, but converting a line that carries
-		// invalid bytes to runes turns each bad byte into a replacement
-		// character with a width of its own, so the assembled row can come out
-		// several cells wider than the space it is being placed in and bleed
-		// into the pane next door. Guest programs can put arbitrary bytes in an
+		// the arithmetic that built them. The cuts above measure as
+		// ansi.StringWidth does, but on a line that carries invalid bytes the
+		// width of a stray byte depends on its neighbours, so a cut can change
+		// it and the assembled row can come out wider than the space it is
+		// being placed in and bleed into the pane next door. Guest programs can put arbitrary bytes in an
 		// OSC title and those titles are rendered into the window chrome.
 		for i, line := range clippedLines {
 			if ansi.StringWidth(line) > maxWidth {

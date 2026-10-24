@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/pastebuf"
 	"github.com/Gaurav-Gosain/tuios/internal/testutil"
 )
 
@@ -56,10 +57,21 @@ var exampleOutcomes = map[string]exampleOutcome{
 	"apply-config#1":         {errCode: ErrVerbCommandFailed, why: "the fixture daemon reads no config file"},
 	"list-dock-components#1": {errCode: ErrVerbNeedsClient, why: "the dock is drawn by a client"},
 	"refresh-dock#0":         {errCode: ErrVerbNeedsClient, why: "the dock is drawn by a client"},
+	"switch-session#0":       {errCode: ErrVerbNeedsClient, why: "switch-session moves an attached client"},
+	"switch-session#1":       {errCode: ErrVerbNeedsClient, why: "switch-session moves an attached client"},
+	"switch-session#2":       {errCode: ErrVerbNeedsClient, why: "switch-session moves an attached client"},
+	"detach-client#0":        {errCode: ErrVerbInvalidParams, why: "the example names a client id, and the fixture has no attached client"},
 	"refresh-dock#1":         {errCode: ErrVerbNeedsClient, why: "the dock is drawn by a client"},
 	"pip#0":                  {errCode: ErrVerbNeedsClient, why: "the picture-in-picture view is drawn by a client"},
 	"pip#1":                  {errCode: ErrVerbNeedsClient, why: "the picture-in-picture view is drawn by a client"},
 	"popup#0":                {errCode: ErrVerbNeedsClient, why: "a popup is a client window"},
+	"tml-open#0":             {errCode: ErrVerbNeedsClient, why: "a popup is a client window"},
+	"tml-open#2":             {errCode: ErrVerbNeedsClient, why: "a popup is a client window"},
+	"tml-close#0":            {errCode: ErrVerbNoSurface, why: "the example names a surface the fixture never opened"},
+	"tml-input#0":            {errCode: ErrVerbNoSurface, why: "the example names a surface the fixture never opened"},
+	"tml-patch#0":            {errCode: ErrVerbNoSurface, why: "the example names a surface the fixture never opened"},
+	"tml-replace#0":          {errCode: ErrVerbNoSurface, why: "the example names a surface the fixture never opened"},
+	"tml-get#0":              {errCode: ErrVerbNoSurface, why: "the example names a surface the fixture never opened"},
 	"popup#1":                {errCode: ErrVerbNeedsClient, why: "a popup is a client window"},
 	"popup#2":                {errCode: ErrVerbNeedsClient, why: "a popup is a client window"},
 	// The question waits for an answer nobody in the fixture gives, and the
@@ -74,11 +86,22 @@ var exampleOutcomes = map[string]exampleOutcome{
 	"dismiss-attention#0": {errCode: ErrVerbNotHuman, why: "only a client attached right now may dismiss, and none is"},
 	// The same holds for answering an approval. The allowed path is proved in
 	// approvals_test.go.
-	"reply-approval#0": {errCode: ErrVerbNotHuman, why: "only a client attached right now may answer, and none is"},
-	"run-command#0":    {errCode: ErrVerbNeedsClient, why: "ToggleZoom is a client command"},
-	"set-layout#0":     {errCode: ErrVerbNeedsClient, why: "tiling is the client's arithmetic"},
-	"set-layout#1":     {errCode: ErrVerbNeedsClient, why: "the master-stack shape is laid out by a client"},
-	"split-window#0":   {errCode: ErrVerbNeedsClient, why: "a split is the client's arithmetic"},
+	"reply-approval#0":    {errCode: ErrVerbNotHuman, why: "only a client attached right now may answer, and none is"},
+	"agent-transcript#0":  {errCode: ErrVerbNotHuman, why: "only a client attached right now may read a transcript, and none is"},
+	"agent-transcript#1":  {errCode: ErrVerbNotHuman, why: "only a client attached right now may read a transcript, and none is"},
+	"reply-history#0":     {errCode: ErrVerbNotHuman, why: "only a client attached right now reads the reply history, and none is"},
+	"add-reply-history#0": {errCode: ErrVerbNotHuman, why: "only a client attached right now adds to the reply history, and none is"},
+	"agent-transcript#2":  {errCode: ErrVerbNotHuman, why: "only a client attached right now may read a transcript, and none is"},
+	// The phones for Web Push are the person's, and the example's nonce is a
+	// placeholder. e2e/tui/webpush_test.go registers one with a real nonce.
+	"register-push#0": {errCode: ErrVerbNotHuman, why: "only the person may register a phone, with a live nonce"},
+	"list-push#0":     {errCode: ErrVerbNotHuman, why: "only the person may list the phones, with a live nonce"},
+	"remove-push#0":   {errCode: ErrVerbNotHuman, why: "only the person may remove a phone, with a live nonce"},
+	"run-command#0":   {errCode: ErrVerbNeedsClient, why: "ToggleZoom is a client command"},
+	"set-layout#0":    {errCode: ErrVerbNeedsClient, why: "tiling is the client's arithmetic"},
+	"set-layout#1":    {errCode: ErrVerbNeedsClient, why: "the master-stack shape is laid out by a client"},
+	"split-window#0":  {errCode: ErrVerbNeedsClient, why: "a split is the client's arithmetic"},
+	"split-window#1":  {errCode: ErrVerbNeedsClient, why: "a split is the client's arithmetic"},
 
 	// The fixture has no agent panes, so no hook ever recorded a conversation
 	// to resume. Typing and dry runs are proved in agent_resume_test.go.
@@ -89,6 +112,7 @@ var exampleOutcomes = map[string]exampleOutcome{
 	// use is not configured. The connection itself is proved with two daemons
 	// in host_connection_test.go.
 	"open-host-connection#0": {errCode: ErrVerbUnknownHost, why: "no hosts are configured in the fixture"},
+	"retry-host#0":           {errCode: ErrVerbUnknownHost, why: "no hosts are configured in the fixture"},
 	// The host filter's example names a host; the fleet is proved with two
 	// daemons in host_fleet_test.go.
 	"list-attention#3": {errCode: ErrVerbUnknownHost, why: "no hosts are configured in the fixture"},
@@ -138,6 +162,25 @@ var exampleOutcomes = map[string]exampleOutcome{
 	"send-agent-message#3": {errCode: ErrVerbInvalidParams, why: "message 12 does not exist here"},
 	"stash-put#0":          {errCode: ErrVerbInvalidParams, why: "/tmp/flame.png does not exist here"},
 	"stash-get#0":          {errCode: ErrVerbInvalidParams, why: "the example path is a placeholder, not a file this session stashed"},
+	// The file verbs name files and transfers the example invents. They are
+	// proved against two real daemons in e2e/tui/file_transfer_test.go.
+	"file-list#0":        {errCode: ErrVerbNoFile, why: "~/src does not exist here"},
+	"file-read#0":        {errCode: ErrVerbNoFile, why: "~/notes.md does not exist here"},
+	"file-rename#0":      {errCode: ErrVerbNoFile, why: "~/a.txt does not exist here"},
+	"file-hash#0":        {errCode: ErrVerbNoFile, why: "~/big.iso does not exist here"},
+	"file-preview#0":     {errCode: ErrVerbNoFile, why: "~/Pictures/cat.jpg does not exist here"},
+	"file-walk#0":        {errCode: ErrVerbNoFile, why: "~/photos does not exist here"},
+	"file-commit#0":      {errCode: ErrVerbNoFile, why: "no copy to ~/big.iso is in flight here"},
+	"open-file-stream#0": {errCode: ErrVerbNoFile, why: "~/big.iso does not exist here"},
+	"open-file-stream#1": {errCode: ErrVerbInvalidParams, why: "no part of a copy to ~/big.iso is here to go on from"},
+	"drop-files#0":       {errCode: ErrVerbNoFile, why: "~/Desktop/screenshot.png does not exist here"},
+	"transfer-start#0":   {errCode: ErrVerbUnknownHost, why: "the fixture daemon has no hosts"},
+	"transfer-cancel#0":  {errCode: ErrVerbNoTransfer, why: "the example's id is a placeholder"},
+	"transfer-pause#0":   {errCode: ErrVerbNoTransfer, why: "the example's id is a placeholder"},
+	"transfer-resume#0":  {errCode: ErrVerbNoTransfer, why: "the example's id is a placeholder"},
+	"transfer-answer#0":  {errCode: ErrVerbNoTransfer, why: "the example's id is a placeholder"},
+	"host-speed-test#0":  {errCode: ErrVerbUnknownHost, why: "the fixture daemon has no hosts"},
+	"open-tree-stream#0": {errCode: ErrVerbNoFile, why: "~/src does not exist here"},
 	// A blocked agent's pane, named by an id the example invents. The pair is
 	// proved against a real pane running a fake agent in verb_respond_test.go.
 	"peek-prompt#0": {errCode: ErrVerbWindowNotFound, why: "the example's window id is a placeholder"},
@@ -196,15 +239,37 @@ var exampleOutcomes = map[string]exampleOutcome{
 	// agent. The review verbs are proved in verb_review_test.go.
 	"review-diff#0": {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-2 does not exist here"},
 	"send-review#0": {errCode: ErrVerbInvalidParams, why: "the fixture's build window runs no agent"},
+	// The fixture's repository has no api/retry.go, and the undo example's
+	// sha is a placeholder. review-stage is proved in
+	// e2e/tui/review_stage_test.go.
+	"review-stage#0": {errCode: ErrVerbHunkChanged, why: "the fixture's repository has no change to api/retry.go"},
+	"review-stage#1": {errCode: ErrVerbHunkChanged, why: "the fixture's repository has no change to api/retry.go"},
+	"review-stage#2": {errCode: ErrVerbInvalidParams, why: "the example's sha is a placeholder"},
+	// No agent finished a turn in the fixture, so no pane has a checkpoint.
+	// The checkpoints are proved in e2e/tui/checkpoint_test.go.
+	"checkpoint-diff#0":    {errCode: ErrVerbNoCheckpoint, why: "no agent finished a turn, so build has no checkpoint 2"},
+	"restore-checkpoint#0": {errCode: ErrVerbNoCheckpoint, why: "no agent finished a turn, so build has no checkpoint 1"},
 	// The fixture has no agent panes, so there is nothing to queue for,
 	// and so no entry to drop. The queue is proved in agent_queue_test.go.
-	"queue-prompt#0":  {errCode: ErrVerbInvalidParams, why: "the fixture's build window runs no agent"},
-	"cancel-queued#1": {errCode: ErrVerbInvalidParams, why: "nothing is queued, so q3 is not an entry"},
-	"compare-fan#0":   {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
-	"verify-fan#0":    {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
-	"keep-fan#0":      {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
-	"keep-fan#1":      {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
-	"get-approval#0":  {errCode: ErrVerbInvalidParams, why: "no approval is held in the fixture"},
+	"queue-prompt#0":    {errCode: ErrVerbInvalidParams, why: "the fixture's build window runs no agent"},
+	"queue-prompt#1":    {errCode: ErrVerbInvalidParams, why: "the fixture's build window runs no agent; its parts are read and checked first"},
+	"cancel-queued#1":   {errCode: ErrVerbInvalidParams, why: "nothing is queued, so q3 is not an entry"},
+	"compare-fan#0":     {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
+	"verify-fan#0":      {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
+	"keep-fan#0":        {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
+	"keep-fan#1":        {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
+	"keep-fan#2":        {errCode: ErrVerbSessionNotFound, why: "api-fan-retry-1 does not exist here"},
+	"set-fan-verdict#0": {errCode: ErrVerbSessionNotFound, why: "api-fan-retry does not exist here"},
+	"judge-fan#0":       {errCode: ErrVerbSessionNotFound, why: "api-fan-retry does not exist here"},
+	// The fixture's panes sit in the main checkout of a throwaway repository
+	// with no change, no worktree and no remote. The ship verbs are proved in
+	// e2e/tui/ship_test.go.
+	"ship-commit#0":  {errCode: ErrVerbNothingToCommit, why: "the fixture's repository has no change"},
+	"ship-merge#0":   {errCode: ErrVerbNotWorktree, why: "build is in the main checkout, not a worktree"},
+	"ship-merge#1":   {errCode: ErrVerbNotWorktree, why: "build is in the main checkout, not a worktree"},
+	"ship-push#0":    {errCode: ErrVerbNoRemote, why: "the fixture's repository has no remote"},
+	"ship-pr#0":      {errCode: ErrVerbNoRemote, why: "the fixture's repository has no remote"},
+	"get-approval#0": {errCode: ErrVerbInvalidParams, why: "no approval is held in the fixture"},
 	// The person's proof comes first, so the nonce the example names is
 	// what refuses it, as for dismiss-attention.
 	"mark-attention#0": {errCode: ErrVerbNotHuman, why: "only a client attached right now may snooze, and none is"},
@@ -242,15 +307,15 @@ func TestEveryVerbExampleReachesItsHandler(t *testing.T) {
 	t.Chdir(testutil.GitRepo(t))
 	d, socketPath := startTestDaemon(t)
 
-	names := make([]string, 0, len(verbRegistry))
-	for name := range verbRegistry {
+	names := make([]string, 0, len(verbRegistry()))
+	for name := range verbRegistry() {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	seen := map[string]bool{}
 	for _, name := range names {
-		entry := verbRegistry[name]
+		entry := verbRegistry()[name]
 		if len(entry.examples) == 0 {
 			t.Errorf("verb %q documents no example, so nothing here can call it", name)
 			continue
@@ -358,14 +423,13 @@ var verbsWithNoDocumentedResult = map[string]bool{
 	"session-info": true, "set-session-accent": true,
 	"set-session-name": true, "set-workspace-name": true,
 	"set-workspace-order": true, "unsubscribe": true,
-	"wait-for": true,
 }
 
 // TestVerbResultSchemasAreDeclaredOrListed keeps the gap above from widening.
 // A result schema is what lets the test check that a handler filled anything
 // in, so a verb without one is a verb the check cannot hold to much.
 func TestVerbResultSchemasAreDeclaredOrListed(t *testing.T) {
-	for name, entry := range verbRegistry {
+	for name, entry := range verbRegistry() {
 		if len(entry.returns) == 0 && !verbsWithNoDocumentedResult[name] {
 			t.Errorf("verb %q names no return fields: document them in its registry "+
 				"entry, or add it to verbsWithNoDocumentedResult", name)
@@ -375,7 +439,7 @@ func TestVerbResultSchemasAreDeclaredOrListed(t *testing.T) {
 		}
 	}
 	for name := range verbsWithNoDocumentedResult {
-		if _, ok := verbRegistry[name]; !ok {
+		if _, ok := verbRegistry()[name]; !ok {
 			t.Errorf("verbsWithNoDocumentedResult names %q, which the registry does not have", name)
 		}
 	}
@@ -400,6 +464,27 @@ func freshWorkSession(t *testing.T, d *Daemon) {
 		if _, err := sess.AddDaemonWindow(name, nil); err != nil {
 			t.Fatalf("add window %q: %v", name, err)
 		}
+	}
+	// The session move-window's to_session example moves a window to.
+	if d.manager.GetSession("review") != nil {
+		_ = d.manager.DeleteSession("review")
+	}
+	if _, err := d.manager.CreateSession("review", &SessionConfig{}, 80, 24); err != nil {
+		t.Fatalf("create the session the move-window example names: %v", err)
+	}
+	// The paste buffers the buffer examples name, fresh for each example
+	// since delete-buffer and paste-buffer with delete remove one.
+	d.buffers = pastebuf.New(pastebuf.DefaultLimit, pastebuf.DefaultMaxBytes)
+	for range 4 {
+		if _, err := d.buffers.Add("echo automatic", pastebuf.Owner{}); err != nil {
+			t.Fatalf("add a buffer: %v", err)
+		}
+		if _, err := d.buffers.Set("", "echo next", false, pastebuf.Owner{}, nil); err != nil {
+			t.Fatalf("set a buffer: %v", err)
+		}
+	}
+	if _, err := d.buffers.Set("deploy", "echo deploy", false, pastebuf.Owner{}, nil); err != nil {
+		t.Fatalf("set buffer deploy: %v", err)
 	}
 }
 

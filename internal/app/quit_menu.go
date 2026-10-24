@@ -22,6 +22,10 @@ const (
 	QuitKillGoNext
 	// QuitKillAndQuit kills the current session and quits the client.
 	QuitKillAndQuit
+	// QuitDeleteWorktree removes the current session's worktree, then the
+	// session, then this client. Offered only when the session sits in a
+	// worktree; the delete fails loud rather than quitting on a failure.
+	QuitDeleteWorktree
 	// QuitStandalone quits a non-daemon client (there is no session to keep).
 	QuitStandalone
 	// QuitCancel closes the menu and does nothing.
@@ -73,10 +77,10 @@ func (m *OS) NextSessionName() string {
 // otherSessionNames lists the daemon sessions this client is not attached to,
 // by identity, from the listing this client already caches.
 //
-// It used to collect the display title of a freshly fetched listing, and both
-// halves of that were wrong. The title is the display name once a session has
-// one, so the kill-and-go-next row switched to a name that addresses nothing,
-// and switching to a name no session answers to makes one. The fetch was a
+// It collects identities, not display titles. The title is the display name
+// once a session has one, so the kill-and-go-next row would switch to a name
+// that addresses nothing, and switching to a name no session answers to makes
+// one. It reads the cache rather than fetching a listing, because a fetch is a
 // blocking daemon round trip on the Update goroutine, taken to open a menu; the
 // cache is what the rail's own rows are drawn from and is refreshed off that
 // goroutine, so reading it is both cheaper and in agreement with the screen.
@@ -127,6 +131,11 @@ func (m *OS) buildQuitMenuItems(others []string, busy bool) []QuitMenuItem {
 	} else {
 		items = append(items, QuitMenuItem{Label: "Kill and quit", Key: "x", Kind: QuitKillAndQuit, Warn: busy})
 	}
+	// The attached session's worktree can go with it. Warn unconditionally:
+	// the row takes a directory, not just a session, whatever is running.
+	if m.sessionWorktreeInfo(m.SessionName) != nil {
+		items = append(items, QuitMenuItem{Label: "Delete worktree and quit", Key: "w", Kind: QuitDeleteWorktree, Warn: true})
+	}
 	return items
 }
 
@@ -168,6 +177,12 @@ func (m *OS) QuitMenuActivate(idx int) tea.Cmd {
 		return nil
 	case QuitKillGoNext:
 		return m.KillSessionGoNext(next)
+	case QuitDeleteWorktree:
+		// One confirmation, one place that shows the toll: the row opens the
+		// close dialog, whose delete-worktree row does the deleting — the
+		// same answer any other close of this session gets. A dialog that is
+		// dismissed leaves the client running.
+		return m.OpenSessionClose()
 	case QuitKillAndQuit, QuitStandalone:
 		m.QuitSession()
 		return tea.Quit
@@ -184,6 +199,7 @@ func (m *OS) DetachClient() tea.Cmd {
 	if !m.IsDaemonSession {
 		return nil
 	}
+	m.cancelHostOpen()
 	m.SyncStateToDaemon()
 	m.FireDetached()
 	// Deliberately no Cleanup: the session outlives this client.

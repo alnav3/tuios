@@ -1,3 +1,5 @@
+//go:build unix
+
 // Command frameloop stands in for a graphics app that fills its pane, in the
 // way that matters to the passthrough: it asks the kernel how big its terminal
 // is in pixels, renders a bitmap of exactly that size, and streams it through
@@ -77,7 +79,13 @@ func main() {
 	wrote := func() {
 		written++
 		if countFile != "" {
-			_ = os.WriteFile(countFile, []byte(strconv.Itoa(written)), 0o644)
+			// Write a temporary file and rename it over the count. A plain
+			// WriteFile truncates first, so a reader could find the file
+			// empty, and a reader that gave up then counted 0 frames.
+			tmp := countFile + ".tmp"
+			if os.WriteFile(tmp, []byte(strconv.Itoa(written)), 0o644) == nil {
+				_ = os.Rename(tmp, countFile)
+			}
 		}
 	}
 

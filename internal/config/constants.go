@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
@@ -39,6 +41,13 @@ const (
 
 	// FastAnimationDuration is the duration for snapping and window swapping animations
 	FastAnimationDuration = 200 * time.Millisecond
+
+	// AnimationSpeedDefault, Min and Max bound appearance.animation_speed, a
+	// percent the durations above are divided by: 200 runs them in half the
+	// time, 50 in twice the time.
+	AnimationSpeedDefault = 100
+	AnimationSpeedMin     = 25
+	AnimationSpeedMax     = 400
 )
 
 // =============================================================================
@@ -66,20 +75,19 @@ const (
 
 var (
 
-	// MaxFPSCap is the ceiling the renderer is allowed to reach. The tick loop
-	// throttles actual work to NormalFPS; this is the upper bound so raising
-	// NormalFPS at runtime (including the "unlimited" setting, which pins it to
-	// this value) can take effect without a restart.
+	// MaxFPSCap is the highest max_fps tuios accepts, and the most a display
+	// sold today refreshes at.
 	//
-	// It is the renderer's own ceiling and not a number of our choosing. Bubble
-	// Tea clamps to 120 in NewProgram, so a larger value here was accepted by
-	// the setting, offered by the settings row, handed to tea.WithFPS and then
-	// quietly ignored: the tick loop really did run faster while the screen did
-	// not, so the setting said one thing and the display did another. Matching
-	// the renderer is the honest of the two fixes, because the other one is to
-	// keep offering a number and explain in the row that part of it does
-	// nothing.
-	MaxFPSCap = 120
+	// Bubble Tea clamps its own frame ticker to 120 in NewProgram, which is
+	// what this cap used to match: a larger value was accepted, handed to
+	// tea.WithFPS and quietly ignored. OS.BindProgram now sets the ticker after
+	// NewProgram, past that clamp, so every value up to this cap is one the
+	// screen really gets.
+	MaxFPSCap = 240
+
+	// DefaultFPS is the frame rate for max_fps = 0, and for "auto" when the
+	// display's rate cannot be found.
+	DefaultFPS = 60
 
 	// MinConfiguredFPS is the floor a configured max_fps is clamped to. Below it
 	// the UI stops feeling like it is responding to the keyboard at all.
@@ -95,8 +103,13 @@ var (
 // =============================================================================
 
 const (
-	// DockHeight is the height of the dock area at the bottom
-	DockHeight = 2
+	// DockFullHeight is the rows a full dock takes: the rule between the panes
+	// and the dock, and the row of pills.
+	DockFullHeight = 2
+
+	// DockCompactHeight is the rows a compact dock takes: the row of pills
+	// alone. See Settings.DockHeight.
+	DockCompactHeight = 1
 
 	// SidebarDefaultWidth is the preferred sidebar width on a wide screen.
 	// Before v0.8.0 it was 28.
@@ -158,6 +171,10 @@ var (
 	// DockModeIconTiling is the icon for tiling mode (Nerd Font: nf-fa-th, a 3x3 grid)
 	DockModeIconTiling string
 
+	// DockModeIconPrefix is the mode pill's label while the leader is armed
+	// (Nerd Font: nf-fa-keyboard)
+	DockModeIconPrefix string
+
 	// DockIconTerminalCount is the icon for terminal count (Nerd Font: nf-fa-terminal)
 	DockIconTerminalCount string
 
@@ -195,6 +212,7 @@ func init() {
 	DockModeIconWindow = " " + fa.WindowRestore.String() + " "
 	DockModeIconTerminal = " " + fa.Terminal.String() + " "
 	DockModeIconTiling = " " + fa.Th.String() + " "
+	DockModeIconPrefix = " " + fa.Keyboard.String() + " "
 	DockIconTerminalCount = fa.Terminal.String()
 	DockIconWorkspaceCount = fa.ThLarge.String()
 	DockIconLeaveRunning = fa.SignOut.String()
@@ -228,6 +246,9 @@ const (
 
 	// DockModeIconTilingASCII is the ASCII fallback for tiling mode
 	DockModeIconTilingASCII = " # "
+
+	// DockModeIconPrefixASCII is the ASCII fallback for the armed leader
+	DockModeIconPrefixASCII = " P "
 
 	// DockIconTerminalCountASCII is the ASCII fallback for terminal count
 	DockIconTerminalCountASCII = "win"
@@ -416,7 +437,7 @@ func (s *Settings) GetAnimationDuration() time.Duration {
 	if !s.MotionAllows(MotionBasic) {
 		return 0
 	}
-	return DefaultAnimationDuration
+	return s.scaleAnimation(DefaultAnimationDuration)
 }
 
 // GetFastAnimationDuration returns the animation duration for fast operations.
@@ -426,7 +447,19 @@ func (s *Settings) GetFastAnimationDuration() time.Duration {
 	if !s.MotionAllows(MotionBasic) {
 		return 0
 	}
-	return FastAnimationDuration
+	return s.scaleAnimation(FastAnimationDuration)
+}
+
+// scaleAnimation divides d by the animation_speed percent. Zero, which a
+// Settings built by hand carries, reads as the default speed. Any other value
+// outside the range moves to the nearest end, as the config loader does.
+func (s *Settings) scaleAnimation(d time.Duration) time.Duration {
+	speed := s.AnimationSpeed
+	if speed == 0 {
+		speed = AnimationSpeedDefault
+	}
+	speed = min(max(speed, AnimationSpeedMin), AnimationSpeedMax)
+	return d * AnimationSpeedDefault / time.Duration(speed)
 }
 
 // SidebarDefaultSections is the rail's layout as it ships.
@@ -450,7 +483,13 @@ const SidebarDefaultSections = "sessions:25,terminals,files:25,agents:34"
 // section the rail does not draw, and that is the only way to turn one off:
 // there is no second switch per section, because a switch cannot say where a
 // thing goes and two spacers would have no switch to share.
-var SidebarSectionNames = []string{"sessions", "terminals", "files", "agents", "git"}
+var SidebarSectionNames = []string{"sessions", "terminals", "files", "agents", "git", SidebarSectionCustom}
+
+// SidebarSectionCustom is the rail section whose rows are the output of a
+// command the user writes, configured in [appearance.sidebar.custom]. It is
+// one section and not a family of named ones, because the rail's sections are
+// a fixed enum that sizes its arrays, and one more value fits that as it is.
+const SidebarSectionCustom = "custom"
 
 // SidebarSectionSpacer is the layout's empty block. It draws nothing and takes
 // lines, which is how a person puts a gap between two sections or pushes what
@@ -490,6 +529,61 @@ var SidebarFolderClicks = []string{
 	SidebarFolderClickNavigate, SidebarFolderClickCd, SidebarFolderClickBoth,
 }
 
+// Rail header cases. See AppearanceConfig.RailHeaderCase.
+//
+// The rail's section headers are furniture: they frame their section without
+// competing with the rows under it, so "lowercase" keeps the muted unbolded
+// label the rail has always drawn. "uppercase" promotes them to headings in
+// their own right: the label goes uppercase and bold in the secondary ink and
+// the rule glyph runs out of it to the rail's edge.
+const (
+	RailHeaderLowercase = "lowercase"
+	RailHeaderUppercase = "uppercase"
+)
+
+// RailHeaderCases lists the valid values for appearance.sidebar.header_case.
+var RailHeaderCases = []string{RailHeaderLowercase, RailHeaderUppercase}
+
+// The rail's row styles, appearance.sidebar.row_style: how the row you are on
+// is marked. bar is the gutter mark the rail has always drawn, marker a
+// pointer glyph in the gutter, underline the name underlined in the row's
+// colour, and pill the name on a fill of that colour.
+const (
+	RailRowBar       = "bar"
+	RailRowMarker    = "marker"
+	RailRowUnderline = "underline"
+	RailRowPill      = "pill"
+)
+
+// RailRowStyles lists the valid values for appearance.sidebar.row_style.
+var RailRowStyles = []string{RailRowBar, RailRowMarker, RailRowUnderline, RailRowPill}
+
+// The rail's header styles, appearance.sidebar.header_style. auto draws a
+// rule after an uppercase header and none after a lowercase one, as the rail
+// always has. plain never draws the rule and rule always does. pill puts the
+// label on a quiet fill, and icon puts the section's icon in front of it.
+const (
+	RailHeaderAuto  = "auto"
+	RailHeaderPlain = "plain"
+	RailHeaderRule  = "rule"
+	RailHeaderPill  = "pill"
+	RailHeaderIcon  = "icon"
+)
+
+// The rail's densities, appearance.sidebar.density. normal stacks the
+// sections as the rail always has, roomy puts a blank row in front of each
+// section header after the first.
+const (
+	RailDensityNormal = "normal"
+	RailDensityRoomy  = "roomy"
+)
+
+// RailDensities lists the valid values for appearance.sidebar.density.
+var RailDensities = []string{RailDensityNormal, RailDensityRoomy}
+
+// RailHeaderStyles lists the valid values for appearance.sidebar.header_style.
+var RailHeaderStyles = []string{RailHeaderAuto, RailHeaderPlain, RailHeaderRule, RailHeaderPill, RailHeaderIcon}
+
 // Where a delete from the files section sends the file.
 //
 // Trash is the default. The rail is an incidental place for a keystroke to land
@@ -504,6 +598,19 @@ const (
 
 // SidebarFileDeletes lists the valid values for appearance.sidebar.file_delete.
 var SidebarFileDeletes = []string{SidebarFileDeleteTrash, SidebarFileDeletePermanent}
+
+// How the rail shows the subagents of an agent row. Rows draws one row per
+// subagent under its pane's row, as space allows; tree draws the same rows on
+// tree lines (SidebarSubagentRowsTree); count draws only the count on the
+// pane's row, as the rail did before it knew more than the count.
+const (
+	SidebarSubagentRowsRows  = "rows"
+	SidebarSubagentRowsCount = "count"
+)
+
+// SidebarSubagentRowsValues lists the valid values for
+// appearance.sidebar.subagent_rows.
+var SidebarSubagentRowsValues = []string{SidebarSubagentRowsRows, SidebarSubagentRowsTree, SidebarSubagentRowsCount}
 
 // FormatWindowTitle expands WindowTitleFormat for one window. The placeholders
 // are {title} (the custom or terminal-reported title), {index} (the window's
@@ -525,16 +632,20 @@ func (s *Settings) FormatWindowTitle(title string, index int, cwd string) string
 }
 
 // FormatWorkspaceTab renders a dock workspace tab label from the configured
-// DockWorkspaceTabFormat. Placeholders are {index} (the workspace number) and
-// {name} (the workspace's name, or its number when unnamed). An empty format
-// returns the name unchanged, which is the historic rendering.
-func (s *Settings) FormatWorkspaceTab(name string, index int) string {
+// DockWorkspaceTabFormat. Placeholders are {index} (the workspace number),
+// {name} (the workspace's name, or its number when unnamed), {icon} (the
+// [dock.tabs] number_glyphs entry for the number) and {zoom} (the [dock.tabs]
+// zoom_marker while the workspace has a zoomed pane). An empty format returns
+// the name unchanged, which is the historic rendering.
+func (s *Settings) FormatWorkspaceTab(name string, index int, icon, zoom string) string {
 	if s.DockWorkspaceTabFormat == "" {
 		return name
 	}
 	return strings.NewReplacer(
 		"{name}", name,
 		"{index}", strconv.Itoa(index),
+		"{icon}", icon,
+		"{zoom}", zoom,
 	).Replace(s.DockWorkspaceTabFormat)
 }
 
@@ -669,8 +780,12 @@ const (
 // setting worked and no way to tell a dimmed pane from a crashed one.
 const DimUnfocusedMax = 90
 
-// DefaultClockFormat is what the clock has always drawn.
-const DefaultClockFormat = "15:04:05"
+// DefaultClockFormat is the layout the clock draws with when none is set. It
+// has no seconds: the dock engine arms the clock's timer for the next change
+// of what it draws, so a clock without seconds wakes the client once a minute
+// where one with seconds wakes it every second. A layout with seconds, such as
+// "15:04:05", still draws them.
+const DefaultClockFormat = "15:04"
 
 // GetClockFormat returns the layout in effect.
 func (s *Settings) GetClockFormat() string {
@@ -707,64 +822,117 @@ func (s *Settings) GetDockPillRightChar() string {
 	return s.GetSidebarPillRightChar()
 }
 
-// GetDockModeCapLeft returns the mode chip's left cap.
+// GetDockModeCapLeft returns the mode chip's left cap, empty when the dock's
+// pills are flat.
 //
-// The chip sits at the head of a row of capped workspace pills, so a square
-// chip beside them reads as an unfinished pill rather than a different kind of
-// thing. It caps regardless of DockPillCaps, which is really about the
-// minimized run, where a cap on every entry turned the row into beads.
-func (s *Settings) GetDockModeCapLeft() string { return s.GetSidebarPillLeftChar() }
-
-// GetDockModeCapRight returns the mode chip's right cap.
-func (s *Settings) GetDockModeCapRight() string { return s.GetSidebarPillRightChar() }
-
-// GetDockWorkspaceCapLeft returns the workspace pill's left cap.
-//
-// The strip keeps its own accessor for the reason the rail does: DockPillCaps
-// is about the mode chip and the minimized run, where a cap on every entry
-// turned the row into beads. A workspace pill is a tab, and a tab wants the
-// rounded end that says where it starts and stops.
-//
-// Empty under ASCII. A half circle has no 7-bit stand-in: "[" is a bracket
-// drawn beside the pill rather than the pill's own edge, and it reads as
-// punctuation in a row that has none.
-func (s *Settings) GetDockWorkspaceCapLeft() string {
-	if s.UseASCIIOnly {
+// The mode chip, the workspace tabs and the minimized run all follow
+// DockPillCaps, so dock_pill_caps = false takes the caps off every pill the
+// settings page says it does.
+func (s *Settings) GetDockModeCapLeft() string {
+	if !s.DockPillCaps {
 		return ""
 	}
 	return s.GetSidebarPillLeftChar()
 }
 
-// GetDockWorkspaceCapRight returns the workspace pill's right cap.
-func (s *Settings) GetDockWorkspaceCapRight() string {
-	if s.UseASCIIOnly {
+// GetDockModeCapRight returns the mode chip's right cap, empty when the dock's
+// pills are flat.
+func (s *Settings) GetDockModeCapRight() string {
+	if !s.DockPillCaps {
 		return ""
 	}
 	return s.GetSidebarPillRightChar()
 }
 
-// GetDockModeIconWindow returns the appropriate window mode icon based on UseASCIIOnly
+// GetDockWorkspaceCapLeft returns the workspace pill's left cap, empty when the
+// dock's pills are flat.
+//
+// Empty under ASCII too. A half circle has no 7-bit stand-in: "[" is a bracket
+// drawn beside the pill rather than the pill's own edge, and it reads as
+// punctuation in a row that has none.
+func (s *Settings) GetDockWorkspaceCapLeft() string {
+	if !s.DockPillCaps || s.UseASCIIOnly {
+		return ""
+	}
+	return s.GetSidebarPillLeftChar()
+}
+
+// GetDockWorkspaceCapRight returns the workspace pill's right cap, empty when
+// the dock's pills are flat.
+func (s *Settings) GetDockWorkspaceCapRight() string {
+	if !s.DockPillCaps || s.UseASCIIOnly {
+		return ""
+	}
+	return s.GetSidebarPillRightChar()
+}
+
+// DockModeIconMaxWidth is the widest icon, in cells, the mode pill takes from
+// appearance.dock_mode_icon_*. The pill shares the dock's left block with the
+// workspace strip, and an icon wider than this would take the strip's room.
+const DockModeIconMaxWidth = 8
+
+// DockModeIconDefault is the word that puts a mode icon back to the built-in
+// for the glyph set. The empty string cannot do it, because an empty icon is
+// a value: it hides the icon.
+const DockModeIconDefault = "default"
+
+// DockModeIconUsable reports whether value can stand as a mode pill icon: no
+// control characters, which would move the cursor or start an escape sequence
+// in the middle of the dock row, and at most DockModeIconMaxWidth cells. The
+// width is the one the dock layout measures with, so a wide glyph is counted
+// as the two cells it takes. The empty string is usable: it hides the icon.
+func DockModeIconUsable(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return lipgloss.Width(value) <= DockModeIconMaxWidth
+}
+
+// dockModeIcon is the icon for one mode: the configured one when it is set
+// and usable, and otherwise the built-in for the glyph set. The configured
+// value wins over use_ascii_only, since the person wrote it for the terminal
+// they have. The word default, written in config.toml by hand, reads as
+// unset, the way the settings page and set-config treat it.
+func (s *Settings) dockModeIcon(set *string, nerd, ascii string) string {
+	if set != nil && strings.TrimSpace(*set) != DockModeIconDefault && DockModeIconUsable(*set) {
+		return *set
+	}
+	if s.NerdFontsOff() {
+		return ascii
+	}
+	return nerd
+}
+
+// GetDockModeIconWindow returns the window mode icon: appearance.dock_mode_icon_window
+// when set, and otherwise the built-in for the glyph set.
 func (s *Settings) GetDockModeIconWindow() string {
-	if s.NerdFontsOff() {
-		return DockModeIconWindowASCII
-	}
-	return DockModeIconWindow
+	return s.dockModeIcon(s.DockModeIconWindow, DockModeIconWindow, DockModeIconWindowASCII)
 }
 
-// GetDockModeIconTerminal returns the appropriate terminal mode icon based on UseASCIIOnly
+// GetDockModeIconTerminal returns the terminal mode icon: appearance.dock_mode_icon_terminal
+// when set, and otherwise the built-in for the glyph set.
 func (s *Settings) GetDockModeIconTerminal() string {
-	if s.NerdFontsOff() {
-		return DockModeIconTerminalASCII
-	}
-	return DockModeIconTerminal
+	return s.dockModeIcon(s.DockModeIconTerminal, DockModeIconTerminal, DockModeIconTerminalASCII)
 }
 
-// GetDockModeIconTiling returns the appropriate tiling mode icon based on UseASCIIOnly
+// GetDockModeIconTiling returns the tiling mode icon: appearance.dock_mode_icon_tiling
+// when set, and otherwise the built-in for the glyph set.
 func (s *Settings) GetDockModeIconTiling() string {
+	return s.dockModeIcon(s.DockModeIconTiling, DockModeIconTiling, DockModeIconTilingASCII)
+}
+
+// GetDockModeIconPrefix returns the mode pill's label while the leader is
+// armed, for the current glyph set.
+func (s *Settings) GetDockModeIconPrefix() string {
 	if s.NerdFontsOff() {
-		return DockModeIconTilingASCII
+		return DockModeIconPrefixASCII
 	}
-	return DockModeIconTiling
+	return DockModeIconPrefix
 }
 
 // GetDockIconLeaveRunning returns the leave-running icon for the current glyph set.
@@ -929,6 +1097,33 @@ func (s *Settings) GetBorderForStyle() lipgloss.Border {
 	}
 }
 
+// OverlayBorder is the border a dialog is drawn with, and a panel when it is
+// framed. It follows border_style, except that the block styles draw the
+// rounded border: a solid or half-block frame round a three-row dialog
+// outweighs what it holds. The hidden style draws spaces, so a dialog keeps
+// its size and every hit rectangle in it.
+func (s *Settings) OverlayBorder() lipgloss.Border {
+	if s.UseASCIIOnly {
+		return lipgloss.ASCIIBorder()
+	}
+	switch s.BorderStyle {
+	case "normal":
+		return lipgloss.NormalBorder()
+	case "thick":
+		return lipgloss.ThickBorder()
+	case "double":
+		return lipgloss.DoubleBorder()
+	case "ascii":
+		return lipgloss.ASCIIBorder()
+	case "hidden":
+		return lipgloss.HiddenBorder()
+	case BorderStyleGlyphs:
+		return s.glyphSetBorder()
+	default:
+		return lipgloss.RoundedBorder()
+	}
+}
+
 // glyphSetBorder is the border the active glyph set draws, with any rune it
 // leaves unnamed taken from the rounded border.
 //
@@ -1035,23 +1230,26 @@ func (s *Settings) GetScrollbarThumbChar() string {
 	return scrollbarThinThumb
 }
 
-// ScrollbarTintHex returns the configured tint when it is a colour literal
-// rather than a keyword. A malformed one is not a colour, so it is refused here
-// as well as warned about at load: a bar drawn in nothing is invisible.
-func (s *Settings) ScrollbarTintHex() (string, bool) {
-	if IsHexColor(s.ScrollbarTint) {
-		return s.ScrollbarTint, true
+// ScrollbarTintColor returns the configured tint when it is a colour rather
+// than a keyword (see theme.ParseColor). A malformed one is not a colour, so it
+// is refused here as well as warned about at load: a bar drawn in nothing is
+// invisible. A keyword wins over a name it shares: muted is the keyword.
+func (s *Settings) ScrollbarTintColor() (string, bool) {
+	switch v := s.ScrollbarTint; v {
+	case ScrollbarTintQuiet, ScrollbarTintBorder, ScrollbarTintMuted:
+		return "", false
+	default:
+		return v, theme.IsColor(v)
 	}
-	return "", false
 }
 
 // ScrollbarTintResolved is the keyword the tint is behaving as, with unset
 // resolved to the documented default.
 //
-// Unset used to reach the renderer as the empty string and match none of its
-// cases, so it fell through to the border rule: clearing the tint gave the one
-// tint that is not the default. The registry, the validator and the config
-// header all say empty means quiet, and now so does the bar.
+// Unset has to be resolved before the renderer sees it: the empty string
+// matches none of its cases and falls through to the border rule, the one tint
+// that is not the default. The registry, the validator and the config header
+// all say empty means quiet, and so does the bar.
 func (s *Settings) ScrollbarTintResolved() string {
 	if s.ScrollbarTint == "" {
 		return ScrollbarTintQuiet
@@ -1060,7 +1258,8 @@ func (s *Settings) ScrollbarTintResolved() string {
 }
 
 // ResolveBackground is what one surface's background is behaving as, given its
-// own setting and appearance.background: off, theme, or a #RRGGBB literal.
+// own setting and appearance.background: off, theme, or a colour (see
+// theme.ParseColor).
 //
 // The surface's own setting wins whenever it holds a value, off included, so
 // one surface can be left bare while the rest are painted. Empty follows the
@@ -1073,7 +1272,7 @@ func ResolveBackground(own, all string) string {
 		v = all
 	}
 	switch {
-	case v == BackgroundTheme, IsHexColor(v):
+	case v == BackgroundTheme, theme.IsColor(v):
 		return v
 	default:
 		return BackgroundOff
@@ -1247,10 +1446,10 @@ const (
 
 	// ZIndexFloating is where the floating band starts: a floating window is
 	// drawn at ZIndexFloating plus its Z, capped at ZIndexFloatingTop. The band
-	// used to start one above the separators at 998, which put a floating
-	// window with Z >= 2 over the dock, the clock, the log viewer, the which-key
-	// overlay and the scrollback browser: every overlay between 1000 and 1003
-	// was reachable with a handful of panes open.
+	// sits well below the overlays: starting it just above the separators at
+	// 998 would put a floating window with Z >= 2 over the dock, the clock, the
+	// log viewer, the which-key overlay and the scrollback browser, every
+	// overlay between 1000 and 1003, with a handful of panes open.
 	ZIndexFloating = 503
 
 	// ZIndexFloatingTop is the highest z-index a floating window can be drawn
@@ -1424,8 +1623,10 @@ var CopyEntries = []string{CopyEntryCursor, CopyEntryCenter}
 // says so on the dock when the text holds a line break or a control character. A write from any other pane waits for the
 // user to allow it, which is what ask does for every pane.
 //
-// Whatever the mode, the pane keeps its own copy, so the program that set it
-// reads it back with an OSC 52 query.
+// Whatever the mode, a pane that runs without the daemon keeps its own copy,
+// so the program that set it reads it back with an OSC 52 query. A pane under
+// the daemon keeps none: the daemon's emulator has no clipboard callback, so
+// every OSC 52 query there is answered with an empty string.
 const (
 	OSC52WriteOff     = "off"
 	OSC52WriteAsk     = "ask"
@@ -1436,4 +1637,14 @@ const (
 // OSC52WriteModes is every value appearance.selection.osc52_write takes.
 var OSC52WriteModes = []string{
 	OSC52WriteOff, OSC52WriteAsk, OSC52WriteFocused, OSC52WriteOn,
+}
+
+// DockHeight is the rows the dock takes when it is shown: one with
+// appearance.dock_compact, two without. It does not look at DockbarPosition,
+// so a caller that has to treat a hidden dock as no rows checks that itself.
+func (s *Settings) DockHeight() int {
+	if s.DockCompact {
+		return DockCompactHeight
+	}
+	return DockFullHeight
 }

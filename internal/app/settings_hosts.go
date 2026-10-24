@@ -139,9 +139,15 @@ func hostStateSentence(status, reason, detail string) string {
 		head = "The link is starting."
 	case federation.StatusReconnecting:
 		head = "The link dropped and tuios is connecting again."
+	case federation.StatusApproval:
+		head = federation.SignInSentence
 	}
 	parts := []string{head}
-	if reason != "" && reason != head {
+	if strings.HasPrefix(reason, head) {
+		// The link's own reason starts with the same sentence and goes on to
+		// say what to do, so it stands alone.
+		parts = []string{reason}
+	} else if reason != "" {
 		parts = append(parts, reason)
 	}
 	if detail != "" {
@@ -215,20 +221,19 @@ func (m *OS) tailnetAddrCandidates() []string {
 	// The [tailscale] table is read here, on the caller's goroutine, and only
 	// the tailnet call is handed off.
 	//
-	// It used to be read inside the goroutine, which meant that goroutine
-	// resolving an XDG path: reading the environment, and creating the config
-	// directory if it was not there. Both of those raced with anything else
-	// changing the environment, which in a test binary is every test that
-	// points XDG at a directory of its own. Reading a small file on the
-	// goroutine that is already building a settings row costs nothing
-	// measurable, and the round trip that actually takes time is still off it.
-	opt, enabled := tailnetOptionsFromFile()
+	// Reading it inside the goroutine would mean that goroutine resolving an
+	// XDG path: reading the environment, and creating the config directory if
+	// it is not there. Both of those race with anything else changing the
+	// environment, which in a test binary is every test that points XDG at a
+	// directory of its own. The file is parsed again only when it changed
+	// (see tailnetOptionsCached), and the round trip that actually takes time
+	// is still off this goroutine.
+	m.tailnetMu.Lock()
+	defer m.tailnetMu.Unlock()
+	opt, enabled := m.tailnetOptionsCached()
 	if !enabled {
 		return nil
 	}
-
-	m.tailnetMu.Lock()
-	defer m.tailnetMu.Unlock()
 	if time.Since(m.tailnetAskedAt) > tailnetCandidateTTL {
 		m.tailnetAskedAt = time.Now()
 		go m.refreshTailnetCandidates(opt)
@@ -253,6 +258,37 @@ func (m *OS) refreshTailnetCandidates(opt federation.TailnetOptions) {
 	m.tailnetMu.Lock()
 	m.tailnetCandidates = addrs
 	m.tailnetMu.Unlock()
+}
+
+// tailnetFileKey names one version of the config file: its path, size and
+// modification time.
+type tailnetFileKey struct {
+	path  string
+	size  int64
+	mtime time.Time
+}
+
+// tailnetOptionsCached is tailnetOptionsFromFile, parsed again only when the
+// config file changed. The hosts page builds this row on every frame the
+// settings panel is up, and parsing the whole config file each time was the
+// largest single cost of such a frame: a pointer moving over the panel
+// composes one per frame (issue #1058). A stat is all an unchanged file costs.
+// The caller holds tailnetMu.
+func (m *OS) tailnetOptionsCached() (federation.TailnetOptions, bool) {
+	path, err := config.GetConfigPath()
+	if err != nil {
+		return federation.DefaultTailnetOptions(), false
+	}
+	key := tailnetFileKey{path: path}
+	if fi, err := os.Stat(path); err == nil {
+		key.size, key.mtime = fi.Size(), fi.ModTime()
+	}
+	if m.tailnetOptValid && key == m.tailnetOptKey {
+		return m.tailnetOpt, m.tailnetOptEnabled
+	}
+	m.tailnetOpt, m.tailnetOptEnabled = tailnetOptionsFromFile()
+	m.tailnetOptKey, m.tailnetOptValid = key, true
+	return m.tailnetOpt, m.tailnetOptEnabled
 }
 
 // tailnetOptionsFromFile is the [tailscale] table, and whether it asks for

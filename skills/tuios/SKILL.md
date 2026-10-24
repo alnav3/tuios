@@ -1,6 +1,6 @@
 ---
 name: tuios
-description: Drive tuios from inside one of its panes. Find out where you are running, read and write other panes, run work and wait on it instead of polling, report your own state so the person sees it, and talk to the other agents and the person safely. `tuios --skill <topic>` prints the rest: fleets of agents, the Inbox and approvals, mail, other machines, events, MCP, the tmux shim, herdr's command line, pane grants, configuration, errors and recipes.
+description: "Drive tuios from inside one of its panes. Find out where you are running, read and write other panes, run work and wait on it instead of polling, report your own state so the person sees it, and talk to the other agents and the person safely. `tuios --skill <topic>` prints the rest: fleets of agents, turn checkpoints, shipping a worktree, the Inbox and approvals, push notifications, pairing a phone, mail, other machines, clients, events, MCP, the tmux shim, herdr's command line, pane grants, configuration, agent features off, errors and recipes."
 ---
 
 # Driving tuios from a pane
@@ -40,10 +40,11 @@ is also your address when another agent wants to reach you. The CLI presents
 `TUIOS_PANE_TOKEN` where the daemon needs it; never pass it by hand.
 
 `TUIOS_SOCKET` names the daemon that runs your pane. Setting it does not send a
-command to another daemon: `XDG_RUNTIME_DIR` chooses the daemon, and a command
-refuses when `TUIOS_SOCKET` names a socket where nothing listens. For a
-throwaway daemon of your own, set `XDG_RUNTIME_DIR` and `XDG_STATE_HOME` to
-fresh directories.
+command to another daemon, and a command refuses when `TUIOS_SOCKET` names a
+socket where nothing listens. For a throwaway daemon of your own, with its own
+socket and saved sessions, pass `--server NAME` (or set `TUIOS_SERVER=NAME`),
+and stop it with `tuios --server NAME kill-server`. A pane of a named server
+has `TUIOS_SERVER` set, so tuios run there reaches that server.
 
 `TMUX` and `TMUX_PANE` are not set in a tuios pane, even when tuios runs inside
 tmux, so do not drive panes with `tmux` here: use the tuios verbs. A tool that
@@ -95,6 +96,7 @@ way. `HOST:SESSION` and `HOST:SESSION:WINDOW` reach another machine
 
 ```sh
 tuios ls
+tuios list-clients
 tuios list-windows -s work
 tuios list-agents -s work
 tuios capture-pane -s work -w build --scrollback --lines 40
@@ -102,8 +104,10 @@ tuios capture-pane -s work -w build --scrollback --lines 40
 
 The listing commands take `--json` when you want to parse rather than read.
 `capture-pane` without `--scrollback` is the visible screen, which ends in the
-blank rows below the cursor. `--lines` counts from the last line with content.
-Leave `--ansi` off when you match text.
+blank rows below the cursor. `--trim` drops those rows. `--lines` counts from
+the last line with content. A line longer than the pane comes back in rows.
+`--unwrap` joins them, so a search finds a long path or URL. Leave `--ansi` off
+when you match text.
 
 ## Drive other windows: open, address, send keys, check
 
@@ -165,6 +169,13 @@ exits with its status:
 tuios run -s work -w tests --timeout 600000 -- go test ./...
 ```
 
+Without shell integration, run the command as the program of a new pane.
+`--wait` exits with its status, and `--keep-open` keeps the output to read:
+
+```sh
+tuios new-window -s work tests --no-focus --keep-open --wait -- go test ./...
+```
+
 Do not capture in a loop with a sleep. The daemon blocks for you:
 
 ```sh
@@ -202,7 +213,18 @@ tuios integration install claude-code    # or codex, gemini-cli, opencode, --all
 tuios doctor agents
 ```
 
-`tuios --skill state` has the hook wiring, metadata, detection and resume.
+A script or a tool without a harness can report with OSC 7501, the Program
+Status Protocol, through `tuios status`. It needs no session or pane id, and
+it works in other terminals that read the protocol too:
+
+```sh
+tuios status working --app build --msg 'Compiling' --progress 40
+tuios status blocked --kind permission --app deploy --msg 'Approve deploy to production?'
+tuios status done --app build --msg 'Built 12 crates'
+```
+
+`tuios --skill state` has the hook wiring, OSC 7501, metadata, detection and
+resume.
 
 ## Other agents and the person
 
@@ -227,6 +249,9 @@ tuios send-agent-message -s work -w review --from "$TUIOS_PANE_ID" 'rebased, ple
 tuios wait-for agent-message -s work -w "$TUIOS_PANE_ID" --timeout 600000
 tuios read-agent-messages -s work -w "$TUIOS_PANE_ID" --unread
 ```
+
+tuios tells the recipient about the message, during its turn or once it is at
+rest. You do not need to follow mail with `ask-agent` to make sure it is read.
 
 The person has an address, `human`. For a decision with a few answers, ask it:
 
@@ -267,6 +292,8 @@ inbox` covers the Inbox, `ask-human` and approvals.
   call. Both describe this build exactly.
 - Read a whole error before retrying. Failures name the cause and the fix, and
   retrying a refusal unchanged fails the same way (`tuios --skill errors`).
+- An `agents_disabled` error means the person turned agent features off. Stop
+  using agent verbs and tell them (`tuios --skill agents-off`).
 
 ## Topics
 
@@ -279,12 +306,21 @@ Print one with `tuios --skill <topic>`:
 | `inbox` | The person's Inbox, `ask-human`, reading a blocked prompt, approvals answered from the Inbox |
 | `mail` | Messages between agents, threads, attachments, the stash, `ask-agent` in full, loops, trust |
 | `fleet` | Selectors, worktrees, `fan`, comparing and reviewing attempts, `start-agent`, headless agents over ACP or the Codex app-server |
+| `checkpoints` | The checkpoint of each finished turn: list, diff, restore and undo the restore |
+| `ship` | Commit, merge, push and open a pull request for a worktree, and the Inbox question a push asks |
 | `hosts` | Other machines: hosts, remote sessions, hosted panes, agents and worktrees there |
+| `files` | Files and copies between machines: `tuios cp` with `--json`, its exit codes, `tuios transfers`, what a host lets you write, the transfer and file verbs |
 | `events` | The event stream (`subscribe`), resuming it, `list-verbs` and the raw socket |
+| `stream` | `stream-pane` and `attach-presence`: a pane as bytes for a client that is not tuios, the size lease, the person's presence and its session scope |
+| `clients` | `list-clients`: which client shows which session, `switch-session`, `detach-client`, and the `client-session-changed` event |
 | `mcp` | tuios as an MCP server: setup, tools, scope |
 | `tmux` | The tmux shim for tools that only drive tmux |
 | `herdr` | herdr's command line and socket, for tools built for herdr |
+| `notify` | Push notifications from the Inbox to the person's phone, and `notify test` |
+| `tml` | TML surfaces: show the person a result, a dashboard or a question, get the answer, own a live surface |
+| `pair` | `tuios pair`: what it changes, what the person must check, and why an agent does not run it |
+| `agents-off` | What works and what fails with `agents_disabled` when the person turns agent features off |
 | `grants` | Pane grants: what a pane may do, and giving a helper less |
 | `config` | Options, appearance, themes, glyphs, the dock, hooks and keybindings |
 | `errors` | Every error code and its remedy, and a daemon that is not running |
-| `recipes` | End to end: a fleet of agents, answering from the Inbox, approvals, agents on another machine, MCP, the tmux shim, scoped grants, a conductor, phone alerts |
+| `recipes` | End to end: a sessionizer, a fleet of agents, answering from the Inbox, approvals, agents on another machine, MCP, the tmux shim, scoped grants, a conductor, phone alerts |

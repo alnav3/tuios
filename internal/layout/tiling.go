@@ -1,7 +1,11 @@
 // Package layout provides window tiling and layout management for the terminal.
 package layout
 
-import "github.com/Gaurav-Gosain/tuios/internal/config"
+import (
+	"math"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+)
 
 // TileLayout represents the position and size for a tiled window
 type TileLayout struct {
@@ -64,6 +68,51 @@ func spans(origin, total, n, gap int) []span {
 	return out
 }
 
+// weightedSpans is spans with the shares in proportion to weights, one weight
+// per neighbour. Weights of the wrong length, or holding a value that is not a
+// positive number, are no answer, and the shares are equal as in spans.
+//
+// The edges are placed at the rounded running total of the weights rather
+// than each share rounded on its own, so the shares always add up to the
+// extent and a layout read back off its own rectangles (see MasterSplitsFrom)
+// comes out cell for cell the same. Every share keeps at least one cell, and
+// the gap gives up ground first, both as in spans.
+func weightedSpans(origin, total, n int, weights []float64, gap int) []span {
+	if n <= 1 || len(weights) != n {
+		return spans(origin, total, n, gap)
+	}
+	sum := 0.0
+	for _, w := range weights {
+		if !(w > 0) || math.IsInf(w, 0) {
+			return spans(origin, total, n, gap)
+		}
+		sum += w
+	}
+	if total-gap*(n-1) < n {
+		gap = max((total-n)/(n-1), 0)
+	}
+	avail := total - gap*(n-1)
+	if avail < n {
+		return spans(origin, total, n, gap)
+	}
+	out := make([]span, 0, n)
+	pos, prev, acc := origin, 0, 0.0
+	for i, w := range weights {
+		acc += w
+		edge := int(math.Round(float64(avail) * acc / sum))
+		if i == n-1 {
+			edge = avail
+		}
+		// One cell for this share, and one for each share after it.
+		edge = min(max(edge, prev+1), avail-(n-1-i))
+		size := edge - prev
+		out = append(out, span{Pos: pos, Size: size})
+		pos += size + gap
+		prev = edge
+	}
+	return out
+}
+
 // splitByRatio is spans for two neighbours whose shares are not equal: the
 // first takes ratio of what is left once the gap is reserved. Both sides keep
 // at least one cell, so a ratio at either end of its range cannot produce a
@@ -113,12 +162,6 @@ func gridColumns(n int) int {
 // the master ratio is the top pane's share of the height.
 func MasterStackSideBySide(screenWidth, usableHeight int) bool {
 	return screenWidth >= usableHeight*cellAspect
-}
-
-// CalculateTilingLayout is CalculateMasterStackLayout with the two stacked
-// panes of the three pane layout sharing the height equally.
-func CalculateTilingLayout(n int, screenWidth int, usableHeight int, topMargin int, masterRatio float64, gap int) []TileLayout {
-	return CalculateMasterStackLayout(n, screenWidth, usableHeight, topMargin, masterRatio, 0, gap)
 }
 
 // CalculateMasterStackLayout returns the master-stack positions for n windows

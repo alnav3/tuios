@@ -20,12 +20,11 @@ import (
 // session that ended: the shells are still running, the panes still have their
 // scrollback, and the only thing that went is this client's way of seeing them.
 //
-// What used to happen was that the client gave up on the first end of the
-// connection, closed every pane it was drawing, and put the user back in the
-// session on their own machine. The far session survived, which was the design,
-// and the person lost their place, which was not. This file is the other half:
-// the client keeps the last frame on screen, dials again with a backoff, and
-// puts the person back where they were.
+// A client that gave up on the first end of the connection would close every
+// pane it was drawing and put the user back in the session on their own
+// machine. The far session would survive, and the person would lose their
+// place. So the client keeps the last frame on screen, dials again with a
+// backoff, and puts the person back where they were.
 //
 // Three rules shape it.
 //
@@ -127,6 +126,13 @@ func (m *OS) beginHostReconnect(cause error) tea.Cmd {
 		// died must not restart the clock or double the dials.
 		return nil
 	}
+	if m.hostOpen != nil {
+		// A click waits for another session, and the newest request wins.
+		// When the click fails, the reconnect starts then. The caller keeps
+		// the panes meanwhile: see HostReconnectDeferred.
+		m.hostReconnectDeferred = true
+		return nil
+	}
 	m.hostReconnectGen++
 	m.hostReconnect = &hostReconnect{
 		gen:         m.hostReconnectGen,
@@ -191,9 +197,24 @@ func (m *OS) handleHostReconnectTick(msg hostReconnectTickMsg) tea.Cmd {
 	version := m.clientVersionForReconnect()
 	caps := m.clientCapabilities()
 	reserve := m.ownLayoutReserveForReconnect()
+	agent, kind := "", ""
+	termType, colorTerm := "", ""
+	served, viewOnly := false, false
+	if m.DaemonClient != nil {
+		agent = m.DaemonClient.SSHAuthSock
+		termType, colorTerm = m.DaemonClient.Term, m.DaemonClient.ColorTerm
+		// A served or read-only client stays one after the reconnect.
+		kind, served, viewOnly = m.DaemonClient.Kind, m.DaemonClient.Served, m.DaemonClient.ViewOnly
+	}
 	return func() tea.Msg {
 		client := session.NewTUIClient()
 		client.SetOwnLayoutReserve(reserve)
+		// Getting the session back is not the person attaching, so it must
+		// not detach the other clients under single_client.
+		client.Reconnect = true
+		client.SSHAuthSock = agent
+		client.Term, client.ColorTerm = termType, colorTerm
+		client.Kind, client.Served, client.ViewOnly = kind, served, viewOnly
 		if _, err := client.ConnectThroughHost(host, version, width, height, caps); err != nil {
 			_ = client.Close()
 			return hostReconnectResultMsg{gen: gen, err: err}
@@ -248,6 +269,8 @@ func (m *OS) resumeOnHost(client *session.TUIClient, state *session.SessionState
 	host := r.host
 	took := time.Since(r.since).Round(time.Second)
 	m.hostReconnect = nil
+	// The reconnect landed, so no click may pull the person away after it.
+	m.cancelHostOpen()
 
 	old := m.DaemonClient
 	if old != nil {
@@ -276,6 +299,8 @@ func (m *OS) resumeOnHost(client *session.TUIClient, state *session.SessionState
 		// not what coming back means.
 		was := m.SubscribedPTYs
 		m.SubscribedPTYs = make(map[string]bool)
+		// A request in flight when the link went may be lost with it.
+		m.paneRequests = nil
 		for _, w := range m.Windows {
 			if w.DaemonMode && w.PTYID != "" && was[w.PTYID] {
 				m.primePaneFromDaemon(w)
@@ -288,7 +313,8 @@ func (m *OS) resumeOnHost(client *session.TUIClient, state *session.SessionState
 	m.MarkAllDirty()
 	m.LogInfo("The link to %s is back after %s", host, took)
 	m.ShowNotification(fmt.Sprintf("The link to %s is back.", host), "success", m.Settings.NotificationDuration)
-	return nil
+	// A rebuild forgot the agents view's live pane. See rebuildForSession.
+	return m.CockpitSideFetch()
 }
 
 // samePaneSet reports whether the session still has exactly the panes this
@@ -389,7 +415,7 @@ func hostReconnectReason(host string, err error) string {
 		case session.ErrVerbUnknownHost:
 			return fmt.Sprintf("The host %s is not configured. Add it with 'tuios hosts add'.", host)
 		case session.ErrVerbProtocolMismatch, session.ErrVerbUnknownVerb:
-			return "The daemon on this machine is too old. Restart it with 'tuios kill-server'."
+			return "The daemon on this machine is too old. Restart it with 'tuios restart-server'."
 		}
 	}
 	return what + fmt.Sprintf(" The session keeps running there. Run 'tuios hosts' to see %s.", host)
@@ -401,7 +427,10 @@ func hostReconnectReason(host string, err error) string {
 func (m *OS) hostLinkNote() string {
 	r := m.hostReconnect
 	if r == nil {
-		return ""
+		if m.daemonReconnect != nil {
+			return " " + daemonWaitNote + " "
+		}
+		return m.hostOpenNote()
 	}
 	name := r.host
 	const room = 12
@@ -410,6 +439,11 @@ func (m *OS) hostLinkNote() string {
 	}
 	return " Reconnecting to " + name + " "
 }
+
+// HostReconnectDeferred reports whether a lost link to the attached host
+// waits for a rail click to land or fail before it is dialed again. The
+// panes stay on screen meanwhile.
+func (m *OS) HostReconnectDeferred() bool { return m.hostReconnectDeferred }
 
 // ReconnectingToHost reports whether the client is trying to get a lost link
 // back. It is what a test reads, and what tells a caller that the frame on

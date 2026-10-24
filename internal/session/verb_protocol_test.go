@@ -21,11 +21,25 @@ import (
 // and the socket path.
 func startTestDaemon(t *testing.T) (*Daemon, string) {
 	t.Helper()
+	return startTestDaemonSized(t, "")
+}
+
+// startTestDaemonSized is startTestDaemon with [daemon] window_size set to
+// policy, for a test about one policy rather than the default.
+func startTestDaemonSized(t *testing.T, policy string) (*Daemon, string) {
+	t.Helper()
+	return startTestDaemonWith(t, &DaemonConfig{WindowSize: policy})
+}
+
+// startTestDaemonWith is startTestDaemon with the fields cfg sets.
+func startTestDaemonWith(t *testing.T, cfg *DaemonConfig) (*Daemon, string) {
+	t.Helper()
 	t.Setenv("XDG_RUNTIME_DIR", testutil.RuntimeDir(t))
 
 	t.Cleanup(useResurrectionDir(t.TempDir()))
 
-	d := NewDaemon(&DaemonConfig{Version: "test", DisableAutoRestore: true})
+	cfg.Version, cfg.DisableAutoRestore = "test", true
+	d := NewDaemon(cfg)
 	if err := d.Start(); err != nil {
 		t.Fatalf("daemon Start: %v", err)
 	}
