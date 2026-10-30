@@ -1,5 +1,9 @@
 # Configuration, appearance, the dock, hooks and keybindings
 
+When the person asks you to move their tmux, screen or zellij settings over,
+read "Keys of tmux, screen or zellij" below. Run `tuios keybinds preset
+tmux`, then `tuios keybinds cheatsheet tmux` to show what moved.
+
 ## Options
 
 Everything scalar is settable at runtime. Find the option rather than guessing
@@ -79,11 +83,24 @@ no border and no title bar. The pane's program gets the full size. With it on,
 `dock_mode_icon_tiling` set the icon in the dock's mode pill. An empty value
 shows no icon, and `default` puts back the icon of the glyph set. An icon can
 be at most 8 cells wide, with no control characters. To remove the whole pill,
-remove `"mode"` from `[dock] left`.
+remove `"mode"` from `[dock] left`. While tiling is on, the pill shows the
+tiling icon. `appearance.dock_mode_pill = "input"` shows the terminal or window
+icon there, with the split letter after it.
 
 `appearance.dock_prefix_indicator` sets where an armed leader shows: `pill`
 (the default) puts a keyboard icon on the mode pill in the warning colour,
 `badge` draws a `PREFIX` badge. The badge also shows when the dock is hidden.
+
+`notifications.duration` sets how many seconds an info or success message stays
+up. The default is 2. `notifications.warning_duration` (default 8) and
+`notifications.error_duration` (default 15) set the time for warnings and
+errors. Any value from 1 to 3600 is valid, and 0 uses the default.
+`notifications.style` sets how a message looks: `full` (the default) has a
+coloured bar on its left and a line above it that counts down, and `plain`
+shows the icon and the text only. `notifications.level` is the least severe
+message the dock shows: `info` (the default), `warning` or `error`. The rest go
+to the log viewer only, or nowhere with `notifications.log_hidden = false`.
+Messages from panes, agents and mail are not held to the level. Change these only when the person asks.
 
 `daemon.window_size` sets the size of a session with more than one client:
 `latest` (the default), the client that last had input, `smallest`, or
@@ -125,10 +142,17 @@ on each pane of the workspace, and a typed label focuses that pane.
 `panes.label_keys` sets the keys (default `1234567890`). It is for the person
 at the keyboard: to focus a pane, use `focus-window`.
 
+The path picker (`Alt+;` in terminal mode or `Ctrl+B .`, the `pick_path`
+action) lists the folder of the focused pane's shell at its cursor, and
+`Enter` types the chosen path there. `path_picker.show_hidden` shows the
+names that start with a dot. It is for the person at the keyboard: to type
+into a pane, use `send-text`.
+
 The pane navigator (`Ctrl+B /`, the `choose_tree` action) is a tree of every
 session, workspace and pane, with a preview and a search over names, folders,
 commands and screen text. `panes.navigator_layout` sets the layout it opens in:
-`tree` (default), `flat` or `cards`. It is for the person at the keyboard: a script reads
+`tree` (default), `flat` or `cards`. `panes.navigator_search = true` opens it
+ready to type a search. It is for the person at the keyboard: a script reads
 the same rows with `tuios list-windows --all --text N --json`.
 
 ## What the person sees
@@ -158,8 +182,17 @@ question about the screen. Do not change them unless the person asks.
   `appearance.sidebar.sections`. `set-config` cannot set its command.
   `tuios refresh-dock rail/custom` runs it again, and `list-dock-components`
   lists it as `rail/custom`.
+- The rail's pane section runs a program in a live pane in the rail. The
+  person sets it in `[appearance.sidebar.pane]` in the file (`command`,
+  `height`, `title`) and places `pane` in `appearance.sidebar.sections`.
+  `tuios list-windows` leaves the pane out. `--rail` lists it.
 - In the rail's files section, `Y` or the folder menu's Copy path copies a
-  path to the person's clipboard.
+  path to the person's clipboard. `I`, or a drag of a row onto a pane,
+  pastes the path into that pane, quoted for its shell.
+- In the rail's files section, `space` shows a preview of the row: code,
+  Markdown, a picture, a PDF page or a folder. `j` and `k` move it to the
+  next row. `space` or `esc` closes it. A row of a listing on another machine
+  is read on that machine, and needs the `files` grant there.
 - When the last pane on the workspace on screen closes, the session shows
   the workspace the person came from: the one that ran `xpanes`, else the
   ones shown before, else the lowest with panes. `workspaces.return_when_empty
@@ -195,7 +228,10 @@ whole name and lets the strip scroll.
 `{index}`, `{name}`, `{icon}` and `{zoom}` are the format's placeholders. The
 last two read `number_glyphs` (the first entry is workspace 1) and
 `zoom_marker` from the `[dock.tabs]` table. That table also switches the strip
-from pills to flat tabs (`style = "flat"`).
+from pills to flat tabs (`style = "flat"`). Its colours apply to both styles.
+`caps = true` puts rounded ends on flat tabs. `active_underline` turns the
+underline on the current tab on or off. When it is not set, only a pill has
+the underline.
 
 The options `list-options` prints are scalars, and spacing and composition are
 set with them like any other. Colour and shape are names from an open set, each standing for a
@@ -210,7 +246,7 @@ tuios list-themes --filter catppuccin
 ```
   catppuccin_frappe     catppuccin_latte      catppuccin_macchiato  catppuccin_mocha
 
-4 of 345 registered themes.
+4 of 346 registered themes.
 
 active: gruvbox_dark (session)
 themes dir: /home/you/.config/tuios/themes
@@ -326,7 +362,10 @@ drawn only when `appearance.border_style` is `glyphs`. A set file goes in the
 glyphs dir `list-glyphs` reported and can `inherits` a built-in. `close`,
 `maximize`, `minimize`, `focus`, `attention`, `bullet` and `add` must be one
 cell wide; a glyph of the wrong width is dropped and named under `problems`,
-which is the one thing to check after writing a set.
+which is the one thing to check after writing a set. The agent-state marks are
+roles too (`state_needs_input`, `state_working`, `state_idle`, `state_done`,
+`state_errored`, `state_unknown`, `state_waiting`) and may be one or two cells,
+so `"state_needs_input": "✋"` is a set file of three lines with `inherits`.
 
 ### Spacing and composition
 
@@ -338,8 +377,9 @@ tuios set-config appearance.clock_format "Mon 3:04PM"
 tuios set-config appearance.window_title_format "{index}: {title}"
 ```
 
-`dim_unfocused` (0 to 90) quiets the content of unfocused panes. It reaches only
-cells a program coloured itself unless a theme is set.
+`dim_unfocused` (0 to 90) quiets the content of unfocused panes. With no theme it
+uses the colours the host terminal reports. If the terminal reports none, text is
+drawn faint.
 `appearance.dim_foreground = false` keeps the text of an unfocused pane at full
 strength and dims only its background.
 
@@ -447,8 +487,14 @@ working recipes.
 
 A hook runs a shell command on an event, with `TUIOS_*` variables carrying the
 facts. The daemon runs `after-new-window`, `after-close-window`,
-`after-focus-change`, `after-workspace-switch`, `after-agent-state` and
-`after-command-finished`, so they fire with nobody attached. `after-attach`,
+`after-focus-change`, `after-workspace-switch`, `after-agent-state`,
+`after-command-finished`, `after-new-worktree` and `after-settle`, so they
+fire with nobody attached. `after-settle` fires when the person settles an
+agent, with `TUIOS_SETTLE_REASON`. `after-new-worktree` runs in the new worktree before its first
+window starts, and tuios waits for it (60 seconds at most). It gets
+`TUIOS_WORKTREE_PATH`, `TUIOS_WORKTREE_BRANCH`, `TUIOS_WORKTREE_REPO_ROOT` and
+`TUIOS_WORKTREE_CREATED_BRANCH`. When it fails, the session is kept and the
+result of `new-worktree` or `fan` carries `hook_error`. `after-attach`,
 `after-detach`, `after-resize`, `after-layout-change` and `after-theme-change`
 run in the client. `after-theme-change` gets `TUIOS_THEME`, `TUIOS_THEME_BG`
 and `TUIOS_THEME_LIGHT`.
@@ -562,6 +608,17 @@ resize_pane_down_5 = ["alt+down"]
 next_workspace = ["n"]          # runs once
 ```
 
+`keybindings.lock = true` is zellij's locked mode. In terminal mode every key
+but the leader goes to the pane. The zellij preset turns it on. With lock on,
+a repeatable action keeps its menu open until `esc`, with no time limit. That
+menu takes only repeatable keys. Any other key goes to the pane, and tuios
+locks again.
+
+`nest`, the leader then enter, is tmux-matryoshka's prefix Enter: every key
+goes to the pane, the leader too, until `keybindings.nest_exit_key` (`f12`).
+It is for a tmux in the pane with the same leader. The dock pill shows
+`NEST F12`.
+
 ### tmux keys with no default
 
 `last_workspace` (tmux `l`), `break_pane` (`!`), `last_session` (`L`) and
@@ -610,9 +667,11 @@ cancel = true
 description = "flatten"
 ```
 
-When the command writes nothing, fails or runs past 10 seconds, the clipboard
-gets the plain selection, and a failure shows the exit code and the first
-line of stderr on the dock. The command runs on the machine of the tuios
+When the command exits 0 and writes nothing, tuios leaves the clipboard and
+the paste buffers alone, so a command that sets the clipboard itself (such as
+`tmux-copy-it`) wins, as in tmux. When it fails or runs past 10 seconds, the
+clipboard gets the plain selection, and the dock shows the exit code and the
+first line of stderr. The command runs on the machine of the tuios
 client, with the command-key variables (`TUIOS_SESSION`,
 `TUIOS_ACTIVE_PANE_ID`, `TUIOS_ACTIVE_PANE_CWD`). In multi copy mode it runs
 once, on the text `y` copies in the current format.

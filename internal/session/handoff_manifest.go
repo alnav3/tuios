@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 )
 
 // The handoff manifest: what one daemon image writes down for the image it
@@ -76,14 +77,32 @@ type handoffPane struct {
 	ExitCode   int
 	ExitSignal int
 	KeepOpen   bool
+	// State is the pane's emulator, packed, with handoffHistoryRows of its
+	// history and the character cluster it left open.
+	State *TerminalState
+	// Live is what the snapshot does not hold.
+	Live handoffLive
 }
 
 // handoffDaemon is the daemon's own record.
 type handoffDaemon struct {
-	SocketPath string
+	SocketPath string `json:"socket_path"`
 	// Listeners is the descriptor of each listening socket, by name.
-	Listeners map[string]int
-	LockFD    int
+	Listeners map[string]int `json:"listeners"`
+	LockFD    int            `json:"lock_fd"`
+	// PaneTokenKey signs every pane's TUIOS_PANE_TOKEN. Without it a token
+	// stops verifying at the handoff, and a process outside its pane's tree
+	// can no longer prove which pane it is.
+	PaneTokenKey []byte        `json:"pane_token_key,omitempty"`
+	Events       handoffEvents `json:"events"`
+	Mail         handoffMail   `json:"mail"`
+	// Fallback is the binary the writing image runs, kept for the new image
+	// to re-exec when it cannot adopt the panes. See handoff_prev.go.
+	Fallback string `json:"fallback"`
+	// FallbackFD is the descriptor Fallback names, carried across the exec,
+	// or -1 when Fallback is a file by name.
+	FallbackFD int          `json:"fallback_fd"`
+	Stats      HandoffStats `json:"stats"`
 }
 
 // handoffManifest is a manifest as read.
@@ -92,13 +111,14 @@ type handoffManifest struct {
 	Sessions []handoffSession
 	Panes    []handoffPane
 	Daemon   handoffDaemon
+	// Size is how many bytes the manifest took.
+	Size int64
 }
 
 // manifestWriter writes records to w.
 type manifestWriter struct {
-	w   *bufio.Writer
-	buf bytes.Buffer
-	n   int64
+	w *bufio.Writer
+	n int64
 }
 
 func newManifestWriter(w io.Writer) (*manifestWriter, error) {
@@ -135,12 +155,13 @@ func (mw *manifestWriter) json(kind byte, v any) error {
 	return mw.record(kind, data)
 }
 
-func (mw *manifestWriter) gob(kind byte, v any) error {
-	mw.buf.Reset()
-	if err := gob.NewEncoder(&mw.buf).Encode(v); err != nil {
-		return err
+// encodeGob is v as one gob record.
+func encodeGob(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(v); err != nil {
+		return nil, err
 	}
-	return mw.record(kind, mw.buf.Bytes())
+	return buf.Bytes(), nil
 }
 
 // finish writes the end record and flushes. It returns the manifest's size.
@@ -153,7 +174,8 @@ func (mw *manifestWriter) finish() (int64, error) {
 
 // readHandoffManifest reads a whole manifest from r.
 func readHandoffManifest(r io.Reader) (*handoffManifest, error) {
-	br := bufio.NewReaderSize(r, 256<<10)
+	var read atomic.Int64
+	br := bufio.NewReaderSize(&countingReader{r: r, n: &read}, 256<<10)
 	magic := make([]byte, len(handoffMagic))
 	if _, err := io.ReadFull(br, magic); err != nil || string(magic) != handoffMagic {
 		return nil, errors.New("not a handoff manifest")
@@ -199,8 +221,12 @@ func readHandoffManifest(r io.Reader) (*handoffManifest, error) {
 				m.Panes = append(m.Panes, p)
 			}
 		case handoffRecDaemon:
-			err = gob.NewDecoder(bytes.NewReader(payload)).Decode(&m.Daemon)
+			// A record from an image without fallback_fd names its binary
+			// by path; left at zero, the field would name stdin.
+			m.Daemon.FallbackFD = -1
+			err = json.Unmarshal(payload, &m.Daemon)
 		case handoffRecEnd:
+			m.Size = read.Load() - int64(br.Buffered())
 			return m, nil
 		default:
 			err = fmt.Errorf("unknown handoff record %q", kind)
@@ -214,7 +240,7 @@ func readHandoffManifest(r io.Reader) (*handoffManifest, error) {
 // checkHandoffVersion refuses a manifest this build cannot read.
 func checkHandoffVersion(v int) error {
 	if v < MinHandoffVersion || v > HandoffVersion {
-		return fmt.Errorf("handoff manifest version %d, this build reads %d to %d", v, MinHandoffVersion, HandoffVersion)
+		return fmt.Errorf("the previous daemon wrote handoff v%d, and this tuios reads v%d to v%d, so it cannot take over the panes. %s", v, MinHandoffVersion, HandoffVersion, restartAdvice())
 	}
 	return nil
 }

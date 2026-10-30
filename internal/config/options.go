@@ -12,6 +12,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
+	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 )
 
 // Option describes one settable configuration path.
@@ -60,7 +61,7 @@ type Option struct {
 	//
 	// The line it draws is between a proportion and a count. Both are ints with
 	// a Max, but a gauge on a count says nothing: notifications.duration allows
-	// up to an hour, so the usual four seconds would draw an empty bar, and
+	// up to an hour, so the usual two seconds would draw an empty bar, and
 	// appearance.scrollback_lines allows a million, so ten thousand would too.
 	// A proportion is the case
 	// where the far end is a place you would actually put the value, which is
@@ -119,6 +120,9 @@ var (
 	// DockPrefixIndicators are where an armed leader shows: on the dock's
 	// mode pill, or on the floating badge it had before the pill could.
 	DockPrefixIndicators = []string{"pill", "badge"}
+	// DockModePills are what the mode pill shows while tiling is on: the
+	// tiling icon, or the icon of the input mode (terminal or window).
+	DockModePills = []string{"tiling", "input"}
 	// WindowTitleStyles are the shapes of a pane's title: pill has rounded
 	// caps on a fill, tab is the fill alone, plain is the text on the line.
 	WindowTitleStyles = []string{"pill", "tab", "plain"}
@@ -138,6 +142,7 @@ const (
 	DefaultSidebarPosition     = "right"
 	DefaultWindowTitlePosition = "top"
 	DefaultDockPrefixIndicator = "pill"
+	DefaultDockModePill        = "tiling"
 	// DefaultBorderGradientAngle runs the gradient from the top left corner
 	// to the bottom right one.
 	DefaultBorderGradientAngle = 45
@@ -166,6 +171,16 @@ var optionSpecs = []Option{
 		Path: "appearance.frame_panels", Type: OptionBool, Section: "appearance",
 		Description: "Frame the larger overlay panels, such as the command palette, in the border style",
 		Default:     "false",
+	},
+	{
+		Path: "appearance.pane_overlays", Type: OptionBool, Section: "appearance",
+		Description: "Draw dialogs and panels like pane windows: framed in the focused pane's border colour, on the pane's background",
+		Default:     "false",
+	},
+	{
+		Path: "appearance.overlay_border_color", Type: OptionString, Section: "appearance",
+		Description: "Colour of every overlay's frame: #89b4fa, a slot name such as bright_cyan, or a role such as accent. Empty keeps the overlay's own, or the focused pane's border under pane_overlays",
+		Default:     "", Color: true,
 	},
 	{
 		Path: "appearance.zen_mode", Type: OptionString, Section: "appearance",
@@ -243,6 +258,11 @@ var optionSpecs = []Option{
 		Default:     "false",
 	},
 	{
+		Path: "appearance.focus_wrap", Type: OptionBool, Section: "appearance",
+		Description: "A focus key at the edge of a tiled layout moves to the pane on the far side",
+		Default:     "false",
+	},
+	{
 		Path: "appearance.focus_follows_mouse", Type: OptionBool, Section: "appearance",
 		Description: "Focus the pane under the cursor as the mouse moves",
 		Default:     "false",
@@ -306,6 +326,11 @@ var optionSpecs = []Option{
 		Path: "appearance.motion", Type: OptionString, Section: "appearance",
 		Description: "How much moves: none, basic (window slides and the copy sweep), or full (also overlay fades and the working-agent shimmer)",
 		Accepted:    MotionLevels, Default: MotionFull,
+	},
+	{
+		Path: "appearance.calm", Type: OptionBool, Section: "appearance",
+		Description: "Calm mode: nothing moves or blinks, and only messages that need you show in the dock",
+		Default:     "false",
 	},
 	{
 		Path: "appearance.modal_dim", Type: OptionInt, Section: "appearance",
@@ -381,6 +406,16 @@ var optionSpecs = []Option{
 		Default:     "", Color: true,
 	},
 	{
+		Path: "appearance.border_focused_color_window", Type: OptionString, Section: "appearance",
+		Description: "Colour of the focused pane's border in window mode. It wins over border_focused_color",
+		Default:     "", Color: true,
+	},
+	{
+		Path: "appearance.border_focused_color_terminal", Type: OptionString, Section: "appearance",
+		Description: "Colour of the focused pane's border in terminal mode. It wins over border_focused_color",
+		Default:     "", Color: true,
+	},
+	{
 		Path: "appearance.border_focused_gradient", Type: OptionString, Section: "appearance",
 		Description: "Two or more colours, separated by spaces, that the focused pane's border steps through. Empty draws one colour",
 		Default:     "",
@@ -408,6 +443,11 @@ var optionSpecs = []Option{
 	{
 		Path: "appearance.niri_reverse_scroll", Type: OptionBool, Section: "appearance",
 		Description: "Reverse the wheel direction in niri scrolling mode",
+		Default:     "false",
+	},
+	{
+		Path: "appearance.niri_scroll_snap", Type: OptionBool, Section: "appearance",
+		Description: "Snap the strip to the nearest column when a scroll stops",
 		Default:     "false",
 	},
 	{
@@ -700,6 +740,11 @@ var optionSpecs = []Option{
 		Default:     DockModeIconDefault, DefaultClears: true, Icon: true,
 	},
 	{
+		Path: "appearance.dock_mode_pill", Type: OptionString, Section: "dock",
+		Description: "What the mode pill shows while tiling is on: tiling shows the tiling icon, input shows the terminal or window icon",
+		Accepted:    DockModePills, Default: DefaultDockModePill,
+	},
+	{
 		Path: "appearance.dock_mode_split_letter", Type: OptionBool, Section: "dock",
 		Description: "Show V or H after the tiling icon in the mode pill. The letter is the direction of the next split",
 		Default:     "true",
@@ -895,6 +940,11 @@ var optionSpecs = []Option{
 		Default:     "true",
 	},
 	{
+		Path: "appearance.sidebar.peek", Type: OptionBool, Section: "sidebar",
+		Description: "Show a session's panes in the terminals section while the pointer or the rail cursor is on its row",
+		Default:     "true",
+	},
+	{
 		Path: "appearance.sidebar.tooltips", Type: OptionBool, Section: "sidebar",
 		Description: "Label the collapsed strip on hover",
 		Default:     "true",
@@ -903,6 +953,11 @@ var optionSpecs = []Option{
 		Path: "appearance.sidebar.background", Type: OptionString, Section: "sidebar",
 		Description: "Background under the rail: off, theme, or a colour (#rrggbb, 0-255, a slot name or a role name); empty follows appearance.background",
 		Accepted:    Backgrounds, Default: "", Color: true,
+	},
+	{
+		Path: "appearance.sidebar.cursor_background", Type: OptionString, Section: "sidebar",
+		Description: "Background of the row under the cursor while the rail has the keyboard: a colour (#rrggbb, 0-255, a slot name or a role name); empty keeps the theme's",
+		Default:     "", Color: true,
 	},
 	{
 		Path: "appearance.sidebar.sections", Type: OptionString, Section: "sidebar",
@@ -923,6 +978,21 @@ var optionSpecs = []Option{
 		Path: "appearance.sidebar.folder_click", Type: OptionString, Section: "sidebar",
 		Description: "What a click on a folder row does",
 		Accepted:    SidebarFolderClicks, Default: SidebarFolderClickNavigate,
+	},
+	{
+		Path: "appearance.sidebar.file_drag", Type: OptionBool, Section: "sidebar",
+		Description: "Drag a row of the files section into a pane to paste its path",
+		Default:     "true",
+	},
+	{
+		Path: "appearance.sidebar.files_style", Type: OptionString, Section: "sidebar",
+		Description: "How the files section draws: list shows one folder at a time, tree opens folders in place under one root",
+		Accepted:    SidebarFilesStyles, Default: SidebarFilesList,
+	},
+	{
+		Path: "appearance.sidebar.group_main", Type: OptionBool, Section: "sidebar",
+		Description: "Gather the repository's main checkout under the repo row with its worktrees. The repo header then opens the main checkout's session",
+		Default:     "false",
 	},
 	{
 		Path: "appearance.sidebar.header_case", Type: OptionString, Section: "sidebar",
@@ -1022,12 +1092,34 @@ var optionSpecs = []Option{
 		Description: "Make a bare \"tuios\" attach to a daemon-backed session instead of running standalone. TUIOS_NO_DAEMON=1 or --standalone overrides it. False when the config file has no [startup] table.",
 		Default:     "true",
 	},
+	{
+		Path: "startup.session", Type: OptionString, Section: "startup",
+		Description: "Session a bare \"tuios\" attaches to. tuios makes it when it is gone. Empty attaches to the most recent session.",
+		Default:     "",
+	},
+	{
+		Path: "startup.window", Type: OptionString, Section: "startup",
+		Description: "Pane, by name or id, that a bare \"tuios\" focuses in startup.session. When no pane has that name, the focus does not change.",
+		Default:     "",
+	},
 
 	// [agents]. Only enabled is a scalar; the rest of the table is lists and
 	// tables, which stay in the file.
 	{
 		Path: "agents.enabled", Type: OptionBool, Section: "agents",
 		Description: "Agents, the Inbox, mail and approvals. Turn off to keep only the multiplexer.",
+		Default:     "true",
+	},
+	{
+		Path: "agents.fold_working", Type: OptionBool, Section: "agents",
+		Description: "Fold the Working group of the agents view. F folds or opens a group, and the view keeps that choice.",
+		Default:     "false",
+	},
+
+	// [tasks]. The daemon reads it when it starts and when the file changes.
+	{
+		Path: "tasks.auto_stage", Type: OptionBool, Section: "agents",
+		Description: "Move task cards on their own when tuios sees their work move: a plan held and then approved, a fan check, a pull request. Off leaves every stage to you.",
 		Default:     "true",
 	},
 
@@ -1079,22 +1171,42 @@ var optionSpecs = []Option{
 	// [notifications]
 	{
 		Path: "notifications.duration", Type: OptionInt, Section: "notifications",
-		Description: "Seconds an info message stays up. 0 uses the default.",
+		Description: "Seconds an info message stays up. 0 uses the default, 2.",
 		Default:     "0", Min: 0, Max: 3600,
 	},
 	{
 		Path: "notifications.warning_duration", Type: OptionInt, Section: "notifications",
-		Description: "Seconds a warning stays up. 0 uses the default.",
+		Description: "Seconds a warning stays up. 0 uses the default, 8.",
 		Default:     "0", Min: 0, Max: 3600,
 	},
 	{
 		Path: "notifications.error_duration", Type: OptionInt, Section: "notifications",
-		Description: "Seconds an error stays up when error_sticky is false",
+		Description: "Seconds an error stays up when error_sticky is false. 0 uses the default, 15.",
 		Default:     "0", Min: 0, Max: 3600,
 	},
 	{
 		Path: "notifications.error_sticky", Type: OptionBool, Section: "notifications",
 		Description: "Make errors wait for esc instead of expiring",
+		Default:     "true",
+	},
+	{
+		Path: "notifications.bell", Type: OptionString, Section: "notifications",
+		Description: "What a pane's bell does: a dock message, a bell in your terminal, both, or nothing",
+		Accepted:    BellModes, Default: BellToast,
+	},
+	{
+		Path: "notifications.style", Type: OptionString, Section: "notifications",
+		Description: "How a dock message looks: full shows a side bar and a countdown line, plain shows the icon and the text only",
+		Accepted:    NotificationStyles, Default: NotificationStyleFull,
+	},
+	{
+		Path: "notifications.level", Type: OptionString, Section: "notifications",
+		Description: "The least severe tuios message the dock shows: info shows every message, warning only warnings and errors, error only errors. Agent and pane alerts do not use this level",
+		Accepted:    NotificationLevels, Default: NotificationLevelInfo,
+	},
+	{
+		Path: "notifications.log_hidden", Type: OptionBool, Section: "notifications",
+		Description: "Put messages below notifications.level in the log viewer. When off, they go nowhere. Warnings and errors always go to the log",
 		Default:     "true",
 	},
 
@@ -1413,6 +1525,11 @@ var optionSpecs = []Option{
 		Description: "Colours of tuios mermaid: tuios for the colours of your theme, or a named theme such as flexoki, nord or rose-pine",
 		Default:     "tuios",
 	},
+	{
+		Path: "mermaid.background", Type: OptionString, Section: "mermaid",
+		Description: "Background of a tuios mermaid picture: theme for the theme's colour, or none for the terminal's own background",
+		Accepted:    []string{"theme", "none"}, Default: "theme",
+	},
 
 	// [hints]. Read each time hints mode opens. hints.patterns is a list and
 	// is set in the file only, like [keybindings].
@@ -1443,6 +1560,13 @@ var optionSpecs = []Option{
 		Default:     "false",
 	},
 
+	// [path_picker]. Read each time the picker opens.
+	{
+		Path: "path_picker.show_hidden", Type: OptionBool, Section: "panes",
+		Description: "The path picker lists hidden files. Alt+h in the picker shows or hides them",
+		Default:     "false",
+	},
+
 	// [panes]. Read each time display_panes opens.
 	{
 		Path: "panes.label_keys", Type: OptionString, Section: "panes",
@@ -1454,6 +1578,16 @@ var optionSpecs = []Option{
 		Description: "How the pane navigator lists the panes when it opens",
 		Accepted:    NavigatorLayouts,
 		Default:     NavigatorLayoutTree,
+	},
+	{
+		Path: "panes.navigator_search", Type: OptionBool, Section: "panes",
+		Description: "Open the pane navigator ready to type a search",
+		Default:     "false",
+	},
+	{
+		Path: "panes.drag_and_drop", Type: OptionBool, Section: "panes",
+		Description: "Drag and drop between panes over the kitty drag and drop protocol (OSC 72)",
+		Default:     "false",
 	},
 
 	// [scratch]. Read each time toggle_scratch creates or shows the scratch
@@ -1474,6 +1608,11 @@ var optionSpecs = []Option{
 		Description: "Command that starts a graphical desktop entry instead of a pane. The entry's argv is added to it. Use a command that takes an argv, such as \"tuios-wayland launch --\" or \"niri msg action spawn --\". Do not use one that joins its arguments into a shell line, such as \"swaymsg exec --\" or \"hyprctl dispatch exec\".",
 		Default:     "",
 	},
+	{
+		Path: "launcher.keep_open", Type: OptionBool, Section: "launcher",
+		Description: "Keep the pane of a program the launcher started after the program exits. A line under the output shows the exit status. Needs a daemon session.",
+		Default:     "false",
+	},
 	// [workspaces]. The daemon reads it when it starts and when the file
 	// changes.
 	{
@@ -1492,6 +1631,13 @@ var optionSpecs = []Option{
 		Path: "paste_buffers.max_kb", Type: OptionInt, Section: "selection",
 		Description: "Most KiB all paste buffers hold together, at most 262144 (256 MiB). When it is full, the oldest go. 0 uses 16384.",
 		Default:     "16384", Min: 0, Max: 262144,
+	},
+	// [worktree]. The daemon reads it when it starts and when the file
+	// changes.
+	{
+		Path: "worktree.path", Type: OptionString, Section: "worktree",
+		Description: "Where new worktrees go, as a template of {{ repo_path }}, {{ repo }} and {{ branch }}, with | slug to make one folder name. A relative path starts at repo_path. Empty puts them under $XDG_DATA_HOME/tuios/worktrees",
+		Default:     "", Check: worktree.ValidatePathTemplate,
 	},
 	// Read by the client on each switch, so a change applies at once.
 	{
@@ -1519,6 +1665,8 @@ func Options() []Option {
 }
 
 // LookupOption returns the option a dotted path names.
+//
+//go:noinline
 func LookupOption(path string) (Option, bool) {
 	opt, ok := optionsByPath[path]
 	return opt, ok

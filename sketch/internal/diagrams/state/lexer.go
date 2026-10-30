@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/state/lexer.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/state/lexer.ts at 8aff183be57021b533f319a29341a529be934b08.
 //
 // As in the flowchart lexer, the port reads UTF-8 bytes: code() decodes the
 // character at a byte offset, and a step past a character that may not be

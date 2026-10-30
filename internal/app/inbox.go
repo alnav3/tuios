@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/Gaurav-Gosain/tuios/internal/composer"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/crashexit"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
@@ -162,6 +164,12 @@ type InboxSnapshotMsg struct {
 	// NoReview says the same of review-diff: the daemon is older than the
 	// review overlay.
 	NoReview bool
+	// Cards are every session's task cards. NoBoard says the daemon is
+	// older than the board, and BoardErr why it refused to list them
+	// otherwise; either way the attention list goes on without the board.
+	Cards    []session.TaskRow
+	NoBoard  bool
+	BoardErr string
 }
 
 // InboxEventsMsg is a batch of attention events from the watcher.
@@ -173,6 +181,8 @@ type InboxEventsMsg struct {
 type InboxEvent struct {
 	Action string                 `json:"action"`
 	Item   *session.AttentionItem `json:"attention"`
+	// Task is the card of a task event.
+	Task *session.TaskRow `json:"task"`
 }
 
 // InboxDownMsg says the watcher lost the daemon. Unsupported says the daemon
@@ -206,6 +216,8 @@ type InboxDismissedMsg struct {
 type InboxResumedMsg struct {
 	Command string
 	Err     error
+	// ID is the offer, whose row shows Resume again when Err is set.
+	ID string
 }
 
 // inboxWatchMsg wraps what the watcher delivers, so Update can re-arm the
@@ -266,6 +278,7 @@ func listenForInbox(ch <-chan tea.Msg) tea.Cmd {
 // runInboxWatch keeps a watch running until ctx ends, starting over after
 // every failure with a growing wait.
 func runInboxWatch(ctx context.Context, dial inboxDial, out chan<- tea.Msg) {
+	defer crashexit.Recover()
 	defer close(out)
 	wait := time.Second
 	for ctx.Err() == nil {
@@ -335,8 +348,18 @@ func inboxWatchOnce(ctx context.Context, dial inboxDial, out chan<- tea.Msg) (bo
 	if err := json.Unmarshal(raw, &listing); err != nil {
 		return false, err
 	}
+	// The cards are listed after the items: list-tasks has no seq, so every
+	// task event the subscription replays is no newer than this listing.
+	types := []string{session.EventAttention}
+	cards, noBoard, boardErr, err := inboxListCards(client)
+	if err != nil {
+		return false, err
+	}
+	if !noBoard && boardErr == "" {
+		types = append(types, session.EventTaskClaimed, session.EventTaskFinished, session.EventTaskChanged)
+	}
 	if _, err := client.CallWithTimeout("subscribe", map[string]any{
-		"types":     []string{session.EventAttention},
+		"types":     types,
 		"after_seq": listing.Seq,
 		"boot_id":   listing.BootID,
 	}, 5*time.Second); err != nil {
@@ -352,7 +375,7 @@ func inboxWatchOnce(ctx context.Context, dial inboxDial, out chan<- tea.Msg) (bo
 	// And whether it can review a pane's changes, so the review keys are
 	// not offered by a daemon that would refuse every one of them.
 	reviewOK, reviewKnown := probeVerb(probe, "review-diff")
-	if !inboxSend(ctx, out, InboxSnapshotMsg{Items: listing.Items, NoMark: known && !supported, NoReview: reviewKnown && !reviewOK}) {
+	if !inboxSend(ctx, out, InboxSnapshotMsg{Items: listing.Items, NoMark: known && !supported, NoReview: reviewKnown && !reviewOK, Cards: cards, NoBoard: noBoard, BoardErr: boardErr}) {
 		return true, ctx.Err()
 	}
 
@@ -395,7 +418,7 @@ func inboxWatchOnce(ctx context.Context, dial inboxDial, out chan<- tea.Msg) (bo
 			case ev.Type == session.EventGap:
 				put(read{gap: true})
 				return
-			case ev.Type == session.EventAttention && ev.Item != nil:
+			case ev.Type == session.EventAttention && ev.Item != nil, ev.Task != nil:
 				if !put(read{ev: ev.InboxEvent}) {
 					return
 				}
@@ -445,6 +468,37 @@ func inboxWatchOnce(ctx context.Context, dial inboxDial, out chan<- tea.Msg) (bo
 			return true, end
 		}
 	}
+}
+
+// inboxListCards lists every session's task cards. noBoard is true when the
+// daemon has no list-tasks, or answers without all_sessions, and boardErr says why it
+// refused otherwise. Neither is an error: the attention list must not go down
+// with the board.
+func inboxListCards(client *session.VerbClient) (cards []session.TaskRow, noBoard bool, boardErr string, err error) {
+	raw, err := client.CallWithTimeout("list-tasks", map[string]any{"all_sessions": true}, 5*time.Second)
+	if callErr, ok := errors.AsType[*session.VerbCallError](err); ok {
+		if callErr.Code == session.ErrVerbUnknownVerb || callErr.Code == session.ErrVerbInvalidParams {
+			return nil, true, "", nil
+		}
+		return nil, false, callErr.Error(), nil
+	}
+	if err != nil {
+		return nil, false, "", err
+	}
+	var res struct {
+		AllSessions bool              `json:"all_sessions"`
+		Tasks       []session.TaskRow `json:"tasks"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, false, "", err
+	}
+	if !res.AllSessions {
+		// A daemon with the task verbs and no all_sessions ignores the
+		// param and answers one session: params take unknown fields.
+		return nil, true, "", nil
+	}
+	sortCards(res.Tasks)
+	return res.Tasks, false, "", nil
 }
 
 // handleInboxWatch applies one delivery and re-arms the listener.
@@ -511,8 +565,10 @@ func (m *OS) applyInboxSnapshot(msg InboxSnapshotMsg) {
 	st.Unsupported = false
 	st.life.noMark = msg.NoMark
 	st.noReview = msg.NoReview
+	m.applyBoardSnapshot(msg)
 	m.inboxChanged()
 	m.announceResumes(st.Items)
+	m.pruneResuming(st.Items)
 }
 
 // announceResumes says once, in the dock, that a restart left conversations
@@ -540,8 +596,14 @@ func (m *OS) announceResumes(items []session.AttentionItem) {
 	if len(fresh) > 1 {
 		text = strconv.Itoa(len(fresh)) + " agent conversations can be resumed"
 	}
-	text += agentAlertSep() + "open the agents view with " + m.pressFor("prefix_inbox", "the prefix key then i") +
-		", and press " + m.inboxKeyOr(config.ActionInboxResume, "y")
+	text += agentAlertSep() + "open the agents view with " + m.pressFor("prefix_inbox", "the prefix key then i")
+	if len(fresh) > 1 {
+		// Several resume together: every row marked, then one key.
+		text += ", and press " + m.inboxKeyOr(config.ActionInboxMarkAll, "*") + " then " +
+			m.inboxKeyOr(config.ActionInboxResume, "y") + " to resume all"
+	} else {
+		text += ", and press " + m.inboxKeyOr(config.ActionInboxResume, "y")
+	}
 	m.ShowNotificationFrom(text, "info", m.Settings.NotificationDuration,
 		NotifTarget{SessionID: fresh[0].Session, WindowID: fresh[0].Window})
 }
@@ -562,6 +624,10 @@ func (m *OS) applyInboxEvents(msg InboxEventsMsg) tea.Cmd {
 	var alert []string
 	var cmds []tea.Cmd
 	for _, ev := range msg.Events {
+		if ev.Task != nil {
+			m.applyTaskEvent(ev.Action, *ev.Task)
+			continue
+		}
 		it := ev.Item
 		if it == nil {
 			continue
@@ -600,6 +666,7 @@ func (m *OS) applyInboxEvents(msg InboxEventsMsg) tea.Cmd {
 	session.SortAttention(st.Items)
 	m.inboxChanged()
 	m.announceResumes(st.Items)
+	m.pruneResuming(st.Items)
 	return tea.Batch(append(cmds, m.scheduleInboxAlerts(alert))...)
 }
 
@@ -632,7 +699,9 @@ func (m *OS) inboxChanged() {
 // inboxAttached reports whether an item is in the session this client is
 // attached to, whose transitions the state sync already alerts on.
 func (m *OS) inboxAttached(it session.AttentionItem) bool {
-	return it.Host == "" && m.AttachedHost == "" && m.IsDaemonSession && it.Session == m.sidebarCurrentSessionID()
+	// Learn mode's pretend agents run in the one session the tour has, and
+	// the rail alerts on them as on any pane of it.
+	return it.Host == "" && m.AttachedHost == "" && (m.IsDaemonSession || m.LearnMode) && it.Session == m.sidebarCurrentSessionID()
 }
 
 // inboxSeenUnderEyes dismisses a finished item for the pane this client is
@@ -640,6 +709,11 @@ func (m *OS) inboxAttached(it session.AttentionItem) bool {
 // the rule the rail applies to its own unread mark.
 func (m *OS) inboxSeenUnderEyes(it session.AttentionItem) tea.Cmd {
 	if it.Kind != session.AttentionFinished || !m.inboxAttached(it) {
+		return nil
+	}
+	if m.LearnMode && m.ShowInbox {
+		// The agents view covers the pane: the New agent sheet leaves the
+		// focus on the last attempt it started, which no one has seen.
 		return nil
 	}
 	if w := m.GetFocusedWindow(); w != nil && w.ID == it.Window {
@@ -699,7 +773,7 @@ func (m *OS) InboxPopSettling() bool {
 	if !m.ShowInbox || st.poppedAt.IsZero() || time.Since(st.poppedAt) >= inboxAnswerSettle {
 		return false
 	}
-	m.ShowNotification("A question just appeared. Read it, then answer", "info", m.Settings.NotificationDuration)
+	m.ShowNotification("A question just appeared. Read it, then answer", "warning", m.Settings.NotificationDuration)
 	return true
 }
 
@@ -758,7 +832,7 @@ func (m *OS) scheduleInboxAlerts(ids []string) tea.Cmd {
 		m.fireInboxAlerts(keep)
 		return nil
 	}
-	return tea.Tick(policy.Settle, func(time.Time) tea.Msg { return InboxAlertDueMsg{IDs: keep} })
+	return m.tickUntilStop(policy.Settle, func(time.Time) tea.Msg { return InboxAlertDueMsg{IDs: keep} })
 }
 
 // fireInboxAlerts raises one alert for the items still open, however many
@@ -857,6 +931,9 @@ func inboxKindWords(it session.AttentionItem) string {
 	case session.AttentionMail:
 		return "wrote to you"
 	case session.AttentionResume:
+		if len(it.RiskyFlags) > 0 {
+			return "can resume its conversation with approvals off"
+		}
 		return "can resume its conversation"
 	case session.AttentionOutbox:
 		return "mail waits to be sent"
@@ -1048,7 +1125,7 @@ func (m *OS) inboxRows() []inboxRow {
 		if len(items) > 0 {
 			// Two kinds can share a group, each sorted oldest first by the
 			// daemon; the group as a whole is kept oldest first too.
-			slices.SortStableFunc(items, func(a, b inboxRow) int { return cmp.Compare(a.item.Since, b.item.Since) })
+			sortx.ShortStableFunc(items, func(a, b inboxRow) int { return cmp.Compare(a.item.Since, b.item.Since) })
 			rows = append(rows, inboxRow{heading: inboxGroupTitle(group), count: len(items)})
 			rows = append(rows, items...)
 		}
@@ -1143,6 +1220,10 @@ func (m *OS) OpenInbox(filter string) {
 	m.cockpitRows()
 	m.cockpitClamp()
 	m.cockpitSync()
+	// A TML popup an agent has floating now moves into the view.
+	if filter == "" {
+		m.cockpitAdoptFloating()
+	}
 }
 
 // OpenInboxOn shows the Inbox with the cursor on the item with this id, as
@@ -1169,6 +1250,8 @@ func (m *OS) inboxLandOn(id string) {
 
 // CloseInbox hides the Inbox, and the peek with it.
 func (m *OS) CloseInbox() {
+	// A surface the person was in floats again, with what they typed.
+	m.cockpitArtifactRelease()
 	m.ShowInbox = false
 	// The live pane goes back to being streamed as its workspace has it.
 	m.cockpitLiveFollow()
@@ -1295,19 +1378,19 @@ func (m *OS) InboxAnswerAsk(n int) tea.Cmd {
 		return nil
 	}
 	if n < 1 || n > len(it.Options) {
-		m.ShowNotification("This question takes 1 to "+strconv.Itoa(len(it.Options)), "info", m.Settings.NotificationDuration)
+		m.ShowNotification("This question takes 1 to "+strconv.Itoa(len(it.Options)), "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	if !inboxShowsWhole(it) {
-		m.ShowNotification("This question has characters this terminal cannot show, so it is not answered here", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("This question has characters this terminal cannot show, so it is not answered here", "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	if m.inboxCut(it) {
-		m.ShowNotification("This question cannot be shown whole here. Enter answers it in the pane", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("This question cannot be shown whole here. Enter answers it in the pane", "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	if !m.inboxAnswerSettled(it, time.Now()) {
-		m.ShowNotification("This question just appeared. Read it, then answer", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("This question just appeared. Read it, then answer", "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	return m.inboxAnswerAskCmd(it, it.Options[n-1])
@@ -1329,7 +1412,7 @@ type InboxAskAnsweredMsg struct {
 // which is what lets the daemon take the answer as the person's.
 func (m *OS) inboxAnswerAskCmd(it session.AttentionItem, answer string) tea.Cmd {
 	if m.DaemonClient == nil || m.AttachedHost != "" || it.Host != "" {
-		m.ShowNotification("Answering needs a client attached to this machine's daemon", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("Answering needs a client attached to this machine's daemon", "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	nonce := m.DaemonClient.HumanNonce()
@@ -1378,11 +1461,11 @@ func (m *OS) applyInboxAskAnswered(msg InboxAskAnsweredMsg) {
 	case msg.Err != nil:
 		m.ShowNotification("The answer did not go through: "+msg.Err.Error(), "error", m.Settings.NotificationDuration*2)
 	case !msg.Applied && msg.Reason == inboxReplyChanged:
-		m.ShowNotification(msg.Name+" is asking something else now, so nothing was answered. Read it again", "info", m.Settings.NotificationDuration*2)
+		m.ShowNotification(msg.Name+" is asking something else now, so nothing was answered. Read it again", "warning", m.Settings.NotificationDuration*2)
 	case !msg.Applied && msg.Standing != "":
-		m.ShowNotification(msg.Name+" was already answered: "+printableTitle(msg.Standing), "info", m.Settings.NotificationDuration)
+		m.ShowNotification(msg.Name+" was already answered: "+printableTitle(msg.Standing), "warning", m.Settings.NotificationDuration)
 	case !msg.Applied:
-		m.ShowNotification(msg.Name+"'s question ended before the answer: "+strings.ReplaceAll(msg.Reason, "_", " "), "info", m.Settings.NotificationDuration)
+		m.ShowNotification(msg.Name+"'s question ended before the answer: "+strings.ReplaceAll(msg.Reason, "_", " "), "warning", m.Settings.NotificationDuration)
 	default:
 		m.ShowNotification(msg.Name+": "+printableTitle(msg.Answer), "success", m.Settings.NotificationDuration)
 	}
@@ -1402,19 +1485,19 @@ func (m *OS) InboxReplyApproval(decision string) tea.Cmd {
 		return nil
 	}
 	if !inboxHeld(it) {
-		m.ShowNotification("1, 2 and 3 answer a held approval. Enter goes to the pane.", "info", m.Settings.NotificationDuration)
+		m.ShowNotification(inboxNotHeldWords, "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	if !slices.Contains(it.Options, decision) {
-		m.ShowNotification("This prompt does not offer "+inboxDecisionWords(decision), "info", m.Settings.NotificationDuration)
+		m.ShowNotification("This prompt does not offer "+inboxDecisionWords(decision), "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	if !inboxShowsWhole(it) || m.inboxCut(it) {
-		m.ShowNotification("This prompt cannot be shown whole here. Enter answers it in the pane", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("This prompt cannot be shown whole here. Enter answers it in the pane", "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	if !m.inboxAnswerSettled(it, time.Now()) {
-		m.ShowNotification("This prompt just changed. Read it, then answer", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("This prompt just changed. Read it, then answer", "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	// A risky allow takes a second press, and a plan is approved only once
@@ -1424,6 +1507,10 @@ func (m *OS) InboxReplyApproval(decision string) tea.Cmd {
 	}
 	return m.inboxReplyCmd(it, decision)
 }
+
+// inboxNotHeldWords is what an answer key says on an item that no hold
+// waits behind, such as an approval the harness asks about in its pane.
+const inboxNotHeldWords = "1, 2 and 3 answer a held approval. Enter goes to the pane."
 
 // refuseRemoteAnswer refuses a key that send-keys typed when that key would
 // act as the person: answer a held approval or a question, or pass on held
@@ -1497,7 +1584,7 @@ func (m *OS) inboxReplyCmd(it session.AttentionItem, decision string) tea.Cmd {
 // digest of the plan they read (inboxReplyExtras).
 func (m *OS) inboxReplyCmdWith(it session.AttentionItem, decision, message string) tea.Cmd {
 	if (m.DaemonClient == nil && m.Inbox.call == nil) || m.AttachedHost != "" {
-		m.ShowNotification("Answering needs a client attached to this machine's daemon", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("Answering needs a client attached to this machine's daemon", "warning", m.Settings.NotificationDuration)
 		return nil
 	}
 	nonce := m.inboxNonce()
@@ -1551,9 +1638,9 @@ func (m *OS) applyInboxApprovalReplied(msg InboxApprovalRepliedMsg) {
 		}
 		m.ShowNotification("The answer did not go through: "+msg.Err.Error()+". Answer in the pane", "error", m.Settings.NotificationDuration*2)
 	case !msg.Applied && msg.Reason == inboxReplyChanged:
-		m.ShowNotification(msg.Name+" is asking about something else now, so nothing was answered. Read it again", "info", m.Settings.NotificationDuration*2)
+		m.ShowNotification(msg.Name+" is asking about something else now, so nothing was answered. Read it again", "warning", m.Settings.NotificationDuration*2)
 	case !msg.Applied:
-		m.ShowNotification(msg.Name+" was already answered: "+inboxDecisionWords(msg.Standing), "info", m.Settings.NotificationDuration)
+		m.ShowNotification(msg.Name+" was already answered: "+inboxDecisionWords(msg.Standing), "warning", m.Settings.NotificationDuration)
 	case msg.Decision != session.ApprovalAsk:
 		m.ShowNotification(msg.Name+": "+inboxDecisionWords(msg.Decision), "success", m.Settings.NotificationDuration)
 	}
@@ -1748,27 +1835,22 @@ func (m *OS) InboxDismiss() tea.Cmd {
 // marks a dismiss the client sends on its own, which shows nothing when it
 // cannot be sent or fails.
 func (m *OS) inboxDismissCmd(id string, silent bool) tea.Cmd {
-	if m.DaemonClient == nil || m.AttachedHost != "" {
+	if (m.DaemonClient == nil && m.Inbox.call == nil) || m.AttachedHost != "" {
 		if !silent {
 			m.ShowNotification("Dismissing needs a client attached to this machine's daemon", "info", m.Settings.NotificationDuration)
 		}
 		return nil
 	}
-	nonce := m.DaemonClient.HumanNonce()
+	nonce := m.inboxNonce()
 	if nonce == "" {
 		if !silent {
 			m.ShowNotification("This daemon issued no attach nonce, so it cannot tell you from an agent. Update the daemon", "error", m.Settings.NotificationDuration*2)
 		}
 		return nil
 	}
-	build := m.DaemonClient.ClientVersion()
+	call := m.inboxCaller()
 	return func() tea.Msg {
-		client, err := session.DialVerbClientAs(build)
-		if err != nil {
-			return InboxDismissedMsg{Err: err, Silent: silent}
-		}
-		defer func() { _ = client.Close() }()
-		_, err = client.CallWithTimeout("dismiss-attention", map[string]any{"id": id, "human_nonce": nonce}, 5*time.Second)
+		_, err := call("dismiss-attention", map[string]any{"id": id, "human_nonce": nonce}, 5*time.Second)
 		return InboxDismissedMsg{Err: err, Silent: silent}
 	}
 }
@@ -1827,10 +1909,10 @@ func (m *OS) applyInboxReleased(msg InboxReleasedMsg) {
 	m.ShowNotification("Passed on to "+printableTitle(msg.To), "success", m.Settings.NotificationDuration)
 }
 
-// InboxResume answers the selected resume item: it goes to the pane and has
-// the daemon type the conversation's resume command there, so the person
-// watches the agent come back. The item closes when the daemon says the
-// command was typed.
+// InboxResume answers the selected resume item: the daemon types the
+// conversation's resume command into its pane. The view stays open and the
+// row says Resuming until the offer closes, so the person can go on with the
+// next row. enter goes to the pane, as on any row.
 func (m *OS) InboxResume() tea.Cmd {
 	it, ok := m.inboxSelected()
 	if !ok {
@@ -1840,35 +1922,20 @@ func (m *OS) InboxResume() tea.Cmd {
 		m.ShowNotification("y resumes a conversation a restart left. Enter goes to the pane.", "info", m.Settings.NotificationDuration)
 		return nil
 	}
-	if it.Host != "" || m.AttachedHost != "" || m.DaemonClient == nil {
-		m.ShowNotification("That pane is on another machine; attach there to resume it", "info", m.Settings.NotificationDuration)
+	if m.Inbox.agents.resuming[it.ID] {
 		return nil
 	}
-	m.CloseInbox()
-	m.inboxJump(it)
-	build := m.DaemonClient.ClientVersion()
-	sessionName, window := it.Session, it.Window
-	return func() tea.Msg {
-		client, err := session.DialVerbClientAs(build)
-		if err != nil {
-			return InboxResumedMsg{Err: err}
-		}
-		defer func() { _ = client.Close() }()
-		raw, err := client.CallWithTimeout("resume-agent", map[string]any{"session": sessionName, "window": window}, 5*time.Second)
-		if err != nil {
-			return InboxResumedMsg{Err: err}
-		}
-		var res struct {
-			Command string `json:"command"`
-		}
-		_ = json.Unmarshal(raw, &res)
-		return InboxResumedMsg{Command: res.Command}
+	if it.Host != "" || m.AttachedHost != "" || m.DaemonClient == nil {
+		m.ShowNotification("That pane is on another machine. Attach there to resume it", "info", m.Settings.NotificationDuration)
+		return nil
 	}
+	return m.resumeOffers([]session.AttentionItem{it})
 }
 
 // applyInboxResumed says what was typed, or why nothing was.
 func (m *OS) applyInboxResumed(msg InboxResumedMsg) {
 	if msg.Err != nil {
+		m.unmarkResuming(msg.ID)
 		m.ShowNotification("The resume did not go through: "+msg.Err.Error(), "error", m.Settings.NotificationDuration*2)
 		return
 	}

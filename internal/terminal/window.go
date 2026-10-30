@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/dnd"
+
 	uv "github.com/charmbracelet/ultraviolet"
 
 	"charm.land/lipgloss/v2"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/debuglog"
+	"github.com/Gaurav-Gosain/tuios/internal/guestenv"
 	"github.com/Gaurav-Gosain/tuios/internal/ptyspawn"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
 	"tuios.dev/vt"
@@ -106,17 +109,6 @@ func (w *Window) IsAltScreen() bool { return w.isAltScreen.Load() }
 
 // SetAltScreen records whether the application is using the alternate screen buffer.
 func (w *Window) SetAltScreen(v bool) { w.isAltScreen.Store(v) }
-
-// clipboard returns the last clipboard content set via OSC 52.
-func (w *Window) clipboard() string {
-	if p := w.clipboardContent.Load(); p != nil {
-		return *p
-	}
-	return ""
-}
-
-// setClipboard records the last clipboard content set via OSC 52.
-func (w *Window) setClipboard(content string) { w.clipboardContent.Store(&content) }
 
 // Cache for local terminal environment variables (detect once, reuse for local windows)
 // SSH sessions will detect per-connection based on their environment
@@ -340,6 +332,11 @@ type Window struct {
 	// ScratchName keys a scratch pane: "scratch" (or empty, from before
 	// names) for the built-in one, the entry's name for a command entry.
 	ScratchName string
+	// Rail marks the session's rail pane, the pane a client draws in its
+	// rail's pane section, with the command line it runs. It is the
+	// session's, like IsScratch. See session.WindowState.Rail.
+	Rail string
+
 	PopupWidth  string
 	PopupHeight string
 	// PopupDim is nil to inherit the popup or modal dim, or an explicit override.
@@ -356,7 +353,6 @@ type Window struct {
 	DaemonResizeFunc  func(w, h int) error     // Callback for resizing daemon PTY
 	DaemonCloseFunc   func()                   // Callback when window is closed (to notify daemon)
 	OnProcessExit     func()                   // Callback when PTY process exits (to close window)
-	clipboardContent  atomic.Pointer[string]   // Written by VT callback on PTY goroutine, read on UI goroutine (OSC 52)
 	ClipboardSetFunc  func(string)             // Callback to propagate clipboard to host
 	NotifyFunc        func(title, body string) // Callback for guest desktop notifications (OSC 9/777/99)
 	BellFunc          func()                   // Callback for guest bell (BEL)
@@ -364,10 +360,11 @@ type Window struct {
 	NvimNavFunc       func(direction string)   // Callback for nvim navigation requests (OSC 7777)
 	NvimNavStateFunc  func(active bool)        // Callback for nvim navigation state (OSC 7777)
 	NvimNavResetFunc  func()                   // Callback when the alternate screen exits
-	outputChan        chan outputChunk         // Channel for serializing daemon PTY output writes
+	DnDFunc           func(dnd.Command)        // Callback for a drag and drop message (OSC 72)
+	outputQ           *outputQueue             // Queue for serializing daemon PTY output writes
 	outputDone        chan struct{}            // Signal to stop the output writer and render coalescer goroutines
 	suppressCallbacks atomic.Bool              // Suppress VT emulator callbacks during state restoration (prevents race conditions)
-	closed            atomic.Bool              // Set by Close() so the external outputChan sender (WriteOutputAsync) stops before teardown
+	closed            atomic.Bool              // Set by Close() so the external output queue sender (WriteOutputAsync) stops before teardown
 
 	// hasFocus is whether this pane has focus on a screen someone could be
 	// looking at, as the app last set it. The PTY reader reads it when the
@@ -449,6 +446,10 @@ type Window struct {
 	AgentState string
 	// AgentMessage is the optional short note reported with AgentState.
 	AgentMessage string
+	// AgentReason is why AgentState is not the state the agent gave:
+	// "silent" for a hooked pane that stopped reporting, whose AgentState is
+	// then unknown. Empty otherwise.
+	AgentReason string
 	// AgentKind is what sort of block a needs_input state is ("approval",
 	// "question"), as the daemon recorded it, empty when the source did not
 	// say. The rail draws it as the row's need word.
@@ -467,6 +468,12 @@ type Window struct {
 	// AgentQueued is how many messages wait in the pane's delivery queue, as the
 	// daemon synced it. Zero for none, and from a daemon that has no queue.
 	AgentQueued int
+	// AgentDraftHeld is true while the person's draft in the agent's input
+	// box holds the next queued message, as the daemon synced it.
+	AgentDraftHeld bool
+	// AgentSettled marks an agent the person put away on the Settled shelf,
+	// as the daemon synced it.
+	AgentSettled bool
 	// AgentSubagents is how many subagents the pane's agent is running, as the
 	// daemon synced it. Zero for none, and from a daemon that counts none.
 	AgentSubagents int
@@ -527,6 +534,10 @@ type Window struct {
 	// frame says which machine, and it says it whether or not the shell is
 	// cooperating about its prompt.
 	Host string
+	// hostElsewhere mirrors Host != "" for the PTY reader goroutine, which
+	// may not read Host while the update loop writes it. See
+	// ProcessElsewhere.
+	hostElsewhere atomic.Bool
 	// HostLink is "reconnecting" while the link to Host is lost and the far
 	// machine keeps the process for its grace, and empty otherwise. The frame
 	// says so in words, because a pane whose screen stopped moving looks the
@@ -747,14 +758,13 @@ func newWindowBase(id, title string, x, y, width, height, z int, ptyDataChan cha
 			}
 		},
 		ClipboardSet: func(_ string, content string) {
-			window.setClipboard(content)
 			if window.ClipboardSetFunc != nil {
 				window.ClipboardSetFunc(content)
 			}
 		},
-		ClipboardQuery: func(_ string) string {
-			return window.clipboard()
-		},
+		// No ClipboardQuery: an OSC 52 query is answered with empty content,
+		// as xterm answers by default. The answer is written to the pane's
+		// input, so it must not carry text a program in the pane chose.
 		Notify: func(title, body string) {
 			if window.NotifyFunc != nil {
 				window.NotifyFunc(title, body)
@@ -771,6 +781,16 @@ func newWindowBase(id, title string, x, y, width, height, z int, ptyDataChan cha
 			}
 		},
 		PrivateOSC: func(cmd int, data []byte) {
+			if cmd == dnd.Code {
+				// The drag and drop protocol. Parsed here, where the body is
+				// still valid; the chunks are joined by the app.
+				if window.DnDFunc != nil {
+					if dnd, ok := dnd.Parse(data); ok {
+						window.DnDFunc(dnd)
+					}
+				}
+				return
+			}
 			if cmd != nvimNavigatorOSC {
 				return
 			}
@@ -809,10 +829,8 @@ func NewWindow(id, title string, x, y, width, height, z int, exitChan chan strin
 // NewWindowIn is NewWindow with the directory the process starts in. An empty
 // dir, or one that is not a directory, keeps this process's own.
 func NewWindowIn(dir, id, title string, x, y, width, height, z int, exitChan chan string, ptyDataChan chan struct{}, scrollbackLines int, command ...string) (*Window, error) {
-	if dir != "" {
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			dir = ""
-		}
+	if dir != "" && !ptyspawn.DirExists(dir) {
+		dir = ""
 	}
 	window := newWindowBase(id, title, x, y, width, height, z, ptyDataChan, scrollbackLines)
 	terminalWidth := max(width-2, 1)
@@ -852,8 +870,8 @@ func NewWindowIn(dir, id, title string, x, y, width, height, z int, exitChan cha
 		cmd.Env = append(guestBaseEnv(),
 			"TERM="+termType,
 			"COLORTERM="+colorTerm,
-			"TERM_PROGRAM="+guestTermProgram(command), // Terminal identity guests can act on
-			"TERM_PROGRAM_VERSION=0.1.0",              // Version for compatibility checking
+			"TERM_PROGRAM="+guestTermProgram(command),             // Terminal identity guests can act on
+			"TERM_PROGRAM_VERSION="+guestenv.TermProgramVersion(), // Version for compatibility checking
 			"TUIOS_WINDOW_ID="+id,
 			guestKittyAnimation(), // whether a=f frame edits reach the host
 		)
@@ -864,11 +882,17 @@ func NewWindowIn(dir, id, title string, x, y, width, height, z int, exitChan cha
 	}
 
 	// Resize PTY after process starts to ensure size is properly set
-	// Some PTY implementations require the process to be running before accepting resize
-	if err := ptyInstance.Resize(terminalWidth, terminalHeight); err != nil {
-		// Not a critical error, continue
-		_ = err
-	}
+	// Some PTY implementations require the process to be running before accepting resize.
+	//
+	// Through SetWinsize, with the pixels Spawn gave it: a bare Resize writes
+	// zero pixels, and the next real announcement then changes the winsize
+	// at the same cell size, which SIGWINCHes a shell that may still be
+	// starting (#1205).
+	_ = ptyspawn.SetWinsize(ptyInstance, terminalWidth, terminalHeight, 0, 0)
+	// The PTY has this size now, so a Resize to it tells the guest nothing.
+	// Unseeded, the first layout announced the size the pane was born at,
+	// and tellGuest SIGWINCHes the shell on every announcement.
+	window.SeedAnnouncedSize(terminalWidth, terminalHeight)
 
 	_, cancel := context.WithCancel(context.Background())
 
@@ -892,7 +916,7 @@ func NewWindowIn(dir, id, title string, x, y, width, height, z int, exitChan cha
 	// Output reaches the renderer through the same coalescer a daemon pane
 	// uses, so a flooding local pane asks for at most one frame per interval
 	// instead of one per PTY read. Close closes outputDone, which stops it.
-	// outputChan stays nil: that is what tells the daemon-only paths
+	// outputQ stays nil: that is what tells the daemon-only paths
 	// (WriteOutputAsync, outputWriter, the drain and resize sentinels) that
 	// this pane has no daemon stream.
 	window.outputDone = make(chan struct{})
@@ -951,10 +975,9 @@ func NewDaemonWindow(id, title string, x, y, width, height, z int, ptyID string,
 	window.PTYID = ptyID
 	window.DaemonMode = true
 	// Each item is one batch off the daemon stream, up to 256 KiB.
-	// maxQueuedBytes bounds the bytes; the slots only bound the count, and
-	// 4096 of them is 160 KiB of channel per pane for a queue that never gets
-	// a hundred items deep.
-	window.outputChan = make(chan outputChunk, 4096)
+	// maxQueuedBytes bounds the bytes; the slots only bound the count. The
+	// queue starts empty and grows with the backlog (output_queue.go).
+	window.outputQ = newOutputQueue()
 	window.outputDone = make(chan struct{})
 	window.coalesceWake = make(chan struct{}, 1)
 
@@ -1005,3 +1028,13 @@ func (w *Window) GuestCursor() (pos uv.Position, hidden, ok bool) {
 func (w *Window) SetHasFocus(focused bool) {
 	w.hasFocus.Store(focused)
 }
+
+// SetHost records the machine the pane's process runs on.
+func (w *Window) SetHost(host string) {
+	w.Host = host
+	w.hostElsewhere.Store(host != "")
+}
+
+// ProcessElsewhere reports whether the pane's process runs on another
+// machine. It is safe from any goroutine.
+func (w *Window) ProcessElsewhere() bool { return w.hostElsewhere.Load() }

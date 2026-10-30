@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/class/render.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/class/render.ts at 8aff183be57021b533f319a29341a529be934b08.
 
 package class
 
@@ -82,12 +82,15 @@ type End struct {
 	after bool
 }
 
-func memberLine(member *ClassMember, measurer text.TextMeasurer, size float64) Line {
+func memberLine(member *ClassMember, measurer text.TextMeasurer, size float64, mono bool) Line {
 	display, _ := member.GetDisplayDetails()
 	txt := js.Trim(text.DecodeEntities(display))
 	style := 0
 	if member.Classifier == "*" {
 		style = text.Italic
+	}
+	if mono {
+		style |= text.Mono
 	}
 	return Line{text: txt, width: measurer.Width(txt, size, style), classifier: member.Classifier}
 }
@@ -141,6 +144,9 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 		hierarchical = false
 	}
 	graph := buildClassGraph(db, hierarchical)
+	monospaced := options.HasMonospace(types.MonospaceMembers)
+	// Explicit class fonts override monospace.
+	mono := func(style svg.ResolvedStyle) bool { return monospaced && !svg.Declares(style.Text, "font-family") }
 	hideEmpty := false
 	if v, ok := conf["hideEmptyMembersBox"].(bool); ok && v {
 		hideEmpty = true
@@ -151,7 +157,7 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 	tinyHeight := js.Round(tiny * 1.4)
 	measurer := options.Measurer
 	if measurer == nil {
-		measurer = text.DefaultMeasurer(options.FontFamily, "")
+		measurer = text.DefaultMeasurer(options.FontFamily, options.FontFamilyMono)
 	}
 	pad := types.Or(options.Padding, 8)
 	// Keep annotations and cardinalities literal unless math is typeset.
@@ -310,10 +316,10 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 		}
 		var attributes, methods []Line
 		for _, m := range cls.Members {
-			attributes = append(attributes, memberLine(m, measurer, memberSize))
+			attributes = append(attributes, memberLine(m, measurer, memberSize, mono(style)))
 		}
 		for _, m := range cls.Methods {
-			methods = append(methods, memberLine(m, measurer, memberSize))
+			methods = append(methods, memberLine(m, measurer, memberSize, mono(style)))
 		}
 		inner := label.Width
 		annotationsH := 0.0
@@ -512,9 +518,11 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 	sides := map[int][]*End{}
 	var sideKeys []int
 	type cardItem struct {
-		text string
-		math *text.Label
-		x, y float64
+		text   string
+		math   *text.Label
+		x, y   float64
+		w, h   float64
+		parent int
 	}
 	var cards []cardItem
 	attach := func(i int, at int, item int, room float64, order int) *End {
@@ -703,7 +711,7 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 	minY := 0.0
 	maxX := lay.Width
 	maxY := lay.Height
-	card := func(raw string, width, x, y float64, side int, after bool) {
+	card := func(parent int, raw string, width, x, y float64, side int, after bool) {
 		if raw == "" {
 			return
 		}
@@ -737,7 +745,7 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 				cy += 3 + h/2
 			}
 		}
-		cards = append(cards, cardItem{text: text.DecodeEntities(raw), math: m, x: cx, y: cy})
+		cards = append(cards, cardItem{text: text.DecodeEntities(raw), math: m, x: cx, y: cy, w: width, h: h, parent: parent})
 		minX = math.Min(minX, cx-width/2)
 		maxX = math.Max(maxX, cx+width/2)
 		minY = math.Min(minY, cy-h/2)
@@ -756,8 +764,10 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 			view := views[ce.Src]
 			x := c.X + view.w/2
 			spread := math.Min(view.h/2-4, 8+float64(float64(k)*6))
-			card(edge.StartLabelRight, startRoom[i], x, c.Y-spread, 1, false)
-			card(edge.EndLabelLeft, endRoom[i], x, c.Y+spread, 1, true)
+			card(ce.Src, edge.StartLabelRight, startRoom[i], x, c.Y-spread, 1, false)
+			card(ce.Dst, edge.EndLabelLeft, endRoom[i], x, c.Y+spread, 1, true)
+			ce.LabelX = c.X + view.w/2 + LOOP + float64(k*8) + 4 + ce.LabelW/2
+			ce.LabelY = c.Y
 		} else if len(route) >= 6 {
 			last := len(route) - 3
 			from := starts[i]
@@ -770,8 +780,28 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 			if to != nil {
 				toSide, toAfter = to.side, to.after
 			}
-			card(edge.StartLabelRight, startRoom[i], route[0], route[1], fromSide, fromAfter)
-			card(edge.EndLabelLeft, endRoom[i], route[last], route[last+1], toSide, toAfter)
+			card(ce.Src, edge.StartLabelRight, startRoom[i], route[0], route[1], fromSide, fromAfter)
+			card(ce.Dst, edge.EndLabelLeft, endRoom[i], route[last], route[last+1], toSide, toAfter)
+		}
+	}
+
+	if options.MaxWidth != nil && *options.MaxWidth > 0 && maxX-minX+float64(2*pad) > *options.MaxWidth {
+		available := *options.MaxWidth
+		cardNodes := make([]*layout.CNode, len(cards))
+		for i, item := range cards {
+			cardNodes[i] = layout.Cnode(item.w, item.h, item.parent)
+			cardNodes[i].X = item.x
+			cardNodes[i].Y = item.y
+		}
+		all := append(append(make([]*layout.CNode, 0, len(cnodes)+len(cardNodes)), cnodes...), cardNodes...)
+		if wrapped, ok := layout.WrapComponents(all, cedges, math.Max(1, available-float64(2*pad)), numberOption(conf, "nodeSpacing", NODE_SEP)); ok {
+			for i := range cards {
+				cards[i].x = cardNodes[i].X
+				cards[i].y = cardNodes[i].Y
+			}
+			minX, minY = 0, 0
+			maxX = wrapped.Width
+			maxY = wrapped.Height
 		}
 	}
 
@@ -800,6 +830,11 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 		lineHeight := js.Round(memberSize * 1.5)
 		var body strings.Builder
 		body.WriteString(`<rect x="` + num(left) + `" y="` + num(top) + `" width="` + num(w) + `" height="` + num(h) + `" fill="var(--_s)" stroke="var(--_b)"` + svg.Rounded(style.Shape) + `/>`)
+		ink := svg.InkFill(style, "")
+		muted := ink
+		if muted == "" {
+			muted = ` fill="var(--_m)"`
+		}
 		first := top + view.titleH
 		second := first + view.attributesH
 		if h > view.titleH {
@@ -812,11 +847,11 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 		y := top + TITLE_PAD
 		for _, annotation := range view.annotations {
 			if annotation.label == nil {
-				body.WriteString(`<text class="pele-annotation" x="0" y="` + num(y+tinyHeight/2+float64(tiny*0.35)) + `" text-anchor="middle" font-size="` + js.Num(tiny) + `" fill="var(--_m)">` + svg.Esc(annotation.text) + `</text>`)
+				svg.WriteStrings(&body, `<text class="pele-annotation" x="0" y="`, num(y+tinyHeight/2+float64(tiny*0.35)), `" text-anchor="middle" font-size="`, js.Num(tiny), `"`, muted, `>`, svg.Esc(annotation.text), `</text>`)
 				y += tinyHeight
 			} else {
 				h := math.Max(tinyHeight, annotation.label.Height)
-				body.WriteString(svg.LabelSvg(*annotation.label, 0, y+h/2, ` class="pele-annotation" font-size="`+js.Num(tiny)+`" fill="var(--_m)"`, options.Icons))
+				body.WriteString(svg.LabelSvg(*annotation.label, 0, y+h/2, ` class="pele-annotation" font-size="`+js.Num(tiny)+`"`+muted, options.Icons))
 				y += h
 			}
 		}
@@ -824,7 +859,7 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 		if view.fontSize != size {
 			titleSize = ` font-size="` + num(view.fontSize) + `"`
 		}
-		body.WriteString(svg.LabelSvg(view.label, 0, (y+first-TITLE_PAD)/2, ` class="pele-label"`+titleSize+` font-weight="var(--_hw)"`+style.Text, icons))
+		body.WriteString(svg.LabelSvg(view.label, 0, (y+first-TITLE_PAD)/2, ` class="pele-label"`+titleSize+` font-weight="var(--_hw)"`+ink+style.Text, icons))
 		lines := func(out *strings.Builder, list []Line, kind string, from float64) {
 			baseline := from + SECTION_PAD + lineHeight/2 + float64(memberSize*0.35)
 			for _, line := range list {
@@ -846,7 +881,11 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 			}
 		}
 		if len(view.attributes) > 0 || len(view.methods) > 0 {
-			body.WriteString(`<g class="pele-members" font-size="` + js.Num(memberSize) + `">`)
+			family := ""
+			if mono(style) {
+				family = ` font-family="` + svg.FONT_MONO + `"`
+			}
+			svg.WriteStrings(&body, `<g class="pele-members" font-size="`, js.Num(memberSize), `"`, ink, family, `>`)
 			lines(&body, view.attributes, "attribute", first)
 			lines(&body, view.methods, "method", second)
 			body.WriteString(`</g>`)
@@ -952,8 +991,6 @@ func draw(db *ClassDb, config types.Config, options types.RenderOptions, turned 
 				Edx: -1,
 				Edy: 0,
 			}
-			ce.LabelX = c.X + view.w/2 + reach + 4 + ce.LabelW/2
-			ce.LabelY = c.Y
 		} else {
 			route := ce.Route
 			for k := 0; k+1 < len(route); k += 3 {

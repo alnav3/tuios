@@ -123,10 +123,11 @@ A report that ends a turn (done or errored) also sends what the pane's status
 line feed (tuios agent-statusline) held back, with set-agent-meta for the same
 pane, so the turn's last context and cost reach the rail.
 
-For claude-code and codex, a SessionStart prints two lines that these
+For claude-code and codex, a SessionStart prints four lines that these
 harnesses add to the agent's context: the pane and the session the agent runs
-in, and "Run tuios --skill to learn how to drive tuios". Claude Code's
-SessionStart after a compaction prints them too, and reports no state.
+in, the commands that reach the other agents and the person, the safety rule,
+and "Run tuios --skill for everything else". Claude Code's SessionStart after a
+compaction prints them too, and reports no state.
 
 For the same two harnesses, SessionStart, UserPromptSubmit and PostToolUse
 also add one line about the pane's unread mail, when there is mail the agent
@@ -608,12 +609,14 @@ func agentHook(o agentHookOptions, args []string, hio agentHookIO) agentHookOutc
 // reportHookEvent sends what one hook event reports, once the pane is found.
 func reportHookEvent(out agentHookOutcome, client verbCaller, hio agentHookIO) agentHookOutcome {
 	if out.Report.SessionOnly {
-		res, err := reportHookSession(client, out.Session, out.Window, out.Harness, out.HarnessPID, out.Report.SessionID)
+		res, dropped, err := reportHookSession(client, out.Session, out.Window, out.Harness, out.HarnessPID, *out.Report)
+		out.Unsupported = dropped
 		if err != nil {
 			out.Error = err.Error()
 			return out
 		}
 		out.Applied, out.Reason = &res.Applied, res.Reason
+		out.TranscriptRefused = res.TranscriptRefused
 		return out
 	}
 	// An event set-agent-state does not take goes with report-agent-activity:
@@ -628,14 +631,18 @@ func reportHookEvent(out agentHookOutcome, client verbCaller, hio agentHookIO) a
 	if r.State != "" {
 		res, dropped, err := reportHook(client, out.Session, out.Window, out.Harness, out.HarnessPID, r)
 		out.Unsupported = dropped
-		if err != nil {
+		switch {
+		case errors.Is(err, errConditionUnsupported):
+			out.Error = err.Error()
+		case err != nil:
 			out.Error = err.Error()
 			return out
+		default:
+			out.Applied, out.State, out.Reason = &res.Applied, res.State, res.Reason
+			out.ActivityRecorded = res.ActivityRecorded
+			out.TranscriptRefused = res.TranscriptRefused
+			out.StatusLineFlushed = flushAtTurnEnd(out, res, client, hio)
 		}
-		out.Applied, out.State, out.Reason = &res.Applied, res.State, res.Reason
-		out.ActivityRecorded = res.ActivityRecorded
-		out.TranscriptRefused = res.TranscriptRefused
-		out.StatusLineFlushed = flushAtTurnEnd(out, res, client, hio)
 	}
 	if alone != nil {
 		res, err := reportHookActivity(client, out.Session, out.Window, out.Harness, out.HarnessPID, r.SessionID, *alone)
@@ -778,7 +785,7 @@ type hookReportResult struct {
 // the ones every daemon takes. activity is the hook event for the pane's
 // activity ring; a daemon from before it drops it, and the report goes
 // without it.
-var hookFields = []string{"kind", "agent_session_id", "transcript_path", "if_state", "harness_pid", "activity", "agent_cwd", "session_start"}
+var hookFields = []string{"kind", "agent_session_id", "transcript_path", "transcript_leaf", "if_state", "subagent_id", "if_subagent_id", "harness_pid", "activity", "agent_cwd", "session_start"}
 
 // setAgentStateParams asks the daemon which params its set-agent-state takes.
 //
@@ -836,6 +843,11 @@ func requireIfState(client verbCaller) error {
 	return nil
 }
 
+// errConditionUnsupported is reportHook's error for a report whose condition
+// the daemon predates, which is not sent. What else the event reports still
+// goes.
+var errConditionUnsupported = errors.New("the daemon predates if_subagent_id, so the subagent's report was not sent. It works once the daemon restarts")
+
 // reportHook sends one report. The hook fields go only to a daemon whose
 // set-agent-state lists them, and the ones it does not are returned as
 // dropped. A report with if_state is not sent at all to a daemon without it,
@@ -857,6 +869,8 @@ func reportHook(client verbCaller, sess, window, harness string, harnessPID int,
 		"agent_session_id": r.SessionID,
 		"transcript_path":  r.TranscriptPath,
 		"if_state":         r.IfState,
+		"subagent_id":      r.SubagentID,
+		"if_subagent_id":   r.IfSubagentID,
 		"agent_cwd":        r.Cwd,
 	} {
 		if v != "" {
@@ -871,6 +885,9 @@ func reportHook(client verbCaller, sess, window, harness string, harnessPID int,
 	}
 	if r.SessionStart && r.SessionID != "" {
 		extra["session_start"] = true
+	}
+	if r.TranscriptLeaf != nil {
+		extra["transcript_leaf"] = *r.TranscriptLeaf
 	}
 	var dropped []string
 	if len(extra) > 0 {
@@ -891,6 +908,11 @@ func reportHook(client verbCaller, sess, window, harness string, harnessPID int,
 		if r.IfState != "" && !known["if_state"] {
 			return hookReportResult{}, dropped, errors.New("the daemon predates if_state, so a conditional report was not sent")
 		}
+		if r.IfSubagentID != "" && !known["if_subagent_id"] {
+			// Sent without it, a subagent's report would clear the main
+			// agent's prompt as well.
+			return hookReportResult{}, dropped, errConditionUnsupported
+		}
 	}
 	raw, err := client.Call("set-agent-state", params)
 	if err != nil {
@@ -907,42 +929,69 @@ func reportHook(client verbCaller, sess, window, harness string, harnessPID int,
 // daemon older than the verb would answer unknown_verb, which costs nothing,
 // but the hook asks list-verbs first anyway so --explain can say why nothing
 // was stored.
-func reportHookSession(client verbCaller, sess, window, harness string, harnessPID int, sessionID string) (hookReportResult, error) {
+func reportHookSession(client verbCaller, sess, window, harness string, harnessPID int, r integration.Report) (hookReportResult, []string, error) {
 	raw, err := client.Call("list-verbs", map[string]any{"verb": "set-agent-session"})
 	if err != nil {
-		return hookReportResult{}, fmt.Errorf("could not ask the daemon whether it has set-agent-session: %w", err)
+		return hookReportResult{}, nil, fmt.Errorf("could not ask the daemon whether it has set-agent-session: %w", err)
 	}
 	var verbs struct {
 		Verbs []struct {
-			Verb string `json:"verb"`
+			Verb   string `json:"verb"`
+			Params []struct {
+				Name string `json:"name"`
+			} `json:"params"`
 		} `json:"verbs"`
 	}
 	if err := json.Unmarshal(raw, &verbs); err != nil {
-		return hookReportResult{}, err
+		return hookReportResult{}, nil, err
 	}
 	known := false
+	fields := map[string]bool{}
 	for _, v := range verbs.Verbs {
 		known = known || v.Verb == "set-agent-session"
+		if v.Verb == "set-agent-session" {
+			for _, p := range v.Params {
+				fields[p.Name] = true
+			}
+		}
 	}
 	if !known {
-		return hookReportResult{}, errors.New("the running daemon predates set-agent-session, so the session was not reported. It works once the daemon restarts")
+		return hookReportResult{}, nil, errors.New("the running daemon predates set-agent-session, so the session was not reported. It works once the daemon restarts")
 	}
 	params := map[string]any{
 		"session":          sess,
 		"window":           window,
 		"harness":          harness,
-		"agent_session_id": sessionID,
+		"agent_session_id": r.SessionID,
 	}
 	if harnessPID > 1 {
 		params["harness_pid"] = harnessPID
 	}
+	var dropped []string
+	for _, key := range []string{"transcript_path", "transcript_leaf"} {
+		var value any
+		if key == "transcript_path" && r.TranscriptPath != "" {
+			value = r.TranscriptPath
+		}
+		if key == "transcript_leaf" && r.TranscriptLeaf != nil {
+			value = *r.TranscriptLeaf
+		}
+		if value == nil {
+			continue
+		}
+		if fields[key] {
+			params[key] = value
+		} else {
+			dropped = append(dropped, key)
+		}
+	}
 	raw, err = client.Call("set-agent-session", params)
 	if err != nil {
-		return hookReportResult{}, err
+		return hookReportResult{}, dropped, err
 	}
 	var res hookReportResult
 	if err := json.Unmarshal(raw, &res); err != nil {
-		return hookReportResult{}, err
+		return hookReportResult{}, dropped, err
 	}
-	return res, nil
+	return res, dropped, nil
 }

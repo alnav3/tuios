@@ -56,20 +56,36 @@ const linkPolicyVerb = "link-peer"
 // machine's own links: they need config.LinkRelayCapabilities.
 const capRelay = "*"
 
+// linkCaps is what a verb or a message needs on a link connection. An array
+// rather than a slice, because the compiler lays a map of arrays of constants
+// out as data. A map of slices is about 28 KB of code that runs at every start
+// of every tuios command, for a table only a link connection reads.
+type linkCaps [3]string
+
+// list is the capabilities, without the unused places of the array.
+func (c linkCaps) list() []string {
+	for i, name := range c {
+		if name == "" {
+			return c[:i]
+		}
+	}
+	return c[:]
+}
+
 // verbCapabilities is what each verb needs on a link connection. An empty list
 // needs nothing.
-var verbCapabilities = map[string][]string{
-	"hello":      nil,
-	"list-verbs": nil,
-	"list-keys":  nil,
-	"link-peer":  nil,
+var verbCapabilities = map[string]linkCaps{
+	"hello":      {},
+	"list-verbs": {},
+	"list-keys":  {},
+	"link-peer":  {},
 	// restrict-connection only gives up authority on the calling
 	// connection, so it needs nothing.
-	"restrict-connection": nil,
+	"restrict-connection": {},
 	// pane-grants only reports; over a link it says no pane grants apply.
 	// set-pane-grants is refused over a link by its handler whatever the
 	// policy, and needs every capability here as well.
-	"pane-grants":     nil,
+	"pane-grants":     {},
 	"set-pane-grants": {capRelay},
 	// apply-config is refused over a link by its handler as well.
 	"apply-config": {capRelay},
@@ -80,6 +96,7 @@ var verbCapabilities = map[string][]string{
 	"list-clients":         {config.LinkAllowList},
 	"list-worktrees":       {config.LinkAllowList},
 	"list-hosts":           {config.LinkAllowList},
+	"list-routes":          {config.LinkAllowList},
 	"list-host-sessions":   {config.LinkAllowList},
 	"list-host-agents":     {config.LinkAllowList},
 	"session-info":         {config.LinkAllowList},
@@ -171,20 +188,25 @@ var verbCapabilities = map[string][]string{
 	// default policy does not give: a surface names its owner on its frame,
 	// and a surface opened from another machine would need that machine's
 	// name there. tml-input acts as the person on this machine.
-	"tml-open":     {capRelay},
-	"tml-close":    {capRelay},
-	"tml-input":    {capRelay},
-	"tml-patch":    {capRelay},
-	"tml-replace":  {capRelay},
-	"tml-get":      {capRelay},
-	"tml-list":     {capRelay},
-	"tml-validate": nil,
-	"open-pane":    {config.LinkAllowOpen},
-	"resize-pane":  {config.LinkAllowOpen},
-	"close-pane":   {config.LinkAllowOpen},
-	"pane-cwd":     {config.LinkAllowOpen},
-	"pane-agent":   {config.LinkAllowOpen},
-	"pane-calls":   {config.LinkAllowOpen},
+	"tml-open":      {capRelay},
+	"tml-close":     {capRelay},
+	"tml-input":     {capRelay},
+	"tml-place":     {capRelay},
+	"tml-patch":     {capRelay},
+	"tml-replace":   {capRelay},
+	"tml-get":       {capRelay},
+	"tml-list":      {capRelay},
+	"artifact-list": {capRelay},
+	"tml-validate":  {},
+	"open-pane":     {config.LinkAllowOpen},
+	"resize-pane":   {config.LinkAllowOpen},
+	"close-pane":    {config.LinkAllowOpen},
+	"pane-cwd":      {config.LinkAllowOpen},
+	"pane-agent":    {config.LinkAllowOpen},
+	"pane-calls":    {config.LinkAllowOpen},
+	// pane-kitty-medium carries the bytes of a file a hosted pane named in a
+	// kitty graphics command: a file read, so it needs files.
+	"pane-kitty-medium": {config.LinkAllowFiles},
 
 	// paste-pane-image writes a file for a hosted pane, which the peer
 	// opened, and needs the pane's token as well. paste-image writes a file
@@ -197,6 +219,7 @@ var verbCapabilities = map[string][]string{
 
 	"refresh-dock":    {config.LinkAllowWrite},
 	"pip":             {config.LinkAllowWrite},
+	"rail-pane":       {config.LinkAllowOpen},
 	"remove-worktree": {config.LinkAllowWrite},
 	// bundle-worktree reads a worktree's files out, which write already
 	// reaches through a shell, and list must not.
@@ -213,6 +236,7 @@ var verbCapabilities = map[string][]string{
 	"close-workspace":  {config.LinkAllowWrite},
 	"send-keys":        {config.LinkAllowWrite},
 	"send-text":        {config.LinkAllowWrite},
+	"clear-history":    {config.LinkAllowWrite},
 	// The paste buffers hold what the person copied on this machine. A
 	// link reads them only where it may also capture a pane, and changes
 	// or pastes them only where it may type.
@@ -227,6 +251,7 @@ var verbCapabilities = map[string][]string{
 	"rename-session":      {config.LinkAllowWrite},
 	"set-session-accent":  {config.LinkAllowWrite},
 	"set-session-space":   {config.LinkAllowWrite},
+	"set-session-order":   {config.LinkAllowWrite},
 	"set-workspace-name":  {config.LinkAllowWrite},
 	"set-workspace-order": {config.LinkAllowWrite},
 	"set-agent-state":     {config.LinkAllowWrite},
@@ -264,7 +289,8 @@ var verbCapabilities = map[string][]string{
 	// agent-activity, list-queued and get-approval return states, counts and
 	// text an agent wrote, which list reaches. review-diff returns file
 	// contents, which write already reaches through a shell and list must
-	// not, as bundle-worktree does. verify-fan opens a window and runs a
+	// not, as bundle-worktree does. compare-fan's detail carries changed
+	// lines, so its handler asks write for it. verify-fan opens a window and runs a
 	// command in it, so it needs open and write. mark-attention is the
 	// person's act, like dismiss-attention.
 	"compare-fan":     {config.LinkAllowList},
@@ -284,6 +310,19 @@ var verbCapabilities = map[string][]string{
 	"verify-fan":     {config.LinkAllowOpen, config.LinkAllowWrite},
 	"mark-attention": {config.LinkAllowRespond},
 
+	// The task cards. The listing carries titles and holders, which list
+	// reaches; a card's prompt is what a pane will be told to do, so a
+	// change needs write.
+	"list-tasks":     {config.LinkAllowList},
+	"get-task":       {config.LinkAllowList},
+	"add-task":       {config.LinkAllowWrite},
+	"claim-task":     {config.LinkAllowWrite},
+	"finish-task":    {config.LinkAllowWrite},
+	"set-task-stage": {config.LinkAllowWrite},
+	"block-task":     {config.LinkAllowWrite},
+	"release-task":   {config.LinkAllowWrite},
+	"remove-task":    {config.LinkAllowWrite},
+
 	// The checkpoints. The listing carries states and the agent's prompts,
 	// which list reaches. The diff carries file contents, and a restore
 	// writes files, so both need write, as review-diff does.
@@ -300,13 +339,17 @@ var verbCapabilities = map[string][]string{
 	"ship-push":   {config.LinkAllowWrite},
 	"ship-pr":     {config.LinkAllowWrite},
 	"ship-status": {config.LinkAllowList},
+
+	// The return notes (verb_note.go).
+	"set-note": {config.LinkAllowWrite},
+	"get-note": {config.LinkAllowList},
 }
 
 // msgCapabilities is what each binary message needs on a link connection.
-var msgCapabilities = map[MessageType][]string{
-	MsgHello:             nil,
-	MsgDetach:            nil,
-	MsgPing:              nil,
+var msgCapabilities = map[MessageType]linkCaps{
+	MsgHello:             {},
+	MsgDetach:            {},
+	MsgPing:              {},
 	MsgList:              {config.LinkAllowList},
 	MsgSubscribePTY:      {config.LinkAllowList},
 	MsgUnsubscribePTY:    {config.LinkAllowList},
@@ -378,7 +421,7 @@ func (d *Daemon) checkLinkVerb(cs *connState, verb string) *verbError {
 	if !known {
 		return linkForbidden(d, cs, verb, nil, "this verb has no link policy, so it is refused over a link")
 	}
-	return d.checkLinkCaps(cs, verb, caps)
+	return d.checkLinkCaps(cs, verb, caps.list())
 }
 
 // checkLinkMessage is checkLinkVerb for a binary message.
@@ -393,7 +436,7 @@ func (d *Daemon) checkLinkMessage(cs *connState, t MessageType) *verbError {
 	if !known {
 		return linkForbidden(d, cs, fmt.Sprintf("message %d", t), nil, "this message has no link policy, so it is refused over a link")
 	}
-	return d.checkLinkCaps(cs, fmt.Sprintf("message %d", t), caps)
+	return d.checkLinkCaps(cs, fmt.Sprintf("message %d", t), caps.list())
 }
 
 // linkFromPane refuses a link connection dialled from inside a pane of this

@@ -61,7 +61,10 @@ While that machine's link is down it ends in `[unreachable, seen 5m ago]`.
   something new when there is something new; repeating the same report does
   not. `tuios list-attention --snoozed` shows what is snoozed.
 - The person sees every agent in one full-screen agents view (ctrl+b i),
-  grouped by what each needs: Needs you, Ready for review, Working, Idle.
+  grouped by what each needs: Needs you, Ready for review, Working, Idle,
+  Settled. The person can settle you (put you away until you need them).
+  You come back by yourself when you ask, fail, finish a turn or mail them.
+  `list-agents` shows `settled`. You cannot settle yourself or another agent.
   Your row shows your state, how long you have been in it, and what you do
   now. Report your state as it changes; that view is drawn from it.
 - Your finished turn's row shows a recap of what you did (turns, files,
@@ -114,6 +117,10 @@ with `--no-wait` and then wait for mail in steps, or come back with
 `tuios ask-human --request-id ID`. Keep the question to one line of at most 160
 bytes and each answer to 60. A new question from your pane replaces your open
 one.
+
+While the call waits, your pane shows `needs_input` with the question as its
+note. Do not set it yourself. When the call returns, your pane shows its earlier
+state again, or the state you reported while it waited.
 
 For a free-form answer, write to the person and wait for the reply:
 

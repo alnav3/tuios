@@ -32,6 +32,8 @@ type Daemon struct {
 	manager *Manager
 	// tml holds the open TML surfaces. See tml_surface.go.
 	tml tmlHost
+	// artifacts is what each pane has shown the person. See artifacts.go.
+	artifacts artifactLog
 	// instance names this daemon run, fresh on every start. hello reports
 	// it, and a hub records it for each host, so a client attached to a
 	// session on another machine can tell which of that machine's hosts is
@@ -59,9 +61,23 @@ type Daemon struct {
 	// progress. See handoff.go.
 	handoffArgs func(manifestFD int) []string
 	handoffMu   sync.Mutex
+	// sessionOrderMu holds one set-session-order from start to end, so two
+	// clients' orders cannot interleave, and a restore from reading the ranks
+	// to making the session. See verb_session_order.go.
+	sessionOrderMu sync.Mutex
 	// adopting is set while a new daemon image rebuilds the sessions its
 	// predecessor handed over. See handoff_adopt.go.
 	adopting atomic.Bool
+	// pipes are the pipes the daemon reads that a handoff would close. See
+	// handoff_refuse.go.
+	pipes pipeHolds
+	// prev is the running binary, kept for a handoff to fall back to. See
+	// handoff_prev.go.
+	prevMu sync.Mutex
+	prev   *prevBinary
+	// lastHandoff is what the handoff that made this image measured, nil
+	// for an image that started fresh.
+	lastHandoff atomic.Pointer[HandoffStats]
 	// herdrSeqs is the highest seq each pane's herdr reporter has sent.
 	herdrSeqs herdrSeqs
 	// herdrWorkspaceMeta holds the tokens tools report on a session with
@@ -82,6 +98,10 @@ type Daemon struct {
 	// Connection tracking
 	clients   map[string]*connState
 	clientsMu sync.RWMutex
+	// hostFocusMu serializes host focus reports, so two clients that change
+	// focus at once cannot both see the session's focus flip. See
+	// handleClientFocus.
+	hostFocusMu sync.Mutex
 
 	// The read budgets large frames and large verb request lines are
 	// charged to, and the connections served now on the main socket and the
@@ -110,6 +130,9 @@ type Daemon struct {
 	// singleClient is [daemon] single_client: every attach takes the other
 	// clients off its session. See detach_client.go.
 	singleClient atomic.Bool
+	// worktreePath is [worktree] path, read on every create so a config
+	// reload applies to the next one. See SetWorktreePath.
+	worktreePath atomic.Pointer[string]
 	// sshAgent keeps each session's ssh agent link. See ssh_agent_follow.go.
 	sshAgent agentFollow
 	// display keeps each session's Wayland link and the display of its
@@ -304,6 +327,9 @@ type Daemon struct {
 	// mail. Its zero value is ready, and off until SetMailWake. See
 	// mail_wake.go.
 	mailWake mailWaker
+	// askTurns keeps one ask-agent typing at a pane at a time. See
+	// ask_turns.go.
+	askTurns askTurns
 
 	// reviewNotes holds the review notes left on panes' changes. Its zero
 	// value is ready; Start loads what the last daemon saved. See
@@ -361,6 +387,11 @@ type Daemon struct {
 	// TUIOS_AGENT_STALL_SECONDS environment override.
 	agentStallTimeout time.Duration
 
+	// silent is [agents] silent_after: how long a pane whose hooks reported
+	// working may go without a report before it shows as silent. See
+	// agent_silent.go.
+	silent silentAfter
+
 	// agentDetectInterval is how often the foreground-process auto-detector polls
 	// each pane to mark or clear a running agent. Zero disables auto-detection. It
 	// is resolved once in NewDaemon from config or the TUIOS_AGENT_DETECT_SECONDS
@@ -375,6 +406,11 @@ type Daemon struct {
 	// agents_switch.go. It is read on every tick, verb and output event, and
 	// written by a config reload, so it is atomic.
 	agentsOff atomic.Bool
+
+	// taskAutoOff is [tasks] auto_stage = false: no card moves on its own.
+	// See task_auto.go. It is read under session state locks and written by
+	// a config reload, so it is atomic.
+	taskAutoOff atomic.Bool
 
 	// wakes are the latches the background loops sleep on at idle. See
 	// idle_wakes.go.
@@ -835,11 +871,22 @@ type DaemonConfig struct {
 	PasteBufferLimit    int
 	PasteBufferMaxBytes int
 	PasteBuffersOff     bool
+	// DragAndDrop is [panes] drag_and_drop: the daemon records what a pane's
+	// program says about drag and drop and answers its query only when on.
+	// See dnd_registration.go.
+	DragAndDrop bool
+	// WorktreePath is [worktree] path: the template the worktrees new-worktree
+	// and fan make are placed by. Empty is the default layout. See
+	// worktree.PathFor.
+	WorktreePath string
 	// AgentStallTimeout overrides how long a pane may report working with no
 	// output before the stall heuristic demotes it to idle. Zero falls back to
 	// the TUIOS_AGENT_STALL_SECONDS environment override, then to the default; a
 	// negative value disables the heuristic.
 	AgentStallTimeout time.Duration
+	// AgentSilentAfter is [agents] silent_after. Zero means
+	// config.DefaultSilentAfter and a negative value turns it off.
+	AgentSilentAfter time.Duration
 	// AgentAutoDetect toggles the foreground-process agent auto-detector. Nil
 	// falls back to the TUIOS_AGENT_AUTODETECT environment override, then to
 	// enabled. A non-nil false disables it.
@@ -924,6 +971,9 @@ type DaemonConfig struct {
 	// MailWakeOff is [agents.mail] wake = false: an agent at rest is not
 	// told about its mail by a typed prompt. See mail_wake.go.
 	MailWakeOff bool
+	// TaskAutoStageOff is [tasks] auto_stage = false: the daemon moves no
+	// card on its own. See task_auto.go.
+	TaskAutoStageOff bool
 	// Checkpoints is [agents.checkpoints]: whether a pane's work tree is
 	// saved when its agent finishes a turn, and how many are kept. The zero
 	// value is on with the default keep. See checkpoints.go.
@@ -978,7 +1028,10 @@ func NewDaemon(cfg *DaemonConfig) *Daemon {
 	d.SetLinkPolicies(cfg.LinkPolicies)
 	d.manager.SetPanePermissions(cfg.Permissions)
 	d.SetQueueMax(cfg.QueueMax)
+	// Stored, not set: the wake latches are made below.
+	d.silent.ns.Store(int64(resolveSilentAfter(cfg.AgentSilentAfter)))
 	d.SetMailWake(!cfg.MailWakeOff)
+	d.taskAutoOff.Store(cfg.TaskAutoStageOff)
 	d.SetCheckpoints(cfg.Checkpoints)
 	d.outbox = newHostOutbox(d)
 	// The socket path is read through a closure rather than copied, because the
@@ -993,6 +1046,8 @@ func NewDaemon(cfg *DaemonConfig) *Daemon {
 	d.manager.SetPreferredShell(cfg.PreferredShell)
 	d.manager.SetHerdrProtocol(cfg.HerdrProtocol)
 	d.manager.SetReturnWhenEmpty(!cfg.StayOnEmptyWorkspace)
+	d.manager.SetDragAndDrop(cfg.DragAndDrop)
+	d.SetWorktreePath(cfg.WorktreePath)
 	d.agentDetectInterval = resolveAgentDetectInterval(cfg.AgentAutoDetect, cfg.AgentDetectInterval)
 	d.agentsOff.Store(cfg.AgentsOff)
 	d.wakes.init()
@@ -1069,7 +1124,7 @@ func (d *Daemon) onSessionCreated(s *Session) {
 	// point somewhere from the start. See ssh_agent_follow.go.
 	d.agentEnsureSession(s.ID)
 	s.setIdleWakes(&d.wakes)
-	d.wakes.listing.Set()
+	d.wakes.sessionsChanged()
 	name := s.Name()
 	// Every daemon-side mutation reaches the attached clients from here, so a
 	// change the daemon made itself shows up in a live TUI without the verb that
@@ -1100,6 +1155,7 @@ func (d *Daemon) onSessionCreated(s *Session) {
 		d.broadcastStateSync(sessionID, state, "update", "")
 	})
 	s.SetHostShownProbe(func() bool { return d.sessionShown(sessionID) })
+	s.SetTaskAutoProbe(func() bool { return !d.taskAutoOff.Load() })
 	// A pane's first output or bell since its subscriptions changed. See
 	// pane_marks.go.
 	s.SetPaneMarkSink(func(ptyID, windowID string, mark uint32) {
@@ -1123,7 +1179,7 @@ func (d *Daemon) onSessionCreated(s *Session) {
 				// comes from a fresh look: the foreground detector, then the
 				// screen tier.
 				if d.agentDetectInterval > 0 {
-					s.scanAgentDetection(d.foregroundResolver(s), d.agentMatcher.identifyDetail, nil)
+					s.scanAgentDetection(d.foregroundResolver(s), d.agentMatcher.identifyKept, nil)
 				}
 				if reg := d.agentMatcher.registry; reg != nil {
 					s.scanPaneForAgent(ev.PTYID, reg)
@@ -1248,6 +1304,11 @@ func (d *Daemon) onSessionCreated(s *Session) {
 			d.attention.noteSessionEvent(name, ev)
 			return
 		}
+		// A task card the change let go, with its pane or its agent.
+		if ev.Type == eventTaskReleased {
+			d.publishReleased(s, []TaskRow{*ev.taskRow}, ev.taskReason)
+			return
+		}
 		// A pane with an activity ring gets its shell's commands and its
 		// state changes added to it. A pane without one costs a map lookup.
 		d.activity.noteSessionEvent(s, ev)
@@ -1285,6 +1346,7 @@ func (d *Daemon) onSessionCreated(s *Session) {
 			Mode:       ev.Mode,
 			Enabled:    ev.Enabled,
 			State:      ev.State,
+			Reason:     ev.Reason,
 			Workspace:  ev.Workspace,
 			Cmdline:    ev.Cmdline,
 			ExitCode:   ev.ExitCode,
@@ -1340,7 +1402,7 @@ func (d *Daemon) onSessionRenamed(s *Session, old string) {
 // PTYs are closed and their windows are gone, but the socket stays open, so the
 // client sits in a dead session with no way to learn what happened.
 func (d *Daemon) onSessionDeleted(s *Session) {
-	d.wakes.listing.Set()
+	d.wakes.sessionsChanged()
 	// The session's ssh agent link goes with it.
 	d.agentForgetSession(s.ID)
 	d.displayForgetSession(s.ID)
@@ -1446,6 +1508,13 @@ func (d *Daemon) Start() error {
 
 	log.Printf("TUIOS daemon started on %s (PID %d)", socketPath, os.Getpid())
 
+	// The binary this image runs, kept for a live upgrade to fall back to,
+	// before an installer can put another in its place. A daemon inside
+	// another program never hands off, nor one on a platform without it.
+	if d.handoffArgs != nil && handoffSupported() {
+		d.keepPrevBinary()
+	}
+
 	// Sweep the previous daemon's leftovers before reading the directory. Runs
 	// whether or not auto-restore is on, since the residue is there either way.
 	CleanResurrectionDir()
@@ -1545,6 +1614,7 @@ func (d *Daemon) serve() {
 	d.startAccepting()
 	go d.cleanupLoop()
 	go d.stallMonitor()
+	go d.silentMonitor()
 	go d.agentMonitor()
 	go d.listingNotifier()
 }
@@ -2044,6 +2114,7 @@ func (d *Daemon) handleConnectionOn(conn net.Conn, viaLink, linkHuman bool) {
 		cs.mu.Lock()
 		sessionID := cs.sessionID
 		sessionName := cs.sessionName
+		input := cs.lastActivity
 		subs := make([]string, 0, len(cs.ptySubscriptions))
 		for ptyID := range cs.ptySubscriptions {
 			subs = append(subs, ptyID)
@@ -2086,7 +2157,7 @@ func (d *Daemon) handleConnectionOn(conn net.Conn, viaLink, linkHuman bool) {
 		// the client is out of d.clients, so the size is taken over the ones that
 		// remain; a clean detach cleared sessionID above and does not come here.
 		if sessionID != "" {
-			d.notifyClientLeft(sessionID, clientID)
+			d.notifyClientLeft(sessionID, clientID, input)
 		}
 
 		_ = conn.Close()
@@ -2484,7 +2555,7 @@ func (d *Daemon) agentDetectScan() bool {
 			pty := sess.GetPTY(ptyID)
 			return pty == nil || pty.detectScanDue(now, quietTicks)
 		}
-		sess.scanAgentDetection(d.foregroundResolver(sess), d.agentMatcher.identifyDetail, due)
+		sess.scanAgentDetection(d.foregroundResolver(sess), d.agentMatcher.identifyKept, due)
 		// The transcript joins ride this tick rather than one of their
 		// own. It runs only for a pane already known to be running a
 		// harness that has a transcript and that has no join yet, so a

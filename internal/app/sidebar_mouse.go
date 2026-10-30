@@ -144,7 +144,7 @@ func (m *OS) applySidebarFlag(on bool) bool {
 // sidebarOpsOn reports whether showing the rail is session state:
 // the daemon keeps it, and a toggle goes to the daemon as an op.
 func (m *OS) sidebarOpsOn() bool {
-	return m.IsDaemonSession && m.DaemonClient != nil && m.DaemonClient.SidebarOps()
+	return !m.NoRail && m.IsDaemonSession && m.DaemonClient != nil && m.DaemonClient.SidebarOps()
 }
 
 // sidebarVisibility is the session's word for a rail that is shown or not.
@@ -298,6 +298,13 @@ func (m *OS) sidebarClearPeek() {
 	m.SidebarPeek = ""
 }
 
+// sidebarPeekAllowed reports whether the person leaves the peek on
+// (appearance.sidebar.peek). Off, the terminals section shows the attached
+// session's panes until a click attaches another one.
+func (m *OS) sidebarPeekAllowed() bool {
+	return m.Settings.SidebarPeekEnabled
+}
+
 // sidebarPeekAt sets the preview to the session row under the pointer, or
 // clears it when the pointer is anywhere else. One event decides: session rows
 // are one cell tall and terminals report motion per cell, so a pointer crossing
@@ -311,6 +318,10 @@ func (m *OS) sidebarClearPeek() {
 // rows clears the preview, which is why the pointer can never reach a peeked
 // terminal row while the peek is still on screen.
 func (m *OS) sidebarPeekAt(x, y int) {
+	if !m.sidebarPeekAllowed() {
+		m.sidebarClearPeek()
+		return
+	}
 	if sidebarVariant(m.GetSidebarWidth()) == sidebarVariantGlyph {
 		// The strip does now have a terminals list to preview into, and the one
 		// thing it cannot do is say whose panes it is showing: the open rail
@@ -446,10 +457,14 @@ func (m *OS) sidebarClick(x, y int, right bool) bool {
 		m.queueSidebarCmd(m.openHostSignIn(hit.SessionID))
 	case sidebarRowGlobalNew:
 		m.SidebarNewGlobalSession()
+	case sidebarRowRailPaneStart:
+		m.RestartRailPane()
 	case sidebarRowCollapse:
 		m.SidebarToggleCollapsed()
 	case sidebarRowRepo:
-		m.SidebarToggleRepoCollapsed(hit.SessionID)
+		if !m.sidebarRepoGotoMain(hit.SessionID) {
+			m.SidebarToggleRepoCollapsed(hit.SessionID)
+		}
 	case sidebarRowFiles:
 		m.queueSidebarCmd(m.ToggleFileView())
 	case sidebarRowFileCd:
@@ -457,7 +472,11 @@ func (m *OS) sidebarClick(x, y int, right bool) bool {
 	case sidebarRowFileUp:
 		m.queueSidebarCmd(m.FileViewUp())
 	case sidebarRowFileEntry:
-		m.queueSidebarCmd(m.FileViewEnter(hit.WindowIndex))
+		// A press arms the drag of the row into a pane. The release does
+		// what a click does when the pointer never left the rail.
+		if !m.armFileDrag(hit) {
+			m.queueSidebarCmd(m.fileViewEnterRow(hit.WindowIndex, hit.WindowID))
+		}
 	case sidebarRowDivider:
 		// A press arms the split drag; a second press inside the double-click
 		// window resets the split instead.
@@ -635,7 +654,9 @@ func (m *OS) sidebarActivateRow(hit sidebarRowHit) {
 	case sidebarRowCollapse:
 		m.SidebarToggleCollapsed()
 	case sidebarRowRepo:
-		m.SidebarToggleRepoCollapsed(hit.SessionID)
+		if !m.sidebarRepoGotoMain(hit.SessionID) {
+			m.SidebarToggleRepoCollapsed(hit.SessionID)
+		}
 	case sidebarRowHost:
 		m.SidebarToggleHostCollapsed(hit.SessionID)
 	case sidebarRowFiles:
@@ -645,7 +666,7 @@ func (m *OS) sidebarActivateRow(hit sidebarRowHit) {
 	case sidebarRowFileUp:
 		m.queueSidebarCmd(m.FileViewUp())
 	case sidebarRowFileEntry:
-		m.queueSidebarCmd(m.FileViewEnter(hit.WindowIndex))
+		m.queueSidebarCmd(m.fileViewEnterRow(hit.WindowIndex, hit.WindowID))
 	case sidebarRowDivider:
 		m.SidebarResetSplit()
 	case sidebarRowSession:
@@ -791,10 +812,10 @@ func (m *OS) sidebarRelease(x, y int) bool {
 	if d.Dragging {
 		if d.Host {
 			m.SidebarHostOrder = d.Order
+			m.saveSidebarState()
 		} else {
-			m.setSidebarSessionOrder(m.attachedMachine(), d.Order)
+			m.commitSessionOrder(d.Order)
 		}
-		m.saveSidebarState()
 		return true
 	}
 
@@ -1069,6 +1090,14 @@ func (m *OS) fileMenuTargetFor(hit sidebarRowHit) fileMenuTarget {
 	case sidebarRowFileUp:
 		t.Up = true
 	case sidebarRowFileEntry:
+		if m.filesTreeOn() {
+			// A row of the tree carries its path from the root, and its folder
+			// is the one it is in.
+			if dir, e, ok := m.fileTreeEntry(hit.WindowID); ok {
+				t.Dir, t.Name, t.IsDir = dir, e.Name, e.Dir
+			}
+			break
+		}
 		// The row carries the entry's name in WindowID; see the note on
 		// fileRowSpec.Key.
 		for _, e := range m.filesView.Entries {

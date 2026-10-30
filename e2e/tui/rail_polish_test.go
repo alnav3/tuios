@@ -71,8 +71,13 @@ func TestBlockedAgentAlertCarriesTheQuestion(t *testing.T) {
 		t.Fatalf("set-agent-state failed: %v\n%s", err, out)
 	}
 	enterTerminalMode(t, term)
+	// The words the rule reads come in as printf's arguments, so the command
+	// line the shell echoes does not hold the question. The rule
+	// takes the first line in the pane's last rows that has the question's
+	// stem. Until the shell prints its next prompt, the echoed command is in
+	// those rows, and a literal question in it was read as the question.
 	runInShell(t, term,
-		`printf 'Do you want to make this edit to main.go?\n\342\235\257 1. Yes\n  2. %s, and tell Claude what to do differently (esc)\n' No`,
+		`printf '%s want to make this edit to main.go?\n\342\235\257 1. Yes\n  2. %s, and tell Claude what to do differently (esc)\n' 'Do you' No`,
 		"2. No, and tell Claude", shellTimeout)
 
 	// The dock cuts a long toast to its budget and the rail cuts the note to
@@ -378,4 +383,76 @@ func railRowOf(s tuitest.Screen, needle string) int {
 		}
 	}
 	return -1
+}
+
+// railGutterAt is the gutter cell of the rail row that holds needle: column 0
+// of a left rail. It returns "" when no rail row holds needle.
+func railGutterAt(s tuitest.Screen, needle string) string {
+	r := railRowOf(s, needle)
+	if r < 0 {
+		return ""
+	}
+	return s.Cell(0, r).Content
+}
+
+// TestAgentRowMarksFocusWithoutTerminals (discussion 850): with the terminals
+// section out of the layout, the agents section is the only place the rail
+// lists a pane. The focused pane's agent row carries the focus mark in its
+// gutter, and the mark moves when focus moves to the other agent pane. It runs
+// at 16 colours and at truecolor, and saves a PNG of each.
+//
+// How this could pass wrongly, written down first:
+//   - The dock repeats each pane's name, so rows are read in the rail's own
+//     columns only.
+//   - An attention state draws a gutter mark of its own, so both panes report
+//     working, which draws a blank gutter.
+//   - A mark on both rows would pass a test that reads one, so each wait
+//     needs the mark on the focused row and a blank gutter on the other.
+//
+// Negative control: with the focusMark argument of sidebarAgentRow put back
+// to the compact-rail rule, no agent row carries a mark and the first wait
+// fails.
+func TestAgentRowMarksFocusWithoutTerminals(t *testing.T) {
+	for _, depth := range []chromeDepth{chromeDepths[0], chromeDepths[2]} {
+		t.Run(depth.name, func(t *testing.T) {
+			cfg := strings.Replace(railConfig(railWidth), "enabled = true\n",
+				"enabled = true\nsections = \"sessions,agents\"\n", 1)
+			term, base := railClient(t, "e2e", cfg, startOpts{cols: 120, rows: 30, env: depth.env})
+			renameWindow(t, term, "ALPHA")
+			newWindow(t, term)
+			renameWindow(t, term, "BRAVO")
+			for _, w := range []string{"ALPHA", "BRAVO"} {
+				if out, err := tuiosCLI(t, base, "set-agent-state", "working", "-s", "e2e", "-w", w); err != nil {
+					t.Fatalf("set-agent-state %s: %v\n%s", w, err, out)
+				}
+			}
+			markedOn := func(focused, other string) func(tuitest.Screen) bool {
+				return func(s tuitest.Screen) bool {
+					if railRowOf(s, "terminals") >= 0 {
+						return false
+					}
+					mark := railGutterAt(s, focused)
+					return mark != "" && mark != " " && railGutterAt(s, other) == " "
+				}
+			}
+			// BRAVO is the pane made last, so it has focus. The frame is saved
+			// before the verdict, so a failing build leaves its frame too.
+			err := term.WaitFor(markedOn("BRAVO", "ALPHA"), uiTimeout)
+			dir := artifactDir(t)
+			savePNG(t, term.Screen(), hostPalette(t, ""), dir, "agent-focus-"+depth.name+"-bravo")
+			saveArtifact(t, term, dir, "agent-focus-"+depth.name+"-bravo")
+			if err != nil {
+				t.Fatalf("the focused agent row carries no focus mark: %v\n%s", err, term.Snapshot())
+			}
+
+			if err := term.SendKeys("1"); err != nil {
+				t.Fatalf("select the first pane: %v", err)
+			}
+			if err := term.WaitFor(markedOn("ALPHA", "BRAVO"), uiTimeout); err != nil {
+				t.Fatalf("the focus mark did not move to the newly focused agent row: %v\n%s", err, term.Snapshot())
+			}
+			savePNG(t, term.Screen(), hostPalette(t, ""), dir, "agent-focus-"+depth.name+"-alpha")
+			saveArtifact(t, term, dir, "agent-focus-"+depth.name+"-alpha")
+		})
+	}
 }

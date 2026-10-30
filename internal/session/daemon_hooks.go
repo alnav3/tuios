@@ -51,14 +51,21 @@ var sessionHookEvents = map[string]hooks.Event{
 	EventCommandFinished:   hooks.AfterCommandFinished,
 }
 
-// sessionSideHooks is sessionHookEvents keyed the other way: the hook events the
-// daemon fires. Derived rather than written out, so the two can never disagree
-// about which side owns an event.
+// sessionSideHooks is sessionHookEvents keyed the other way, plus the one event
+// the daemon runs outside the event sink: the hook events the daemon fires.
+// Derived rather than written out, so the two can never disagree about which
+// side owns an event.
 var sessionSideHooks = func() map[hooks.Event]bool {
 	set := make(map[hooks.Event]bool, len(sessionHookEvents))
 	for _, ev := range sessionHookEvents {
 		set[ev] = true
 	}
+	// after-new-worktree comes from no stream event: createWorktreeSession
+	// runs it itself and waits for it. The worktree is the daemon's fact.
+	set[hooks.AfterNewWorktree] = true
+	// after-settle comes from no stream event either: settleAgent fires it
+	// (agent_settle.go). The settle is the daemon's fact.
+	set[hooks.AfterSettle] = true
 	return set
 }()
 
@@ -176,6 +183,7 @@ func (d *Daemon) loadHooks(cfg *DaemonConfig) {
 	if !m.HasHooks() {
 		return
 	}
+	m.SetHold(d.pipes.hold)
 	d.hooks = m
 	d.agentHooks = newAgentHookGate()
 }

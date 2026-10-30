@@ -71,6 +71,10 @@ type Job struct {
 	Env []string
 	// Timeout kills the process group after this long. Zero is no timeout.
 	Timeout time.Duration
+	// Release, when set, is called once: when the run ends and nothing it
+	// started is left, or when Start refuses the job. It drops herdr's lease
+	// on the plugin's install (HoldLease).
+	Release func()
 }
 
 // Runner runs plugin commands and keeps their log.
@@ -97,6 +101,10 @@ type Runner struct {
 	// OnPID, when set, is told each process the runner starts and ends, so
 	// the daemon can tell a plugin's process from a person's.
 	OnPID func(pid int, running bool)
+	// Hold, when set, is held from a command's start until its output is
+	// read: the daemon does not hand off while a pipe it reads is open. A
+	// command it refuses is not started.
+	Hold func(pluginID string) (release func(), ok bool)
 }
 
 // NewRunner returns an empty runner.
@@ -140,6 +148,10 @@ func ResolveProgram(program, root string) (string, *Error) {
 // stdout and stderr kept up to OutputCap each. A start refused by a bound
 // is logged as failed and returned as an error.
 func (r *Runner) Start(j Job) (LogEntry, *Error) {
+	lease := func() {}
+	if j.Release != nil {
+		lease = sync.OnceFunc(j.Release)
+	}
 	now := time.Now().UnixMilli()
 	r.mu.Lock()
 	r.next++
@@ -150,6 +162,7 @@ func (r *Runner) Start(j Job) (LogEntry, *Error) {
 		e.Stdout, e.Stderr = &empty, &empty
 		r.pushLocked(e)
 		r.mu.Unlock()
+		lease()
 		return e, errf(code, "%s", msg)
 	}
 	switch {
@@ -165,6 +178,19 @@ func (r *Runner) Start(j Job) (LogEntry, *Error) {
 	program, perr := ResolveProgram(j.Command[0], j.Plugin.PluginRoot)
 	if perr != nil {
 		return refuse(perr.Code, perr.Msg)
+	}
+	release := func() {}
+	if r.Hold != nil {
+		rel, ok := r.Hold(j.Plugin.PluginID)
+		if !ok {
+			return refuse("plugin_host_upgrading", "the daemon is being upgraded. Try again in a moment")
+		}
+		release = rel
+		failed := refuse
+		refuse = func(code, msg string) (LogEntry, *Error) {
+			release()
+			return failed(code, msg)
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	argv := append([]string{program}, j.Command[1:]...)
@@ -321,6 +347,8 @@ func (r *Runner) Start(j Job) (LogEntry, *Error) {
 		delete(r.procs[j.Plugin.PluginID], cmd)
 		group.release()
 		r.mu.Unlock()
+		release()
+		lease()
 	}()
 	return e, nil
 }

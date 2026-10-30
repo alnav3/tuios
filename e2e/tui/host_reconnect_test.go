@@ -3,9 +3,9 @@ package tuie2e
 import (
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -74,37 +74,40 @@ func clickRailSession(t *testing.T, term *tuitest.Terminal, session string) {
 	mouseClick(t, term, 3, row, tuitest.MouseLeft, 0)
 }
 
-// freezeTheLink stops the far side of every open link without ending it. The
-// pipe stays open and carries nothing, which is what a link looks like after
-// a laptop wakes from sleep: no end of it has been told, and the fake ssh has
-// no keepalives to find out. Only the link's own heartbeat can.
+// freezeTheLink stops the far side of every link this test opened without
+// ending it. The pipe stays open and carries nothing, which is what a link
+// looks like after a laptop wakes from sleep: no end of it has been told, and
+// the fake ssh has no keepalives to find out. Only the link's own heartbeat
+// can.
 func freezeTheLink(t *testing.T) {
 	t.Helper()
-	out, err := exec.Command("pgrep", "-f", tuiosBin+" stdio-proxy").Output()
-	pids := strings.Fields(string(out))
-	if err != nil || len(pids) == 0 {
-		t.Fatalf("find the link's proxy: %v", err)
+	pids := testProxies(t)
+	if len(pids) == 0 {
+		t.Fatalf("find the link's proxy: no stdio-proxy serves a machine this test made")
 	}
 	for _, pid := range pids {
-		if out, err := exec.Command("kill", "-STOP", pid).CombinedOutput(); err != nil {
-			t.Fatalf("stop the link's proxy %s: %v\n%s", pid, err, out)
+		if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+			t.Fatalf("stop the link's proxy %d: %v", pid, err)
 		}
 	}
 	t.Cleanup(func() {
 		for _, pid := range pids {
-			_ = exec.Command("kill", "-CONT", pid).Run()
-			_ = exec.Command("kill", "-KILL", pid).Run()
+			_ = syscall.Kill(pid, syscall.SIGCONT)
+			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	})
 }
 
-// breakTheLink kills the far side of every open link, which is what an ssh
-// child dying looks like from this machine.
+// breakTheLink kills the far side of every link this test opened, which is
+// what an ssh child dying looks like from this machine.
 func breakTheLink(t *testing.T) {
 	t.Helper()
-	out, err := exec.Command("pkill", "-f", tuiosBin+" stdio-proxy").CombinedOutput()
-	if err != nil {
-		t.Fatalf("kill the link's proxy: %v\n%s", err, out)
+	pids := testProxies(t)
+	if len(pids) == 0 {
+		t.Fatalf("kill the link's proxy: no stdio-proxy serves a machine this test made")
+	}
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
 	}
 }
 
@@ -374,8 +377,9 @@ func TestTheDaemonSaysWhyALinkDropped(t *testing.T) {
 // word.
 //
 // First a click on the frozen link is replaced by a click on a session here,
-// and the late dial of the first must not pull the person away. Then a
-// click on a session on a link that is frozen and looks up. The
+// and the late dial of the first must not pull the person away. Then the
+// navigator opens a session on the frozen link and must not freeze the
+// screen (#742). Then a click on a session on a link that is frozen and looks up. The
 // click asks the daemon to retry the host, which pings the link, finds it
 // silent, ends it and dials it again. The session opens on the new link. The
 // second half leaves an attached session idle on a frozen link and nobody
@@ -443,8 +447,40 @@ func TestASilentLinkIsFoundAndTheRailStillOpensItsSessions(t *testing.T) {
 	}
 	save("replaced-click.txt")
 
+	// The navigator opens a session on the frozen link the way the rail
+	// does: off the Update goroutine, with the dock saying so (#742). It
+	// used to dial on the Update goroutine, and the screen froze until the
+	// dial failed.
 	freezeTheLink(t)
+	openNavigator(t, term, "far-quiet")
+	sendKeys(t, term, "/")
+	if err := term.SendKeys("far-quiet"); err != nil {
+		t.Fatalf("type the query: %v", err)
+	}
+	if err := term.WaitFor(func(s tuitest.Screen) bool { return strings.Count(s.Text(), "far-quiet") >= 2 }, uiTimeout); err != nil {
+		t.Fatalf("the navigator search never showed far-quiet: %v\n%s", err, term.Snapshot())
+	}
 	start := time.Now()
+	sendKeys(t, term, tuitest.Enter)
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		text := s.Text()
+		return strings.Contains(text, "Connecting to build") || strings.Contains(text, "Reconnecting to build")
+	}, 5*time.Second); err != nil {
+		t.Fatalf("ASSERTION: the navigator froze on a session of a frozen host: %v\n%s", err, term.Snapshot())
+	}
+	save("navigator-waits.txt")
+	if err := term.WaitFor(func(s tuitest.Screen) bool { return railCurrentIs(s, "far-quiet") }, 18*time.Second); err != nil {
+		t.Fatalf("ASSERTION: the session the navigator asked for on a frozen host never opened: %v\n%s", err, term.Snapshot())
+	}
+	t.Logf("the navigator opened the session on a frozen link after %v", time.Since(start).Round(100*time.Millisecond))
+	save("navigator-opened.txt")
+	time.Sleep(insertGuard)
+	clickRailSession(t, term, "elsewhere")
+	waitRailCurrent(t, term, "elsewhere")
+	time.Sleep(insertGuard)
+
+	freezeTheLink(t)
+	start = time.Now()
 	clickRailSession(t, term, "far-quiet")
 	if err := term.WaitFor(func(s tuitest.Screen) bool {
 		text := s.Text()

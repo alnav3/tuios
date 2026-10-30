@@ -15,6 +15,7 @@ type resumeAgentResult struct {
 	Harness        string `json:"harness"`
 	AgentSessionID string `json:"agent_session_id"`
 	Command        string `json:"command"`
+	Warning        string `json:"warning"`
 	Typed          bool   `json:"typed"`
 }
 
@@ -49,10 +50,13 @@ func printResumeAgent(w io.Writer, raw json.RawMessage) error {
 	}
 	if !res.Typed {
 		fmt.Fprintln(w, res.Command)
-		return nil
+	} else {
+		fmt.Fprintf(w, "Resumed %s conversation %s in %s: %s\n",
+			plainLine(res.Harness), plainLine(res.AgentSessionID), shortWindowID(res.WindowID), res.Command)
 	}
-	fmt.Fprintf(w, "Resumed %s conversation %s in %s: %s\n",
-		plainLine(res.Harness), plainLine(res.AgentSessionID), shortWindowID(res.WindowID), res.Command)
+	if res.Warning != "" {
+		fmt.Fprintln(w, plainLine(res.Warning))
+	}
 	return nil
 }
 
@@ -86,7 +90,7 @@ the agent was doing when the daemon stopped did not finish.`,
 			return runResumeAgent(sessionName, windowTarget, dryRun, jsonOutput)
 		},
 	}
-	cmd.Flags().StringVarP(&sessionName, "session", "s", "", "Target session (default: most recently active)")
+	cmd.Flags().StringVarP(&sessionName, "session", "s", "", "Target session (default: this pane's session, else the most recently active)")
 	cmd.Flags().StringVarP(&windowTarget, "window", "w", "", "Target window by name or ID (default: focused)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print the command without typing it")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output result as JSON")

@@ -54,6 +54,7 @@ func StateFingerprint(s *SessionState) uint64 {
 	str(s.Name)
 	str(s.DisplayName)
 	str(s.Accent)
+	str(s.Note)
 	flag(s.Restored)
 	str(s.FocusedWindowID)
 	num(s.CurrentWorkspace)
@@ -77,6 +78,28 @@ func StateFingerprint(s *SessionState) uint64 {
 	str(s.PaneReportBg)
 	str(s.PaneReportFg)
 	str(s.PaneReportPalette)
+	// The task cards, which only the task verbs write. A card's history only
+	// grows at its end, so its length and its newest entry stand for it.
+	num(len(s.Tasks))
+	for i := range s.Tasks {
+		tk := &s.Tasks[i]
+		str(tk.ID)
+		str(tk.Title)
+		str(tk.Stage)
+		str(strconv.FormatInt(tk.StageAt, 10))
+		str(tk.Holder)
+		flag(tk.Blocked != nil)
+		if tk.Blocked != nil {
+			str(tk.Blocked.Reason)
+			str(tk.Blocked.By)
+		}
+		str(tk.Fan)
+		num(len(tk.History))
+		if n := len(tk.History); n > 0 {
+			str(tk.History[n-1].Action)
+			str(strconv.FormatInt(tk.History[n-1].At, 10))
+		}
+	}
 
 	// Windows are ordered, and the order is meaningful (it is the z-order the
 	// peer rebuilds its list in), so they are hashed as they stand.
@@ -86,6 +109,7 @@ func StateFingerprint(s *SessionState) uint64 {
 		str(w.ID)
 		str(w.Title)
 		str(w.CustomName)
+		str(w.Note)
 		num(w.X)
 		num(w.Y)
 		num(w.Width)
@@ -119,12 +143,25 @@ func StateFingerprint(s *SessionState) uint64 {
 		str(w.AgentKind)
 		str(w.AgentSessionID)
 		str(w.AgentSessionHarness)
+		if k := w.AgentFlags; k != nil {
+			str(k.Harness)
+			num(len(k.Flags))
+			for _, f := range k.Flags {
+				str(f)
+			}
+		}
 		num(len(w.AgentMeta))
 		for _, t := range w.AgentMeta {
 			str(t.Key)
 			str(t.Value)
 		}
 		num(w.AgentQueued)
+		if w.AgentDraftHeld {
+			num(1)
+		} else {
+			num(0)
+		}
+		flag(w.AgentSettled)
 		num(w.AgentSubagents)
 		num(len(w.AgentSubagentList))
 		for _, sa := range w.AgentSubagentList {

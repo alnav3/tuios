@@ -96,6 +96,7 @@ var windowMenuRows = []menuRow{
 	{parts: []menuPart{{"window_prefix_next", "Next window"}}, desc: "Next window"},
 	{parts: []menuPart{{"window_prefix_prev", "Previous window"}}, desc: "Previous window"},
 	{parts: []menuPart{{"window_prefix_tiling", "Toggle tiling mode"}}, desc: "Toggle tiling mode"},
+	{parts: []menuPart{{"window_prefix_float", "Float or tile the pane"}}, desc: "Float or tile the pane"},
 	{parts: []menuPart{{"split_vertical", "Split right"}}, desc: "Split right"},
 	{parts: []menuPart{{"split_horizontal", "Split down"}}, desc: "Split down"},
 	{parts: []menuPart{{"prefix_fullscreen", "Toggle zoom"}}, desc: "Toggle zoom"},
@@ -171,7 +172,9 @@ var leaderPaneRows = []menuRow{
 	{parts: []menuPart{{"prefix_split_vertical", "Split vertical"}}, desc: "Split vertical"},
 	{parts: []menuPart{{"prefix_rotate_split", "Rotate split"}}, desc: "Rotate split"},
 	{parts: []menuPart{{"prefix_equalize_splits", "Equalize splits"}}, desc: "Equalize splits"},
-	{parts: []menuPart{{"hints", "Hints"}, {"display_panes", "Pane labels"}}, desc: "Hints, labels"},
+	// The path picker shares the row too. Its key goes in a column whose keys
+	// are already five cells wide, so the menu still fits an 80x24 screen.
+	{parts: []menuPart{{"hints", "Hints"}, {"display_panes", "Pane labels"}, {"pick_path", "Pick a path"}}, desc: "Hints, labels, paths"},
 	{parts: []menuPart{{"last_pane", "Last pane"}}, desc: "Last pane"},
 	{parts: []menuPart{{"mark_pane", "Mark pane"}}, desc: "Mark pane"},
 	{parts: []menuPart{{"resize_pane_left_5", "Resize pane left"}, {"resize_pane_up_5", "Resize pane up"}, {"resize_pane_down_5", "Resize pane down"}, {"resize_pane_right_5", "Resize pane right"}}, desc: "Resize pane"},
@@ -182,8 +185,12 @@ var leaderPaneRows = []menuRow{
 // and quit rows menuSections adds for the session kind.
 var leaderSessionRows = []menuRow{
 	{parts: []menuPart{{"prev_session", "Previous session"}, {"next_session", "Next session"}}, desc: "Prev/next session"},
-	{parts: []menuPart{{"prefix_session_switcher", "Sessions"}}, desc: "Sessions"},
-	{parts: []menuPart{{"prefix_workspace_switcher", "Workspaces"}}, desc: "Workspaces"},
+	// The worktree key shares the switcher's row: a row more makes the
+	// leader's menu too tall for a 120x40 screen.
+	{parts: []menuPart{{"prefix_session_switcher", "Sessions"}, {"new_worktree", "New worktree"}}, desc: "Sessions/new worktree"},
+	// The session note shares the workspace switcher's row, for the same
+	// height reason.
+	{parts: []menuPart{{"prefix_workspace_switcher", "Workspaces"}, {"set_note", "Session note"}}, desc: "Workspaces/session note"},
 	{parts: []menuPart{{"choose_tree", "Find a pane"}}, desc: "Find a pane"},
 	{parts: []menuPart{{"goto_picker", "Go to anything"}}, desc: "Go to anything"},
 	{parts: []menuPart{{"prefix_close_session", "Close session"}}, desc: "Close session"},
@@ -222,6 +229,7 @@ var leaderToolRows = []menuRow{
 var leaderAgentRows = []menuRow{
 	{parts: []menuPart{{"prefix_inbox", "Agents view"}}, desc: "Agents view"},
 	{parts: []menuPart{{"prefix_next_attention", "Oldest waiting"}}, desc: "Oldest waiting"},
+	{parts: []menuPart{{"prev_agent", "Previous agent"}, {"next_agent", "Next agent"}}, desc: "Prev/next agent"},
 	{parts: []menuPart{{"prefix_mail", "Mail for you"}}, desc: "Mail for you"},
 	{parts: []menuPart{{"prefix_next_finished", "Newest finished"}}, desc: "Newest finished"},
 	{parts: []menuPart{{"prefix_review", "Review changes"}}, desc: "Review changes"},
@@ -269,10 +277,10 @@ func menuSections(prefixType string, st MenuState) []menuSection {
 	// both leave for window mode.
 	if st.Daemon {
 		sessions.rows = append(sessions.rows, row("prefix_detach", "Detach session"), row("prefix_quit", "Quit menu"))
-		modes.rows = append(modes.rows, row("prefix_exit_mode", "Window mode"))
+		modes.rows = append(modes.rows, pair("Window/nest mode", part("prefix_exit_mode", "Window mode"), part("nest", "Nest mode")))
 	} else {
 		sessions.rows = append(sessions.rows, row("prefix_quit", "Quit application"))
-		modes.rows = append(modes.rows, pair("Window mode", part("prefix_detach", "Window mode"), part("prefix_exit_mode", "Window mode")))
+		modes.rows = append(modes.rows, pair("Window/nest mode", part("prefix_detach", "Window mode"), part("prefix_exit_mode", "Window mode"), part("nest", "Nest mode")))
 	}
 	// With multifocus on, the copy-mode key enters multi copy mode, and the
 	// menu says so: this is where a multifocus user finds out it exists.
@@ -299,6 +307,12 @@ func menuSections(prefixType string, st MenuState) []menuSection {
 		sidebarRow,
 		row("prefix_explore", "Focus sidebar"),
 		row("prefix_file_search", "Search files"),
+		// Calm mode is a row of its own at the end of Modes. A key added to
+		// a shared row widens that row's key column, and the zoom row's
+		// description has to stay "Toggle zoom" for a rebind to read as one
+		// key. At 80x24 the end of Modes flows into a column of one-cell
+		// keys, so the row costs no width there.
+		row("toggle_calm", "Calm mode"),
 	)
 	return []menuSection{
 		{title: "Workspaces", rows: leaderWorkspaceRows},
@@ -315,11 +329,12 @@ func menuSections(prefixType string, st MenuState) []menuSection {
 // IsAgentPrefixKeybinding reports whether a prefix menu line is one that only
 // means something to a person running agents: the Inbox, the oldest waiting
 // item, the Inbox on its mail, reviewing a pane's changes, the newest finished
-// turn and the Agents settings tab. The client leaves them out of the menu
+// turn, the Agents settings tab and stepping between agent panes. The client leaves them out of the menu
 // until an agent has been seen; the keys work either way.
 func IsAgentPrefixKeybinding(k Keybinding) bool {
 	switch k.Action {
-	case "prefix_inbox", "prefix_next_attention", "prefix_mail", "prefix_review", "prefix_next_finished", "prefix_agents_settings":
+	case "prefix_inbox", "prefix_next_attention", "prefix_mail", "prefix_review", "prefix_next_finished", "prefix_agents_settings",
+		"next_agent", "prev_agent":
 		return true
 	}
 	return false
@@ -564,9 +579,11 @@ func numberedLabel(keys []string) string {
 	return strings.Join(pieces, "/")
 }
 
-// keyNames is how a which-key row spells a named key.
+// keyNames is how a which-key row spells a named key. enter is the ↵ arrow,
+// as the arrows are arrows: one cell, so the leader's menu still fits 80x24
+// with nest on the window mode line (Esc/↵).
 var keyNames = map[string]string{
-	"esc": "Esc", "escape": "Esc", "tab": "Tab", "enter": "Enter", "return": "Enter",
+	"esc": "Esc", "escape": "Esc", "tab": "Tab", "enter": "↵", "return": "↵",
 	"space": "Space", "backspace": "Backspace", "delete": "Delete", "insert": "Insert",
 	"home": "Home", "end": "End", "pgup": "PgUp", "pgdown": "PgDn",
 	"left": "←", "right": "→", "up": "↑", "down": "↓",

@@ -21,9 +21,28 @@ The configuration reference lives on the docs site: https://tuios.dev/docs/confi
 
 It covers the whole `config.toml`: the `[appearance]` table and its `sidebar`, `scrollbar`, dock, and window-button options, `[notifications.agent]`, `[notifications.mail]` (see [AGENT_STATE.md](AGENT_STATE.md#the-inbox)), all 23 `[keybindings]` sections, `[daemon]`, `[startup]`, `[tape]`, `[screenshot]`, `[hooks]`, and `[debug]`, along with what hot-reloads and what needs a restart.
 
+`[notifications]` sets how many seconds a message stays up. `duration` is for info and success messages, and its default is 2. `warning_duration` (default 8) and `error_duration` (default 15) are for warnings and errors. Any value from 1 to 3600 is valid, and 0 uses the default. tuios warns about a negative value and uses the default. tuios warns about a value above 3600 and uses 3600. `style` sets how a message looks. `full` (the default) shows a coloured bar on the left of the message and a line above it that counts down. `plain` shows the icon and the text only. The icon keeps its colour, so an error still looks different from an info message. `level` sets the least severe message the dock shows: `info` (the default) shows every message, `warning` only warnings and errors, and `error` only errors. A message the dock does not show still goes to the log viewer (`Ctrl+B D l`), so the notice for a key that did nothing can be read there. Set `log_hidden = false` to keep those messages out of the log as well. Warnings and errors always go to the log. A message from a pane, an agent or mail does not use `level`. `[notifications.agent]` and `[notifications.mail]` control those messages.
+
 `[notifications.mail]` has `enabled`, `notify`, `dock`, `sound` and `between_agents`. Each key except `between_agents` follows the same key in `[notifications.agent]` while it is unset, so a config without the table alerts as before. `between_agents` (default `false`) also alerts on a message from one agent to another. Sound mode, cooldown, cue files and quiet hours always come from `[notifications.agent]`. `tuios set-config notifications.mail.KEY ""` clears a key, and `tuios get-config` then prints `(follows notifications.agent.KEY)`.
 
 `tuios list-options` describes every settable path with its type, default, and accepted values, straight from the registry the validator uses. The in-app settings page (`Ctrl+B ,`) edits and persists the same options, and its rows are derived from that same registry: an option an agent can set is an option a person can reach, and a test fails the build if one is not.
+
+## Sidebar peek
+
+When you put the pointer on a session row in the sidebar, the terminals
+section shows the panes of that session. When you move the rail cursor onto a
+session row, the same thing occurs. This is the peek. To turn it off, set
+`appearance.sidebar.peek` to `false`:
+
+```toml
+[appearance.sidebar]
+peek = false   # true is the default
+```
+
+With the peek off, the terminals section shows the panes of the attached
+session. It changes only when you attach to a different session. The setting
+also shows in Settings, Sidebar, and `tuios set-config appearance.sidebar.peek
+false` changes it while tuios runs.
 
 ## Split the config into several files
 
@@ -201,6 +220,35 @@ option_glyphs = "auto"   # auto, alt, bind, type
 See [Shifted digits and AZERTY](KEYBINDINGS.md#shifted-digits-and-azerty) and
 [One Option key for typing](KEYBINDINGS.md#one-option-key-for-typing).
 
+## Lock mode
+
+```toml
+[keybindings]
+lock = true
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `lock` | `false` | `true` gives every key to the pane in terminal mode, except the leader. The leader unlocks for one action, and then tuios locks again. A repeatable action keeps its menu open until you press `esc`. That menu takes only repeatable keys, and any other key goes to the pane. The zellij preset sets `true`. |
+
+See [Lock mode](KEYBINDINGS.md#lock-mode).
+
+## Nest mode
+
+```toml
+[keybindings]
+nest_exit_key = "f12"
+
+[keybindings.prefix_mode]
+nest = ["enter"]
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `nest_exit_key` | `"f12"` | The key that ends nest mode. A key that cannot be read goes back to `"f12"`, and a key programs type is reported as a problem. The `nest` action (the leader, then `enter`) turns nest mode on: every key goes to the pane, the leader too, until this key. |
+
+See [Nest mode](KEYBINDINGS.md#nest-mode).
+
 ## Opening links
 
 tuios finds two kinds of link in a pane. An OSC 8 hyperlink is a link that a
@@ -326,6 +374,31 @@ nvim_navigation = true
 See [KEYBINDINGS.md](KEYBINDINGS.md#neovim-pane-navigation) for the matching
 focus-key mappings and protocol behaviour.
 
+## Wrap focus at the edge
+
+`appearance.focus_wrap` is `false` by default. Set it to `true` to wrap
+directional focus at the edge of a tiled layout, as tmux `select-pane` does:
+
+```toml
+[appearance]
+focus_wrap = true
+```
+
+When no pane is in that direction, focus goes to the pane on the far side that
+faces the focused pane. If more than one pane is on the far side, tuios picks
+by the rule of a normal focus move. A pane that fills the layout in that
+direction keeps focus.
+
+The option applies to every directional focus move in a tiled layout:
+
+- The focus keys in window mode, in terminal mode and after the prefix.
+- The Neovim navigator hand-back, when `nvim_navigation` is on.
+- `tuios focus-window --direction` and the `FocusDirection` tape command.
+
+In the scrolling layout, up and down wrap inside the column. Left and right
+move along the strip and do not wrap. With tiling off, focus does not wrap.
+The tmux shim always wraps, as tmux does, and does not read this option.
+
 `persist_scrollback` in `[daemon]` (default `true`) saves each pane's history with its session. After a daemon restart or a reboot, the restored pane shows that history above a dim divider, and the new shell starts under it. `persist_scrollback_lines` (default 1000) and `persist_scrollback_kb` (default 2048) set the most lines and the most KiB one pane saves. The files hold what your panes printed, secrets included. Set `persist_scrollback = false` to stop this. The next time the daemon starts, it deletes the history it saved before. See [SESSIONS.md](SESSIONS.md#pane-history).
 
 `window_size` in `[daemon]` sets the size of a session that has more than one client. The names are the names of the tmux `window-size` option. See [SESSIONS.md](SESSIONS.md#session-size-with-more-than-one-client).
@@ -394,7 +467,24 @@ display = "follow"
 
 `[panes]` sets `label_keys`, the keys that the pane labels (`Ctrl+B Q`) use. The default is `1234567890`. Letters `a` to `z` and digits are allowed. See [KEYBINDINGS.md](KEYBINDINGS.md#pane-labels).
 
-`[panes]` also sets `navigator_layout`, the layout the pane navigator (`Ctrl+B /`) opens in: `tree`, `flat` or `cards`. The default is `tree`. Press `v` in the navigator to change the layout. See [KEYBINDINGS.md](KEYBINDINGS.md#the-pane-navigator).
+`[panes]` also sets `navigator_layout`, the layout the pane navigator (`Ctrl+B /`) opens in: `tree`, `flat` or `cards`. The default is `tree`. Press `v` in the navigator to change the layout. `navigator_search = true` opens it ready to type a search, and `esc` with nothing typed closes it. See [KEYBINDINGS.md](KEYBINDINGS.md#the-pane-navigator).
+
+`[panes] drag_and_drop = true` turns on drag and drop between panes over the kitty drag and drop protocol (OSC 72). A program that speaks it, such as yazi 26.9 or later, can drag files from its pane: hold the left button on a file in terminal mode and carry it to another pane. A pane whose program speaks the protocol takes the drop itself. Any other pane gets the paths as a paste, by the rules of [dragging a file into a pane](#drag-a-file-into-a-pane) below: quoted for the shell in the pane, and refused, with the reason in the label, when that pane could not use a path on this machine. The same rules hold the pane the drag starts from. Dropped text, as against paths, goes only into a pane whose program turned bracketed paste on. tuios reads no file for either side and refuses a drop back into the pane the drag came from. The default is `false`. The protocol is kitty's and still settling, so the switch is off until it is asked for.
+
+`[path_picker]` sets `show_hidden`. With `true`, the path picker (`Alt+;`) shows the names that start with a dot when it opens. The default is `false`. `Alt+H` in the picker shows or hides them. See [KEYBINDINGS.md](KEYBINDINGS.md#pick-a-path).
+
+## Drag a file into a pane
+
+`appearance.sidebar.file_drag` lets you drag a row of the files section onto a
+pane. The pane gets the path, quoted for the shell in the pane. It is on by
+default. `I` on a row does the same for the focused pane, with this option on
+or off. See
+[KEYBINDINGS.md](KEYBINDINGS.md#drag-a-file-into-a-pane).
+
+```toml
+[appearance.sidebar]
+file_drag = false
+```
 
 `[scratch]` sets the size of the box in which `Ctrl+B g` shows the scratch terminal. The old `session` key is no longer used. See [SESSIONS.md](SESSIONS.md#the-scratch-terminal).
 
@@ -417,6 +507,21 @@ animation_speed = 200   # a number from 25 to 400
 A value outside 25 to 400 moves to the nearest end. `appearance.motion = "none"`
 still turns the animations off, whatever the speed. Overlay fades and the copy
 sweep keep their own timing. The copy sweep uses `appearance.selection.flash_ms`.
+
+## Calm mode
+
+`appearance.calm` turns calm mode on. Nothing moves or blinks, and only the
+messages that need you show in the dock. `Ctrl+B Z` (`toggle_calm`) turns it
+on and off and saves the choice here.
+
+```toml
+[appearance]
+calm = true   # default: false
+```
+
+Calm mode sits over `appearance.motion`. When you turn calm mode off, the
+motion level you set comes back. See
+[KEYBINDINGS.md](KEYBINDINGS.md#calm-mode) for what calm mode changes.
 
 ## Theme transition
 
@@ -561,11 +666,16 @@ own text output.
 `tuios mermaid` builds its colours from your tuios theme. `[mermaid] theme`
 picks one of the named diagram themes instead. The `--theme` flag wins over it.
 
+`[mermaid] background` is `theme` (the default) or `none`. With `none`, a kitty
+or png picture has no background, so the diagram is on the background of your
+terminal. The `--background` flag wins over it.
+
 ```toml
 [mermaid]
 theme = "flexoki"   # tuios (the default), pele, flexoki, flexoki-dark, nord,
                     # everforest, gruvbox, rose-pine, catppuccin-mocha,
                     # catppuccin-latte, tokyo-night, dracula, solarized-light, kanagawa
+background = "none" # theme (the default) or none
 ```
 
 ## CharmTone themes
@@ -647,10 +757,7 @@ omarchy: Tokyo Night, from /home/you/.local/state/omarchy/current. tuios follows
 
 ## Colour values
 
-Every colour key in tuios takes the same values: the backgrounds, the
-border colours, `scrollbar.tint`, `[appearance.selection]`, the dock's
-`fg` and `bg` keys, `[dock.tabs]`, the agent row's `fg`, and a theme
-file's `chrome` object.
+Every colour key in tuios takes the same values: the backgrounds, the border colours, `overlay_border_color`, `scrollbar.tint`, `sidebar.cursor_background`, `[appearance.selection]`, the dock's `fg` and `bg` keys, `[dock.tabs]`, the agent row's `fg`, and a theme file's `chrome` object.
 
 | Value | Example | What it is |
 |---|---|---|
@@ -816,6 +923,17 @@ Use only a command that takes an argv and runs it as an argv. Do not use a
 command that joins its arguments into a shell line, such as `swaymsg exec --`
 or `hyprctl dispatch exec`. With such a command, the text of a desktop entry
 becomes shell code. Any installed package can write a desktop entry.
+
+A program from the launcher closes its pane when it exits. Set
+`launcher.keep_open` to keep the pane. A line under the output shows the exit
+status, as with `tuios new-window --keep-open`. Close the pane when you are
+done with it. The option needs a daemon session. With `--standalone` the pane
+closes as before.
+
+```toml
+[launcher]
+keep_open = true
+```
 
 ## Workspace numbers
 
@@ -998,6 +1116,56 @@ With `center`, the grid is off, so `master_grid` has no effect. The first pane
 of the workspace is the master. To make another pane the master, focus it and
 press `Ctrl+B L Enter`.
 
+## Start session and start pane
+
+Two `[startup]` options choose where a plain `tuios` opens. Both are empty by
+default.
+
+| Option | What it does | Default |
+|---|---|---|
+| `startup.session` | The session that `tuios` attaches to. tuios makes the session if it is gone, as `tuios attach NAME -c` does. Empty attaches to the most recent session | empty |
+| `startup.window` | The pane, by name or id, that `tuios` focuses in `startup.session` before it attaches. When no pane has that name, the focus does not change. It needs `startup.session` | empty |
+
+```toml
+[startup]
+session = "home"
+window = "start"
+```
+
+`tuios attach`, `tuios new` and every other command use the session you give
+them, and ignore these options. `startup.session` uses the daemon even when
+`startup.daemon` is `false`. `--standalone` and `TUIOS_NO_DAEMON=1` still run a
+local session. Both options are on the settings page, in the Startup section.
+See [SESSIONS.md](SESSIONS.md#start-session-and-start-pane).
+
+## Scrolling layout
+
+These options shape the scrolling layout. See
+[LAYOUT_MODES.md](LAYOUT_MODES.md#scrolling-layout).
+
+| Option | What it does | Values | Default |
+|---|---|---|---|
+| `appearance.scroll_column_width` | The width of a new column, as a percent of the screen | 20 to `scroll_column_max` | 55 |
+| `appearance.scroll_column_max` | The largest width a column can have, as a percent of the screen | 20-100 | 90 |
+| `appearance.scroll_column_presets` | The widths that `scroll_cycle_width` steps through, as percents of the screen | a list of 1-100 | empty (33, 50, 55, 67, 90 and 100) |
+
+`scroll_cycle_width` sets the focused column to the next width in the list
+that is larger than the current width. After the largest width, it goes back
+to the smallest. tuios sorts the list. It skips a width that is larger than
+`scroll_column_max`. It ignores a value that is not from 1 to 100 and shows a
+config warning. This example cycles a column through a half, two thirds and the
+full screen:
+
+```toml
+[appearance]
+scroll_column_width = 50
+scroll_column_max = 100
+scroll_column_presets = [50, 67, 100]
+```
+
+A change to the list applies when tuios reloads the config. The settings page
+does not show this option. Edit it in `config.toml`.
+
 ## Drop preview
 
 While you drag a tiled pane in BSP, tuios shows where the pane would land if you let go. See [LAYOUT_MODES.md](LAYOUT_MODES.md). The preview is a frame in the accent colour, drawn with the same border characters as the panes. With `fill`, the area inside the frame gets one tint, and the text under it fades into that tint. On a 16-colour terminal the frame is reverse video and the area inside stays as it is. Two options shape that preview:
@@ -1026,7 +1194,8 @@ default. Set it to `false` for flat pills:
 dock_pill_caps = false
 ```
 
-Under ASCII glyphs the workspace tabs have no caps. The rail's pills do not
+Under ASCII glyphs the workspace tabs have no caps. The option also controls
+the ends that `[dock.tabs] caps` puts on flat tabs. The rail's pills do not
 change with this option.
 
 ## Mode pill icons
@@ -1062,6 +1231,15 @@ dock_mode_icon_tiling = ""
   alone. With the default icons, the pill then has the same width as the pill
   of the leader key, so the workspace tabs do not move when you press the
   leader key.
+- `appearance.dock_mode_pill` sets what the pill shows while tiling is on.
+  `tiling` (the default) shows the tiling icon in terminal mode and in window
+  mode. `input` shows the terminal icon or the window icon, and the split
+  letter after it shows that tiling is on.
+
+```toml
+[appearance]
+dock_mode_pill = "input"
+```
 
 To remove the whole mode pill, remove `"mode"` from the `left` list in the
 `[dock]` table. See [The dock's components](#the-docks-components).
@@ -1164,6 +1342,45 @@ window_title_align = "center"
 settings page, in the Appearance section, and `tuios set-config` applies them
 at once.
 
+## Focused border colour
+
+The focused pane's border shows the mode. By default it is the theme's cyan
+in window mode and its green in terminal mode. Three keys set it.
+
+| Option | Values | Default |
+|---|---|---|
+| `appearance.border_focused_color` | a [colour](#colour-values). It sets the border in both modes | empty |
+| `appearance.border_focused_color_window` | a [colour](#colour-values). It sets the border in window mode | empty |
+| `appearance.border_focused_color_terminal` | a [colour](#colour-values). It sets the border in terminal mode | empty |
+
+```toml
+[appearance]
+border_focused_color_window = "accent"
+border_focused_color_terminal = "#ff9e64"
+```
+
+- A key for one mode wins over `border_focused_color` in that mode.
+- An empty key uses the next key. After the three keys, the theme sets the colour.
+- `border_focused_color` also replaces the colours for copy mode and for an
+  agent that waits. The keys for one mode do not.
+- On many themes the cyan and the green have the same lightness. The default
+  terminal mode colour then moves darker, or lighter when darker is too faint.
+  You can then see the mode without the hue.
+- The default unfocused border is darker than both focused borders on a dark
+  background, and lighter on a light one. You can see focus without the hue.
+- Each default focused border has at least twice the contrast of the unfocused
+  border against the background.
+- With no theme, the default unfocused border is a grey near your terminal
+  background. The focused borders use a saturated cyan and green.
+- With `appearance.session_border` on, the focused border in window mode uses
+  the session colour. In terminal mode it uses the terminal mode colour.
+  Terminal mode stands further from the background and is at least as
+  saturated, so it is the more visible of the two. The session colour moves
+  toward the background to make the step.
+- At 16 colours the default borders use bright cyan and bright green, the
+  slots of your terminal's palette.
+- The settings page has a row for each key, in the Appearance section.
+
 ## Focused border gradient
 
 `appearance.border_focused_gradient` draws the focused pane's border in two
@@ -1197,15 +1414,35 @@ border_gradient_angle = 45
 
 The small dialogs, such as rename, confirm and new space, draw their frame in the pane border style, `appearance.border_style`. The larger panels, such as the command palette, the switchers, the Agents view and the settings page, have no frame unless `appearance.frame_panels` is on. Then they take the same frame.
 
+With `appearance.pane_overlays` on, a dialog or a panel looks like a pane window:
+
+- Every panel is framed, as if `frame_panels` were on.
+- The frame takes the focused pane's border colour, because an open dialog or panel is the focused thing. That is `appearance.border_focused_color` when it is set. Otherwise it is the theme's colour for the current mode (copy mode or a waiting agent) or the session's tint.
+- The frame and everything in it sit on the background of an empty pane cell. That is `appearance.pane_background` when it is set, else the terminal's own. The title and hints in the frame line share that background, as they do in a pane.
+- The selected row, the row under the pointer and input fields are steps of that background. On a navy pane, a selected row is a darker navy.
+- Pills keep their own colours.
+
+The option is off by default. Then a dialog or a panel keeps its own shaded background, and its frame keeps its quiet ink. Some cases keep the shade even with the option on:
+
+- Under `hidden`, no frame is drawn, so the shade is a dialog's only edge.
+- At 16 colours every background is the terminal's own, so the option changes only the frame's colour.
+- With no theme, and a terminal that never reports its background, there is no colour to fill the overlay with or to step its rows from.
+
+`appearance.overlay_border_color` sets a colour for every dialog and panel frame, with or without `pane_overlays`.
+
 | Option | Values | Default |
 |---|---|---|
 | `appearance.border_style` | `rounded`, `normal`, `thick`, `double`, `hidden`, `block`, `ascii`, `outer-half-block`, `inner-half-block`, `glyphs` | `rounded` |
 | `appearance.frame_panels` | `true` frames every panel in the border style, `false` leaves the panels without a frame | `false` |
+| `appearance.pane_overlays` | `true` draws dialogs and panels like pane windows, `false` keeps their own shaded background | `false` |
+| `appearance.overlay_border_color` | A colour for every dialog and panel frame: `#89b4fa`, a slot name such as `bright_cyan`, or a role such as `accent`. Empty keeps the frame's own colour, or the focused pane's border under `pane_overlays` | empty |
 
 ```toml
 [appearance]
 border_style = "double"
 frame_panels = true
+pane_overlays = true
+overlay_border_color = "accent"
 ```
 
 How each border style draws a dialog or a framed panel:
@@ -1254,8 +1491,10 @@ new_window_follow_ssh = true
 ```
 
 tuios finds ssh in the foreground of the pane. ssh can run from a shell, or
-from `sshpass`, `autossh` or `mosh`. tuios reads only the processes that you
-own in the pane. It runs the `ssh` or `mosh` that it finds on its own `PATH`,
+from `sshpass`, `autossh` or `mosh`. ssh can also run from another program,
+such as your own helper script (`tt ssh box`). tuios then follows only an
+interactive login: an ssh line with no remote command, and with none of `-s`,
+`-N`, `-T` or `-W`. tuios reads only the processes that you own in the pane. It runs the `ssh` or `mosh` that it finds on its own `PATH`,
 with no shell on this machine. It never runs the program that the pane runs.
 
 The new ssh gets the same environment as an ordinary new pane. If the ssh
@@ -1305,7 +1544,11 @@ These ssh lines get an ordinary pane:
   form, made of letters, digits and `._:@[]-`, or a hop that starts with `-`.
 - A mosh destination that starts with `-`.
 - mosh with `--ssh`, `--client` or `--server`.
-- ssh that another program starts, such as `scp`, `rsync`, `git` or `sftp`.
+- ssh that a file transfer starts: `scp`, `rsync`, `git`, `sftp` or `sshfs`.
+- ssh that another program starts, when the line has a remote command, or
+  `-s`, `-N`, `-T` or `-W`.
+
+When a split asks to follow ssh and gets an ordinary pane, the dock says why.
 
 Put a `ProxyCommand` or a `ProxyJump` in `~/.ssh/config` to use it with a
 split. A split with `-J` on the command line is followed.
@@ -1410,6 +1653,8 @@ inactive_fg   = "#4f5b58"
 number_glyphs = ["I", "II", "III"]  # {icon}: the first entry is workspace 1; past the end prints the number
 zoom_marker   = " [ ]"        # {zoom} on the current workspace while a pane is zoomed
 show_add      = false         # keep the trailing "+" tab in the flat style
+caps          = false         # rounded ends on each flat tab
+active_underline = false      # underline the current tab
 ```
 
 Colours take any [colour value](#colour-values). The colours are overrides:
@@ -1417,6 +1662,44 @@ a flat strip with none set puts the current tab on the theme's accent, in
 bold, and draws the others in dim text on the bar's own ground, so it still
 shows where you are. A value that is not a colour is ignored, with a
 warning, as if it were unset.
+
+The four tab colours (`active_fg`, `active_bg`, `inactive_fg`, `inactive_bg`)
+and `inactive_bold` also apply to pills. A pill with no colour set keeps the
+theme's look. The current pill is always bold, so `active_bold` is for flat
+tabs only.
+
+`active_underline` underlines the tab of the current workspace. When it is not
+set, a pill is underlined and a flat tab is not.
+
+`caps = true` gives each flat tab the rounded ends of a pill. Each end has the
+colour of its tab's background. A tab with no background gets a blank column
+in place of each end, so the tabs keep their width. The ends use the pills'
+glyphs: there are none under ASCII glyphs or with
+`appearance.dock_pill_caps = false`. Pills always have ends, so `caps` with
+the pill style gives a warning.
+
+Flat tabs with your own colours and rounded ends:
+
+```toml
+[dock.tabs]
+style       = "flat"
+caps        = true
+active_bg   = "magenta"
+active_fg   = "bg"
+active_bold = true
+inactive_bg = "bright_black"
+inactive_fg = "fg"
+```
+
+Pills with your own colours and no underline:
+
+```toml
+[dock.tabs]
+active_bg        = "magenta"
+active_fg        = "bg"
+inactive_bg      = "bright_black"
+active_underline = false
+```
 Besides `{index}` and `{name}`, the tab format takes `{icon}` and `{zoom}`.
 `{index}` is the workspace's number, which is its position: dragging a tab to
 another place, or moving the workspace with `move_workspace_left` and
@@ -1581,6 +1864,156 @@ A row that waits for a person keeps its attention mark in the gutter. The
 marker glyph is the `marker` role of the glyph set (see [GLYPHS.md](GLYPHS.md)).
 The option is on the settings page, in the Sidebar section.
 
+The focused pane's row in the terminals section carries the mark. Sometimes
+the rail does not show that row. The agents row of the pane then carries the
+mark in its gutter. This occurs in these cases:
+
+- `sections` does not include `terminals`.
+- The rail is narrow and lists an agent pane only in the agents section.
+- The terminals section has no room for the row.
+- The terminals section shows the panes of another session.
+
+The agents row uses the bar or the marker. With `underline` or `pill`, it
+uses the bar.
+
+## Pick a path from the files
+
+The path picker types a path at the cursor of a pane. It lists the same folder
+as the files section: the folder that the shell in the pane is in. Press
+`Alt+;` in terminal mode, or `Ctrl+B .`. Type to filter, `Tab` to open a
+folder, and `Enter` to type the path. See
+[KEYBINDINGS.md](KEYBINDINGS.md#pick-a-path).
+
+## Where worktrees go
+
+`tuios worktree new`, `New worktree...` on the rail and `tuios fan` make a
+git worktree for each new session. By default it goes in
+`$XDG_DATA_HOME/tuios/worktrees/<repo>/<branch>`, outside the repository.
+`[worktree] path` puts it somewhere else, given as a path template:
+
+```toml
+[worktree]
+path = "{{ repo_path }}/.worktrees/{{ branch | slug }}"
+```
+
+| Variable | What it holds |
+|---|---|
+| `repo_path` | The main checkout's directory |
+| `repo` | Its base name |
+| `branch` | The branch, as given |
+
+`| slug` turns a value into one folder name: `feat/retry` becomes
+`feat-retry`. Use it on `branch`. Without it, `{{ branch }}` keeps the slash
+and makes a folder per part, so the worktree of `feat/x` lands inside the
+worktree of `feat`, and `tuios worktree rm --force` on `feat` deletes both.
+A relative path starts at `repo_path`, so `.worktrees/{{ branch | slug }}` is
+the same as the example above. A leading `~/` is your home folder. The
+template has to use `branch`, or every branch would get the same folder.
+
+The variables are the ones worktrunk's `worktree-path` uses, and `| sanitize`
+is another name for `| slug`, so a template copied from a worktrunk config
+works as it is. worktrunk's `sanitize` turns only `/` and `\` into `-`, while
+`slug` turns every run of characters other than letters, digits, `.` and `_`
+into one `-`. A branch with other characters, such as `fix--retry` or
+`feat+x`, can get a different folder name from each tool.
+
+When the worktree is inside the repository and git does not ignore it, the
+main checkout lists it as untracked, and `git add -A` there would take it in.
+tuios then warns after it makes the worktree and names the folder that holds
+the worktrees, such as `/.claude/worktrees/` for
+`.claude/worktrees/{{ branch | slug }}`, to add to `.gitignore` or
+`.git/info/exclude`. It never edits those files itself.
+
+The daemon makes every worktree, so it reads the setting, when it starts and
+when the file changes. The path is then the same whichever client asked.
+Empty is the default. While it is empty, `TUIOS_WORKTREE_DIR` in the daemon's
+environment still moves the default folder (see
+[CLI_REFERENCE.md](CLI_REFERENCE.md#tuios_worktree_dir)).
+
+## The main checkout in the sessions tree
+
+`appearance.sidebar.group_main` gathers the repository's main checkout under
+the repo row with its worktrees. The main checkout is the session whose
+directory is the repository itself, usually on `main` or `master`. The option
+is `false` by default,
+which leaves the main checkout's sessions flat in the list and groups only
+the worktrees split off the repository.
+
+```toml
+[appearance.sidebar]
+group_main = true
+```
+
+With it on, a session in the main checkout is one of the group's children,
+labelled by its branch like the rest, and the repo header points at it:
+`enter` or a click on the header opens the main checkout's session instead of
+folding the group, and opens the group first when it was folded. The fold
+gesture stays on the header's right-click menu, as `Fold group` and
+`Unfold group`. The option is on the settings page, in the Sidebar section.
+
+Independent of the option, the daemon now records the main checkout the way
+it records a worktree, so `tuios worktree ls` and the worktree verbs see it
+alongside the worktrees it was split into.
+
+## The files section style
+
+`appearance.sidebar.files_style` sets how the rail's files section shows a
+folder:
+
+| Value | What it shows |
+|---|---|
+| `list` | One folder. `..` goes up, and a folder row goes into the folder. This is the default |
+| `tree` | One tree from the folder. A folder opens under its own row, with indent guides and an open or closed mark |
+
+```toml
+[appearance.sidebar]
+files_style = "tree"
+```
+
+In the tree, the rail has these keys on a name:
+
+| Key | What it does |
+|---|---|
+| `l`, `right` | Open the folder. On an open folder, go to its first name |
+| `h`, `left` | Close the open folder. On another name, go to its folder |
+| `enter`, a click | Open or close the folder. On a file, do what the list does |
+
+The file action keys (`a`, `r`, `d`, `y`, `x`, `p`, `Y`, `S`) act on the name
+under the cursor. A new file or a paste goes into the folder of that name. On
+an open folder, it goes into that folder. With `folder_click = "cd"`, a folder
+row types a cd into the pane and does not open. With `both`, a folder row
+only opens, because a cd moves the root of the tree to that folder.
+
+In both styles, `g` and `G` on a file go to the first or last name of the
+list. Press the key again to go to the first or last row of the rail.
+
+tuios reads a folder only when you open it. It remembers the open folders of
+each session until tuios stops. You can open 64 folders at most. Each open
+folder shows its first 2000 names. tuios watches each open folder on this
+computer and shows a change without a key. A folder that is open under a
+folder on another computer shows a change when you open it again. When tuios
+sees that an open folder is gone, it closes the folder. A new folder with the
+same name starts closed.
+
+## The rail's cursor row
+
+When the rail has the keyboard, the row under the cursor has a lighter
+background, and its text is bold and underlined in the accent colour.
+`appearance.sidebar.cursor_background` sets the background of that row.
+
+```toml
+[appearance.sidebar]
+cursor_background = "#3b4261"   # or a slot name, such as "blue", or a role, such as "accent"
+```
+
+The value is a [colour](#colour-values). Empty, the default, keeps the
+theme's background for the cursor row. The colour does not change the text
+colour, so choose a colour that your text is readable on. The option sets
+only the row under the cursor while the rail has the keyboard. The rows under
+the mouse pointer and the cursor of an unfocused rail keep their own
+background. At 16 colours, the option has no effect: the cursor row is in
+reverse video. The option is on the settings page, in the Sidebar section.
+
 ## The rail's section headers
 
 `appearance.sidebar.header_style` sets how a section header is drawn:
@@ -1618,6 +2051,14 @@ density = "roomy"
 ```
 
 The panes do not move. Only the rail's rows change.
+
+## The rail's cursor row
+
+When the rail has the keyboard, the cursor row has a lighter background. The
+text of the row is also bold and underlined in the accent colour. This mark
+does not need the background, so you can see the cursor on a see-through
+terminal or with `background = "off"`. The gutter keeps its own marks. At 16
+colours the cursor row is in reverse video.
 
 ## A rail section that overflows
 
@@ -1680,6 +2121,49 @@ place the section. `[appearance.sidebar.custom]` is read from the file only:
 the command runs outside every pane on every refresh, as dock commands and
 hooks do, and in the default open mode any pane can call `set-option`, so
 the command stays out of its reach, as `daemon.respond_from_shell` does.
+
+## The rail's pane section
+
+The rail can show a live terminal pane under its own heading. Place `pane` in
+`appearance.sidebar.sections` and describe it in `[appearance.sidebar.pane]`:
+
+```toml
+[appearance.sidebar]
+sections = "sessions:25,terminals,files:25,pane,agents:34"
+
+[appearance.sidebar.pane]
+title   = "tv"
+command = "tuiostv-helper view"
+height  = 12
+```
+
+| Key | Meaning |
+|---|---|
+| `title` | The section's heading. Defaults to `pane`. |
+| `command` | The program the pane runs, through `sh -c` (`cmd /C` on Windows). |
+| `height` | The most rows the pane takes. `0` or unset takes the section's share, such as `pane:30` in the layout. |
+
+The program runs in a real terminal in the session, so it survives a detach.
+The pane is not one of your panes: tiling, layouts, the terminals section and
+`tuios list-windows` leave it out. `tuios list-windows --rail` lists it.
+
+The pane is as wide as the rail's content and as tall as the lines the section
+gets. When the rail changes size, the program gets the new size. When the rail
+is hidden, folded, narrower than 10 columns or gives the section no lines, the
+program keeps running at its last size and the client draws nothing for it. An
+idle program costs no frames. The pane shows text only: kitty images are not
+drawn in the rail.
+
+Click the pane, or press `P` in window mode (`focus_rail_pane`), to type into
+it. A program that asks for the mouse gets clicks, motion and the wheel.
+`alt+esc`, a click outside the pane, or the leader key gives the keyboard back.
+`esc` goes to the program.
+
+When the program exits, the pane closes and the section says so. Click the
+line to start it again. A session has one rail pane, and only the main rail
+draws it. If two clients name different commands, the last one to ask
+replaces the pane. `[appearance.sidebar.pane]` is read from the file only, for
+the reason `[appearance.sidebar.custom]` is.
 
 ## Turn off agent features
 
@@ -1773,6 +2257,34 @@ needs version 2 of the integration:
 run `tuios integration install claude-code` (or `opencode`, `kilo`, `qwen`)
 again after upgrading. [AGENT_STATE.md](AGENT_STATE.md#approvals-from-the-inbox) says how
 a prompt is held, answered and handed back.
+
+## The pane bell
+
+A program in a pane rings the bell when it prints the BEL character. For
+example, `printf '\a'` rings it. `notifications.bell` sets what tuios does then:
+
+```toml
+[notifications]
+bell = "toast"   # or "forward", "both", "off"
+```
+
+- `toast` shows "bell" in the dock. This is the default.
+- `forward` sends the bell to the terminal that tuios runs in. That terminal
+  then plays its sound, flashes, or marks the window or tab.
+- `both` does the two.
+- `off` does neither.
+
+tuios sends the bell for every pane, also for the pane you are in. It sends
+at most one bell from each pane in 200 milliseconds. A client attached to the
+daemon sends the bell to its own terminal. Over `tuios ssh` and in tuios-web,
+the bell goes to that client, not to the machine that runs tuios.
+
+The terminal decides what a bell does. In Ghostty, for example, set
+`bell-features` to choose a sound, an attention request or a title mark.
+
+The workspace bell marker does not change with this setting. Set
+`bell_marker` under `[dock.tabs]` to change it. You can also change
+the setting on the settings page, in the "Alerts" tab, as "Pane bell".
 
 ## Push notifications to your phone
 
@@ -1963,6 +2475,37 @@ when it starts and again when the file changes. A change applies to the next
 pane. [AGENT_STATE.md](AGENT_STATE.md#herdrs-pane-state-protocol) says what is
 accepted.
 
+## Show a hooked agent that stops reporting
+
+A hooked agent reports at each prompt and each tool call. When it sends no
+report for `silent_after`, tuios shows it as `unknown` with the reason
+`silent`, and its row reads "No report for N min":
+
+```toml
+[agents]
+silent_after = "10m"   # default; "0" or "off" turns it off
+```
+
+The value is a Go duration, such as `90s` or `20m`. A value that does not
+parse reads as `10m`, with a warning. The daemon reads the value when it
+starts and again when the file changes. See
+[Silent agents](AGENT_STATE.md#silent-agents).
+
+## Fold the Working group
+
+The agents view (`ctrl+b i`) can open with the Working group folded. A folded
+group shows its heading, its count and the state mark of each agent in it.
+
+```toml
+[agents]
+fold_working = true   # default false
+```
+
+`F` folds or opens any group in the view. tuios keeps that choice in
+`sidebar.json` in its state folder (`$XDG_STATE_HOME/tuios` on Linux). The
+choice wins over `fold_working`. The settings page has this option on the
+Behavior tab, as "Fold Working".
+
 ## Report pane states to your terminal
 
 When tuios runs in a terminal that reads OSC 7501, the Program Status
@@ -1997,6 +2540,7 @@ find a plugin runs nothing. A plugin runs only when its id is in `enabled`.
 `tuios plugins install SOURCE` writes `plugins.lock` beside `config.toml`.
 It pins each installed plugin to one commit. Keep the file with your config,
 and run `tuios plugins install` on a new machine to get the same commits.
+`tuios plugins uninstall ID` removes the plugin from the file.
 
 An enabled plugin runs its commands with your rights, outside every pane.
 Enable only plugins that you trust.
@@ -2009,6 +2553,7 @@ tuios plugins enable example.notes
 tuios plugins disable example.notes
 tuios plugins link ~/src/my-herdr-plugin
 tuios plugins install owner/repo        # also adds the id to enabled
+tuios plugins uninstall example.notes   # also removes the id from enabled
 ```
 
 You must run them from a terminal outside tuios. A change to the file that
@@ -2204,6 +2749,35 @@ from protocol panes, and a key the harness never states draws nothing (see
 [Agent metadata](AGENT_STATE.md#what-feeds-it)). No option is needed to turn
 the feeds on, and there is nothing to configure for them.
 
+## The task board
+
+`b` in the agents view shows the task board: the cards of every session,
+grouped by stage ([AGENT_STATE.md](AGENT_STATE.md#the-agents-view)). `[tasks]
+stages` picks the stages it shows. The order stays todo, plan, doing, verify,
+review, shipped, done whatever the list's order, and a stage the list leaves
+out has no head. Empty, or naming no known stage, shows every stage. An
+unknown name is reported as a config warning and ignored.
+
+```toml
+[tasks]
+stages = ["todo", "doing", "verify"]
+```
+
+tuios moves a card on its own when it records a fact about the card's work: a
+plan held for approval and then approved, a fan check, a pull request
+opening, merging or closing ([CLI_REFERENCE.md](CLI_REFERENCE.md#tuios-task)
+has the table). A move fires only from the stages that fact moves a card
+from, never on a blocked or done card, and the card's history names the
+reason. The plan stage is reached only when `[agents.approvals]` holds plans
+for the harness and the pane is not in front of you. `auto_stage = false`
+leaves every stage to you. A fan's stamp on a card (`tuios fan --task`) is
+still written, though the card then stays where it is.
+
+```toml
+[tasks]
+auto_stage = false
+```
+
 ## What a pane may do
 
 Every pane holds grants that say what a process in it may do through tuios:
@@ -2244,6 +2818,17 @@ mode = "strict"
 grants = ["read", "write", "fan", "files"]
 ```
 
+`task` lets a pane add, claim and finish the task cards of its own session
+(`tuios task`) without `admin`. A pane claims only for itself and changes only
+the card it holds. `admin` includes `task`. Under `strict`, give it to the
+panes that take work from a conductor:
+
+```toml
+[agents.permissions]
+mode = "strict"
+grants = ["read", "write", "fan", "task"]
+```
+
 The daemon reads the table when it starts and again when the file changes. A
 change that gives panes less reaches every pane on the default at its next
 call. A change that gives more, such as `strict` to `open`, waits, because a
@@ -2257,6 +2842,55 @@ change it, so no pane can loosen it. The [paste buffers](#paste-buffers) hold
 what you copied, so a pane needs `read` to read them, `write` to change them,
 and both to paste one.
 [AGENT_STATE.md](AGENT_STATE.md#what-a-pane-may-do) has the whole model.
+
+## SSH server limits
+
+The `[ssh]` section sets the limits of the `tuios ssh` server. The server reads
+it when it starts. The defaults do not stop a normal login.
+
+```toml
+[ssh]
+handshake_timeout = "120s" # time to finish the login; 0 turns the limit off
+idle_timeout = "0"         # close a connection with no traffic for this long; 0 is off
+max_handshakes = 32        # connections that log in at the same time; 0 is no limit
+max_sessions = 64          # sessions open at the same time; 0 is no limit
+```
+
+- `handshake_timeout`: The server closes a connection that does not log in
+  within this time. It is the same as `LoginGraceTime` in OpenSSH. The limit
+  ends when the login is complete, so it does not close a session that you
+  use.
+- `idle_timeout`: The server closes a connection after this time with no
+  traffic in either direction. It is off by default. A session that shows a
+  clock or other output that changes stays open.
+- `max_handshakes`: When this many connections are logging in, the server
+  closes a new connection at once. A connection that is logged in does not
+  count.
+- `max_sessions`: When this many sessions are open, over all connections, the
+  server refuses a new session. The client sees a message. The refused session
+  does not attach to a session and does not open a pane.
+
+A duration is a value such as `90s`, `30m` or `2h`. A value that does not
+parse, or a negative value, gives a warning and the default.
+`tuios ssh --handshake-timeout`, `--idle-timeout`, `--max-handshakes` and
+`--max-sessions` replace these values for one run. The server writes the limits
+it uses to its log when it starts.
+
+Like `[hosts]`, the section is not in `list-options`, and `tuios set-config`
+cannot change it.
+
+## Move between machines
+
+The `next_host` and `prev_host` keybind actions go to a session on the next or
+the previous machine: this machine first, then the `[hosts]` table. They have
+no default key. See
+[KEYBINDINGS.md](KEYBINDINGS.md#cycle-through-machines).
+
+```toml
+[keybindings.window_management]
+next_host = ["alt+."]
+prev_host = ["alt+,"]
+```
 
 ## What another machine may do here
 
@@ -2285,7 +2919,7 @@ allow = ["list", "mail"]
 | `open` | Start processes: sessions, windows, worktrees, fans, `start-agent`, clones of a repository by its URL, and panes this machine runs for it. |
 | `write` | Change what is here: type into panes, `run` a line at a prompt, close and move windows, set options, layouts and names, report agent state, and attach. Also read a worktree's work out with `bundle-worktree` (`tuios worktree pull`), since a machine that may type into a shell here can read those files already. |
 | `respond` | Answer for the person: prompts, held approvals, `ask-human` questions, dismissing Inbox items, and passing on held mail. Also type into a pane that waits on a prompt, from a pane on the other machine. The person on the other machine, outside every pane, needs only `write` for that. |
-| `files` | Read and write files here with the file verbs: a file's bytes, copies in and out (`transfer-start` on the other machine), new folders, moves and removes. It is apart from `write`, so you can stop one machine's copies and keep its typing. A write that arrives over the link lands only in the folders of `files_roots` (the receive folder unless you add more, see below), and the drop folder for dropped files, never in `~/.ssh`, `~/.gnupg`, credentials, shell start files, login items or tuios's own config, whatever `allow` and `files_roots` say. A read never returns keys or credentials. See [protocol.md](protocol.md#files-and-transfers). |
+| `files` | Read and write files here with the file verbs: a file's bytes, copies in and out (`transfer-start` on the other machine), new folders, moves and removes. It is apart from `write`, so you can stop one machine's copies and keep its typing. A write that arrives over the link lands only in the folders of `files_roots` (the receive folder unless you add more, see below), and the drop folder for dropped files, never in `~/.ssh`, `~/.gnupg`, credentials, shell start files, login items or tuios's own config, whatever `allow` and `files_roots` say. A read never returns keys or credentials. It also lets a window here that the other machine draws show kitty images that a program names by path (`kitten icat --transfer-mode=file`): this machine reads the file under the same read rules and `files_read_roots`, and sends the bytes. See [protocol.md](protocol.md#files-and-transfers). |
 
 With no table, a machine may `list`, `mail`, `open`, `write` and `files`,
 which is what every link could do before the policy existed. `respond` is
@@ -2311,13 +2945,23 @@ files_roots = ["~/Downloads/tuios", "~/dev"]
 
 A path is absolute or starts with `~`. `files_roots = ["~"]` lets the machine
 write anywhere in your home folder; the deny list below still holds inside
-every root, so even then it cannot touch `~/.ssh` or a shell start file. A
-write outside the roots is refused, and the refusal says where writes may land
-and which setting to change. A reload that widens `files_roots`, like one that
-widens `allow`, waits for `tuios config apply`.
+every root, so even then it cannot touch `~/.ssh`, a shell start file, or the
+config folders of the agent harnesses tuios integrates (Claude Code, Codex,
+Gemini CLI, opencode, Cursor and the others), which name commands those tools
+run. A write outside the roots is refused, and the refusal says where writes
+may land and which setting to change. A reload that widens `files_roots`, like
+one that widens `allow`, waits for `tuios config apply`.
+
+**The mode of a file a link writes.** A file that another machine writes here
+gets the sender's permission bits under this machine's umask, as `cp` and
+`scp` without `-p` do. It never gets group or world write. The execute bits
+stay, so a script stays runnable. This holds for a paired device too.
 
 **Where a link may read: `files_read_roots`.** Unset, a machine with `files`
-reads any file you can read, apart from the read deny list: keys, credentials,
+reads any file you can read, apart from the read deny list: keys, credentials
+(also the logins and API keys of agent tools such as Gemini CLI, opencode, Qwen
+Code, Kilo, Pi, oh-my-pi, Hermes, Amp and the Copilot CLI, Cursor's MCP servers, the sops age keys, atuin's
+key and history, Ollama's key, and the OCI, doctl and ngrok credentials),
 shell start files, `~/.gitconfig`, keyrings, shell histories, browser profiles,
 `/proc` and tuios's own state. A
 deny list can never name every secret on a machine. Set `files_read_roots` to
@@ -2343,13 +2987,22 @@ whole number with `B`, `KB`, `MB`, `GB`, `TB`, `KiB`, `MiB`, `GiB` or `TiB`.
 `tuios config apply`. A write that does not fit is refused as
 `disk_full` before a byte moves. One machine may have at most 8 write streams
 and 64 unfinished part files here at once. Past that, a write is `busy`, and
-a copy waits and tries again. The drop folder holds at most 256 MiB for all
+a copy waits and tries again.
+
+A machine may also make at most `files_max_entries` new files and folders
+here in ten minutes: 20,000 unless you set it. An empty file uses no bytes,
+so `files_min_free` does not stop a machine from making millions of them.
+Past the bound, a new file or folder is `busy`, and a copy waits and goes on.
+The count goes down evenly over the ten minutes. A folder copy of 20,000 files
+lands at full speed, and a larger one goes on at about 33 files a second.
+`0` turns the bound off. A reload that raises it waits for `tuios config apply`. The drop folder holds at most 256 MiB for all
 drops together, and a machine writes there only inside a drop that
 `file-drop-dir` made.
 
 ```toml
 [hosts."*"]
 files_min_free = "5GiB"
+files_max_entries = 50000
 ```
 
 A copy that another machine starts here with `transfer-start` or `drop-files`

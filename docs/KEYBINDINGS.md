@@ -46,7 +46,7 @@ uses that leader. The offer changes nothing until you press `U` and Enter.
 | `tuios` | `ctrl+b` | The tuios keys. This is the default |
 | `tmux` | `ctrl+b` | tmux 3.8's keys after the leader |
 | `screen` | `ctrl+a` | GNU screen's keys after the leader, also on the control variant (`ctrl+a ctrl+n`). `ctrl+a ctrl+a` goes to the last workspace. `ctrl+a a` sends `ctrl+a` to the pane |
-| `zellij` | `ctrl+g` | zellij's unlock-first keys. After `ctrl+g`, `p` opens pane mode (the window menu), `t` tab mode (the workspace menu), `s` copy mode and `o` the session switcher. The next key runs one action. In pane mode `r` splits right, `d` splits down, `f` zooms, `h` `j` `k` `l` move focus and `c` renames. In tab mode `n` opens a workspace, `x` closes it, and `h` and `l` go to the previous and next |
+| `zellij` | `ctrl+g` | zellij's unlock-first keys. After `ctrl+g`, `p` opens pane mode (the window menu), `t` tab mode (the workspace menu), `s` copy mode and `o` the session switcher. The next key runs one action. In pane mode `r` splits right, `d` splits down, `f` zooms, `h` `j` `k` `l` move focus and `c` renames. In tab mode `n` opens a workspace, `x` closes it, and `h` and `l` go to the previous and next. It turns on [lock mode](#lock-mode) |
 
 - A tmux window is a workspace here. A tmux pane is a window here. So `c`,
   `n`, `p`, `l`, `0` to `9`, `,` and `&` act on workspaces.
@@ -79,6 +79,77 @@ uses that leader. The offer changes nothing until you press `U` and Enter.
 `tuios keybinds cheatsheet tmux` shows the keys in three groups: the keys that
 work as in tmux, the tuios keys that moved, and what tmux has that tuios does
 not. `tuios keybinds preset show tmux` prints the preset file.
+
+## Lock mode
+
+Lock mode gives every key to the program in the pane. It is the locked mode of
+zellij. Turn it on in `config.toml`:
+
+```toml
+[keybindings]
+lock = true
+```
+
+The zellij preset turns it on. Set `lock = false` to turn it off under that
+preset.
+
+- In terminal mode, tuios takes only the leader. Every other key goes to the
+  pane, also the keys that tuios binds. `alt+1` to `alt+9`, `alt+n`,
+  `alt+esc`, `ctrl+p`, the arrow keys with `alt`, `shift+up` and the hold key
+  all go to the pane.
+- The leader unlocks. Press the leader, then the keys of one action. The
+  action runs and tuios locks again.
+- A repeatable action keeps its menu open. These are the actions in
+  `keybindings.repeat`, such as focus moves and resize steps. Press the key
+  again to move again. You do not press the leader again.
+- The open menu then takes only repeatable keys. Any other key closes the
+  menu and goes to the pane, and tuios locks again. For example, `x` after
+  `ctrl+b left right` goes to the pane. It does not close a pane. The
+  which-key panel of the open menu shows only the repeatable keys and `esc`.
+- Press `esc` to close the menu and lock again. `ctrl+c` also closes it.
+- Press the leader to close the menu and open a new leader menu.
+- A key that the open menu does not bind closes the menu. The key goes to the
+  pane.
+- To go to window mode, press the leader, then `esc`.
+- To send the leader to the pane, press the leader two times.
+- Window mode, overlays, copy mode and the mouse do not change.
+
+The mode pill in the dock shows a lock when tuios is locked. It shows an open
+lock while the leader or a menu waits for a key. Without Nerd Fonts, the pill
+shows `LOCK` and `UNLOCK`. When the dock is hidden, or
+`appearance.dock_prefix_indicator` is `"badge"`, the floating badge shows
+`PREFIX` and the open lock while a menu waits for a key.
+
+## Nest mode
+
+Nest mode gives every key to the program in the pane, the leader too, until
+you press one key to end it. It is tmux-matryoshka's prefix `Enter`, for a
+tmux in the pane, or a tuios on another machine, that uses the same leader.
+The `nest` action turns it on. Its default key is the leader, then `enter`,
+in every preset. To put it on a key of its own:
+
+```toml
+[keybindings.terminal_mode]
+nest = ["alt+shift+enter"]
+```
+
+- In terminal mode, every key goes to the focused pane: the leader, the keys
+  tuios binds and the hold key. A nested tmux gets its own `ctrl+b`.
+- `F12` ends nest mode. It does not go to the pane. Set
+  `keybindings.nest_exit_key` to use another key. A key that tuios cannot
+  read goes back to `F12`, so nest mode always has a way out, and a key that
+  programs type, such as a letter or `enter`, is reported in the log viewer.
+- Overlays opened with the mouse, copy mode and the mouse itself do not
+  change. A drag or a resize with the mouse keeps nest mode on.
+- While the sidebar has the keyboard, it takes the keys. Press `esc` to give
+  them back to the pane in nest mode.
+- Nest mode belongs to the client, not to the session. Another client on the
+  same session keeps its keys. It ends when the client leaves terminal mode,
+  and on detach.
+
+The mode pill in the dock shows `NEST F12`, and the focused pane's border
+takes the same colour. When the dock has no mode pill, the floating badge
+shows `NEST F12`.
 
 ## The full list
 
@@ -113,7 +184,9 @@ on a terminal too.
 
 ## Editing sidebar files
 
-Focus the sidebar with `s` in window mode or `Ctrl+B e`, then select a file.
+Focus the sidebar with `s` in window mode or `Ctrl+B e`, or walk into it with
+the terminal-mode focus keys from the outermost window (see Moving focus), then
+select a file.
 With both sidebar edges visible, `e` while the sidebar has keyboard focus
 switches focus to the other edge; press it again to return. `Ctrl+B H` toggles
 the independently configured opposite rail without changing the original
@@ -127,6 +200,44 @@ not text. The binding is `file_edit` in `[keybindings.sidebar_files]`.
 `Y` copies the absolute path of the selected file or folder. The context menu
 of a folder has a Copy path row that does the same. The binding is
 `file_copy_path` in `[keybindings.sidebar_files]`.
+
+`I` pastes the path of the selected file or folder into the focused pane. The
+context menu of a row has a Paste path in pane row that does the same. The
+binding is `file_insert_path` in `[keybindings.sidebar_files]`.
+
+### Drag a file into a pane
+
+You can also drag a row with the mouse. Press a row, move the pointer out of
+the sidebar, and release the button over a pane. The pane gets the path.
+
+- While you drag, the row in the sidebar looks picked up.
+- A heavy frame in the accent colour shows the pane under the pointer. A pane
+  that does not take the path gets the frame in the warning colour.
+- A label at the pointer shows the name, the pane and the program in the pane.
+- `Esc` cancels the drag.
+- A release over the sidebar, the dock or an empty area does nothing.
+- A click that stays in the sidebar does what a click on the row did before.
+
+After the drop, the pane has the focus and the mode does not change.
+
+tuios quotes the path for the program in the pane. It knows sh, bash, zsh,
+dash, ksh, fish, nu, csh, PowerShell, elvish and cmd. Other programs get POSIX
+single quotes. A folder path ends in `/`. A space follows the path, so you can
+type the next word. Hold `Alt` when you release a folder to type a cd to it.
+The path goes in as a paste. A program that turned on bracketed paste gets it
+as one paste.
+
+tuios does not paste the path in these cases. The label and a dock note say
+why.
+
+- The pane is on another machine.
+- The pane runs ssh or mosh, or its shell reports a folder on another machine.
+- The file is in a listing from another machine.
+- The name holds a line break or a control character.
+- The pane is in copy mode.
+
+A drag never copies or moves the file. To turn the drag off, set
+`appearance.sidebar.file_drag = false`.
 
 When the session runs on another machine, tuios does not check the file on your
 machine. If the editor is not on that machine, no pane opens. tuios shows a
@@ -148,6 +259,31 @@ tuios makes the folder when it is not there. A file that is there stays, and
 the copy gets the name `name (from HOST).ext`. The context menu of a row has a
 Send to host row that does the same. The binding is `file_send` in
 `[keybindings.sidebar_files]`.
+
+`Space` shows a quick look preview of the selected row. The preview opens over
+the panes and shows:
+
+- code with syntax colours and line numbers,
+- Markdown as formatted text,
+- a picture, a PDF page or a film frame,
+- the names in a folder.
+
+A file that is not text shows its type and size. A long text shows its first
+5000 lines, and the preview says so. Turn the mouse wheel over the preview to
+scroll it.
+
+`Up` and `Down` (or `j` and `k`) move the cursor to the next row, and the preview
+shows that row. `Space` or `Esc` closes the preview. A click outside it closes
+it too. The preview takes no other key: every other key goes to the sidebar.
+When the sidebar loses keyboard focus, the preview closes.
+
+For a listing on another machine, that machine reads the file and sends the
+preview. Its host policy must allow `files`. The binding is `file_quick_look`
+in `[keybindings.sidebar_files]`.
+
+A picture uses Kitty graphics when the terminal supports them. Other terminals
+get block characters. At 16 colours the preview names the picture and does not
+draw it.
 
 `Ctrl+B f` searches file names below the directory of the focused pane. It also
 works while you type in a pane. `Ctrl+F` searches below the folder that the
@@ -204,9 +340,13 @@ Four keys move focus to the window in a direction. Each key has a binding in win
 
 Focus goes to the nearest window that lies in that direction and faces the focused window. At the edge of a tiled layout, focus stays where it is. With tiling off, a window that does not face the focused window can also get focus.
 
+Set `appearance.focus_wrap = true` to wrap focus at the edge of a tiled layout. Focus then goes to the window on the far side that faces the focused window. For example, left from the leftmost window goes to the rightmost window in the same rows. A window that fills the layout in that direction keeps focus. The option is off by default. See [CONFIGURATION.md](CONFIGURATION.md#wrap-focus-at-the-edge).
+
+The terminal-mode and prefix keys go on into the sidebar. When no window lies in that direction and the sidebar is shown on that edge, the sidebar gets the keyboard, as `s` in window mode does. With `focus_wrap` on, focus wraps first. The sidebar gets the keyboard only when no window is on the far side. The key in the opposite direction gives the keyboard back to the window you came from. A hidden sidebar stays hidden.
+
 With tiling off, `h` and `l` snap the focused window to the left or right half of the screen. `j` and `k` always move focus. The actions are `snap_left`, `snap_right`, `focus_down` and `focus_up` in `[keybindings.layout]`.
 
-In the scrolling layout, left and right move between columns. Up and down move between the windows in one column.
+In the scrolling layout, left and right move between columns. Up and down move between the windows in one column. With `focus_wrap` on, up and down wrap inside the column. Left and right do not wrap.
 
 ## Finding a pane
 
@@ -281,6 +421,14 @@ title, folder, running command, session and workspace. It also reads the last
 matching line on its row. `esc` stops the search and keeps the results. A
 second `esc` clears the search.
 
+To open the navigator ready to type, so `Ctrl+B /` then a name finds a pane,
+set this in `config.toml`. `esc` with nothing typed then closes it.
+
+```toml
+[panes]
+navigator_search = true
+```
+
 The current session's panes are read from your client, and the preview of
 those panes is live. The other sessions are read when the navigator opens.
 Their preview shows the screen as it was then, with its colors. The preview
@@ -331,7 +479,9 @@ Workspaces and panes are listed for the sessions on the machine you are attached
 The optional [tuios-nvim-navigator](https://github.com/Tim4c/tuios-nvim-navigator)
 plugin lets the terminal-mode focus keys move through Neovim splits first. The
 feature is off by default. Set `appearance.nvim_navigation = true` to enable
-it. At a split edge, TUIOS moves to the adjacent pane instead. The plugin
+it. At a split edge, TUIOS moves to the adjacent pane instead, or into the
+sidebar when the pane is the outermost one on that side. With
+`appearance.focus_wrap = true`, TUIOS wraps to the pane on the far side first. The plugin
 announces when it is active, so the same keys keep their normal TUIOS behaviour
 in shells and other programs.
 
@@ -370,7 +520,14 @@ the tape manager.
 | `pgup`, `pgdown` | A page up or down, stopping at the ends |
 | `k`, `j`, `g`, `G` | Up, down, first and last, in a list with no filter to type into |
 | `ctrl+u` | Clear a typed filter (fixed) |
+| `alt+backspace`, `ctrl+w`, `ctrl+backspace` | Delete the last word of a typed filter (fixed). `alt+backspace` is `Option+Backspace` on a Mac whose terminal sends Option as Alt |
 | wheel | Scroll the list under the pointer, stopping at the ends (fixed) |
+
+The word keys take a word the way the shell's `Option+Backspace` does: they skip
+the characters at the end that are not part of a word, then take the word. A word
+is letters, digits and `_`, and a blank, `/`, `.` or `-` ends one. So
+`src/dir1/dir2` becomes `src/dir1/`, then `src/`, then nothing. Every short text
+field in tuios takes them, the rename, file and new worktree dialogs among them.
 
 The movement keys are the `[keybindings.lists]` section. Each action takes the
 keys that do it:
@@ -440,9 +597,11 @@ One dialog renames a window, a session and a workspace. It opens holding the cur
 | `enter` | Save the name |
 | `esc` | Cancel |
 | `ctrl+u` | Clear the field |
+| `alt+backspace`, `ctrl+w`, `ctrl+backspace` | Delete the last word |
 | `ctrl+c` | Clear the field, or cancel when it is already empty |
 
 A click on the `clear` hint in the dialog's border clears the field too. In the help's search, `ctrl+u` clears the query.
+
 
 ### Mode keys in the dock
 
@@ -475,7 +634,7 @@ no space in it, such as a long path, is cut where the room ends.
 | Keys | Where | What it does |
 |---|---|---|
 | `ctrl+b N` | anywhere | Show the last message from a pane, or the last message that was too long for the dock, also after it went from the dock |
-| `ctrl+b j` | anywhere | Go to the pane of the newest message |
+| `ctrl+b j` | anywhere | Go to the pane of the newest message. On an agent integration notice, ask to install the integration |
 | `j`, `k`, `up`, `down`, wheel | message view | Scroll one line |
 | `ctrl+d`, `ctrl+u`, `space`, `pgdown`, `pgup` | message view | Scroll half a page |
 | `g`, `G`, `home`, `end` | message view | Go to the first or last line |
@@ -536,6 +695,29 @@ The action is `toggle_scratch`, and `[scratch]` sets the size of the box. See
 [SESSIONS.md](SESSIONS.md#the-scratch-terminal). To add more scratch terminals
 on keys of their own, see [Command keys](#command-keys).
 
+## New worktree
+
+`Ctrl+B U` makes a worktree of the repository of the focused pane's folder.
+A small dialog asks for the branch name. `tab` moves to the session name.
+Leave the session name empty to use the name the dialog shows. `enter` makes a
+new branch in a new worktree and a session in it. The session is grouped under
+its repository in the sidebar, and tuios switches to it. This is what
+`tuios worktree new` does. `esc` closes the dialog.
+
+If the focused pane is not in a git repository, a message says so. The action
+is `new_worktree`, and the command palette has it too. A right-click on a
+session or a repository in the sidebar opens the same dialog.
+
+## Session note
+
+`Ctrl+B I` opens a one-line editor with the note of the session. A note says
+what the session is for or what comes next. `enter` saves the note. An empty
+note removes it. `esc` closes the editor. The action is `set_note`. The command
+palette and the menu of a session row in the sidebar have it too.
+
+The dock shows the note when you attach or switch to the session. See
+[SESSIONS.md](SESSIONS.md#return-notes).
+
 ## Picture in picture
 
 `p` in window mode pins the focused pane as the picture-in-picture view, a
@@ -543,6 +725,12 @@ small live copy of the pane in a corner of the screen. Press `p` again, on any
 pane, to unpin it. A click on the view focuses the pane. The action is
 `toggle_pip`, and `[pip]` sets the size and the corner. See
 [SESSIONS.md](SESSIONS.md#picture-in-picture).
+
+## Rail pane
+
+`P` in window mode gives the keyboard to the pane in the rail's pane section.
+`alt+esc` gives it back. The action is `focus_rail_pane`. See
+[CONFIGURATION.md](CONFIGURATION.md#the-rails-pane-section).
 
 ## Spotlight
 
@@ -564,6 +752,61 @@ programs get it. An open dialog, menu or popup closes before `Esc` turns the
 spotlight off. The actions are `toggle_spotlight` and
 `prefix_toggle_spotlight`, and `[spotlight]` sets the size and the dimming.
 The key was `b` in earlier versions.
+
+## Pick a path
+
+`Alt+;` in terminal mode opens the path picker at the cursor of the focused
+pane. `Ctrl+B .` opens it too. The picker lists the folder that the shell in
+the pane is in. Folders come first, then files. Type to filter the names.
+Press `Enter` to type the path of the selected name at the cursor.
+tuios quotes the path for the shell in the pane, by the same rules as a drag
+from the sidebar. See [Drag a file into a pane](#drag-a-file-into-a-pane).
+
+| Key | What it does |
+| --- | --- |
+| Text | Filter the names |
+| `Up`, `Down`, `Ctrl+P`, `Ctrl+N` | Move the selection |
+| `Tab` | Open the selected folder. On a file, complete the name |
+| `Shift+Tab`, `Backspace` with no filter text | Go up one folder |
+| `/` at the start | Start an absolute path |
+| `~/` at the start | Start a path in the home folder |
+| `Enter` | Type the path and close the picker |
+| `Alt+H` | Show or hide the hidden files |
+| `Esc` | Close the picker and type nothing |
+
+The filter line shows the path that you built, for example `src/app/`. A
+click on a name types its path. The mouse wheel moves the selection.
+
+The path is relative to the folder of the pane. A path that starts with `/`
+or `~/` stays absolute. tuios puts a path with a space or a special character
+in quotes. When the program in the pane turned on bracketed paste, tuios
+sends the path as a paste. Else it types the path.
+
+The picker works in a pane on another machine. The daemon on that machine
+lists the folder, with the same read rules as the sidebar's files section.
+When the shell in the pane runs ssh to another machine, the picker does not
+open.
+
+The action is `pick_path`. `path_picker.show_hidden = true` shows the hidden
+files when the picker opens. The default is `false`.
+
+## Calm mode
+
+`Ctrl+B Z` turns calm mode on and off. Use it to keep your attention on one
+task. While calm mode is on:
+
+- Nothing moves. Window slides, panel fades, the working-agent shimmer and the
+  copy sweep stop. Your `appearance.motion` level does not change.
+- Nothing blinks. The cursor is steady.
+- Messages from panes, agents and mail do not show in the dock. The log keeps
+  them. An agent that needs you still shows its message, and so do warnings
+  and errors.
+- The dock tabs do not mark output on other workspaces. The bell mark stays.
+
+The dock shows `calm` while it is on. `calm 3` means that 3 messages are in
+the log. When you turn calm mode off, tuios tells you how many messages came
+in. The action is `toggle_calm`. To keep calm mode on after a restart, set
+`appearance.calm = true`. See [CONFIGURATION.md](CONFIGURATION.md#calm-mode).
 
 ## Paste an image
 
@@ -602,6 +845,7 @@ tuios reads the image with the clipboard tool of your system:
 | Linux, X11 | `xclip`. `xsel` cannot read an image. |
 | macOS | `osascript`, or `pngpaste` when it is installed |
 | Windows | PowerShell |
+| WSL | `powershell.exe`, which reads the Windows clipboard. WSLg's `wl-paste` and `xclip` see no image copied on Windows. |
 
 The file is a PNG, JPEG, GIF, WebP, BMP or TIFF image of 8 MB or less. Only
 you can read it. tuios deletes it after one hour, or when the daemon stops.
@@ -969,6 +1213,30 @@ next_workspace = ["alt+y"]
 prev_workspace = ["alt+u"]
 ```
 
+## Cycle through machines
+
+The `next_host` and `prev_host` actions go to a session on the next or the
+previous machine. The order is the order of the machine groups in the rail.
+This machine is first, then the machines of the `[hosts]` table. The actions
+wrap at the end. They skip a machine whose link is not up and a machine with
+no session.
+
+On each machine, they go to the session you last showed on that machine. If
+you have not been on that machine, or that session is gone, they go to the
+session that is attached there. If no session is attached, they go to the first
+session in the rail. With no other machine, they show "No other machines".
+
+The actions have no default key. The command palette has the entries "Next
+machine" and "Previous machine". To bind them:
+
+```toml
+[keybindings.window_management]
+next_host = ["alt+."]
+prev_host = ["alt+,"]
+```
+
+Like `next_session`, a chord with Alt or Ctrl also works in terminal mode.
+
 ## Actions for a tmux-style keymap
 
 These actions have no default key. Bind them in any
@@ -1096,6 +1364,8 @@ in the middle row, set `appearance.selection.copy_entry` to `center`.
 | `n` | Go to the next match in the direction of the last search |
 | `N` | Go to the next match in the opposite direction |
 | `Esc` in the search prompt | Cancel the search and move the cursor back |
+| `q` or `Esc` | Leave copy mode. In a selection, `Esc` and `q` only end the selection |
+| `Ctrl+C` | Leave copy mode from normal mode, a selection, the search prompt or `f`/`t`. Nothing is copied |
 
 The prompt shows `/` or `?` to show the direction. The search starts at the
 copy cursor. When no match is found in that direction, the search continues
@@ -1129,20 +1399,45 @@ prompts.
 
 When a search finds more than 1000 matches, the prompt shows `1000+`.
 
+### Focus keys in copy mode
+
+The `terminal_focus_left`, `terminal_focus_right`, `terminal_focus_up` and
+`terminal_focus_down` keys also work in copy mode. In window mode, the
+window-mode focus keys work. Focus moves to the next pane. The old pane stays
+in copy mode, as in tmux. When you go back to it, the copy cursor is where you
+left it.
+
+A focus key that copy mode also uses keeps its copy mode action. For example,
+`h` moves the copy cursor, and `alt+left` moves focus. This example binds
+`alt+h` and `alt+l` as in tmux:
+
+```toml
+[keybindings.terminal_mode]
+terminal_focus_left = ["alt+h"]
+terminal_focus_right = ["alt+l"]
+```
+
+A key under the leader does not work in copy mode, because copy mode uses
+`Ctrl+B` for page up. `Ctrl+B` and then an arrow key does not move focus there.
+
 ### Line start and line end
 
-`Home` moves the copy cursor to the start of the line, as `0` does. `End`
-moves it to the end of the line, as `$` does. Both keys also move the end of a
-`v` or `V` selection.
+`Home` moves the copy cursor to column zero of the line, as `0` does. `End`
+moves it to the last nonblank character of the line, as `$` does, and not to
+the blank cells up to the pane edge. `copy_mode_first_nonblank` moves it to the
+first nonblank character, as `^` does, and has no default key. On a blank line
+all three go to column zero. The keys also move the end of a `v` or `V`
+selection.
 
 | Action | Default key |
 | --- | --- |
 | `copy_mode_line_start` | `Home` |
+| `copy_mode_first_nonblank` | none |
 | `copy_mode_line_end` | `End` |
 
 The keys are in the `copy_mode` section. They work only in copy mode. In the
-search prompt, they do not move the cursor. `0` and `$` are fixed keys, and
-you cannot rebind them.
+search prompt, they do not move the cursor. `0`, `^` and `$` are fixed keys,
+and you cannot rebind them.
 
 Do not bind a key here that copy mode already uses, such as `y` or `v`, or a
 key of a `[[keybindings.copy_pipe]]` entry. `tuios keybinds doctor` and the
@@ -1201,6 +1496,64 @@ edit_scrollback = ["ctrl+o"]
 The tmux preset uses `Ctrl+B E` to make the splits equal. With that preset,
 the editor key is `Ctrl+B Ctrl+T E`.
 
+### Other end of a selection
+
+In a `v` or `V` selection, `o` moves the copy cursor to the other end of the
+selection. The selected text does not change. The next motion moves the end
+that the cursor is on now. Press `o` again to go back. If the other end is
+outside the pane, the pane scrolls to show it. tmux and vim use `o` the same
+way.
+
+### Clear the scrollback
+
+The `clear_scrollback` action clears the scrollback of the focused pane. It
+also removes the rows above the prompt, and the prompt row moves to the top of
+the pane. Ghostty, iTerm2 and Terminal.app do the same on `Cmd+K`.
+
+| Action | Default key |
+| --- | --- |
+| `clear_scrollback` | None |
+
+The command palette entry is "Clear the scrollback".
+
+- tuios sends no key to the program, so the shell does not redraw.
+- When the shell marks its prompt with OSC 133, tuios keeps all the lines of
+  the prompt.
+- In a session with a daemon, the daemon clears the pane. Each client of the
+  session shows the clear. An attach later does not bring the old rows back.
+- The key also works in copy mode. tuios leaves copy mode.
+- tuios clears nothing while a full-screen program, such as vim or less, uses
+  the pane. tuios shows a message.
+
+`tuios clear-history` clears the scrollback from the command line, as tmux
+`clear-history` does. It keeps the screen. With `--screen`, it does the same
+as the key. See [CLI_REFERENCE.md](CLI_REFERENCE.md#tuios-clear-history).
+
+The action has no default key, because the host terminal usually keeps `Cmd+K`
+for itself. To use `Cmd+K`, bind `super+k` in the `global` section. A key in
+the `global` section works in terminal mode and in window mode.
+
+```toml
+[keybindings.global]
+clear_scrollback = ["super+k"]
+```
+
+Then tell the host terminal to send `Cmd+K` to tuios. In Ghostty, add this line
+to the Ghostty config:
+
+```
+keybind = cmd+k=unbind
+```
+
+In iTerm2 and Terminal.app, `Cmd+K` is a menu item. Remove or change its
+shortcut in the settings of the terminal. A terminal that does not send the
+Super key cannot send `super+k`. Bind another key, such as `Ctrl+B K`:
+
+```toml
+[keybindings.prefix_mode]
+clear_scrollback = ["K"]
+```
+
 ### Pipe a yank through a command
 
 A yank can go through a command before it goes to the clipboard. tmux calls
@@ -1226,10 +1579,14 @@ The command runs with `sh -c`. It gets the selection on stdin. The clipboard
 gets what the command writes to stdout. When the selection does not end with
 a new line, tuios removes one new line from the end of the output.
 
+When the command stops with exit code 0 and writes nothing, tuios does not
+change the clipboard or the paste buffers. The dock shows a message. Use this
+for a command that sets the clipboard itself, such as `tmux-copy-it`, or that
+sends the text to a socket or a file. tmux does the same: the write of the
+command stays.
+
 The clipboard gets the selection itself in these cases:
 
-- The command writes nothing. Use this for a command that sends the text to a
-  socket or a file.
 - The command stops with an exit code that is not 0. The dock shows the exit
   code and the first line of stderr.
 - The command runs for more than 10 seconds. tuios stops the command and the
@@ -1238,7 +1595,8 @@ The clipboard gets the selection itself in these cases:
 tuios waits until the command closes its stdout. `xclip` starts a process that
 stays open after `xclip` stops, and keeps stdout open. tuios then waits 1
 second more. To prevent the wait, send the stdout of `xclip` to `/dev/null`.
-This example also puts each yank in the X primary selection:
+This example puts each yank in the X primary selection. The command writes
+nothing, so the clipboard does not change:
 
 ```toml
 [appearance.selection]
@@ -1256,7 +1614,7 @@ The fields of a `[[keybindings.copy_pipe]]` entry:
 - `description` names the entry in the dock messages. It is optional.
 
 The entry takes its key from copy mode. An entry on `y` replaces the plain
-yank. Copy mode does not use `p` or `P`. When an entry takes `q`, `Esc`, `v`, `V`, `/`,
+yank. Copy mode does not use `p` or `P`. When an entry takes `q`, `Esc`, `Ctrl+C`, `v`, `V`, `/`,
 `?` or a digit, tuios shows a warning when it loads the config. When no text is selected, the key
 shows a message and runs nothing. While you type a search, the key goes into
 the search.
@@ -1395,14 +1753,16 @@ runs the same search from a shell.
 
 Everything waiting for you, and every agent tuios knows of, is one full-screen
 view on `ctrl+b i`. It was the Inbox panel. The agents are grouped by what
-each needs from you: Needs you, Ready for review, Working, Idle, Earlier. What
-the Inbox held is the Needs you group. See
+each needs from you: Needs you, Ready for review, Working, Idle, Settled. What
+the Inbox held is the Needs you group. Settled holds the agents you put away
+with `D` and the agents at rest for more than an hour. See
 [AGENT_STATE.md](AGENT_STATE.md#the-agents-view) for what goes in it.
 
 | Keys | What it does |
 |---|---|
 | `ctrl+b i` | Open the agents view |
 | `ctrl+b o` | Go to the oldest item that needs you; `o` again, inside the repeat window, goes to the next |
+| `opt+shift+j` / `opt+shift+k` (`alt+shift+j` / `alt+shift+k` off macOS), or `ctrl+b J` / `ctrl+b K` | Next and previous agent pane (`next_agent`, `prev_agent`), in the order the rail's agents section lists them, wrapping at the ends. From a pane with no agent they go to the first and the last. An agent in another session or workspace is switched to, as choosing its row does. The chords also work in terminal mode and while the rail has the keyboard |
 | `ctrl+b M` | Open the agents view on the mail for you (`m` there opens the whole mailbox) |
 
 Inside it:
@@ -1416,16 +1776,22 @@ Inside it:
 | `space` | Read an approval's or a question's prompt and answer it here |
 | `n` | Open the New agent sheet. See below |
 | `c` | On an attempt of a fan: compare the attempts. See below |
+| `b` | Show the task board, the cards grouped by stage, or the agents again |
+| `t` | On a card: take it for the pane behind the agents view. `n` on a card opens the New agent sheet on it |
+| `o` | Open what the agent has shown, such as a TML form, on its Artifacts tab, and use it. `esc` goes back to the list |
 | `f` | Show only what needs you, then each kind of item, then every agent |
 | `s` | Step the order inside each group |
 | `/` | Search. A `key:value` term is a selector, such as `harness:codex` |
 | `d` `z` `u` `S` | Dismiss, snooze, undo, show the snoozed items |
-| `y` `p` `m` | Resume, pass held mail on, open the mailbox |
-| `x` `*` | Mark an agent, or every agent shown, for a bulk answer. A marked row shows a mark, and the header counts the marks |
+| `D` | Settle the agent: put it away until it needs you. It goes to Settled, and its finished turn closes. `D` on a settled agent takes it off the shelf, and `u` undoes a settle within 10 seconds. With marks, settle every marked agent. The Settle button in the focus header does the same |
+| `y` `p` `m` | Resume in place (the view stays open), pass held mail on, open the mailbox |
+| `x` `*` | Mark an agent or a Resume row, or every row shown, for a bulk answer. A marked row shows a mark, and the header counts the marks |
 | `1` `3` with marks | Allow every marked approval once, after a sheet that lists them, or reject them |
-| `[` `]` | Switch the focus tabs: Thread, Changes, Checkpoints and Pane |
-| `J` `K` | Scroll the thread, or a long plan waiting for a yes |
+| `y` with marks | Resume every marked Resume row. `*` then `y` resumes them all |
+| `[` `]` | Switch the focus tabs: Card on the board, Thread, Changes, Artifacts, Checkpoints and Pane |
+| `J` `K` | Scroll the thread, or a long plan waiting for a yes. On the Artifacts tab, move between the artifacts |
 | `e` | Show every line of every card in the thread |
+| `F` | Fold or open the group of the row under the cursor. On a folded heading, `enter` also opens it |
 | `v` | Review the agent's changes |
 | `ctrl+]` | Go to the agent's pane and zoom it. `ctrl+b i` comes back to the same agent |
 | `l` `h`, `right` `left` | On a narrow screen, open the focus and go back to the list |
@@ -1475,13 +1841,32 @@ through `tuios start-agent`. Uncommitted files stay in this folder. On a
 linked host the agent works in a new worktree of the host's checkout, which
 the host finds by the repository's origin.
 
+The Artifacts tab lists what the agent has shown you: each TML document its
+pane opened, open or closed, and each screenshot it took. The newest is
+first. The selected one is drawn under the list. An open document is the
+same document as its popup or pane, with the same state: what you choose in
+one place shows in the other. `o` or a click gives it the keys, and `esc`
+gives them back. A closed document shows what it showed last, and your
+answer. A document from another session is read-only here.
+
+A TML popup and the agents view do not show at the same time:
+
+- Open the view while an agent's popup floats, and the view selects that
+  agent and shows the popup's document, with the keys.
+- A document that opens while the view is open shows in the focus when it is
+  from the selected agent. From another agent, its row gets a
+  `● new artifact` chip, and a popup moves the row to Needs you. A click on
+  the chip opens it.
+- Close the view while the Artifacts tab shows an open document, and its
+  window gets the focus and floats again.
+
 In the image view, which a click on an image chip in the reply opens: `o`
 opens the image in the desktop's viewer, `c` saves a copy and copies its
 path, `s` saves a copy, `left` and `right` step through the images, `+` and
 `-` zoom, and `esc` or a click outside the picture closes it.
 
 The mouse works too. A click on a row selects it, and a double-click goes to
-its pane. A click on a group heading folds the group. The buttons on an
+its pane. A click on a group heading folds the group, as `F` does. The buttons on an
 approval card answer it. `+ New agent` opens the New agent sheet, and the search box opens
 the search. The wheel scrolls the list, and over the focus it scrolls the
 card. A search narrows the items with the agents. A selector the search line
@@ -1521,7 +1906,8 @@ These keys are in three sections of their own, rebindable like any other:
 `inbox_write`, `inbox_sort`, `inbox_view_pane`, `inbox_new_agent`,
 `inbox_allow`, `inbox_allow_always`, `inbox_open`, `inbox_back`,
 `inbox_help`, `inbox_mark`, `inbox_mark_all`, `inbox_tab_prev`,
-`inbox_tab_next`, `inbox_expand`, `inbox_compare`),
+`inbox_tab_next`, `inbox_expand`, `inbox_fold`, `inbox_compare`, `inbox_artifact`,
+`inbox_board`, `inbox_take`),
 `[keybindings.inbox_peek]` (the prompt: `peek_approve`, `peek_approve_always`,
 `peek_deny`, `peek_type`, `peek_read_again`, `peek_go`, `peek_back`) and
 `[keybindings.mail]` (the mailbox: `mail_down`, `mail_up`, `mail_page_down`,
@@ -1597,7 +1983,8 @@ not offered and do what an unbound key does: after `ctrl+b` in terminal mode,
 | `ctrl+b A` | anywhere | Open the Agents tab of the settings page, where you install, update and uninstall each harness's integration |
 | `v` | agents view | Review the changes in the item's pane |
 | `z`, then `1` to `4` | agents view | Snooze the item: 15 minutes, 1 hour, until 9:00 tomorrow, or until it changes; any other key cancels. On a snoozed item, wake it |
-| `u` | agents view | Undo the last dismiss or snooze, within 10 seconds |
+| `u` | agents view | Undo the last dismiss, snooze or settle, within 10 seconds |
+| `D` | agents view | Settle the agent, or every marked one. Put away until it needs you |
 | `S` | agents view | Show or hide snoozed items |
 | `R` | agents view | Reject a held approval, or keep a plan planning, with a reason you type (`r` and `3` stay the plain reject) |
 | `n` | agents view | Start a new agent |
@@ -1605,7 +1992,7 @@ not offered and do what an unbound key does: after `ctrl+b` in terminal mode,
 | `J`, `K`, `ctrl+d`, `ctrl+u` | agents view | Scroll the card, such as a long plan |
 | `u` | rail agent row | Mark the pane's finished turn unread, for every client (not the pane in front of you) |
 | `z` | rail agent row | Snooze what needs you in the pane: the agents view opens on it with the four lengths |
-| `enter` | rail `+N at rest` line | Show the agent rows folded as at rest, until the rail lets go of the keyboard (after a click with the rail not focused, until a click outside the rail or a pane is focused) |
+| `enter` | rail `+N at rest` line | Show the agent rows folded as at rest, settled agents included, until the rail lets go of the keyboard (after a click with the rail not focused, until a click outside the rail or a pane is focused) |
 | `r` | agents view, on a finished or errored item | Reply to the agent: the editor under the thread, queued with `enter` and typed when the agent is at rest |
 | `r` | rail agent row | Reply to the agent, the same line in the agents view; refused while the pane waits on a prompt |
 | `v` | rail agent row | Review the pane's changes |
@@ -1656,15 +2043,21 @@ the lines they are on. The code is coloured by its file type in the
 active theme's colours, added and removed lines sit on green and red grounds,
 and the words that changed in a changed line are marked. It owns every key
 while it is open, in either mode.
-The keys are the overlay's own, not bindings, like the scrollback browser's:
+The keys are the overlay's own, not bindings, like the scrollback browser's,
+except the hunk and file motions and the stage keys, which are in
+`[keybindings.review]`:
 
 | Keys | What it does |
 | --- | --- |
 | `j` / `k`, arrows | Move by line; with the file list focused, move through the files |
 | `space`, `pgdown`, `ctrl+d` / `pgup`, `ctrl+u` | Move by a page |
 | `g` / `G` | First or last line |
-| `]` / `[` | Next or previous hunk, going on into the next or previous file |
-| `}` / `{` | Next or previous file |
+| `]` / `[` | Next or previous hunk, going on into the next or previous file (`review_next_hunk`, `review_prev_hunk`) |
+| `}` / `{` | Next or previous file (`review_next_file`, `review_prev_file`) |
+| `a` | Stage the hunk under the cursor (`review_stage_hunk`) |
+| `d` | Unstage the hunk under the cursor (`review_unstage_hunk`) |
+| `A` / `D` | Stage or unstage the whole file (`review_stage_file`, `review_unstage_file`) |
+| `z` | Undo the last stage or unstage (`review_undo_stage`) |
 | `s` | One column, or the old and new sides next to each other where the diff column is wide enough (about 120 columns of screen) |
 | `h` / `l`, `left` / `right` | Scroll the code sideways |
 | `tab` | Focus the file list or the diff |
@@ -1680,8 +2073,32 @@ The keys are the overlay's own, not bindings, like the scrollback browser's:
 | `r` | Read the diff again |
 | `esc`, `q` | Close (from a review opened in the compare view, go back to it) |
 
+A stage key changes only the index of the pane's worktree. The working files
+do not change. A hunk header shows `staged` when the index holds all of the
+hunk, and `partly staged` when it holds some of it. `a` stages only the lines of
+the hunk you see. When git splits those lines into two hunks of the index, the
+first `a` stages one part and the hunk shows `partly staged`. Press `a` again
+to stage the rest. The keys do nothing in a comparison of two attempts.
+
 In the note line and the other one-line prompts every printable key is text,
 a paste is typed as one line, `enter` saves and `esc` drops.
+
+`]`, `[`, `}` and `{` need Option on some layouts, AZERTY among them, where
+Option is often the Alt key that tuios reads. To move them, bind other keys in
+the `review` section. A key bound there wins over the overlay's own key, so
+pick one the table above does not use:
+
+```toml
+[keybindings.review]
+review_next_hunk = ["n"]
+review_prev_hunk = ["p"]
+review_next_file = ["N"]
+review_prev_file = ["P"]
+```
+
+The footer and the help overlay show the keys as they are bound. tuios warns
+when a `review` key is one of the overlay's own keys, and
+`tuios keybinds doctor` lists it under REVIEW KEYS.
 
 The compare view lists the attempts of the fan, with what each changed
 against the fan's base and its last check:
@@ -1697,8 +2114,8 @@ against the fan's base and its last check:
 | `esc`, `q`, `w` | Back to the review |
 
 A key from `send-keys` or a tape may move around the review but never acts as
-you: a note it typed is not saved, and `S`, `x`, `V` and the keep
-confirmation refuse it. See
+you: a note it typed is not saved, and `S`, `x`, `V`, the stage keys and the
+keep confirmation refuse it. See
 [Reviewing an agent's changes](AGENT_STATE.md#reviewing-an-agents-changes).
 
 ## Other keyboard layouts
@@ -1934,6 +2351,7 @@ ordinary `ctrl` chord that no terminal interferes with:
 | `ctrl+b` then an arrow | Focus the pane in that direction |
 | `ctrl+b n` / `ctrl+b p` | Next and previous pane |
 | `ctrl+b (` / `ctrl+b )` | Previous and next session |
+| `ctrl+b K` / `ctrl+b J` | Previous and next agent pane |
 | `ctrl+b a` | Launcher |
 | `ctrl+b 0` to `ctrl+b 9` | Jump to a pane |
 
@@ -1964,6 +2382,11 @@ prev_workspace = ["p"]
 
 An action in the list repeats only when a key runs it after the leader. tuios
 warns about an entry with no such key, and about a misspelt action.
+
+With `keybindings.lock` on, there is no repeat window in terminal mode. A
+repeatable action keeps its menu open until you press `esc`, with no time
+limit. The open menu takes only repeatable keys. Any other key goes to the
+pane, and tuios locks again. See [Lock mode](#lock-mode).
 
 Workspace switching on `opt+1` to `opt+9` works with no configuration on a
 US or ABC keyboard layout. It also works in a terminal that reports Alt with

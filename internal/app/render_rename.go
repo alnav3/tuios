@@ -2,13 +2,16 @@ package app
 
 import (
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
-	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
 
 // renameDialogWidth is the micro-dialog's preferred inner width: a name and a
 // cursor, and nothing that would make it a panel. It is the least that keeps
 // all three hints in the border once their modifiers are shortened.
 const renameDialogWidth = 31
+
+// noteDialogWidth is the editor's inner width for a return note, which is a
+// line of words rather than a name.
+const noteDialogWidth = 60
 
 // renameHintClear is the clear hint's index in renameHints, which is how its
 // drawn rect is found to make it pressable.
@@ -39,9 +42,13 @@ func (m *OS) renderRenameDialog() (string, overlay.Geometry, int, int, bool) {
 	if !m.Renaming() {
 		return "", overlay.Geometry{}, 0, 0, false
 	}
-	pal := theme.UI()
+	pal := m.overlayUI()
 	renderW := m.GetRenderWidth()
-	inner := overlay.DialogFitWidth(renameDialogWidth, renderW)
+	want := renameDialogWidth
+	if m.RenameKind == RenameNote {
+		want = noteDialogWidth
+	}
+	inner := overlay.DialogFitWidth(want, renderW)
 
 	// Sigil, a space, the field, and one cell of right pad, so the cursor never
 	// sits against the frame.

@@ -1,8 +1,6 @@
 package input
 
 import (
-	"unicode/utf8"
-
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/app"
 )
@@ -27,7 +25,9 @@ func handleChooseTree(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 //
 // In the search line every printable key is text, the movement keys that are
 // not letters still move, enter goes to the row, and esc leaves the search:
-// the first esc keeps the query, and a second clears it.
+// the first esc keeps the query, and a second clears it. A navigator that
+// opened on the search line (panes.navigator_search) closes on an esc with
+// nothing typed, as the list does.
 func handleNavigatorInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	key := msg.String()
 	if o.NavigatorSearching() {
@@ -36,23 +36,19 @@ func handleNavigatorInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		}
 		switch key {
 		case "esc":
+			if o.NavigatorTypeFirst() && o.NavigatorQuery() == "" {
+				o.CloseNavigator()
+				return o, nil
+			}
 			o.NavigatorSearch(false)
 		case "enter":
 			o.NavigatorActivateSelected()
-		case "backspace":
-			if q := o.NavigatorQuery(); q != "" {
-				_, size := utf8.DecodeLastRuneInString(q)
-				o.NavigatorSetQuery(q[:len(q)-size])
-			}
-		case "ctrl+u":
-			o.NavigatorSetQuery("")
+			// A session on another machine opens off the Update goroutine.
+			return o, o.TakeSidebarCmd()
 		default:
-			text := msg.Text
-			if key == "space" {
-				text = " "
-			}
-			if text != "" {
-				o.NavigatorSetQuery(o.NavigatorQuery() + text)
+			q := o.NavigatorQuery()
+			if changed, _ := editFilterQuery(msg, &q, true); changed {
+				o.NavigatorSetQuery(q)
 			}
 		}
 		return o, nil
@@ -70,6 +66,8 @@ func handleNavigatorInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.CloseNavigator()
 	case "enter":
 		o.NavigatorActivateSelected()
+		// A session on another machine opens off the Update goroutine.
+		return o, o.TakeSidebarCmd()
 	case "/":
 		o.NavigatorSearch(true)
 	case "h", "left":

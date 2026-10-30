@@ -75,6 +75,13 @@ func (m *OS) GetOrCreateScrollingLayout() *layout.ScrollingLayout {
 	sl.Gap = m.separatorGap()
 	sl.DefaultWidth = m.ScrollColumnWidthFraction()
 	sl.MaxProportion = float64(m.Settings.GetScrollColumnMax()) / 100
+	// The presets are per client like the cap, so a config reload reaches a
+	// live strip here too. Both slices are shared and only read: no allocation
+	// on this path.
+	sl.PresetWidths = layout.DefaultPresetWidths
+	if len(m.Settings.ScrollColumnPresets) > 0 {
+		sl.PresetWidths = m.Settings.ScrollColumnPresets
+	}
 	// A zoom on the strip is one column widened past the cap the others are
 	// held to. The strip is already a camera, wider than the screen and showing
 	// what it cannot fit at the edges, so a second camera over it would be two
@@ -355,15 +362,21 @@ func (m *OS) ScrollingExpelWindow() {
 // ScrollingScrollViewport scrolls the viewport manually (mouse wheel).
 // Uses instant positioning so scrolling feels direct and responsive.
 func (m *OS) ScrollingScrollViewport(delta int) {
-	sl := m.GetOrCreateScrollingLayout()
-	viewW := m.ScrollingViewWidth()
-	// Cancel any in-flight slide animations so the wheel feels direct
-	m.CompleteAllAnimations()
 	// A flat number of cells rather than a share of the view. See
 	// config.NiriScrollCellsDefault: a trackpad sends one wheel event per cell
 	// the fingers cross, so a step measured against the screen's width made one
 	// flick cross the whole strip and stop dead at the clamp.
-	sl.ViewportX += delta * max(m.Settings.NiriScrollCells, config.NiriScrollCellsMin)
+	m.ScrollingScrollViewportCells(delta * max(m.Settings.NiriScrollCells, config.NiriScrollCellsMin))
+}
+
+// ScrollingScrollViewportCells moves the strip by cells, to the right when
+// positive. A finger on tuios-web moves it this way, by the cells it crossed.
+func (m *OS) ScrollingScrollViewportCells(cells int) {
+	sl := m.GetOrCreateScrollingLayout()
+	viewW := m.ScrollingViewWidth()
+	// Cancel any in-flight slide animations so the wheel feels direct
+	m.CompleteAllAnimations()
+	sl.ViewportX += cells
 	sl.ClampViewport(viewW)
 	m.scrollingSetPositionsInstant()
 }

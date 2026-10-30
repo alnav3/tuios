@@ -7,8 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"runtime/pprof"
 	"syscall"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/app"
@@ -96,7 +96,13 @@ func runLocal() error {
 	// wants, and a session already running is a separate process this cannot
 	// reach, so the setting never disturbs one.
 	if useDaemonByDefault(userConfig) {
-		err := runAttach("", true)
+		// startup.session names the session a bare "tuios" opens, made when it
+		// is gone, as "tuios attach NAME -c" does. Empty keeps the most recent.
+		name := userConfig.Startup.Session
+		if name != "" {
+			attachFocusWindow = userConfig.Startup.Window
+		}
+		err := runAttach(name, true)
 		// A daemon that will not start must not leave the user with no
 		// terminal. This route was not asked for on the command line: it is
 		// what the shipped default does, so the standalone session it replaced
@@ -110,22 +116,10 @@ func runLocal() error {
 		fmt.Fprintln(os.Stderr, "Sessions in this window are not saved. Run 'tuios daemon' to see why it fails.")
 	}
 
-	if cpuProfile != "" {
-		f, err := os.Create(cpuProfile)
-		if err != nil {
-			return fmt.Errorf("could not create CPU profile: %w", err)
-		}
-		defer func() {
-			if closeErr := f.Close(); closeErr != nil {
-				log.Printf("Warning: failed to close CPU profile file: %v", closeErr)
-			}
-		}()
-
-		if err := pprof.StartCPUProfile(f); err != nil {
-			return fmt.Errorf("could not start CPU profile: %w", err)
-		}
-		defer pprof.StopCPUProfile()
+	if err := startCPUProfile(); err != nil {
+		return err
 	}
+	defer stopCPUProfile()
 
 	startPprofServer()
 
@@ -202,6 +196,34 @@ type sshServerFlags struct {
 	authorizedKeys string
 	ephemeral      bool
 	noAuth         bool
+	// The limit flags. Nil means the flag was not given, and the [ssh]
+	// section of the config file decides.
+	handshakeTimeout *time.Duration
+	idleTimeout      *time.Duration
+	maxHandshakes    *int
+	maxSessions      *int
+}
+
+// checkLimits refuses a negative limit flag. 0 turns a limit off, so a
+// negative value is a mistake and not a way to say "no limit".
+func (f sshServerFlags) checkLimits() error {
+	for _, d := range []struct {
+		name string
+		v    *time.Duration
+	}{{"--handshake-timeout", f.handshakeTimeout}, {"--idle-timeout", f.idleTimeout}} {
+		if d.v != nil && *d.v < 0 {
+			return fmt.Errorf("%s is negative. Give a duration such as 2m, or 0 to turn the limit off", d.name)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		v    *int
+	}{{"--max-handshakes", f.maxHandshakes}, {"--max-sessions", f.maxSessions}} {
+		if c.v != nil && *c.v < 0 {
+			return fmt.Errorf("%s is negative. Give a count, or 0 to turn the limit off", c.name)
+		}
+	}
+	return nil
 }
 
 func runSSHServer(f sshServerFlags) error {
@@ -249,6 +271,10 @@ func runSSHServer(f sshServerFlags) error {
 		DefaultSession:     f.defaultSession,
 		AuthorizedKeysPath: f.authorizedKeys,
 		NoAuth:             f.noAuth,
+		HandshakeTimeout:   f.handshakeTimeout,
+		IdleTimeout:        f.idleTimeout,
+		MaxHandshakes:      f.maxHandshakes,
+		MaxSessions:        f.maxSessions,
 		Version:            version,
 		Ephemeral:          f.ephemeral,
 		ShowKeys:           interfaceFlags.ShowKeys,
@@ -276,5 +302,6 @@ func useDaemonByDefault(cfg *config.UserConfig) bool {
 	if standaloneMode || os.Getenv("TUIOS_NO_DAEMON") == "1" {
 		return false
 	}
-	return cfg != nil && cfg.Startup.Daemon
+	// A start session lives in the daemon, so naming one asks for it.
+	return cfg != nil && (cfg.Startup.Daemon || cfg.Startup.Session != "")
 }

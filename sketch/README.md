@@ -6,7 +6,7 @@ It is a port of [pele](https://github.com/obsidianmd/pele), the Mermaid
 renderer by [kepano](https://github.com/kepano) of
 [Obsidian](https://obsidian.md), under the MIT licence. The layout, the
 shapes, the safety rules and the test corpus are pele's work. The port
-follows pele v1.8.0, commit `8fad23bd51783e4df1204e177a7fb0d2a30dcd13`.
+follows pele v1.12.0, commit `8aff183be57021b533f319a29341a529be934b08`.
 [LICENSE](LICENSE) has the notice of pele and of the port.
 [raster/fonts/NOTICE](raster/fonts/NOTICE) has the licences of the fonts that
 sketch/raster draws text in: Arimo (SIL Open Font License 1.1) and Go Mono.
@@ -23,8 +23,13 @@ swimlane diagrams, use case diagrams and agent flows: every type that pele
 draws. A type that pele does not draw gives an error with the code
 `unsupported-diagram`.
 
-The output matches the output of pele, except links. The test suite compares
-each diagram with an SVG that pele drew from the same source, byte for byte.
+The output matches the output of pele, except links and one line break. The
+test suite compares each diagram with an SVG that pele drew from the same
+source, byte for byte.
+
+At a narrow width, a label too wide for its room breaks at its last space, or
+at its last hyphen after a letter or digit, before it breaks inside a word.
+pele breaks after the last character that fits (tuios issue 1032).
 
 Links go through Go's `net/url`, not the WHATWG URL parser of a browser, so
 some links differ from pele's. sketch writes no link for `http:host` or
@@ -74,7 +79,15 @@ other than http, https, mailto or tel.
 | agentflow | 12/12 |
 
 `testdata/extra` holds more cases that pele drew, which its corpus does not
-cover, such as Chinese and Japanese labels that wrap. They match too.
+cover, such as Chinese and Japanese labels that wrap, and the label tags,
+break hints, class rows, sankey gradients, state curves and quadrant labels of
+pele v1.9.0, and the comments, bare titles, sankey values and chart bounds of
+pele v1.10.0, and the new tests of pele v1.10.1 to v1.12.0: text colours on
+fills, casings, the `monospace` option, wrapped messages, treemap spacing and
+block edge labels. They match too.
+`testdata/errors` holds sources that pele refuses, and the error pele gives for
+each: the message, the code, and the line, column and snippet in the source as
+written. sketch gives the same errors.
 The cases of `math-typeset.json` are drawn with a fixed math resolver, the
 same one in `gen.mjs` and in `golden_test.go`.
 
@@ -105,11 +118,20 @@ if err != nil {
 os.WriteFile("out.svg", []byte(svg.Data), 0o644)
 ```
 
+`RenderOptions.Monospace` lists the parts that are measured and drawn in the
+monospace font: `MonospaceMembers` (class), `MonospaceAttributes` (ER),
+`MonospaceFiles` (tree view) and `MonospaceMessages` (sequence).
+
+A label on a fill that the diagram sets with `style`, `classDef`, or a
+sequence `rect` or `box` uses `--pele-fg-on-light` or `--pele-fg-on-dark`,
+whichever contrasts more with the fill. `Theme.FgOnLight` and `Theme.FgOnDark`
+set them.
+
 `svg.Type` is pele's name for the diagram type, such as `flowchart`.
 `svg.MermaidType` is the name Mermaid gives it, such as `flowchart-v2` for
 `graph TD`. A `Diagram` and an `Error` carry both names too. A parse error
 names the diagram type even when the parser of the type does not, as pele
-v1.8.0 does.
+v1.9.0 does.
 
 ## Math
 
@@ -138,7 +160,13 @@ Ishikawa diagrams, Cynefin diagrams, event models, Venn diagrams, Wardley
 maps, railroad diagrams, swimlane diagrams, use case diagrams and agent flows
 with box-drawing characters, for a terminal that shows no pictures. For a
 graph it takes the layout that sketch works out for the SVG and maps it to
-cells. The labels stay real text. A pie chart is a disc of half blocks in
+cells. The labels stay real text. Text in `<sub>` or `<sup>` shows in Unicode
+subscript or superscript characters, such as H₂O and mc², when each character
+has one, and after `_` or `^` when not. Text in `<code>`, `<kbd>`, `<u>` and the
+other styled tags shows as it is. Text shaped like a tag that is not HTML,
+such as `List<T>`, stays text. A line also breaks at a zero-width space or a
+soft hyphen, which shows as `-` where the line breaks. A class diagram puts its
+groups of classes that are not joined in rows to fit the columns. A pie chart is a disc of half blocks in
 the series colours, with a legend of labels, shares and, with `showData`,
 values. pele leaves a slice under 1% out of the pie. Without colour, or in 40
 columns or fewer, a pie chart is a bar for each slice. A mindmap is a tree. A gantt chart is bars on a date axis, a blank

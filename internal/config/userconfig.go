@@ -9,6 +9,7 @@ import (
 	"log"
 	"reflect"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,12 +48,18 @@ type UserConfig struct {
 	// Panes is the [panes] table: the keys display_panes labels the panes
 	// with. See panes.go.
 	Panes PanesConfig `toml:"panes"`
+	// PathPicker is the [path_picker] table: what the path picker lists.
+	// See path_picker.go.
+	PathPicker PathPickerConfig `toml:"path_picker"`
 	// Scratch is the [scratch] table: the size of the scratch terminal that
 	// toggle_scratch shows in a popup. See scratch.go.
 	Scratch ScratchConfig `toml:"scratch"`
 	// PiP is the [pip] table: the size and corner of the picture-in-picture
 	// view that toggle_pip pins. Client-local, like the spotlight. See pip.go.
 	PiP PiPConfig `toml:"pip"`
+
+	// SSH is the [ssh] table: the limits of the tuios ssh server. See ssh.go.
+	SSH SSHConfig `toml:"ssh"`
 
 	// Mermaid is the [mermaid] table: the colours of tuios mermaid. See mermaid.go.
 	Mermaid MermaidConfig `toml:"mermaid"`
@@ -67,12 +74,17 @@ type UserConfig struct {
 	// to paste again. See paste_buffers.go.
 	PasteBuffers PasteBuffersConfig `toml:"paste_buffers"`
 
+	// Worktree is the [worktree] table: where the worktrees tuios makes go.
+	// See worktree.go.
+	Worktree WorktreeConfig `toml:"worktree"`
+
 	// YieldedDefaults are the new default bindings left off because the key
 	// was already the user's for another action in the same table. It is
 	// worked out on load and never written. See yieldingDefaults.
 	YieldedDefaults []YieldedDefault `toml:"-"`
-	// RetiredKeybinds are the user's bindings to actions tuios no longer
-	// has, dropped on load. See migrateInboxKeys.
+	// RetiredKeybinds are the user's bindings dropped on load: to an action
+	// tuios no longer has, or a key another action took as its default. See
+	// migrateInboxKeys and dropStaleDuplicateKeys.
 	RetiredKeybinds []RetiredKeybind `toml:"-"`
 	// LoadWarnings say what the load of a config split over several files
 	// skipped: an included file that is not there, or an include cycle. It is
@@ -100,6 +112,9 @@ type UserConfig struct {
 	// panes. Outside the option registry for the same reason as the tables
 	// above. See agents.go.
 	Agents AgentsConfig `toml:"agents,omitempty"`
+	// Tasks is the [tasks] table: which stages the task board shows, and
+	// whether the daemon moves cards on its own. See tasks.go.
+	Tasks TasksConfig `toml:"tasks,omitempty"`
 	// Notify is the [notify] table: push notifications for the Inbox, sent
 	// by the daemon. Outside the option registry for the same reason as
 	// [hosts]. See notify.go.
@@ -128,6 +143,22 @@ type NotificationsConfig struct {
 
 	// ErrorSticky makes errors wait for esc instead of expiring (default true).
 	ErrorSticky *bool `toml:"error_sticky"`
+
+	// Bell is what a pane's BEL does: toast, forward, both or off. See
+	// BellModes.
+	Bell string `toml:"bell"`
+
+	// Style is how a dock message looks: full or plain. See
+	// NotificationStyles.
+	Style string `toml:"style"`
+
+	// Level is the least severe message the dock shows: info, warning or
+	// error. See NotificationLevels.
+	Level string `toml:"level"`
+
+	// LogHidden keeps a message below Level in the log viewer (default
+	// true). Off, it is dropped. Warnings and errors are logged either way.
+	LogHidden *bool `toml:"log_hidden"`
 
 	// Agent is the [notifications.agent] table: what happens when a pane's
 	// agent state changes. See agent_alerts.go.
@@ -177,6 +208,16 @@ type StartupConfig struct {
 	// bare "tuios" whose daemon will not start runs standalone for that one run
 	// and says so, so this never leaves the user without a terminal.
 	Daemon bool `toml:"daemon"`
+	// Session is the session a bare "tuios" attaches to, made when it is gone,
+	// as "tuios attach NAME -c" does. Empty keeps the old choice: the most
+	// recent session. A name needs the daemon, so a set Session takes the
+	// daemon route even with Daemon off; --standalone and TUIOS_NO_DAEMON=1
+	// still win. Any subcommand names its own session and ignores this.
+	Session string `toml:"session"`
+	// Window is the pane a bare "tuios" focuses in Session before it attaches,
+	// by id or name as "tuios focus-window" resolves it. It needs Session. A
+	// name no pane has leaves the focus where it was and creates nothing.
+	Window string `toml:"window"`
 }
 
 // TapeConfig holds settings for per-directory project tapes (.tuios.tape).
@@ -331,6 +372,8 @@ var WindowSizeModes = []string{WindowSizeSmallest, WindowSizeLargest, WindowSize
 type AppearanceConfig struct {
 	BorderStyle              string                  `toml:"border_style"`                 // Border style: rounded, normal, thick, double, hidden, block, ascii, outer-half-block, inner-half-block, glyphs
 	FramePanels              bool                    `toml:"frame_panels"`                 // Frame overlay panels in the border style at every colour depth (default: false)
+	PaneOverlays             bool                    `toml:"pane_overlays"`                // Draw dialogs and panels like pane windows (default: false)
+	OverlayBorderColor       string                  `toml:"overlay_border_color"`         // Colour of every overlay frame; empty keeps the overlay's own, or the focused border under pane_overlays
 	ZenMode                  string                  `toml:"zen_mode"`                     // Zen mode: disabled, always, mouse (default: disabled)
 	Links                    string                  `toml:"links"`                        // Links tuios acts on: off, marked, all (default: all)
 	LinkClick                string                  `toml:"link_click"`                   // The click that opens a link: both, ctrl, shift, off (default: both)
@@ -344,6 +387,7 @@ type AppearanceConfig struct {
 	ScrollLines              int                     `toml:"scroll_lines"`                 // Lines scrolled per mouse wheel notch (default: 3, min: 1, max: 50)
 	CopyOnSelect             *bool                   `toml:"copy_on_select"`               // Copy a mouse selection to the clipboard on release (default: true)
 	NvimNavigation           *bool                   `toml:"nvim_navigation"`              // Let the Neovim navigator plugin hand terminal focus keys back to TUIOS (default: false)
+	FocusWrap                *bool                   `toml:"focus_wrap"`                   // A focus key at the edge of a tiled layout moves to the pane on the far side (default: false)
 	FocusFollowsMouse        *bool                   `toml:"focus_follows_mouse"`          // Focus the pane under the cursor as the mouse moves (default: false)
 	FocusFollowsMousePause   string                  `toml:"focus_follows_mouse_pause"`    // The key that pauses focus_follows_mouse while held: ctrl, alt, off (default: off)
 	AltDrag                  *bool                   `toml:"alt_drag"`                     // Alt + left-drag moves a pane (default: true)
@@ -359,6 +403,7 @@ type AppearanceConfig struct {
 	PreferredShell           string                  `toml:"preferred_shell"`              // Preferred shell: if empty, auto-detect based on platform.
 	AnimationsEnabled        *bool                   `toml:"animations_enabled,omitempty"` // Deprecated: folded into motion on load (false is none)
 	Motion                   string                  `toml:"motion"`                       // How much moves: none, basic (window slides, copy sweep), full (also fades and the working shimmer) (default: full)
+	Calm                     *bool                   `toml:"calm"`                         // Calm mode: no motion or blinking, and only messages that need you reach the dock (default: false)
 	ModalDim                 *int                    `toml:"modal_dim"`                    // Percent the screen behind a modal overlay is darkened; 0 is off (default: 30)
 	PopupDim                 *int                    `toml:"popup_dim"`                    // Percent the screen behind a popup is darkened; 0 is off (default: 0)
 	ConfirmQuit              *bool                   `toml:"confirm_quit"`                 // Always show quit confirmation dialog (default: false). When false, only shown if foreground processes are running.
@@ -377,6 +422,10 @@ type AppearanceConfig struct {
 	SharedBorders            *bool                   `toml:"shared_borders"`               // Share borders between adjacent tiled windows (default: false)
 	// Customization
 	BorderFocusedColor string `toml:"border_focused_color"` // Hex color for focused pane border (e.g., "#89b4fa")
+	// BorderFocusedColorWindow and BorderFocusedColorTerminal are the focused
+	// border in one mode. Each wins over BorderFocusedColor in its mode.
+	BorderFocusedColorWindow   string `toml:"border_focused_color_window"`
+	BorderFocusedColorTerminal string `toml:"border_focused_color_terminal"`
 	// BorderFocusedGradient is two or more colours the focused border steps
 	// through, separated by spaces or commas. Empty draws one colour.
 	BorderFocusedGradient string `toml:"border_focused_gradient"`
@@ -387,6 +436,7 @@ type AppearanceConfig struct {
 	ZoomMaxWidth         int    `toml:"zoom_max_width"`         // Max width in cells for zoom mode (0 = fullscreen, e.g. 120 centers at 120 cols)
 	NiriReverseScroll    bool   `toml:"niri_reverse_scroll"`    // Reverse mouse scroll direction in niri scrolling mode (default: false)
 	NiriScrollCells      int    `toml:"niri_scroll_cells"`      // Cells the niri viewport moves per mouse wheel event (default: 8, min: 1, max: 200)
+	NiriScrollSnap       bool   `toml:"niri_scroll_snap"`       // Snap the strip to the nearest column when a wheel or a drag stops (default: false)
 	// PrefixRepeatTime is how long the prefix stays armed after a repeatable
 	// prefix command, in milliseconds, so ctrl+b then left left left walks
 	// three columns. Zero turns it off. This is tmux's repeat-time.
@@ -397,6 +447,7 @@ type AppearanceConfig struct {
 	DockWorkspaceTooltip   *bool    `toml:"dock_workspace_tooltip"`    // Show the workspace name on hover when the pill cuts or omits it (default: true)
 	DockWorkspaceLabelMax  *int     `toml:"dock_workspace_label_max"`  // Cell cap on a workspace pill's label; 0 draws the whole name (default: 12)
 	DockPrefixIndicator    string   `toml:"dock_prefix_indicator"`     // Where an armed leader shows: pill (default) or badge
+	DockModePill           string   `toml:"dock_mode_pill"`            // What the mode pill shows while tiling is on: tiling (default) or input
 	DockPillCaps           *bool    `toml:"dock_pill_caps"`            // Rounded caps on every dock pill (default: true; false draws flat pills)
 	DockModeSplitLetter    *bool    `toml:"dock_mode_split_letter"`    // V or H after the tiling icon in the mode pill (default: true)
 	DockModeIconWindow     *string  `toml:"dock_mode_icon_window"`     // Mode pill icon in window mode; "" draws none (default: the glyph set's)
@@ -430,14 +481,18 @@ type AppearanceConfig struct {
 	// because that is what a settings stepper and a CLI argument can carry: the
 	// option registry holds ints, and "50" is a value a person types. The model
 	// keeps the master ratio as the fraction the tilers want.
-	MasterRatio       int    `toml:"master_ratio"`        // Master pane width in the master-stack layout, percent of the screen (default: 50)
-	ScrollColumnWidth int    `toml:"scroll_column_width"` // New column width in the scrolling layout, percent of the screen (default: 55)
-	ScrollColumnMax   int    `toml:"scroll_column_max"`   // Highest that width may be set to, percent of the screen (default: 90, up to 100)
-	ZoomSize          int    `toml:"zoom_size"`           // How much of the screen a zoomed pane takes, percent (default: 95)
-	PanelPadding      int    `toml:"panel_padding"`       // Columns of surface padding inside every overlay panel (default: 2)
-	ClockFormat       string `toml:"clock_format"`        // Go time layout the clock overlay is drawn with (default: 15:04)
-	DimUnfocused      int    `toml:"dim_unfocused"`       // Percent an unfocused pane's content is carried toward its own ground (default: 0)
-	DimMultifocus     bool   `toml:"dim_multifocus"`      // Dim the panes in the multifocus set too (default: false)
+	MasterRatio       int `toml:"master_ratio"`        // Master pane width in the master-stack layout, percent of the screen (default: 50)
+	ScrollColumnWidth int `toml:"scroll_column_width"` // New column width in the scrolling layout, percent of the screen (default: 55)
+	ScrollColumnMax   int `toml:"scroll_column_max"`   // Highest that width may be set to, percent of the screen (default: 90, up to 100)
+	// ScrollColumnPresets are the widths scroll_cycle_width steps through, in
+	// percent of the screen, like niri's preset-column-widths. Empty keeps the
+	// built-in 33, 50, 55, 67, 90 and 100.
+	ScrollColumnPresets []int  `toml:"scroll_column_presets,omitempty"` // Widths scroll_cycle_width steps through, percent of the screen (default: built-in presets)
+	ZoomSize            int    `toml:"zoom_size"`                       // How much of the screen a zoomed pane takes, percent (default: 95)
+	PanelPadding        int    `toml:"panel_padding"`                   // Columns of surface padding inside every overlay panel (default: 2)
+	ClockFormat         string `toml:"clock_format"`                    // Go time layout the clock overlay is drawn with (default: 15:04)
+	DimUnfocused        int    `toml:"dim_unfocused"`                   // Percent an unfocused pane's content is carried toward its own ground (default: 0)
+	DimMultifocus       bool   `toml:"dim_multifocus"`                  // Dim the panes in the multifocus set too (default: false)
 
 	// DimForeground is a pointer because it defaults to true.
 	DimForeground *bool `toml:"dim_foreground"` // Let dim_unfocused dim the pane's text too, not only its background (default: true)
@@ -817,6 +872,9 @@ type SidebarConfig struct {
 	Workspaces string `toml:"workspaces"`
 	Marquee    *bool  `toml:"marquee"`  // Scroll a hovered row's overflowing title (default: true)
 	Tooltips   *bool  `toml:"tooltips"` // Label the collapsed strip on hover (default: true)
+	// Peek shows a session's panes in the terminals section while the pointer
+	// or the rail cursor rests on that session's row (default: true).
+	Peek *bool `toml:"peek"`
 	// Sections is the rail's layout: which sections it stacks, in what order,
 	// and the share of it each may claim. See SidebarDefaultSections.
 	Sections string `toml:"sections"`
@@ -829,6 +887,12 @@ type SidebarConfig struct {
 	// FolderClick is what a click on a folder row does: navigate, cd or both
 	// (default: navigate).
 	FolderClick string `toml:"folder_click"`
+	// FileDrag lets a row of the files section be dragged into a pane to
+	// paste its path (default: true).
+	FileDrag *bool `toml:"file_drag"`
+	// FilesStyle is how the files section draws: list or tree (default:
+	// list). See SidebarFilesStyles.
+	FilesStyle string `toml:"files_style"`
 	// HeaderCase is how the rail's section headers read: lowercase or uppercase
 	// (default: lowercase). See RailHeaderCases.
 	HeaderCase string `toml:"header_case"`
@@ -853,6 +917,10 @@ type SidebarConfig struct {
 	// Background is the ground painted under the rail: off, theme or
 	// #RRGGBB, and empty follows appearance.background (default: empty).
 	Background string `toml:"background"`
+	// CursorBackground is the ground of the row under the rail's cursor
+	// while the rail has the keyboard: a colour, and empty keeps the
+	// palette's own (default: empty).
+	CursorBackground string `toml:"cursor_background"`
 	// AgentRow is the [appearance.sidebar.agent_row] table: the tokens an
 	// agent row draws and the value rules that colour them. Decoded as generic
 	// TOML and read by ParseSidebarAgentRow, so a wrong value in it is a
@@ -877,10 +945,21 @@ type SidebarConfig struct {
 	// SubagentHideFinished hides a finished subagent's row this long after it
 	// ended: a duration, or off (default: off).
 	SubagentHideFinished string `toml:"subagent_hide_finished"`
+	// GroupMain gathers the repository's main checkout — the session whose
+	// directory is the repository itself, usually on main or master — under
+	// the repo row with its worktrees (default: false, the main checkout's
+	// sessions stay flat). With it on, the repo header's activation goes to
+	// the main checkout's session; the fold gesture moves to the header's
+	// right-click menu.
+	GroupMain *bool `toml:"group_main"`
 	// Custom is the [appearance.sidebar.custom] table: the command whose
 	// output the custom section draws, its heading, and when it runs. Read
 	// from the file only; see SidebarCustomConfig for why.
 	Custom SidebarCustomConfig `toml:"custom"`
+	// Pane is the [appearance.sidebar.pane] table: the program the pane
+	// section runs, its heading and its height. Read from the file only, for
+	// the reason Custom is. See sidebar_pane.go.
+	Pane SidebarPaneConfig `toml:"pane"`
 	// Left and Right independently configure rails on the two screen edges.
 	// When absent, the existing rail still lives at Position with its existing
 	// settings. A new edge must be explicitly enabled; see sidebar_edges.go.
@@ -930,6 +1009,18 @@ type KeybindingsConfig struct {
 	// "bind" when keyboard_layout is "us" or, with keyboard_layout unset, the
 	// Mac's input source is US or ABC, and "alt" otherwise.
 	OptionGlyphs string `toml:"option_glyphs,omitempty"`
+	// Lock is zellij's locked mode. When true, terminal mode gives every key
+	// to the focused pane except the leader: no terminal_mode key, no global
+	// key, no workspace chord and no hold key. The leader unlocks for one
+	// action, and tuios locks again when it is done. A repeatable action (see
+	// Repeat) keeps its menu open until esc, and that menu takes only the
+	// repeatable actions. Unset is false, or the preset's.
+	Lock *bool `toml:"lock,omitempty"`
+	// NestExitKey is the key that ends nest mode, the mode the nest
+	// action turns on, in which the focused pane gets every key, the leader
+	// included, as tmux-matryoshka's prefix Enter does. Empty is
+	// DefaultNestExitKey.
+	NestExitKey string `toml:"nest_exit_key,omitempty"`
 	// Repeat lists the actions that stay armed after the leader, as tmux's
 	// bind -r does: the same key pressed again inside
 	// appearance.prefix_repeat_time runs the action again without the leader.
@@ -1013,6 +1104,9 @@ type KeybindingsConfig struct {
 	// visual selection. Copy mode's vim motions are fixed keys and are not
 	// here. See getDefaultCopyModeKeybinds.
 	CopyMode map[string][]string `toml:"copy_mode"`
+	// Review binds are live while the review overlay is open and no note is
+	// being typed: its hunk and file motions. See getDefaultReviewKeybinds.
+	Review map[string][]string `toml:"review"`
 	// GUI binds are read only by a native GUI client (tuios-gpui), through
 	// the GUI bridge's keybinds event. They are desktop chords that need no
 	// leader, such as ctrl+shift+t. The terminal client never looks them up,
@@ -1045,6 +1139,7 @@ func DefaultConfig() *UserConfig {
 			ScrollLines:              3,
 			DockbarPosition:          DefaultDockbarPosition,
 			DockPrefixIndicator:      DefaultDockPrefixIndicator,
+			DockModePill:             DefaultDockModePill,
 			WindowTitlePosition:      DefaultWindowTitlePosition,
 			WindowTitleStyle:         DefaultWindowTitleStyle,
 			WindowTitleAlign:         DefaultWindowTitleAlign,
@@ -1085,6 +1180,7 @@ func DefaultConfig() *UserConfig {
 				OSC52Write: OSC52WriteFocused,
 			},
 			NvimNavigation: new(false),
+			FocusWrap:      new(false),
 			Sidebar: SidebarConfig{
 				// A fresh pointer per call, so a caller that flips it in place
 				// cannot change the next DefaultConfig.
@@ -1093,6 +1189,7 @@ func DefaultConfig() *UserConfig {
 				Width:         SidebarDefaultWidth,
 				Sections:      SidebarDefaultSections,
 				FolderClick:   SidebarFolderClickNavigate,
+				FilesStyle:    SidebarFilesList,
 				HeaderCase:    RailHeaderLowercase,
 				RowStyle:      RailRowBar,
 				HeaderStyle:   RailHeaderAuto,
@@ -1130,7 +1227,8 @@ func DefaultConfig() *UserConfig {
 		Hints:        defaultHintsConfig(),
 		Scratch:      defaultScratchConfig(),
 		PiP:          defaultPiPConfig(),
-		Mermaid:      MermaidConfig{Theme: "tuios"},
+		SSH:          defaultSSHConfig(),
+		Mermaid:      MermaidConfig{Theme: "tuios", Background: "theme"},
 		Panes:        defaultPanesConfig(),
 		PasteBuffers: defaultPasteBuffersConfig(),
 		Keybindings: KeybindingsConfig{
@@ -1153,6 +1251,9 @@ func DefaultConfig() *UserConfig {
 				// p pins the focused pane as the picture-in-picture view and
 				// unpins it again. p for pin. It was free in window mode.
 				"toggle_pip": {"p"},
+				// P gives the keyboard to the rail's pane section, next to
+				// the p that pins a pane in the corner.
+				"focus_rail_pane": {"P"},
 				// Finishing a mouse selection has always told the user to press
 				// 'c' to copy it. Until this binding existed, nothing was
 				// listening.
@@ -1179,6 +1280,11 @@ func DefaultConfig() *UserConfig {
 				// "alt+N" normalizes to alt+n, which is already next-window.
 				"next_session": {"alt+shift+n"},
 				"prev_session": {"alt+shift+p"},
+				// Walking agent panes, on the vim pair, terminal-safe for the
+				// same reason. On macOS Option+Shift+j and k compose Ô and ,
+				// which the glyph table maps back to these chords.
+				"next_agent": {"alt+shift+j"},
+				"prev_agent": {"alt+shift+k"},
 			},
 			Workspaces: getDefaultWorkspaceKeybinds(),
 			Layout:     getDefaultLayoutKeybinds(),
@@ -1268,6 +1374,10 @@ func DefaultConfig() *UserConfig {
 				// out of the glyph table on purpose and nothing matches it.
 				"next_session": {")"},
 				"prev_session": {"("},
+				// Stepping through agent panes, shifted j and k as on the
+				// direct chords. Lower j and k are taken here.
+				"next_agent": {"J"},
+				"prev_agent": {"K"},
 				// The launcher's direct chord is alt+space, which macOS turns
 				// into a non-breaking space that matches nothing. This is the
 				// way in that does not depend on the terminal.
@@ -1320,6 +1430,11 @@ func DefaultConfig() *UserConfig {
 				// G for go to, one shift from the g that shows the scratch
 				// terminal.
 				"goto_picker": {"G"},
+				// U makes a worktree of the focused pane's repository, herdr's
+				// leader+G. G is the go-to picker here, ctrl+g is the zellij
+				// preset's leader, and the multifocus docs suggest Y. U is
+				// free in every preset.
+				"new_worktree": {"U"},
 				// /, which searches everywhere else too. tmux puts its tree on
 				// s, which is the scrollback browser here.
 				"choose_tree":       {"/"},
@@ -1351,6 +1466,11 @@ func DefaultConfig() *UserConfig {
 				"prefix_agents_settings": {"A"},
 				// F, as in tmux-fingers. f searches files.
 				"hints": {"F"},
+				// . as in the current folder: the path picker lists it.
+				"pick_path": {"."},
+				// enter, as tmux-matryoshka's prefix Enter. Free in every
+				// preset.
+				"nest": {"enter"},
 				// Q, as in tmux's display-panes, which is q there. q is the
 				// quit menu here, and the slip from Q to q opens a menu that
 				// asks first.
@@ -1358,6 +1478,10 @@ func DefaultConfig() *UserConfig {
 				// g shows or hides the scratch terminal in a popup. It was
 				// free here, and f is kept free for the reason above.
 				"toggle_scratch": {"g"},
+				// Z for calm (zen): no motion, no blinking, and only the
+				// messages that need you. z zooms, and the slip from Z to z
+				// costs nothing.
+				"toggle_calm": {"Z"},
 				// V pastes the clipboard's image into the pane as the path of a
 				// file on the pane's machine. Capital, one shift from the v
 				// that reviews.
@@ -1374,6 +1498,8 @@ func DefaultConfig() *UserConfig {
 				// E opens the scrollback in the editor, one shift from the e
 				// that focuses the rail. Copy mode has it on ctrl+g.
 				ActionEditScrollback: {"E"},
+				// I writes the session's return note. i is the Inbox.
+				"set_note": {"I"},
 			},
 			WindowPrefix: map[string][]string{
 				"window_prefix_new":    {"n"},
@@ -1382,6 +1508,7 @@ func DefaultConfig() *UserConfig {
 				"window_prefix_next":   {"tab"},
 				"window_prefix_prev":   {"shift+tab"},
 				"window_prefix_tiling": {"t"},
+				"window_prefix_float":  {"f"},
 				"window_prefix_cancel": {"esc"},
 			},
 			MinimizePrefix: map[string][]string{
@@ -1477,6 +1604,7 @@ func DefaultConfig() *UserConfig {
 			Mail:          getDefaultMailKeybinds(),
 			Transfers:     getDefaultTransfersKeybinds(),
 			CopyMode:      getDefaultCopyModeKeybinds(),
+			Review:        getDefaultReviewKeybinds(),
 			GUI:           getDefaultGUIKeybinds(),
 			Global: map[string][]string{
 				// ctrl+p is fish's history-back and vim's keyword completion, and
@@ -1493,6 +1621,10 @@ func DefaultConfig() *UserConfig {
 			Lists: getDefaultListsKeybinds(),
 		},
 	}
+	// Written out so the file shows the key and its default.
+	cfg.Notifications.Bell = BellToast
+	cfg.Notifications.Style = NotificationStyleFull
+	cfg.Notifications.Level = NotificationLevelInfo
 	return cfg
 }
 
@@ -1606,9 +1738,20 @@ const (
 	ActionInboxShowSnoozed = "inbox_show_snoozed"
 	ActionInboxDenyReason  = "inbox_deny_reason"
 	ActionInboxNewAgent    = "inbox_new_agent"
+	// ActionInboxSettle settles the selected agent, or every marked one: it
+	// goes to the Settled shelf until it needs the person again.
+	ActionInboxSettle = "inbox_settle"
 	// ActionInboxCompare opens the comparison of the attempts of the fan
 	// under the cursor.
-	ActionInboxCompare    = "inbox_compare"
+	ActionInboxCompare = "inbox_compare"
+	// ActionInboxBoard groups the fleet by task stage, or by agent state
+	// again; ActionInboxTake claims the card under the cursor for the
+	// focused pane.
+	ActionInboxBoard = "inbox_board"
+	ActionInboxTake  = "inbox_take"
+	// ActionInboxArtifact opens what the agent under the cursor has shown,
+	// such as a TML form, on its Artifacts tab, and gives it the keys.
+	ActionInboxArtifact   = "inbox_artifact"
 	ActionInboxDetailDown = "inbox_detail_down"
 	ActionInboxDetailUp   = "inbox_detail_up"
 	// The approval card's keys, the keys that open and close the focus on a
@@ -1620,10 +1763,11 @@ const (
 	ActionInboxHelp        = "inbox_help"
 	ActionInboxMark        = "inbox_mark"
 	ActionInboxMarkAll     = "inbox_mark_all"
-	// The focus\'s tabs, and every line of every thread card.
+	// The focus\'s tabs, every line of every thread card, and the group fold.
 	ActionInboxTabPrev      = "inbox_tab_prev"
 	ActionInboxTabNext      = "inbox_tab_next"
 	ActionInboxExpand       = "inbox_expand"
+	ActionInboxFold         = "inbox_fold"
 	ActionAgentUnread       = "agent_unread"
 	ActionAgentSnooze       = "agent_snooze"
 	ActionAgentReply        = "agent_reply"
@@ -1690,9 +1834,13 @@ func getDefaultInboxKeybinds() map[string][]string {
 		ActionInboxSnooze:      {"z"},
 		ActionInboxUndo:        {"u"},
 		ActionInboxShowSnoozed: {"S"},
+		ActionInboxSettle:      {"D"},
 		ActionInboxDenyReason:  {"R"},
 		ActionInboxNewAgent:    {"n"},
 		ActionInboxCompare:     {"c"},
+		ActionInboxBoard:       {"b"},
+		ActionInboxTake:        {"t"},
+		ActionInboxArtifact:    {"o"},
 		ActionInboxDetailDown:  {"J", "ctrl+d"},
 		ActionInboxDetailUp:    {"K", "ctrl+u"},
 		ActionInboxAllow:       {"a"},
@@ -1705,6 +1853,7 @@ func getDefaultInboxKeybinds() map[string][]string {
 		ActionInboxTabPrev:     {"["},
 		ActionInboxTabNext:     {"]"},
 		ActionInboxExpand:      {"e"},
+		ActionInboxFold:        {"F"},
 	}
 }
 
@@ -1826,6 +1975,12 @@ func getDefaultSidebarFilesKeybinds() map[string][]string {
 		// S sends the file or folder to another machine. Capital, because it
 		// starts a copy over a link, and one shift from nothing else here.
 		"file_send": {"S"},
+		// I pastes the path into the focused pane, quoted for its shell: the
+		// keyboard form of dragging the row onto the pane.
+		"file_insert_path": {"I"},
+		// space previews the row, as Finder and yazi do. Free in the rail:
+		// nothing else in the rail's scope takes it.
+		"file_quick_look": {"space"},
 	}
 }
 
@@ -1846,6 +2001,7 @@ func getDefaultTerminalModeKeybinds() map[string][]string {
 			"terminal_scroll_page_up":   {"shift+pgup"},
 			"terminal_scroll_page_down": {"shift+pgdown"},
 			"terminal_paste_host":       {"ctrl+shift+v", "super+v", "shift+super+v", "middle"},
+			"pick_path":                 {"opt+;"},
 		}
 	}
 	return map[string][]string{
@@ -1874,6 +2030,10 @@ func getDefaultTerminalModeKeybinds() map[string][]string {
 		// chord was dead for as long as it was written the other way round, and
 		// nothing said so until the reachability table pressed it.
 		"terminal_paste_host": {"ctrl+shift+v", "super+v", "shift+super+v", "middle"},
+		// alt+; is free in bash, zsh and fish, and no preset binds it. The
+		// picker types a path at the prompt, so its key has to work while
+		// typing into the shell.
+		"pick_path": {"alt+;"},
 	}
 }
 
@@ -2430,6 +2590,8 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 		s.BorderStyle = cfg.Appearance.BorderStyle
 	}
 	s.FramePanels = cfg.Appearance.FramePanels
+	s.PaneOverlays = cfg.Appearance.PaneOverlays
+	s.OverlayBorderColor = cfg.Appearance.OverlayBorderColor
 
 	// ZenMode only takes one of its three values, so a typo in the config lands
 	// on the default the validator warned it would fall back to.
@@ -2550,6 +2712,9 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	if sb.Marquee != nil {
 		s.SidebarMarquee = *sb.Marquee
 	}
+	// Assigned whatever the file says, so a key removed from it turns the
+	// peek back on at the next reload.
+	s.SidebarPeekEnabled = sb.Peek == nil || *sb.Peek
 	// The layout falls back to the shipped one when unset, so a config file
 	// written before the files section existed lays the rail out the way it
 	// always did plus the new section, rather than drawing nothing at all.
@@ -2571,6 +2736,15 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	}
 	if sb.FolderClick != "" {
 		s.SidebarFolderClick = sb.FolderClick
+	}
+	if sb.FileDrag != nil {
+		s.SidebarFileDrag = *sb.FileDrag
+	}
+	// A typo reads as the default, the same contract the other enum options
+	// keep, and the validator says so.
+	s.SidebarFilesStyle = SidebarFilesList
+	if slices.Contains(SidebarFilesStyles, sb.FilesStyle) {
+		s.SidebarFilesStyle = sb.FilesStyle
 	}
 	// A typo reads as the default, the same contract the other enum options
 	// keep.
@@ -2601,6 +2775,9 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	s.SidebarAgentRestFold, _ = ParseAgentRestFold(sb.AgentRestFold)
 	// Anything but count draws rows, the default; validation names a typo.
 	s.SidebarSubagents = ResolveSidebarSubagentView(cfg.Appearance.Sidebar, primary)
+	if sb.GroupMain != nil {
+		s.SidebarGroupMain = *sb.GroupMain
+	}
 	if sb.Tooltips != nil {
 		s.Tooltips = *sb.Tooltips
 	}
@@ -2628,6 +2805,11 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 		s.DockPrefixIndicator = cfg.Appearance.DockPrefixIndicator
 	} else {
 		s.DockPrefixIndicator = DefaultDockPrefixIndicator
+	}
+	if slices.Contains(DockModePills, cfg.Appearance.DockModePill) {
+		s.DockModePill = cfg.Appearance.DockModePill
+	} else {
+		s.DockModePill = DefaultDockModePill
 	}
 	s.DockCompact = cfg.Appearance.DockCompact
 	// The mode icons are pointers so an empty string can hide the icon, which is
@@ -2687,6 +2869,7 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	s.WindowChromeBackground = cfg.Appearance.WindowChromeBackground
 	s.DockBackground = cfg.Appearance.DockBackground
 	s.SidebarBackground = cfg.Appearance.Sidebar.Background
+	s.SidebarCursorBackground = cfg.Appearance.Sidebar.CursorBackground
 
 	// A pointer because zero is a real value here: it turns the repeat window
 	// off, and a plain int could not tell that from an absent key.
@@ -2771,6 +2954,9 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	s.ThemeTransitionMs = clampPercent(cfg.Appearance.ThemeTransitionMs, ThemeTransitionMsMin, ThemeTransitionMsMax, ThemeTransitionMsDefault)
 	s.ScrollColumnMax = clampPercent(cfg.Appearance.ScrollColumnMax, ScrollColumnWidthMin, ScrollColumnWidthCeiling, ScrollColumnWidthMax)
 	s.ScrollColumnWidth = clampPercent(cfg.Appearance.ScrollColumnWidth, ScrollColumnWidthMin, s.ScrollColumnMax, ScrollColumnWidthDefault)
+	// Assigned unconditionally, so a reload that removes the list goes back to
+	// the built-in presets.
+	s.ScrollColumnPresets = ScrollColumnPresetFractions(cfg.Appearance.ScrollColumnPresets)
 	s.DimUnfocused = min(max(cfg.Appearance.DimUnfocused, 0), DimUnfocusedMax)
 	// DimForeground defaults to true, so it is a pointer: an unset key has to
 	// read as on, and only an explicit false turns it off.
@@ -2791,6 +2977,7 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	s.ShowCPU = cfg.Appearance.ShowCPU
 	s.ShowRAM = cfg.Appearance.ShowRAM
 	s.NiriReverseScroll = cfg.Appearance.NiriReverseScroll
+	s.NiriScrollSnap = cfg.Appearance.NiriScrollSnap
 	s.NiriScrollCells = clampPercent(cfg.Appearance.NiriScrollCells, NiriScrollCellsMin, NiriScrollCellsMax, NiriScrollCellsDefault)
 
 	if cfg.Appearance.ScrollbackLines > 0 {
@@ -2815,6 +3002,8 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	}
 	s.KeyboardLayout = cfg.Keybindings.KeyboardLayout
 	s.OptionGlyphs = cfg.Keybindings.OptionGlyphs
+	s.Lock = cfg.Keybindings.Lock != nil && *cfg.Keybindings.Lock
+	s.NestExitKey = cfg.Keybindings.NestExitKey
 
 	// The motion level. A config that was not run through the load path (one
 	// built in code) can still carry the old boolean, so it is folded here as
@@ -2827,6 +3016,7 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	if s.NoAnimationsFlag {
 		s.Motion = MotionNone
 	}
+	s.Calm = a.Calm != nil && *a.Calm
 	if a.ModalDim != nil {
 		s.ModalDim = min(max(*a.ModalDim, 0), ModalDimMax)
 	}
@@ -2896,6 +3086,9 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	}
 	if cfg.Appearance.NvimNavigation != nil {
 		s.NvimNavigation = *cfg.Appearance.NvimNavigation
+	}
+	if cfg.Appearance.FocusWrap != nil {
+		s.FocusWrap = *cfg.Appearance.FocusWrap
 	}
 
 	// FocusFollowsMouse defaults to false; a pointer so turning it off in the
@@ -2998,7 +3191,7 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	// Custom border colors override the theme-derived colors. Empty strings
 	// clear any override and restore theme colors. This runs after the theme
 	// switch above, which resets the derived colors.
-	theme.SetBorderOverrides(cfg.Appearance.BorderFocusedColor, cfg.Appearance.BorderUnfocusedColor)
+	theme.SetBorderOverrides(cfg.Appearance.BorderOverrides())
 	s.BorderFocusedGradient = cfg.Appearance.BorderFocusedGradient
 	s.BorderGradientAngle = DefaultBorderGradientAngle
 	if a := cfg.Appearance.BorderGradientAngle; a != nil {
@@ -3105,24 +3298,51 @@ func (f FPSLimit) Valid() bool {
 	return ok
 }
 
+// notificationDurationMax is the longest lifetime, in seconds, that
+// notifications.KEY takes: the Max the option registry gives it, which is also
+// what the settings page and set-config allow.
+func notificationDurationMax(key string) int {
+	if opt, ok := LookupOption("notifications." + key); ok && opt.Max > 0 {
+		return opt.Max
+	}
+	return 3600
+}
+
 // ApplyNotificationConfig applies the [notifications] section to the package
-// globals the renderer reads. Absent or non-positive values leave the built-in
-// default in place rather than collapsing a message to zero seconds, which is
-// the failure mode the old 1500ms default was already close enough to.
+// settings the renderer reads. Absent or non-positive values leave the built-in
+// default in place rather than collapsing a message to zero seconds. A value
+// past the registry's Max is cut to it.
 func ApplyNotificationConfig(cfg *UserConfig, s *Settings) {
-	if cfg.Notifications.Duration > 0 {
-		s.NotificationDuration = time.Duration(cfg.Notifications.Duration) * time.Second
+	apply := func(key string, seconds int, into *time.Duration) {
+		if seconds <= 0 {
+			return
+		}
+		*into = time.Duration(min(seconds, notificationDurationMax(key))) * time.Second
 	}
-	if cfg.Notifications.WarningDuration > 0 {
-		s.NotificationWarningDuration = time.Duration(cfg.Notifications.WarningDuration) * time.Second
-	}
-	if cfg.Notifications.ErrorDuration > 0 {
-		s.NotificationErrorDuration = time.Duration(cfg.Notifications.ErrorDuration) * time.Second
-	}
+	apply("duration", cfg.Notifications.Duration, &s.NotificationDuration)
+	apply("warning_duration", cfg.Notifications.WarningDuration, &s.NotificationWarningDuration)
+	apply("error_duration", cfg.Notifications.ErrorDuration, &s.NotificationErrorDuration)
 	// ErrorSticky defaults to true, so nil means "keep the default" and only an
 	// explicit false turns it off.
 	if cfg.Notifications.ErrorSticky != nil {
 		s.NotificationErrorSticky = *cfg.Notifications.ErrorSticky
+	}
+	// An unknown value keeps the default; validation already warned about it.
+	s.Bell = BellToast
+	if slices.Contains(BellModes, cfg.Notifications.Bell) {
+		s.Bell = cfg.Notifications.Bell
+	}
+	s.NotificationStyle = NotificationStyleFull
+	if slices.Contains(NotificationStyles, cfg.Notifications.Style) {
+		s.NotificationStyle = cfg.Notifications.Style
+	}
+	s.NotificationLevel = NotificationLevelInfo
+	if slices.Contains(NotificationLevels, cfg.Notifications.Level) {
+		s.NotificationLevel = cfg.Notifications.Level
+	}
+	s.NotificationLogHidden = true
+	if cfg.Notifications.LogHidden != nil {
+		s.NotificationLogHidden = *cfg.Notifications.LogHidden
 	}
 }
 
@@ -3324,8 +3544,8 @@ func migrateInboxKeys(cfg *UserConfig) {
 	}
 }
 
-// RetiredKeybind is a binding to an action tuios no longer has, dropped on
-// load.
+// RetiredKeybind is a binding dropped on load: to an action tuios no longer
+// has, or a key another action took as its default.
 type RetiredKeybind struct {
 	Section string   `json:"section"`
 	Action  string   `json:"action"`
@@ -3377,6 +3597,10 @@ func fillMissingKeybinds(cfg, defaultCfg *UserConfig) {
 			}
 			if cfg.Keybindings.LeaderTwice == "" {
 				cfg.Keybindings.LeaderTwice = kb.LeaderTwice
+			}
+			if cfg.Keybindings.Lock == nil && kb.Lock != nil {
+				lock := *kb.Lock
+				cfg.Keybindings.Lock = &lock
 			}
 		}
 	}
@@ -3465,6 +3689,9 @@ func fillMissingKeybinds(cfg, defaultCfg *UserConfig) {
 	}
 	if cfg.Keybindings.CopyMode == nil {
 		cfg.Keybindings.CopyMode = make(map[string][]string)
+	}
+	if cfg.Keybindings.Review == nil {
+		cfg.Keybindings.Review = make(map[string][]string)
 	}
 
 	migrateLegacyKeybinds(cfg)
@@ -3564,12 +3791,28 @@ func fillMissingKeybinds(cfg, defaultCfg *UserConfig) {
 	fillMapDefaults(cfg.Keybindings.Transfers, defaultCfg.Keybindings.Transfers)
 	// Copy mode's section is newer than every config written before it.
 	fillMapDefaults(cfg.Keybindings.CopyMode, defaultCfg.Keybindings.CopyMode)
+	// The review overlay's section is newer than every config written before it.
+	fillMapDefaults(cfg.Keybindings.Review, defaultCfg.Keybindings.Review)
 	// The GUI section is newer than every config written before it.
 	fillMapDefaults(cfg.Keybindings.GUI, defaultCfg.Keybindings.GUI)
 
+	var dropped []RetiredKeybind
 	for _, section := range keybindSectionPairs(cfg, defaultCfg) {
-		dropStaleDuplicateKeys(section.target, section.defaults)
+		for _, d := range dropStaleDuplicateKeys(section.target, section.defaults) {
+			dropped = append(dropped, RetiredKeybind{
+				Section: section.name, Action: d.action, Keys: []string{d.key},
+				Note: fmt.Sprintf("%q is the default key of %s. To keep %q on %s, bind %s to another key.", d.key, d.owner, d.key, d.action, d.owner),
+			})
+		}
 	}
+	// The drops come out of a map walk; sorted, the report reads the same on
+	// every run.
+	// sort.Slice, not slices.SortFunc: see docs/perf.md, "Where the bytes go".
+	sort.Slice(dropped, func(i, j int) bool {
+		a, b := dropped[i], dropped[j]
+		return cmp.Or(cmp.Compare(a.Section, b.Section), cmp.Compare(a.Action, b.Action), cmp.Compare(a.Keys[0], b.Keys[0])) < 0
+	})
+	cfg.RetiredKeybinds = append(cfg.RetiredKeybinds, dropped...)
 }
 
 // yieldingDefaults are the actions whose default key arrived after users could
@@ -3581,16 +3824,28 @@ func fillMissingKeybinds(cfg, defaultCfg *UserConfig) {
 var yieldingDefaults = map[string]bool{
 	"hints":          true,
 	"toggle_scratch": true,
+	// alt+; and prefix ., new in the release after v0.10.1.
+	"pick_path": true,
+	// Z after the prefix, new with calm mode.
+	"toggle_calm": true,
 	// Q after the prefix, new in the release after v0.8.5.
 	"display_panes": true,
 	// U in window mode, new with the keybind presets.
 	"open_keybind_presets": true,
 	// / after the prefix, new in the release after v0.8.5.
 	"choose_tree": true,
+	// enter after the prefix, new with nest mode.
+	"nest": true,
 	// G after the prefix, new with the go-to picker.
 	"goto_picker": true,
+	// U after the prefix, new with the worktree key.
+	"new_worktree": true,
+	// I after the prefix, new with the return notes.
+	"set_note": true,
 	// p in window mode, new in the release after v0.8.2.
 	"toggle_pip": true,
+	// P in window mode, new with the rail's pane section.
+	"focus_rail_pane": true,
 	// V after the prefix, new in the release after v0.8.2.
 	"paste_image": true,
 	// ] and # after the prefix, new in the release after v0.8.5.
@@ -3606,6 +3861,9 @@ var yieldingDefaults = map[string]bool{
 	// j and k in window mode, new in the release after v0.8.0.
 	"focus_down": true,
 	"focus_up":   true,
+	// J and K after the prefix, new with the agent walk.
+	"next_agent": true,
+	"prev_agent": true,
 	// The Inbox keys new with the agents cockpit, after v0.10.1. R and n
 	// changed hands: R was free and n was inbox_deny_reason's.
 	"inbox_new_agent":    true,
@@ -3621,6 +3879,7 @@ var yieldingDefaults = map[string]bool{
 	"inbox_tab_prev":     true,
 	"inbox_tab_next":     true,
 	"inbox_expand":       true,
+	"inbox_fold":         true,
 	// ctrl+alt+N (ctrl+opt+N on macOS), the first default for
 	// send_to_workspace_N.
 	"send_to_workspace_1": true,
@@ -3778,39 +4037,43 @@ func dropPresetShadows(user, tuios, preset map[string][]string) int {
 }
 
 // keybindSection pairs a config section with the defaults for that section.
-type keybindSection struct{ target, defaults map[string][]string }
+type keybindSection struct {
+	name             string
+	target, defaults map[string][]string
+}
 
 func keybindSectionPairs(cfg, defaultCfg *UserConfig) []keybindSection {
 	c, d := &cfg.Keybindings, &defaultCfg.Keybindings
 	return []keybindSection{
-		{c.WindowManagement, d.WindowManagement},
-		{c.Workspaces, d.Workspaces},
-		{c.Layout, d.Layout},
-		{c.ModeControl, d.ModeControl},
-		{c.System, d.System},
-		{c.Navigation, d.Navigation},
-		{c.RestoreMinimized, d.RestoreMinimized},
-		{c.PrefixMode, d.PrefixMode},
-		{c.WindowPrefix, d.WindowPrefix},
-		{c.MinimizePrefix, d.MinimizePrefix},
-		{c.WorkspacePrefix, d.WorkspacePrefix},
-		{c.DebugPrefix, d.DebugPrefix},
-		{c.TapePrefix, d.TapePrefix},
-		{c.LayoutPrefix, d.LayoutPrefix},
-		{c.TuiosPrefix, d.TuiosPrefix},
-		{c.TerminalMode, d.TerminalMode},
-		{c.Sidebar, d.Sidebar},
-		{c.SidebarFiles, d.SidebarFiles},
-		{c.SidebarAgents, d.SidebarAgents},
-		{c.Inbox, d.Inbox},
-		{c.InboxPeek, d.InboxPeek},
-		{c.Mail, d.Mail},
-		{c.Transfers, d.Transfers},
-		{c.CopyMode, d.CopyMode},
-		{c.GUI, d.GUI},
-		{c.Global, d.Global},
-		{c.Script, d.Script},
-		{c.Lists, d.Lists},
+		{"window_management", c.WindowManagement, d.WindowManagement},
+		{"workspaces", c.Workspaces, d.Workspaces},
+		{"layout", c.Layout, d.Layout},
+		{"mode_control", c.ModeControl, d.ModeControl},
+		{"system", c.System, d.System},
+		{"navigation", c.Navigation, d.Navigation},
+		{"restore_minimized", c.RestoreMinimized, d.RestoreMinimized},
+		{"prefix_mode", c.PrefixMode, d.PrefixMode},
+		{"window_prefix", c.WindowPrefix, d.WindowPrefix},
+		{"minimize_prefix", c.MinimizePrefix, d.MinimizePrefix},
+		{"workspace_prefix", c.WorkspacePrefix, d.WorkspacePrefix},
+		{"debug_prefix", c.DebugPrefix, d.DebugPrefix},
+		{"tape_prefix", c.TapePrefix, d.TapePrefix},
+		{"layout_prefix", c.LayoutPrefix, d.LayoutPrefix},
+		{"tuios_prefix", c.TuiosPrefix, d.TuiosPrefix},
+		{"terminal_mode", c.TerminalMode, d.TerminalMode},
+		{"sidebar", c.Sidebar, d.Sidebar},
+		{"sidebar_files", c.SidebarFiles, d.SidebarFiles},
+		{"sidebar_agents", c.SidebarAgents, d.SidebarAgents},
+		{"inbox", c.Inbox, d.Inbox},
+		{"inbox_peek", c.InboxPeek, d.InboxPeek},
+		{"mail", c.Mail, d.Mail},
+		{"transfers", c.Transfers, d.Transfers},
+		{"copy_mode", c.CopyMode, d.CopyMode},
+		{"review", c.Review, d.Review},
+		{"gui", c.GUI, d.GUI},
+		{"global", c.Global, d.Global},
+		{"script", c.Script, d.Script},
+		{"lists", c.Lists, d.Lists},
 	}
 }
 
@@ -3830,7 +4093,11 @@ func keybindSectionPairs(cfg, defaultCfg *UserConfig) []keybindSection {
 // silently picking a winner would hide. Nor is an action's last key ever taken,
 // however the defaults read: a sole binding is a deliberate choice, and only a
 // redundant extra one can be residue. ValidateConfig warns about what is left.
-func dropStaleDuplicateKeys(section, defaults map[string][]string) {
+//
+// It returns the keys it took, for keybinds doctor: a key the user wrote on
+// purpose is taken the same way, and would otherwise vanish without a word.
+func dropStaleDuplicateKeys(section, defaults map[string][]string) []droppedKey {
+	var dropped []droppedKey
 	claimants := make(map[string][]string)
 	for action, keys := range section {
 		for _, key := range keys {
@@ -3863,9 +4130,14 @@ func dropStaleDuplicateKeys(section, defaults map[string][]string) {
 			section[action] = slices.DeleteFunc(slices.Clone(section[action]), func(k string) bool {
 				return k == key
 			})
+			dropped = append(dropped, droppedKey{action: action, key: key, owner: owner})
 		}
 	}
+	return dropped
 }
+
+// droppedKey is a key dropStaleDuplicateKeys took from action and left to owner.
+type droppedKey struct{ action, key, owner string }
 
 // ConfigWarnings returns the non-fatal problems in cfg as human-readable lines,
 // for surfacing inside the running TUI. Reported only to a log nobody reads,
@@ -3895,4 +4167,15 @@ func GetConfigPath() (string, error) {
 		return xdg.ConfigFile("tuios/config.toml")
 	}
 	return path, nil
+}
+
+// BorderOverrides are the border colour keys of a, as the theme package takes
+// them.
+func (a *AppearanceConfig) BorderOverrides() theme.BorderOverrides {
+	return theme.BorderOverrides{
+		Focused:         a.BorderFocusedColor,
+		FocusedWindow:   a.BorderFocusedColorWindow,
+		FocusedTerminal: a.BorderFocusedColorTerminal,
+		Unfocused:       a.BorderUnfocusedColor,
+	}
 }

@@ -8,13 +8,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/listnav"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/tape"
-	"github.com/Gaurav-Gosain/tuios/internal/theme"
+	"github.com/Gaurav-Gosain/tuios/internal/textedit"
 	"github.com/Gaurav-Gosain/tuios/internal/units"
 	"github.com/adrg/xdg"
 )
@@ -401,7 +402,7 @@ func (m *OS) RenderTapeManager() string {
 		m.InitTapeManager()
 	}
 
-	pal := theme.UI()
+	pal := m.overlayUI()
 	bg := pal.Surface
 	width := m.panelWidth(tapeManagerWidth)
 
@@ -554,6 +555,10 @@ func (m *OS) HandleTapeManagerInput(key string) bool {
 
 	switch m.TapeManager.Mode {
 	case TapeManagerNaming:
+		if textedit.IsWordDeleteKey(key) {
+			m.TapeManager.NameBuffer = textedit.DropLastWord(m.TapeManager.NameBuffer)
+			return true
+		}
 		switch key {
 		case "enter":
 			m.TapeManagerConfirmRecording()
@@ -562,8 +567,10 @@ func (m *OS) HandleTapeManagerInput(key string) bool {
 			m.TapeManager.Mode = TapeManagerList
 			return true
 		case "backspace":
-			if len(m.TapeManager.NameBuffer) > 0 {
-				m.TapeManager.NameBuffer = m.TapeManager.NameBuffer[:len(m.TapeManager.NameBuffer)-1]
+			if name := m.TapeManager.NameBuffer; name != "" {
+				// By character, like every other field.
+				_, size := utf8.DecodeLastRuneInString(name)
+				m.TapeManager.NameBuffer = name[:len(name)-size]
 			}
 			return true
 		default:

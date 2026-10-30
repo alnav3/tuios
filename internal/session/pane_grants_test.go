@@ -641,7 +641,9 @@ func TestAPaneCannotTypeIntoAPaneThatHoldsMore(t *testing.T) {
 	if f, _ := focusedWindowID(d.manager.GetSession("a").GetState()); f != a2 {
 		t.Fatalf("focused window = %s, want %s for this check", f, a2)
 	}
-	wantForbidden(t, "send-text into the focused admin sibling", callP(c, t, "send-text", map[string]any{"text": widen}))
+	if code := errCode(t, callP(c, t, "send-text", map[string]any{"text": widen})); code != ErrVerbInvalidParams {
+		t.Errorf("send-text with no window from a pane answered %s, want invalid_params", code)
+	}
 
 	// Its own pane is always its own to type into.
 	result(t, callP(c, t, "send-text", map[string]any{"window": a1, "text": "x"}))
@@ -688,9 +690,12 @@ func TestTypingIntoAPromptNeedsRespond(t *testing.T) {
 		t.Errorf("ask-agent into a prompt answered %s, want agent_blocked as before", code)
 	}
 
-	// respond covers it.
+	// respond covers it, with allow_blocked to say the caller read the prompt.
 	setStrict(d, append(append([]string{}, config.DefaultStrictGrants...), config.PaneGrantRespond)...)
-	result(t, callP(c, t, "send-keys", map[string]any{"window": a2, "keys": "Enter"}))
+	if code := errCode(t, callP(c, t, "send-keys", map[string]any{"window": a2, "keys": "Enter"})); code != ErrVerbAgentBlocked {
+		t.Errorf("send-keys with respond and no allow_blocked answered %s, want agent_blocked", code)
+	}
+	result(t, callP(c, t, "send-keys", map[string]any{"window": a2, "keys": "Enter", "allow_blocked": true}))
 
 	// A pane that has come to a prompt since the call was checked is refused
 	// by the handler's second look.
@@ -896,7 +901,16 @@ func TestThePluginTokenHoldsTheCaller(t *testing.T) {
 		t.Errorf("a caller with a plugin's token was confirmed as the person")
 	}
 
-	env["TUIOS_PLUGIN_TOKEN"] = "00" + env["TUIOS_PLUGIN_TOKEN"][2:]
+	// Flip one hex digit rather than writing a fixed prefix: a token whose
+	// first byte is already 00 would survive that untouched, and the daemon
+	// would rightly take it. (Once in 256 daemon starts, drawn on CI.)
+	tampered := []byte(env["TUIOS_PLUGIN_TOKEN"])
+	if tampered[0] == '0' {
+		tampered[0] = '1'
+	} else {
+		tampered[0] = '0'
+	}
+	env["TUIOS_PLUGIN_TOKEN"] = string(tampered)
 	bad, err := DialVerbClientAt(sp, "test")
 	if err != nil {
 		t.Fatal(err)

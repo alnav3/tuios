@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,12 +17,14 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Gaurav-Gosain/tuios/internal/childproc"
 	"github.com/Gaurav-Gosain/tuios/internal/composer"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
 	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
 	"github.com/Gaurav-Gosain/tuios/internal/harness"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 )
 
@@ -129,6 +132,8 @@ type spawnSheet struct {
 	hits   []ckHit
 	// gen tells an answer for this opening from one for an earlier one.
 	gen uint64
+	// card is the task card n opened the sheet on, nil for none.
+	card *spawnCard
 }
 
 // spawnInfoMsg carries what the sheet's opening command read.
@@ -155,6 +160,8 @@ type spawnStartedMsg struct {
 	sheet *spawnSheet
 	text  string
 	err   error
+	// warn says the agent started and its task was not sent.
+	warn bool
 }
 
 // CockpitSpawnOpen reports whether the spawn sheet is up.
@@ -195,7 +202,7 @@ func (m *OS) CockpitNewAgent() tea.Cmd {
 	}
 	// A kept draft keeps what was read for it, so its Start works at once;
 	// the command below reads it again.
-	s.field, s.list, s.notice = spTask, false, ""
+	s.field, s.list, s.notice, s.card = spTask, false, "", nil
 	ck.spawnGen++
 	s.gen = ck.spawnGen
 	s.folder = m.spawnFolder()
@@ -203,14 +210,25 @@ func (m *OS) CockpitNewAgent() tea.Cmd {
 	m.spawnRank(s)
 	ck.spawn = s
 	m.cockpitTouch()
+	if m.LearnMode && m.learnSpawn != nil {
+		// No programs and no git in the browser: the tour says what the
+		// sheet offers.
+		info := m.learnSpawn()
+		s.folder = info.Folder
+		return m.learnSpawnInfoCmd(s.gen, info)
+	}
 	return spawnInfoCmd(s.gen, s.folder)
 }
 
-// spawnFolder is the directory "this folder" means: the focused pane's, or
-// the client's own when the pane has not said where it is.
+// spawnFolder is the directory "this folder" means: the folder the focused
+// pane's shell is in, or the client's own when that cannot be read. The sheet
+// runs git there and Start makes a worktree of it, so an OSC 7 report alone
+// never chooses it (paneShellDir).
 func (m *OS) spawnFolder() string {
-	if w := m.GetFocusedWindow(); w != nil && m.paneIsLocal(w) && w.Cwd != "" {
-		return w.Cwd
+	if w := m.GetFocusedWindow(); w != nil && m.paneIsLocal(w) {
+		if dir, ok := paneShellDir(w, true); ok {
+			return dir
+		}
 	}
 	dir, _ := os.Getwd()
 	return dir
@@ -273,7 +291,7 @@ func (m *OS) spawnSortAgents(s *spawnSheet) {
 		}
 		return len(spawnCommon)
 	}
-	slices.SortStableFunc(s.agents, func(a, b spawnAgent) int {
+	sortx.SortStableFunc(s.agents, func(a, b spawnAgent) int {
 		return cmp.Or(cmp.Compare(rank(a), rank(b)), cmp.Compare(b.seen, a.seen), cmp.Compare(common(a), common(b)), cmp.Compare(a.cmd, b.cmd))
 	})
 	find := func(id string) int {
@@ -331,6 +349,11 @@ func (m *OS) spawnRank(s *spawnSheet) {
 	} else {
 		local.load, local.loadOK = spawnLoadAvg()
 	}
+	if m.LearnMode && m.learnSpawn != nil {
+		// A browser tab has no cores or load to rank by, and its host name
+		// is the runtime's.
+		local.name, local.cores, local.load, local.loadOK = cmp.Or(m.learnSpawn().Machine, local.name), 0, 0, false
+	}
 	ms := []spawnMachine{local}
 	for _, h := range m.FederationHosts {
 		if h.Name == federation.LocalHostName {
@@ -351,7 +374,7 @@ func (m *OS) spawnRank(s *spawnSheet) {
 		free := 1 - min(max(x.load/float64(max(x.cores, 1)), 0), 1)
 		return cores*free - 0.5*float64(x.working)
 	}
-	slices.SortStableFunc(ms, func(a, b spawnMachine) int {
+	sortx.SortStableFunc(ms, func(a, b spawnMachine) int {
 		first := func(x, _ bool) int {
 			if x {
 				return -1
@@ -423,7 +446,7 @@ func spawnInfoCmd(gen uint64, folder string) tea.Cmd {
 func spawnBranches(root string) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "git", "-C", root, "for-each-ref", "--sort=-committerdate", "--count=30",
+	out, err := childproc.Git(ctx, root, "for-each-ref", "--sort=-committerdate", "--count=30",
 		"--format=%(refname:short)", "refs/heads").Output()
 	if err != nil {
 		return nil
@@ -1019,7 +1042,26 @@ func (m *OS) spawnStart() tea.Cmd {
 	default:
 		m.ShowNotification("Starting "+s.agents[s.agent].cmd+" in a new worktree"+where+".", "info", m.Settings.NotificationDuration)
 	}
-	call := m.inboxCaller()
+	call, nonce, card := m.inboxCaller(), m.inboxNonce(), s.card
+	if host != "" {
+		card = nil
+	}
+	taskID := ""
+	if card != nil {
+		taskID = card.id
+	}
+	// The daemon takes the card in the call: start-agent claims it for the
+	// pane it opens, and fan stamps it with the fan it makes. A card of
+	// another session than the one the agent starts in is claimed after, as
+	// before, or not at all for a fan.
+	switch {
+	case card == nil:
+	case verb == "fan":
+		params["task"], params["task_session"], params["human_nonce"] = card.id, card.session, nonce
+		card = nil
+	case params["session"] == card.session:
+		params["task"], params["human_nonce"] = card.id, nonce
+	}
 	build := ""
 	if m.DaemonClient != nil {
 		build = m.DaemonClient.ClientVersion()
@@ -1039,6 +1081,26 @@ func (m *OS) spawnStart() tea.Cmd {
 			}
 		}
 		raw, err := call(verb, params, spawnStartTimeout)
+		// A daemon from before the task parameter refuses it by name, and a
+		// card that cannot be taken refuses the call. The agent starts
+		// either way, and the card is claimed after, which says why it was
+		// not taken.
+		var callErr *session.VerbCallError
+		leftOut := ""
+		if err != nil && params["task"] != nil && errors.As(err, &callErr) && taskParamRefused(callErr) {
+			// admitTaskParam's message starts with the verb and names
+			// the card; the started line names both already.
+			leftOut = strings.TrimPrefix(callErr.Message, verb+" with task: ")
+			if rest, ok := strings.CutPrefix(leftOut, "task card "+taskID+" "); ok {
+				leftOut = "it " + rest
+			}
+			delete(params, "task")
+			delete(params, "task_session")
+			delete(params, "human_nonce")
+			raw, err = call(verb, params, spawnStartTimeout)
+		} else if params["task"] != nil && verb == "start-agent" {
+			card = nil
+		}
 		if err != nil {
 			return spawnStartedMsg{sheet: s, err: err}
 		}
@@ -1047,17 +1109,39 @@ func (m *OS) spawnStart() tea.Cmd {
 			Total                   int
 			Ready                   bool
 			Group                   string
+			PromptStatus            string           `json:"prompt_status"`
+			PromptNote              string           `json:"prompt_note"`
+			WindowID                string           `json:"window_id"`
+			Task                    *session.TaskRow `json:"task"`
+			TaskNote                string           `json:"task_note"`
 		}
 		_ = json.Unmarshal(raw, &res)
+		held := spawnClaim(call, nonce, card, res.Session, res.WindowID)
+		switch {
+		case res.Task != nil && verb == "start-agent":
+			held = " It holds " + res.Task.ID + "."
+		case res.Task != nil:
+			held = " They work on " + res.Task.ID + "."
+		case res.TaskNote != "":
+			held = " " + printableTitle(res.TaskNote)
+		case leftOut != "" && verb == "fan":
+			// A fan claims nothing after, so this is the one place the
+			// person hears the card was left out.
+			held = " " + taskID + " was left out: " + printableTitle(leftOut)
+		}
 		switch {
 		case verb == "fan" && res.Total > 1:
-			return spawnStartedMsg{sheet: s, text: fmt.Sprintf("Started %d agents on %s%s.", res.Total, res.Group, where)}
+			return spawnStartedMsg{sheet: s, text: fmt.Sprintf("Started %d agents on %s%s.", res.Total, res.Group, where) + held}
 		case verb == "fan":
-			return spawnStartedMsg{sheet: s, text: "Started " + what + where + ". The task is typed when the agent is ready."}
+			return spawnStartedMsg{sheet: s, text: "Started " + what + where + ". The task is typed when the agent is ready." + held}
 		case !res.Ready && res.Reason != "":
-			return spawnStartedMsg{sheet: s, text: "Started " + what + " in " + res.Session + where + ". It is not ready: " + res.Reason}
+			return spawnStartedMsg{sheet: s, warn: true, text: "Started " + what + " in " + res.Session + where + ". It is not ready: " + res.Reason + held}
+		case res.PromptStatus != "" && res.PromptStatus != session.PromptSent:
+			// The agent is up and its task did not go through: the
+			// notice says so, and not that all went well.
+			return spawnStartedMsg{sheet: s, warn: true, text: "Started " + what + " in " + res.Session + where + ". The task was not sent: " + res.PromptNote + held}
 		}
-		return spawnStartedMsg{sheet: s, text: "Started " + what + " in " + res.Session + where + "."}
+		return spawnStartedMsg{sheet: s, text: "Started " + what + " in " + res.Session + where + "." + held}
 	}
 }
 
@@ -1096,6 +1180,10 @@ func (m *OS) applySpawnStarted(msg spawnStartedMsg) {
 		msg.sheet.task.Clear()
 		msg.sheet.branch.Clear()
 		msg.sheet.branchAuto = ""
+	}
+	if msg.warn {
+		m.ShowNotification(msg.text, "warning", m.Settings.NotificationDuration*2)
+		return
 	}
 	m.ShowNotification(msg.text, "info", m.Settings.NotificationDuration)
 }
@@ -1154,4 +1242,18 @@ func (m *OS) spawnClick(x, y int) tea.Cmd {
 		s.list = false
 	}
 	return nil
+}
+
+// taskParamRefused reports whether a refusal names one of the parameters the
+// sheet sends for a card. An older daemon names whichever unknown one it read
+// first.
+func taskParamRefused(err *session.VerbCallError) bool {
+	if err.Hint == nil {
+		return false
+	}
+	switch err.Hint.Param {
+	case "task", "task_session", "human_nonce":
+		return true
+	}
+	return false
 }

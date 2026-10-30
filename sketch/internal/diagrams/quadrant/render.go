@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/quadrant/render.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/quadrant/render.ts at 8aff183be57021b533f319a29341a529be934b08.
 
 package quadrant
 
@@ -50,7 +50,7 @@ func renderQuadrant(model *QuadrantDb, config types.Config, options types.Render
 	pointSize := js.Round(size * 0.75)
 	measurer := options.Measurer
 	if measurer == nil {
-		measurer = text.DefaultMeasurer(options.FontFamily, "")
+		measurer = text.DefaultMeasurer(options.FontFamily, options.FontFamilyMono)
 	}
 	natural := js.Round(math.Max(100, length(config, "chartWidth", 500, 4000)))
 	width := js.Round(common.CapWidth(options, natural, 280, 0))
@@ -123,6 +123,10 @@ func renderQuadrant(model *QuadrantDb, config types.Config, options types.Render
 	taken := []float64{left + tileW, top, left + w - tileW, top + h, left, top + tileH, left + w, top + h - tileH}
 	isClear := func(from int, x0, y0, x1, y1 float64) bool {
 		for k := from; k < len(taken); k += 4 {
+			// Empty quadrant labels must not block point labels.
+			if taken[k] >= taken[k+2] || taken[k+1] >= taken[k+3] {
+				continue
+			}
 			if x0 < taken[k+2] && x1 > taken[k] && y0 < taken[k+3] && y1 > taken[k+1] {
 				return false
 			}
@@ -250,8 +254,9 @@ func renderQuadrant(model *QuadrantDb, config types.Config, options types.Render
 			`" cx="`+num(cx)+`" cy="`+num(cy)+`" r="`+num(r)+`"`+stroke+svg.ResolveStyle(styles).Shape+`/>`)
 	}
 
-	// A label goes below its point, or above, right or left of it when that is the first place
-	// that is inside the chart and free. A second round lets it cross the gaps between quadrants.
+	// A label goes below its point, or above, right or left of it, or below its quadrant's title,
+	// when that is the first place that is inside the chart and free. A second round lets it
+	// cross the gaps between quadrants.
 	// Large charts skip the search for a free place.
 	careful := len(dots) <= CAREFUL
 	if careful {
@@ -265,22 +270,42 @@ func renderQuadrant(model *QuadrantDb, config types.Config, options types.Render
 		halfW := t.Width / 2
 		halfH := float64(t.Size*0.6) + (t.Height-t.LineHeight)/2
 		away := d.reach + textPad
-		spots := [8]float64{cx, cy + away + halfH, cx, cy - away - halfH, cx + away + halfW, cy, cx - away - halfW, cy}
+		inset := math.Min(away, math.Max(0, (tileW-t.Width)/2))
+		// The title of the point's quadrant: 0 top right, 1 top left, 2 bottom left, 3 bottom right.
+		var quadrant int
+		switch {
+		case cx < left+w/2 && cy < top+h/2:
+			quadrant = 1
+		case cx < left+w/2:
+			quadrant = 2
+		case cy < top+h/2:
+			quadrant = 0
+		default:
+			quadrant = 3
+		}
+		heading := 8 + 4*quadrant
+		below := math.Max(cy+away, taken[heading+3]+textPad) + halfH
+		spots := [10]float64{cx, cy + away + halfH, cx, cy - away - halfH, cx + away + halfW, cy, cx - away - halfW, cy, cx, below}
 		tx := cx
 		ty := spots[1]
 		found := false
-		for k := 0; k < 16; k += 2 {
-			spot := k % 8
+		for k := 0; k < 20; k += 2 {
+			spot := k % 10
+			// A label moved below a title keeps clear of the plot's edge.
+			margin := 0.0
+			if spot == 8 {
+				margin = inset
+			}
 			x := spots[spot]
-			if spot < 4 && t.Width < w {
-				x = math.Min(math.Max(spots[spot], left+halfW), left+w-halfW)
+			if (spot < 4 || spot == 8) && t.Width < w {
+				x = math.Min(math.Max(spots[spot], left+halfW+margin), left+w-halfW-margin)
 			}
 			y := spots[spot+1]
 			if x-halfW < left || x+halfW > left+w || y-halfH < top || y+halfH > top+h {
 				continue
 			}
 			from := 8
-			if k < 8 {
+			if k < 10 {
 				from = 0
 			}
 			free := !careful || isClear(from, x-halfW, y-halfH, x+halfW, y+halfH)

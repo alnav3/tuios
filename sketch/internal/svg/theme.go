@@ -1,4 +1,4 @@
-// Ported from pele src/svg/theme.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/svg/theme.ts at 8aff183be57021b533f319a29341a529be934b08.
 
 package svg
 
@@ -24,6 +24,14 @@ const RADIUS = "var(--pele-radius,4px)"
 // Use CSS for rx variables to support older browsers. Put the default first so
 // diagram styles can override it.
 const ROUNDED = ` style="rx:var(--_r)"`
+
+// SetsFill reports whether a shape style from ResolveStyle sets a fill: /[";]fill:/.
+func SetsFill(shape string) bool { return Declares(shape, "fill") }
+
+// Declares reports whether a style sets prop: /[";]prop:/.
+func Declares(style, prop string) bool {
+	return strings.Contains(style, `"`+prop+`:`) || strings.Contains(style, `;`+prop+`:`)
+}
 
 // Rounded returns the attributes of a rectangle with the corner radius
 // in their style, or in a style of its own.
@@ -109,7 +117,7 @@ func ResolveStyle(declarations []string) ResolvedStyle {
 		}
 		prop := strings.ToLower(js.Trim(decl[:at]))
 		value := js.Trim(reImportant.ReplaceAllString(decl[at+1:], ""))
-		if value == "" || reUnsafe.MatchString(value) {
+		if value == "" || reUnsafe.MatchString(value) || InvalidXML(value) {
 			continue
 		}
 		if shapeProps[prop] {
@@ -201,6 +209,8 @@ func classByte(c byte) bool {
 }
 
 // SeriesColor is the color for the nth data series in a chart, cycling through eight tokens.
+//
+//go:noinline
 func SeriesColor(index int) string {
 	return seriesVars[((index%8)+8)%8]
 }

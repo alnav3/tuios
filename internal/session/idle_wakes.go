@@ -22,6 +22,10 @@ type idleWakes struct {
 	// start working through a change to its session's state.
 	stall wakeLatch
 
+	// silent wakes silentMonitor for the same reason: a pane can only start
+	// working, or report again, through a change to its session's state.
+	silent wakeLatch
+
 	// cleanup wakes cleanupLoop. What it releases is left behind by output,
 	// input and resizes, and what it expires is a routed request.
 	cleanup wakeLatch
@@ -29,6 +33,11 @@ type idleWakes struct {
 	// listing wakes listingNotifier: something a client's session listing
 	// shows may have changed. See daemon_listing_push.go.
 	listing wakeLatch
+	// listingNow asks listingNotifier to look at the listing without waiting
+	// out listingPushGap: a session was made or ended, which a script that
+	// runs tuios kill-session or tuios new wants to see on the rail at once
+	// (issue #1225). See sessionsChanged.
+	listingNow wakeLatch
 
 	// detectTicks, stallTicks, cleanupTicks and listingTicks count the timer
 	// fires of agentMonitor, stallMonitor, cleanupLoop and listingNotifier.
@@ -36,13 +45,23 @@ type idleWakes struct {
 	stallTicks   atomic.Int64
 	cleanupTicks atomic.Int64
 	listingTicks atomic.Int64
+	silentTicks  atomic.Int64
 }
 
 func (w *idleWakes) init() {
 	w.detect.init()
 	w.stall.init()
+	w.silent.init()
 	w.cleanup.init()
 	w.listing.init()
+	w.listingNow.init()
+}
+
+// sessionsChanged is a session made or ended. The listing push goes out after
+// listingPushSettle, not after listingPushGap.
+func (w *idleWakes) sessionsChanged() {
+	w.listing.Set()
+	w.listingNow.Set()
 }
 
 // activity is a pane printing or taking input.
@@ -57,6 +76,7 @@ func (w *idleWakes) activity() {
 func (w *idleWakes) stateChanged() {
 	w.detect.Set()
 	w.stall.Set()
+	w.silent.Set()
 	w.cleanup.Set()
 	w.listing.Set()
 }

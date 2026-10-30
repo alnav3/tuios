@@ -53,7 +53,7 @@ const fanVerifyWindow = "verify"
 // refusal's hint names only the fan sessions the caller on cs reaches, so a
 // pane held to its own reach learns no other session's name from it.
 func (d *Daemon) fanTarget(cs *connState, name string) (*Session, *WorktreeInfo, *verbError) {
-	sess, info, verr := d.worktreeTarget(name)
+	sess, info, verr := d.worktreeTarget(cs, name)
 	if verr != nil {
 		return nil, nil, verr
 	}
@@ -201,6 +201,13 @@ func (d *Daemon) verbCompareFan(cs *connState, params json.RawMessage) (any, *ve
 	var p fanCompareParams
 	if verr := decodeParams(params, &p); verr != nil {
 		return nil, verr
+	}
+	// detail returns the first changed lines of each attempt's files, which
+	// are file contents: over a link it needs what review-diff needs.
+	if p.Detail {
+		if verr := d.checkLinkPolicy(cs, linkCapReadOut, "compare-fan with detail"); verr != nil {
+			return nil, verr
+		}
 	}
 	_, info, verr := d.fanTarget(cs, p.Session)
 	if verr != nil {
@@ -455,6 +462,8 @@ func (d *Daemon) verbVerifyFan(cs *connState, params json.RawMessage) (any, *ver
 			Detail: skippedDetail(skipped),
 		})
 	}
+	// The cards the fan works on move to verify. See task_auto.go.
+	d.autoStageFan(info.FanID, moveVerifyStarted, taskReasonVerifyStarted)
 	out := map[string]any{
 		"type":     "fan_verify_started",
 		"group":    info.Group,
@@ -507,9 +516,10 @@ func (d *Daemon) startFanVerify(sess *Session, dir, command string, env []string
 	}
 
 	var (
-		argv   []string
-		r, w   *os.File
-		extras []*os.File
+		argv    []string
+		r, w    *os.File
+		extras  []*os.File
+		release = func() {}
 	)
 	if runtime.GOOS == "windows" {
 		// No descriptor passes to a console process, so the window's own exit
@@ -522,6 +532,12 @@ func (d *Daemon) startFanVerify(sess *Session, dir, command string, env []string
 		}
 		extras = []*os.File{w}
 		argv = []string{"/bin/sh", "-c", fanVerifyScript, "tuios-verify", command}
+		// Held before the window starts. A handoff that asks after this is
+		// refused, and one that asked before holds paneLife, so the window
+		// cannot start until it is over. Held only once the window was in, a
+		// handoff could take paneLife in between, carry the window, and close
+		// the pipe the check reports on with the exec.
+		release = d.pipes.hold("a fan check is running in session " + sess.Name())
 	}
 	none := Grants(0)
 	sessionID := sess.ID
@@ -540,6 +556,7 @@ func (d *Daemon) startFanVerify(sess *Session, dir, command string, env []string
 		_ = w.Close()
 	}
 	if err != nil {
+		release()
 		if r != nil {
 			_ = r.Close()
 		}
@@ -553,7 +570,10 @@ func (d *Daemon) startFanVerify(sess *Session, dir, command string, env []string
 
 	status := make(chan *int, 1)
 	if r != nil {
-		go func() { status <- readVerifyStatus(r, sess, win.PTYID) }()
+		go func() {
+			defer release()
+			status <- readVerifyStatus(r, sess, win.PTYID)
+		}()
 	} else {
 		go func() {
 			code, exited := d.waitPopupExit(sess, win, 0, nil)
@@ -639,6 +659,9 @@ func (d *Daemon) watchFanVerify(sess *Session, run *fanVerifyRun, rec *FanVerify
 	if !current {
 		return
 	}
+	// The last check to end, with none passed, sends the fan's cards back
+	// to doing. See task_auto.go.
+	d.noteFanVerifyEnded(sess)
 	if !keptOpen {
 		// A passed check's window has already ended on its own; closing it
 		// here takes it out of a session no client is attached to. A timed
@@ -762,7 +785,7 @@ func (d *Daemon) verbKeepFan(cs *connState, params json.RawMessage) (any, *verbE
 	if p.Session == "" {
 		return nil, invalidParam("session", "session is required: the attempt to keep")
 	}
-	kept, info, verr := d.worktreeTarget(p.Session)
+	kept, info, verr := d.worktreeTarget(cs, p.Session)
 	if verr != nil {
 		return nil, verr
 	}
@@ -801,7 +824,7 @@ func (d *Daemon) verbKeepFan(cs *connState, params json.RawMessage) (any, *verbE
 				recorded = b
 			}
 		}
-		res, verr := d.shipMerge(kept.Name(), info.Path, info.RepoRoot, recorded, p.Into, p.MergeMode, "")
+		res, verr := d.shipMerge(d.shipCallerIsPerson(cs), kept.Name(), info.Path, info.RepoRoot, recorded, p.Into, p.MergeMode, "")
 		if verr != nil {
 			if verr.Hint != nil {
 				verr.Hint.Detail += " No sibling was removed."

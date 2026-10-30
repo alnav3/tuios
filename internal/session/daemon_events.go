@@ -108,8 +108,18 @@ const (
 	// an emit action, or the close. TML carries the surface, the name and
 	// the value. It reaches only a subscriber that names it in types, and a
 	// tml-open with events. See tml_surface.go.
-	EventTML        = "tml-event"
-	EventSubscribed = "subscribed" // subscribe ack result type
+	EventTML = "tml-event"
+	// EventTaskClaimed, EventTaskFinished and EventTaskChanged follow the
+	// task cards of a session (task.go). Task carries the card's row as
+	// list-tasks gives it. On claimed and finished, Window is the pane that
+	// held the card. On changed, Action says what happened: added, staged,
+	// blocked, unblocked, released or removed, and Reason carries why a card
+	// was released without its holder asking (pane closed, agent left,
+	// restart).
+	EventTaskClaimed  = "task-claimed"
+	EventTaskFinished = "task-finished"
+	EventTaskChanged  = "task-changed"
+	EventSubscribed   = "subscribed" // subscribe ack result type
 )
 
 // defaultEventQueue bounds a subscriber's per-connection event queue. When it is
@@ -169,7 +179,9 @@ type streamEvent struct {
 	// so a zero value is always "not applicable" and is omitted.
 	Workspace int    `json:"workspace,omitempty"`
 	Dropped   uint64 `json:"dropped,omitempty"`
-	// Reason says why a gap marker was sent: one of the Gap* constants.
+	// Reason says why a gap marker was sent, one of the Gap* constants, and
+	// on an agent-state event why state is not the state the agent gave:
+	// "silent" for a hooked pane that stopped reporting.
 	Reason string `json:"reason,omitempty"`
 	// BootID names the daemon start that numbered Seq. It is on every event
 	// and on every gap marker.
@@ -205,6 +217,8 @@ type streamEvent struct {
 	File *TransferFile `json:"file,omitempty"`
 	// TML is a tml-event's surface, name and value.
 	TML *TMLEvent `json:"tml,omitempty"`
+	// Task is a task event's card, as list-tasks gives its row.
+	Task *TaskRow `json:"task,omitempty"`
 
 	// relayed marks an event copied from a linked host's own stream. It is
 	// delivered only to a subscriber that asked for other machines' events,
@@ -218,15 +232,18 @@ type streamEvent struct {
 // before publishing to the hub. Window/PTYID are filled in by the per-PTY emitter
 // or the window op that raises the event.
 type SessionEvent struct {
-	Type      string
-	Window    string
-	PTYID     string
-	Title     string
-	Body      string
-	Bytes     int
-	Mode      string
-	Enabled   bool
-	State     string
+	Type    string
+	Window  string
+	PTYID   string
+	Title   string
+	Body    string
+	Bytes   int
+	Mode    string
+	Enabled bool
+	State   string
+	// Reason is why an agent-state event's State is not the state the agent
+	// gave: AgentReasonSilent, or empty. See agent_silent.go.
+	Reason    string
 	Workspace int
 	// The command fields of the prompt and command events. See streamEvent.
 	Cmdline    string
@@ -274,6 +291,10 @@ type SessionEvent struct {
 	hookWorktree, hookAgentSession string
 	hookRoot                       string
 	hookRunDir                     string
+	// taskRow and taskReason are an eventTaskReleased's card, as list-tasks
+	// gives it, and why it was let go (task.go).
+	taskRow    *TaskRow
+	taskReason string
 }
 
 // eventCompletionSeen is raised when an attached client's state push shows it
@@ -296,6 +317,13 @@ const eventAttentionDetail = "attention-detail"
 // eventCompletionSeen: the Inbox ends an approval hold on the pane, so the
 // harness shows its own prompt to the person now looking at it.
 const eventPaneFocused = "pane-focused"
+
+// eventTaskReleased is raised by the state change that closed a pane or
+// ended its agent, once per task card the pane held and the change let go
+// (releasedTaskEvents). It is internal on the same terms as
+// eventCompletionSeen: the daemon's sink turns it into a task-changed
+// released event on the stream, and nothing else reads it.
+const eventTaskReleased = "task-released"
 
 // eventProgramStatus is raised when a pane's OSC 7501 records changed. It is
 // internal: the daemon's sink copies the records into the window state and

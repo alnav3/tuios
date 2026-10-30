@@ -47,6 +47,9 @@ type Manager struct {
 	// stayOnEmpty is workspaces.return_when_empty turned off. The zero value
 	// is the default, on. Every session reads it through ReturnWhenEmpty.
 	stayOnEmpty atomic.Bool
+	// dragAndDrop is [panes] drag_and_drop. Every session reads it through
+	// DragAndDrop. See dnd_registration.go.
+	dragAndDrop atomic.Bool
 	// sshAgentFollow is [daemon] ssh_agent = "follow": a new pane gets
 	// SSH_AUTH_SOCK naming its session's agent link. See ssh_agent_follow.go.
 	sshAgentFollow atomic.Bool
@@ -171,6 +174,12 @@ func (m *Manager) SetReturnWhenEmpty(on bool) {
 func (m *Manager) ReturnWhenEmpty() bool {
 	return !m.stayOnEmpty.Load()
 }
+
+// SetDragAndDrop sets panes.drag_and_drop for every session.
+func (m *Manager) SetDragAndDrop(on bool) { m.dragAndDrop.Store(on) }
+
+// DragAndDrop is what SetDragAndDrop last set, false when nothing did.
+func (m *Manager) DragAndDrop() bool { return m.dragAndDrop.Load() }
 
 // PreferredShell is what SetPreferredShell last set, or "".
 func (m *Manager) PreferredShell() string {
@@ -307,6 +316,9 @@ func (m *Manager) CreateSession(name string, cfg *SessionConfig, width, height i
 	}
 	if cfg.ReturnWhenEmpty == nil {
 		cfg.ReturnWhenEmpty = m.ReturnWhenEmpty
+	}
+	if cfg.DragAndDrop == nil {
+		cfg.DragAndDrop = m.DragAndDrop
 	}
 	if cfg.HerdrEnv == nil {
 		cfg.HerdrEnv = m.HerdrEnv
@@ -559,14 +571,25 @@ func (m *Manager) ListSessions() []SessionInfo {
 
 	// Order the sessions themselves, not their Info snapshots: Info truncates
 	// Created to whole seconds, so two sessions made in the same second tied and
-	// took the map's random iteration order. Sort on the full-precision timestamp,
-	// with the name as a final tiebreak, so the list is stable everywhere it is
-	// read (sidebar, switcher, palette).
+	// took the map's random iteration order. The placed sessions come first,
+	// by rank (set-session-order), then the rest on the full-precision
+	// timestamp, with the name as a final tiebreak, so the list is stable
+	// everywhere it is read (sidebar, switcher, palette) and is the same order
+	// on every client.
 	ordered := make([]*Session, 0, len(m.sessions))
+	ranks := make(map[*Session]int, len(m.sessions))
 	for _, session := range m.sessions {
 		ordered = append(ordered, session)
+		ranks[session] = session.rank()
 	}
 	sort.Slice(ordered, func(i, j int) bool {
+		ri, rj := ranks[ordered[i]], ranks[ordered[j]]
+		if ri != rj {
+			if ri == 0 || rj == 0 {
+				return rj == 0
+			}
+			return ri < rj
+		}
 		if ordered[i].Created.Equal(ordered[j].Created) {
 			return ordered[i].Name() < ordered[j].Name()
 		}
@@ -646,16 +669,21 @@ func newerPick(used, bestUsed, active, bestActive time.Time, s, best *Session) b
 }
 
 // GetDefaultSession returns the session the person used last, creating one if
-// none exist. It used to return the first session a range over the map gave,
-// which Go randomises, so a bare attach landed on any session at all.
-func (m *Manager) GetDefaultSession(cfg *SessionConfig, width, height int) (*Session, error) {
+// none exist. The bool reports whether it created the session. It used to
+// return the first session a range over the map gave, which Go randomises,
+// so a bare attach landed on any session at all.
+func (m *Manager) GetDefaultSession(cfg *SessionConfig, width, height int) (*Session, bool, error) {
 	if session := m.LastUsedSession(); session != nil {
-		return session, nil
+		return session, false, nil
 	}
 
 	// No sessions, create default with generated name
 	name := m.GenerateSessionName()
-	return m.CreateSession(name, cfg, width, height)
+	session, err := m.CreateSession(name, cfg, width, height)
+	if err != nil {
+		return nil, false, err
+	}
+	return session, true, nil
 }
 
 // Shutdown stops all sessions and cleans up.

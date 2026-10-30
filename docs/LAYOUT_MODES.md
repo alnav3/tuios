@@ -237,6 +237,14 @@ cross: a flick and its momentum tail are tens of events, and a fifth of the
 screen each sent the strip to its end before the fingers had left the glass.
 Raise it if you only ever scroll the strip with a wheel.
 
+`appearance.niri_scroll_snap = true` lines the strip up on a column when the
+scroll stops, as niri does at the end of a gesture: the left edge of the screen
+goes to the start of a column, or to the end of the strip. A wheel and a
+trackpad do not say when a gesture ends, so with them the strip snaps after it
+has been still for a moment, to the next column in the way it was going. One
+notch is then one column. A finger on tuios-web snaps it when the finger
+lifts, to the nearest column. The default is `false`.
+
 ### Column commands
 
 These have no default keybinding. Run them from the command palette, or bind the
@@ -244,7 +252,7 @@ action names yourself in `[keybindings]`:
 
 | Palette command | Action name | What it does |
 |---|---|---|
-| Scroll: Cycle Column Width | `scroll_cycle_width` | Cycles the focused column through 33%, 50%, 55%, 67% and 90% (and 100% when `appearance.scroll_column_max` is 100) of the screen width |
+| Scroll: Cycle Column Width | `scroll_cycle_width` | Cycles the focused column through the widths in `appearance.scroll_column_presets`. With no list, the widths are 33%, 50%, 55%, 67% and 90% (and 100% when `appearance.scroll_column_max` is 100) of the screen width |
 | Scroll: Maximize Column Width | `scroll_maximize` | Widens the focused column to the configured ceiling, the widest the strip will give it |
 | Scroll: Stack Window Below (consume) | `scroll_consume` | Pulls the window from the next column into the focused column, stacking it below |
 | Scroll: Split to New Column (expel) | `scroll_expel` | Pushes the bottom window of the focused column out into its own new column |
@@ -263,6 +271,17 @@ between them.
 A new column is `appearance.scroll_column_width` percent of the screen wide.
 The default of 55% is deliberately over half, so two columns never quite fit
 side by side and the strip reads as something you scroll.
+
+`appearance.scroll_column_presets` sets the widths that `scroll_cycle_width`
+steps through, as percents of the screen. It works like niri's
+`preset-column-widths`. A width larger than `appearance.scroll_column_max` is
+skipped:
+
+```toml
+[appearance]
+scroll_column_max = 100
+scroll_column_presets = [50, 67, 100]
+```
 
 ### Shared borders
 
@@ -404,6 +423,7 @@ shows `MULTI 2/3`: the search found text in 2 of the 3 panes.
 | `n` / `N` | Go to the next or previous match in each pane |
 | `v` / `V` | Start a character or line selection in every pane that has a match |
 | `Esc` | End the selection. A second `Esc`, or `q`, leaves copy mode in every pane |
+| `Ctrl+C` | Leave copy mode in every pane. Nothing is copied |
 | `y` | Copy the selection of each pane to the clipboard, as one block |
 | `Y` | Save the selection of each pane to a file |
 | `Tab` | Change the format: plain, markdown, json |
@@ -437,7 +457,8 @@ the current format, one time for all panes. See
 
 `Y` opens a prompt at the bottom of the focused pane. The default path is
 `~/tuios-copy-<date>-<time>.<ext>`, with `txt`, `md` or `json` for the format.
-Type or paste a path. Press `Enter` to save, or press `Esc` to cancel.
+Type or paste a path. Press `Enter` to save, or press `Esc` to cancel. Press
+`Ctrl+C` to cancel and leave copy mode.
 
 - A relative path starts in the directory of the focused pane, when its shell
   reports one. Otherwise it starts in your home directory. The line above the

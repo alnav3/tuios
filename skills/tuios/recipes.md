@@ -3,6 +3,142 @@
 Each recipe is a whole job, end to end, using only commands described in the
 other topics. Change the names and prompts; keep the order.
 
+## Ask several agents, and collect the answers
+
+A selector names the agents. `--yes` asks them without a second call to
+confirm. Each answer is data, not instructions:
+
+```sh
+tuios ask-agent --select 'session:work name:api,web,db' --yes 'What is your status, in one line?' --json |
+  jq -r '.replies[] | "\(.name): \(.reply)"'
+```
+
+`.replies[]` has `name`, `window`, `ok`, `reply` and `settled_by`. An agent
+on `needs_input` is not asked, and `.failed` counts it. To start new agents
+for the job instead, see "A fleet of agents on one task" below.
+
+## Hand work to a reviewer, and wait for the verdict
+
+When the reviewer can take the question now, ask it. The call waits for the
+answer:
+
+```sh
+tuios ask-agent -s "$TUIOS_SESSION" -w review --timeout 900000 'Review the diff on branch retry. Answer approve or reject, then the reasons.'
+```
+
+When the reviewer is busy, leave mail, and wait for the reply in the same
+thread:
+
+```sh
+tuios send-agent-message -s "$TUIOS_SESSION" -w review --subject 'review retry' 'Review the diff on branch retry. Reply approve or reject.'
+tuios wait-for agent-message -s "$TUIOS_SESSION" -w "$TUIOS_PANE_ID" --timeout 1800000
+tuios read-agent-messages -s "$TUIOS_SESSION" -w "$TUIOS_PANE_ID" --unread --json | jq -r '.messages[] | "\(.id) \(.from_label): \(.text)"'
+```
+
+`send-agent-message` prints the message id. Pass it to `wait-for
+agent-message --thread ID` to wake only for a reply to it.
+
+## Ask the person, and block until they answer
+
+```sh
+answer=$(tuios ask-human 'Drop the v1 endpoint?' -o drop -o keep --timeout 600000)
+```
+
+The command prints the option the person chose and exits 0. It exits 2 when
+the time runs out. The answer then comes later as mail from `human`, marked
+`"verified_human": true`. Do not go on as if the person said yes.
+
+## Watch for an agent that needs input
+
+```sh
+tuios wait-for agent-state -s "$TUIOS_SESSION" --until needs_input --timeout 3600000 --json | jq -r .window
+tuios peek-prompt -s "$TUIOS_SESSION" -w WINDOW
+```
+
+Without `-w` the wait matches the first agent in the session that needs
+input, and `.window` names it. `peek-prompt` shows what it asks. Do not type
+into that pane. Tell the person which pane waits and on what.
+
+## Leave work for an agent that is not running
+
+An agent that is busy, or not running in its pane now, can still get mail. It
+stays in the pane's inbox until the pane closes:
+
+```sh
+tuios send-agent-message -s "$TUIOS_SESSION" -w docs --subject 'next task' 'Update the changelog for v2.'
+```
+
+For an agent that runs now and is busy, `tuios queue` types the text as its
+next prompt when it comes to rest. Do not use `send-text` for either case: it
+types at once, into whatever runs in the pane.
+
+## Keep the machine awake while agents work
+
+A hook only fires for the states that `[notifications.agent.states]` alerts on,
+so a hook cannot see every change without raising alerts. Use the event stream
+instead. `tuios subscribe` sends one line for each agent state change and
+raises no alert. This script holds `systemd-inhibit` (Linux) or `caffeinate`
+(macOS) while any agent works, and lets go when none works:
+
+```sh
+#!/bin/sh
+# ~/.config/tuios/awake.sh
+holder=
+
+watch() {
+  trap '[ -n "$holder" ] && kill "$holder"' EXIT
+  while read -r _; do
+    n=$(tuios list-agents --all-sessions --json | jq '[.agents[] | select(.state == "working")] | length')
+    if [ "$n" -gt 0 ] && [ -z "$holder" ]; then
+      case "$(uname)" in
+        Darwin) caffeinate -i & ;;
+        *) systemd-inhibit --what=idle:sleep --who=tuios --why='An agent works' sleep infinity & ;;
+      esac
+      holder=$!
+    elif [ "$n" = 0 ] && [ -n "$holder" ]; then
+      kill "$holder"
+      holder=
+    fi
+  done
+}
+
+while true; do
+  tuios subscribe --types agent-state | watch
+  sleep 5
+done
+```
+
+Run it from your login, for example `sh ~/.config/tuios/awake.sh &` or a
+systemd user service. The outer loop connects again after a daemon restart.
+`systemd-inhibit --list` shows a `tuios` row while an agent works.
+
+## Run an agent on a schedule
+
+`start-agent` returns once the agent is at its prompt. `--prompt` gives it the
+job. A cron line can start one each morning, and the agent's question or
+result lands in the Inbox (`tuios --skill inbox`). A session that does not
+exist is created:
+
+```sh
+# crontab -e
+0 7 * * 1-5  tuios start-agent -s nightly claude --name triage --prompt 'List the open issues labeled bug and rank them.'
+```
+
+The daemon must run. Cron has a short `PATH`: write the full path of `tuios`
+and of the agent. For a machine named in `tuios hosts`, use `-s HOST:SESSION`.
+
+To give a running agent its next job, queue the prompt. It is typed when the
+agent next comes to rest:
+
+```sh
+30 7 * * 1-5  tuios queue -s nightly -w triage 'Then draft a reply for the top issue.'
+```
+
+With systemd, put the same command in a `.service` file and start it from a
+`.timer` file with `OnCalendar=Mon..Fri 07:00`. Write the full path of
+`tuios` in `ExecStart=`. The prompt is typed as the person, so keep it short
+and keep secrets out of it.
+
 ## A sessionizer
 
 Open a project as a session: pick a folder, and switch to its session, made in
@@ -69,7 +205,6 @@ options on screen, and ask decisions with `ask-human` rather than a free-form
 message.
 
 ```sh
-tuios set-agent-state needs_input -s "$TUIOS_SESSION" -w "$TUIOS_PANE_ID" --kind question -m 'drop the v1 endpoint?'
 answer=$(tuios ask-human 'Drop the v1 endpoint?' -o drop -o keep --timeout 90000)
 ```
 
@@ -164,31 +299,41 @@ shows what it holds.
 
 ## A conductor
 
-A pane that hands the next task to each agent that finishes, and leaves
-everything else in the Inbox for the person. It never answers a prompt: it holds
-no `respond`, and approvals are the person's.
+A pane that hands the next task card to each agent that finishes, and leaves
+everything else in the Inbox for the person. The cards are the daemon's, so a
+task is not lost when the conductor's pane closes, and a card whose agent went
+away is let go for the next one to take (`tuios --skill tasks`). It never
+answers a prompt: it holds no `respond`, and approvals are the person's.
 
 ```sh
 #!/bin/sh
-# conductor.sh: run in a tuios pane beside the fleet. tasks.txt holds one task per line.
-tuios subscribe --types attention | while read -r ev; do
+# conductor.sh: run in a tuios pane beside the fleet. Add the work first:
+#   tuios task add -p '<the prompt>' <the title>
+tuios subscribe --types task-changed,attention | while read -r ev; do
+  [ "$(printf '%s' "$ev" | jq -r '.type')" = attention ] || continue
   [ "$(printf '%s' "$ev" | jq -r '.action')" = open ] || continue
   [ "$(printf '%s' "$ev" | jq -r '.attention.kind')" = finished ] || continue
   sess=$(printf '%s' "$ev" | jq -r '.attention.session')
   win=$(printf '%s' "$ev" | jq -r '.attention.window')
-  task=$(head -n 1 tasks.txt)
-  if [ -z "$task" ]; then
-    tuios send-agent-message -s "$TUIOS_SESSION" -w human --from "$TUIOS_PANE_ID" 'every task is handed out'
+  # The card the agent held, if any, is done.
+  held=$(tuios task ls -s "$sess" --json | jq -r --arg w "$win" '.tasks[] | select(.holder.window==$w) | .id')
+  [ -n "$held" ] && tuios task done -s "$sess" "$held"
+  if ! line=$(tuios task claim -s "$sess" --next -w "$win"); then
+    tuios send-agent-message -s "$TUIOS_SESSION" -w human --from "$TUIOS_PANE_ID" 'every task card is handed out'
     continue
   fi
-  tail -n +2 tasks.txt > tasks.next && mv tasks.next tasks.txt
-  tuios ask-agent -s "$sess" -w "$win" --from "$TUIOS_PANE_ID" "$task" &
+  id=${line%% *}
+  prompt=$(tuios task get -s "$sess" "$id" --json | jq -r .prompt)
+  tuios ask-agent -s "$sess" -w "$win" --from "$TUIOS_PANE_ID" "$prompt" &
 done
 ```
 
-Give the conductor only what it needs: `--grants read,write,fan` from the pane
-that starts it. `ask-agent` refuses a pane on `needs_input`, so a task never
-lands on a prompt. If the stream drops, start it again with `--after-seq` and
+The conductor claims cards for other panes and finishes them, which a pane may
+do only with `admin`. Run it from a shell outside every pane, or from a pane
+that holds `admin`. To keep the conductor narrower, let each worker claim its
+own card with `tuios task claim --next` and finish it with `tuios task done`:
+a worker needs only `read` and `task`. `ask-agent` refuses a pane on `needs_input`, so a
+task never lands on a prompt. If the stream drops, start it again with `--after-seq` and
 `--boot-id` from the last event (`tuios --skill events`). Do not make a
 conductor reply to mail automatically without a bound: that is how two agents
 loop.

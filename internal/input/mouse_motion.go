@@ -48,6 +48,14 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.EndPointerGrabs()
 	}
 
+	// A drag between panes over OSC 72 owns the pointer once the source
+	// program started it: the pane under the pointer hears of it through the
+	// protocol, not as mouse motion. Before that, this only watches for the
+	// gesture and the motion goes on to the pane. See dnd_drag.go.
+	if o.DnDMotion(mouse.X, mouse.Y, mouse.Button) {
+		return o, nil
+	}
+
 	// An open context menu tracks the pointer, so the row that would run on a
 	// click is the row the cursor is on. It also stops here rather than falling
 	// through: the pane underneath is behind a modal menu and has no business
@@ -56,12 +64,22 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.ContextMenuHover(mouse.X, mouse.Y)
 		return o, nil
 	}
+	if o.PathPickerOpen() {
+		o.PathPickerHover(mouse.X, mouse.Y)
+		return o, nil
+	}
 
 	// A pressed or dragged sidebar session row owns the pointer until release:
 	// the motion either commits the press to a reorder drag or advances the
 	// drag, and nothing underneath may see it either way.
 	if o.SidebarDragActive() {
 		o.SidebarDragMotion(mouse.X, mouse.Y)
+		return o, nil
+	}
+	// A held row of the rail's files section owns the pointer the same way,
+	// on its way to the pane it is dropped on.
+	if o.FileDragActive() {
+		o.FileDragMotion(mouse.X, mouse.Y, mouse.Mod.Contains(tea.ModAlt))
 		return o, nil
 	}
 	if o.SidebarEdgeActive() {
@@ -100,7 +118,7 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		// A docked session is a real pane, not a list of sidebar rows. Send
 		// tracking motion to its guest before the rail hover path consumes it.
 		if w := o.SidebarSessionPaneAt(mouse.X, mouse.Y); w != nil {
-			if w.Terminal != nil && guestWantsMotion(w.Terminal, mouse.Button) {
+			if paneWantsMotion(o, w, mouse.Button) {
 				if tx, ty, inside := w.ScreenToTerminal(mouse.X, mouse.Y); inside {
 					sendMouseToWindow(o, w, uv.MouseMotionEvent{X: tx, Y: ty, Button: uv.MouseButton(mouse.Button), Mod: uv.KeyMod(mouse.Mod)})
 				}
@@ -231,7 +249,7 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if o.Mode == app.TerminalMode && (mouse.Button != tea.MouseNone || !pipOwns(mouse.X, mouse.Y, o)) {
 		focusedWindow := o.GetFocusedWindow()
 		if focusedWindow != nil && focusedWindow.Terminal != nil {
-			if guestWantsMotion(focusedWindow.Terminal, mouse.Button) {
+			if paneWantsMotion(o, focusedWindow, mouse.Button) {
 				// Convert to terminal-relative coordinates (0-based)
 				termX, termY, inContent := focusedWindow.ScreenToTerminal(mouse.X, mouse.Y)
 				// Check if motion is within terminal content area
@@ -370,6 +388,14 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			return o, nil
 		}
 
+		// The pane the press grabbed, as in the drag above. A peer's sync
+		// can move the focus mid-gesture, and the rest of the resize then
+		// went to the focused pane with the grabbed pane's starting
+		// rectangle: a tiled pane took a floating pane's row and height.
+		if o.DraggedWindowIndex >= 0 && o.DraggedWindowIndex < len(o.Windows) {
+			focusedWindow = o.Windows[o.DraggedWindowIndex]
+		}
+
 		xOffset := mouse.X - o.ResizeStartX
 		yOffset := mouse.Y - o.ResizeStartY
 
@@ -378,8 +404,13 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		newWidth := focusedWindow.Width
 		newHeight := focusedWindow.Height
 
+		// A floating pane resizes alone even with tiling on. The tiling
+		// branches below hold edges on the screen boundary and move the
+		// tiled panes that share the dragged edge's line.
+		tiled := o.ResizesWithTiling(focusedWindow)
+
 		// In scrolling mode, only allow width resize (columns fill full height)
-		if o.UseScrollingLayout {
+		if tiled && o.UseScrollingLayout {
 			yOffset = 0
 		}
 
@@ -473,7 +504,7 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 
 		// In tiling mode (except scrolling), block resizing edges at the
 		// content-region boundaries
-		if o.AutoTiling && !o.UseScrollingLayout {
+		if tiled && !o.UseScrollingLayout {
 			const edgeTolerance = 2 // Small tolerance for detecting screen edges
 
 			// Check which edges are at content-region boundaries
@@ -530,7 +561,7 @@ func handleMouseMotion(msg tea.MouseMotionMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			if o.SharedBorders && !treeInSync {
 				o.MarkBSPSyncPending()
 			}
-		} else if o.UseScrollingLayout {
+		} else if tiled && o.UseScrollingLayout {
 			// Scrolling mode: compute width from horizontal drag delta. All
 			// strip math runs against the content width beside the sidebar band,
 			// matching ScrollingSetPositions.

@@ -216,12 +216,11 @@ func (m *OS) applyTheme(name string) {
 // package and repaints so the new colors show immediately. Empty values clear
 // the override and restore the theme-derived colors.
 func (m *OS) applyBorderColors() {
-	focused, unfocused := "", ""
+	var overrides theme.BorderOverrides
 	if m.UserConfig != nil {
-		focused = m.UserConfig.Appearance.BorderFocusedColor
-		unfocused = m.UserConfig.Appearance.BorderUnfocusedColor
+		overrides = m.UserConfig.Appearance.BorderOverrides()
 	}
-	theme.SetBorderOverrides(focused, unfocused)
+	theme.SetBorderOverrides(overrides)
 	m.MarkAllDirty()
 }
 
@@ -393,8 +392,11 @@ func (m *OS) settingsCategories() []settingsCategory {
 			custom("", m.themeEditItem()),
 			opt("appearance.theme_light"),
 			custom("appearance.glyphs", m.glyphItem()),
+			custom("", m.shareLookItem()),
 			opt("appearance.border_style"),
 			opt("appearance.frame_panels"),
+			opt("appearance.pane_overlays"),
+			opt("appearance.overlay_border_color"),
 			opt("appearance.window_title_position"),
 			opt("appearance.window_title_style"),
 			opt("appearance.window_title_align"),
@@ -411,6 +413,8 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("appearance.scrollbar.thumb"),
 			opt("appearance.scrollbar.track"),
 			opt("appearance.border_focused_color"),
+			opt("appearance.border_focused_color_window"),
+			opt("appearance.border_focused_color_terminal"),
 			opt("appearance.border_unfocused_color"),
 			opt("appearance.border_focused_gradient"),
 			opt("appearance.border_gradient_angle"),
@@ -475,6 +479,7 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("appearance.sidebar.header_case"),
 			opt("appearance.sidebar.row_style"),
 			opt("appearance.sidebar.header_style"),
+			opt("appearance.sidebar.cursor_background"),
 			opt("appearance.sidebar.density"),
 			opt("appearance.sidebar.show_glyphs"),
 			opt("appearance.sidebar.show_counts"),
@@ -482,10 +487,14 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("appearance.sidebar.file_icons"),
 			opt("appearance.sidebar.file_icon_colors"),
 			opt("appearance.sidebar.folder_click"),
+			opt("appearance.sidebar.file_drag"),
+			opt("appearance.sidebar.files_style"),
 			opt("appearance.sidebar.editor"),
 			opt("appearance.sidebar.file_actions"),
 			opt("appearance.sidebar.file_delete"),
+			opt("appearance.sidebar.group_main"),
 			opt("appearance.sidebar.marquee"),
+			opt("appearance.sidebar.peek"),
 			opt("appearance.sidebar.tooltips"),
 			// Filed here rather than under Appearance, which is where it used to
 			// sit: the registry already calls it a sidebar option, it counts paths
@@ -564,6 +573,9 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("hints.all_panes"),
 			opt("panes.label_keys"),
 			opt("panes.navigator_layout"),
+			opt("panes.navigator_search"),
+			opt("panes.drag_and_drop"),
+			opt("path_picker.show_hidden"),
 		}),
 	}
 
@@ -586,6 +598,7 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("appearance.dock_mode_icon_window"),
 			opt("appearance.dock_mode_icon_terminal"),
 			opt("appearance.dock_mode_icon_tiling"),
+			opt("appearance.dock_mode_pill"),
 			opt("appearance.dock_mode_split_letter"),
 			opt("appearance.dock_compact"),
 		}),
@@ -594,6 +607,7 @@ func (m *OS) settingsCategories() []settingsCategory {
 	behavior := settingsCategory{
 		Name: "Behavior",
 		Items: m.resolveRows([]settingsRow{
+			custom("appearance.calm", m.calmItem()),
 			opt("appearance.motion"),
 			opt("appearance.animation_speed"),
 			opt("appearance.theme_transition"),
@@ -607,17 +621,20 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("appearance.click_to_type"),
 			opt("appearance.auto_enter_terminal_on_focus"),
 			opt("appearance.nvim_navigation"),
+			opt("appearance.focus_wrap"),
 			opt("appearance.alt_drag"),
 			opt("appearance.right_click_opens_menu"),
 			opt("appearance.new_window_inherit_cwd"),
 			opt("appearance.new_window_follow_ssh"),
 			opt("appearance.niri_reverse_scroll"),
 			opt("appearance.niri_scroll_cells"),
+			opt("appearance.niri_scroll_snap"),
 			opt("appearance.niri_click_reveals"),
 			opt("appearance.niri_hover_reveals"),
 			opt("appearance.prefix_repeat_time"),
 			custom("appearance.max_fps", m.maxFPSItem()),
 			opt("appearance.preferred_shell"),
+			opt("agents.fold_working"),
 			opt("pip.width"),
 			opt("pip.height"),
 			opt("pip.corner"),
@@ -636,6 +653,10 @@ func (m *OS) settingsCategories() []settingsCategory {
 		opt("notifications.warning_duration"),
 		opt("notifications.error_duration"),
 		opt("notifications.error_sticky"),
+		opt("notifications.bell"),
+		opt("notifications.style"),
+		opt("notifications.level"),
+		opt("notifications.log_hidden"),
 	}
 	// The agent alerts, under their heading row. With the agent features
 	// off both go, heading and all.
@@ -659,6 +680,8 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("startup.layout"),
 			opt("startup.start_in_terminal_mode"),
 			opt("startup.daemon"),
+			opt("startup.session"),
+			opt("startup.window"),
 		}),
 	}
 
@@ -704,8 +727,10 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("scratch.width"),
 			opt("scratch.height"),
 			opt("launcher.gui_command"),
+			opt("launcher.keep_open"),
 			opt("workspaces.return_when_empty"),
 			opt("workspaces.new_window_when_empty"),
+			opt("worktree.path"),
 		}),
 	}
 
@@ -716,6 +741,7 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("daemon.agent_autodetect"),
 			opt("daemon.agent_detect_seconds"),
 			opt("daemon.resume_agents"),
+			opt("tasks.auto_stage"),
 		}), daemon.Items[2:]...)...)
 	}
 	// The restart row leads the tab, where a person who came to the daemon's
@@ -869,6 +895,22 @@ func (m *OS) themeEditItem() settingItem {
 			m.CloseSettings()
 			m.OpenThemeEditor(theme.CurrentThemeID(), false, "")
 			return nil
+		},
+	}
+}
+
+// shareLookItem shares the look in the setups discussion: the comment goes
+// on the clipboard and the discussion opens. The page closes first, so the
+// screenshot shows the screen and not the page.
+func (m *OS) shareLookItem() settingItem {
+	return settingItem{
+		Label:   "Share my look",
+		Desc:    "Put your look and a screenshot in the setups discussion on GitHub. Press enter to start.",
+		Control: controlEnum,
+		value:   func(*OS) string { return "GitHub" },
+		activate: func(m *OS) tea.Cmd {
+			m.CloseSettings()
+			return m.ShareLook("", "", "")
 		},
 	}
 }
@@ -1091,6 +1133,16 @@ func (m *OS) spotlightItem() settingItem {
 			m.setOption("spotlight.enabled", strconv.FormatBool(v))
 		})
 	item.differs = differsFromDefault("spotlight.enabled", func(m *OS) string { return strconv.FormatBool(m.SpotlightOn()) })
+	return item
+}
+
+// calmItem is the calm mode switch. Hand-written, as the spotlight row is,
+// because turning calm off also reports and resets the held messages.
+func (m *OS) calmItem() settingItem {
+	item := boolItem("Calm mode", "Stop motion and blinking. Show only messages that need you.",
+		func() bool { return m.CalmOn() },
+		func(m *OS, v bool) { m.SetCalm(v) })
+	item.differs = differsFromDefault("appearance.calm", func(m *OS) string { return strconv.FormatBool(m.CalmOn()) })
 	return item
 }
 

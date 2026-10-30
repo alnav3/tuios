@@ -105,6 +105,7 @@ func (m *OS) BuildSessionState() *session.SessionState {
 			PopupDim:    w.PopupDim,
 			Scratch:     w.IsScratch,
 			ScratchName: w.ScratchName,
+			Rail:        w.Rail,
 			Stack:       w.Stack,
 			StackIndex:  w.StackIndex,
 			Kind:        w.Kind,
@@ -221,8 +222,12 @@ func (m *OS) BuildSessionState() *session.SessionState {
 	// The pane geometry inputs travel with the session because they are inputs
 	// to every client's layout arithmetic. Always sent, never nil: nil on the
 	// wire means a client too old to say, and this one can.
+	sharedBorders := m.SharedBorders
+	if m.OwnPaneBorders {
+		sharedBorders = m.SessionSharedBorders
+	}
 	state.PaneGeometry = &session.PaneGeometryState{
-		SharedBorders:     m.SharedBorders,
+		SharedBorders:     sharedBorders,
 		PaneGap:           m.PaneGap,
 		ScrollColumnWidth: m.ScrollColumnWidth,
 	}
@@ -1298,6 +1303,7 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 	w.SetTitle(ws.Title)
 	adoptWindowHost(w, ws.Host)
 	m.takeDaemonCwd(w, ws)
+	m.takeDaemonDnD(w, ws)
 	w.HostLink = ws.HostLink
 	w.CustomName = ws.CustomName
 	if adoptGeometry {
@@ -1320,6 +1326,7 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 	w.IsPopup = ws.Popup
 	w.IsScratch = ws.Scratch
 	w.ScratchName = ws.ScratchName
+	w.Rail = ws.Rail
 	w.Stack, w.StackIndex = ws.Stack, ws.StackIndex
 	w.Kind, w.URI = ws.Kind, ws.URI
 	w.PopupWidth = ws.PopupWidth
@@ -1346,18 +1353,24 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 		w.SetAltScreen(ws.IsAltScreen)
 	}
 	w.AgentMessage = ws.AgentMessage
+	w.AgentReason = ws.AgentReason
 	w.AgentKind = ws.AgentKind
 	w.AgentHarness = ws.AgentHarness
 	w.StartedBySession, w.StartedByWindow = startedByFromWire(ws.StartedBy)
 	w.AgentMeta = agentMetaFromWire(w.AgentMeta, ws.AgentMeta)
 	w.AgentQueued = ws.AgentQueued
+	w.AgentDraftHeld = ws.AgentDraftHeld
+	w.AgentSettled = ws.AgentSettled
 	w.AgentSubagents = ws.AgentSubagents
 	w.AgentSubagentList = subagentsFromWire(w.AgentSubagentList, ws.AgentSubagentList)
 	w.ProgramStatus = programStatusFromWire(w.ProgramStatus, ws.ProgramStatus)
 	w.AgentStateAt = ws.AgentStateAt
 	prevSeq := w.AgentCompletionSeq
 	w.AgentCompletionSeq = ws.CompletionSeq
-	if string(ws.AgentState) == w.AgentState && ws.CompletionSeq > prevSeq {
+	// A silent pane is drawn as unknown, the state it is shown as. See
+	// session.WindowState.ShownAgentState.
+	shown := string(ws.ShownAgentState())
+	if shown == w.AgentState && ws.CompletionSeq > prevSeq {
 		// A whole turn fell between two snapshots. See noteAgentTurnWithin.
 		// Inside a sync it waits for the sync's focus. See turnsWithinSync.
 		if m.applyingPeerSync {
@@ -1369,7 +1382,7 @@ func (m *OS) updateWindowFromState(w *terminal.Window, ws *session.WindowState) 
 	// Last, and it adopts AgentState itself: an alert raised from here reads the
 	// message and harness above, which have to be the ones that arrived with the
 	// state rather than the ones it replaced.
-	m.noteAgentState(w, string(ws.AgentState))
+	m.noteAgentState(w, shown)
 	m.markHostProgramStatus()
 	w.ForegroundCmd = ws.ForegroundCmd
 	// The shell's pid, as the daemon that spawned it knows it, and the only
@@ -1462,6 +1475,7 @@ func adoptWindowState(window *terminal.Window, ws session.WindowState) {
 	window.IsPopup = ws.Popup
 	window.IsScratch = ws.Scratch
 	window.ScratchName = ws.ScratchName
+	window.Rail = ws.Rail
 	window.Stack, window.StackIndex = ws.Stack, ws.StackIndex
 	window.Kind, window.URI = ws.Kind, ws.URI
 	window.PopupWidth = ws.PopupWidth
@@ -1476,13 +1490,16 @@ func adoptWindowState(window *terminal.Window, ws session.WindowState) {
 	window.PreMinimizeWidth = ws.PreMinimizeW
 	window.PreMinimizeHeight = ws.PreMinimizeH
 	window.SetAltScreen(ws.IsAltScreen) // also drives mouse event forwarding
-	window.AgentState = string(ws.AgentState)
+	window.AgentState = string(ws.ShownAgentState())
 	window.AgentMessage = ws.AgentMessage
+	window.AgentReason = ws.AgentReason
 	window.AgentKind = ws.AgentKind
 	window.AgentHarness = ws.AgentHarness
 	window.StartedBySession, window.StartedByWindow = startedByFromWire(ws.StartedBy)
 	window.AgentMeta = agentMetaFromWire(nil, ws.AgentMeta)
 	window.AgentQueued = ws.AgentQueued
+	window.AgentDraftHeld = ws.AgentDraftHeld
+	window.AgentSettled = ws.AgentSettled
 	window.AgentSubagents = ws.AgentSubagents
 	window.AgentSubagentList = subagentsFromWire(nil, ws.AgentSubagentList)
 	window.ProgramStatus = programStatusFromWire(nil, ws.ProgramStatus)
@@ -1521,6 +1538,7 @@ func (m *OS) newWindowFromState(ws *session.WindowState) *terminal.Window {
 	}
 	adoptWindowHost(window, ws.Host)
 	m.takeDaemonCwd(window, ws)
+	m.takeDaemonDnD(window, ws)
 	window.HostLink = ws.HostLink
 
 	caps := m.hostCaps()
@@ -1566,6 +1584,7 @@ func (m *OS) createWindowFromSync(ws *session.WindowState) *terminal.Window {
 // owns.
 func (m *OS) closeWindowFromSync(w *terminal.Window) {
 	m.clearNvimNavigation(w.ID)
+	m.dndWindowClosed(w.ID)
 	m.pipSourceClosed(w)
 	if m.DaemonClient != nil && w.PTYID != "" {
 		m.unsubscribeFromPTY(w)
@@ -1645,6 +1664,14 @@ func (m *OS) placeUnplacedWindows(state *session.SessionState, firstSeen []*term
 		x, y, width, height := m.NewWindowPlacement()
 		if w.IsPopup {
 			x, y, width, height = m.popupRect(w)
+		} else if bw, bh, tiled, ok := m.newPaneBox(); ok && w.Workspace == m.CurrentWorkspace && !w.IsFloating {
+			// The box the layout is about to give it, which is the size
+			// the daemon started its process at when this client asked for
+			// the window. The floating placement box first and the tile
+			// after were two resizes of a shell that was still starting,
+			// and zsh drew its prompt twice (#1205).
+			width, height = bw, bh
+			w.Tiled = tiled
 		}
 		w.X, w.Y = x, y
 		// Resize rather than assigning the size and telling the daemon by hand:
@@ -1757,10 +1784,11 @@ func (m *OS) adoptSyncedWindows(created []*terminal.Window, removed []int, place
 // insertSyncedWindow puts a daemon-created pane into the BSP tree by splitting
 // the pane that was focused when it was asked for. A split key (ctrl+b | / -)
 // or a preselection records the side and the pane before the request, because
-// the daemon makes the window and it arrives through a state sync. Without a
-// recorded side the tree's scheme picks the axis. The recorded request is
-// cleared whether or not it applies. TileAllWindows runs afterwards and,
-// finding every window already in the tree, only re-applies the layout.
+// the daemon makes the window and it arrives through a state sync. A window
+// asked for from outside the client takes the client's preselection here
+// instead. Without either the tree's scheme picks the axis. The recorded
+// request is cleared whether or not it applies. TileAllWindows runs afterwards
+// and, finding every window already in the tree, only re-applies the layout.
 //
 // focusBefore is the focus before the sync that brought the window, which is
 // the shared focus every client of the session holds, so a peer that did not
@@ -1769,6 +1797,17 @@ func (m *OS) insertSyncedWindow(win *terminal.Window, focusBefore string) {
 	dir := m.pendingSplitDir
 	targetID := m.pendingSplitTarget
 	m.CancelPendingSplit()
+	// A window this client did not ask for, such as one from tuios
+	// new-window in a script (issue #1228), has no recorded split. This
+	// client's preselection still belongs to the pane focusBefore names, so it
+	// decides the side, and is spent only once it has placed a window. A split
+	// this client recorded keeps priority: addDaemonWindow already moved the
+	// preselection into it.
+	fromPreselection := false
+	if targetID == "" && dir == layout.PreselectionNone && m.PreselectionDir != layout.PreselectionNone {
+		dir = m.PreselectionDir
+		fromPreselection = true
+	}
 	if targetID == "" {
 		targetID = focusBefore
 	}
@@ -1793,6 +1832,9 @@ func (m *OS) insertSyncedWindow(win *terminal.Window, focusBefore string) {
 	}
 	if dir != layout.PreselectionNone {
 		tree.InsertWindowWithPreselection(windowIntID, targetIntID, dir, m.GetBSPBounds(), m.separatorGap())
+		if fromPreselection {
+			m.PreselectionDir = layout.PreselectionNone
+		}
 		return
 	}
 	tree.InsertWindow(windowIntID, targetIntID, layout.SplitNone, 0.5, m.GetBSPBounds(), m.separatorGap())
@@ -2203,7 +2245,7 @@ func (m *OS) unsubscribeFromPTY(window *terminal.Window) {
 	// The pinned pane is drawn in the picture-in-picture view wherever it
 	// is, so its stream stays open. Unpinning it, or its closing, clears the
 	// pin first and lets this through. See pip.go.
-	if m.pipKeepsStream(window) || m.cockpitKeepsStream(window) {
+	if m.pipKeepsStream(window) || m.cockpitKeepsStream(window) || m.railPaneKeepsStream(window) {
 		return
 	}
 
@@ -2516,7 +2558,7 @@ func adoptWindowHost(w *terminal.Window, host string) {
 	if w == nil {
 		return
 	}
-	w.Host = host
+	w.SetHost(host)
 }
 
 // startedByFromWire splits a window's started_by into its session and window,

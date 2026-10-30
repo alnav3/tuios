@@ -76,6 +76,7 @@ func ValidateConfig(cfg *UserConfig) *ValidationResult {
 	validateCommands(cfg, result)
 	validateCopyPipes(cfg, result)
 	validateCopyModeKeys(cfg, result)
+	validateReviewKeys(cfg, result)
 
 	// Validate leader key
 	if cfg.Keybindings.LeaderKey != "" {
@@ -85,6 +86,31 @@ func ValidateConfig(cfg *UserConfig) *ValidationResult {
 				Field:   "keybindings",
 				Key:     "leader_key",
 				Message: errMsg,
+			})
+		}
+	}
+
+	// The key that ends nest mode is read as the leader is: a key that cannot
+	// be pressed would leave nest mode with no way out, and one that programs
+	// type would end it in the middle of typing.
+	if k := cfg.Keybindings.NestExitKey; k != "" {
+		if valid, errMsg := normalizer.ValidateKey(k); !valid {
+			result.Errors = append(result.Errors, ValidationError{
+				Field:   "keybindings",
+				Key:     "nest_exit_key",
+				Message: errMsg,
+			})
+		} else if KeyTypes(k) {
+			result.Warnings = append(result.Warnings, ValidationError{
+				Field:   "keybindings",
+				Key:     "nest_exit_key",
+				Message: fmt.Sprintf("%q is a key programs type, so nest mode ends each time it is typed. Use a function key, such as %s, or a key with ctrl or alt", k, DefaultNestExitKey),
+			})
+		} else if leader := cfg.Keybindings.LeaderKey; leader != "" && IsKeyPress(CanonicalKey(leader), k) {
+			result.Warnings = append(result.Warnings, ValidationError{
+				Field:   "keybindings",
+				Key:     "nest_exit_key",
+				Message: fmt.Sprintf("%q is the leader, so the program in the pane never gets it in nest mode. Use another key, such as %s", k, DefaultNestExitKey),
 			})
 		}
 	}
@@ -116,14 +142,16 @@ func ValidateConfig(cfg *UserConfig) *ValidationResult {
 	validateResumeAgents(cfg, result)
 	validateWindowSize(cfg, result)
 	validateSSHAgent(cfg, result)
+	validateSSH(cfg, result)
 	validateDisplay(cfg, result)
 	validateLinkPolicies(cfg, result)
 	validatePanePermissions(cfg, result)
 	validateAgentWork(cfg, result)
 	validatePasteBuffers(cfg, result)
+	validateWorktree(cfg, result)
+	validateTasks(cfg, result)
 
-	// Validate the notifications section (warn on a duration that would put a
-	// message back under the accessibility floor)
+	// Validate the notifications section (warn on a duration tuios cannot use)
 	validateNotificationsConfig(cfg, result)
 	validateNotify(cfg, result)
 
@@ -144,21 +172,35 @@ func ValidateConfig(cfg *UserConfig) *ValidationResult {
 		})
 	}
 
-	// Check for essential actions that should have keybindings
-	essentialActions := map[string]string{
-		"new_window":          "window_management",
-		"close_window":        "window_management",
-		"enter_terminal_mode": "mode_control",
-		"enter_window_mode":   "mode_control",
-		"quit":                "mode_control",
+	// Check for essential actions that should have keybindings. An action
+	// counts as bound when any key reaches it or another action that does the
+	// same thing: window mode is entered as well from terminal mode's exit key
+	// and the leader's exit key, and a config that clears enter_window_mode for
+	// one of those has lost nothing.
+	essentialActions := []struct {
+		section, action string
+		alternatives    [][2]string
+	}{
+		{section: "window_management", action: "new_window"},
+		{section: "window_management", action: "close_window"},
+		{section: "mode_control", action: "enter_terminal_mode"},
+		{section: "mode_control", action: "enter_window_mode", alternatives: [][2]string{
+			{"prefix_mode", "prefix_exit_mode"},
+			{"terminal_mode", "terminal_exit_mode"},
+		}},
+		{section: "mode_control", action: "quit"},
 	}
 
-	for action, section := range essentialActions {
-		if !hasKeybinding(cfg, section, action) {
+	for _, e := range essentialActions {
+		bound := hasKeybinding(cfg, e.section, e.action)
+		for _, alt := range e.alternatives {
+			bound = bound || hasKeybinding(cfg, alt[0], alt[1])
+		}
+		if !bound {
 			result.Warnings = append(result.Warnings, ValidationError{
-				Field:   section,
-				Key:     action,
-				Message: fmt.Sprintf("Essential action '%s' has no keybinding, so TUIOS may be difficult to use", action),
+				Field:   e.section,
+				Key:     e.action,
+				Message: fmt.Sprintf("Essential action '%s' has no keybinding, so TUIOS may be difficult to use", e.action),
 			})
 		}
 	}
@@ -204,6 +246,7 @@ func ValidateConfig(cfg *UserConfig) *ValidationResult {
 
 	validateDock(cfg, result)
 	validateSidebarCustom(cfg, result)
+	validateSidebarPane(cfg, result)
 	validateSidebarEdges(cfg.Appearance.Sidebar, result)
 	validateHints(cfg, result)
 	validatePanes(cfg, result)
@@ -274,32 +317,31 @@ func validateDisplay(cfg *UserConfig, result *ValidationResult) {
 	warnEnum(result, "daemon", "display", cfg.Daemon.Display, DisplayModes, DisplayOff)
 }
 
-// minReadableNotification is the shortest message lifetime this config will
-// accept without complaint. Below about four seconds a status line is a time
-// limit on reading content with no way to extend it, which is the WCAG 2.2.1
-// failure the old 1500ms default was. The value is not enforced, because a user
-// who has read the warning and wants a faster bar is entitled to one; it is
-// reported so the choice is a choice.
-const minReadableNotification = 4
-
-// validateNotificationsConfig warns when a configured message lifetime is short
-// enough to be unreadable. Negative and zero values are not warned about: they
-// mean "unset" and leave the default in place.
+// validateNotificationsConfig warns about a message lifetime tuios cannot use.
+// A short lifetime is the user's choice and is not reported. Zero means "use
+// the default". A negative value is ignored and the default stays, and a value
+// past the registry's Max is cut to it, which also keeps the seconds-to-
+// Duration conversion from overflowing.
 func validateNotificationsConfig(cfg *UserConfig, result *ValidationResult) {
 	check := func(key string, seconds int) {
-		if seconds <= 0 || seconds >= minReadableNotification {
+		limit := notificationDurationMax(key)
+		var msg string
+		switch {
+		case seconds < 0:
+			msg = fmt.Sprintf("%d is less than 0. tuios uses the default.", seconds)
+		case seconds > limit:
+			msg = fmt.Sprintf("%d is more than %d. tuios uses %d.", seconds, limit, limit)
+		default:
 			return
 		}
-		result.Warnings = append(result.Warnings, ValidationError{
-			Field: "notifications",
-			Key:   key,
-			Message: fmt.Sprintf("%ds is shorter than the %ds needed to read a message; it is applied as written but is an accessibility (WCAG 2.2.1) failure",
-				seconds, minReadableNotification),
-		})
+		result.Warnings = append(result.Warnings, ValidationError{Field: "notifications", Key: key, Message: msg})
 	}
 	check("duration", cfg.Notifications.Duration)
 	check("warning_duration", cfg.Notifications.WarningDuration)
 	check("error_duration", cfg.Notifications.ErrorDuration)
+	warnEnum(result, "notifications", "bell", cfg.Notifications.Bell, BellModes, BellToast)
+	warnEnum(result, "notifications", "style", cfg.Notifications.Style, NotificationStyles, NotificationStyleFull)
+	warnEnum(result, "notifications", "level", cfg.Notifications.Level, NotificationLevels, NotificationLevelInfo)
 
 	agent := &cfg.Notifications.Agent
 	if _, _, err := ParseQuietHours(agent.QuietHours); err != nil {
@@ -362,6 +404,7 @@ func validateAppearanceEnums(cfg *UserConfig, result *ValidationResult) {
 	}
 	checkEnum("dockbar_position", cfg.Appearance.DockbarPosition, DockbarPositions)
 	checkEnum("dock_prefix_indicator", cfg.Appearance.DockPrefixIndicator, DockPrefixIndicators)
+	checkEnum("dock_mode_pill", cfg.Appearance.DockModePill, DockModePills)
 	checkEnum("sidebar.position", cfg.Appearance.Sidebar.Position, SidebarPositions)
 	for _, problem := range SidebarSectionProblems(cfg.Appearance.Sidebar.Sections) {
 		result.Warnings = append(result.Warnings, ValidationError{
@@ -383,6 +426,7 @@ func validateAppearanceEnums(cfg *UserConfig, result *ValidationResult) {
 		})
 	}
 	checkEnum("sidebar.folder_click", cfg.Appearance.Sidebar.FolderClick, SidebarFolderClicks)
+	checkEnum("sidebar.files_style", cfg.Appearance.Sidebar.FilesStyle, SidebarFilesStyles)
 	checkEnum("sidebar.file_delete", cfg.Appearance.Sidebar.FileDelete, SidebarFileDeletes)
 	validateSidebarSubagents(cfg.Appearance.Sidebar, result)
 	if cfg.Appearance.Sidebar.Workspaces != "" {
@@ -419,13 +463,15 @@ func validateAppearanceEnums(cfg *UserConfig, result *ValidationResult) {
 	validateTitleFormat(cfg.Appearance.WindowTitleFormat, result)
 	validateGlyphSet(cfg, result)
 	validateOmarchyTheme(cfg, result)
-	validateDimUnfocused(cfg, result)
 	validateClockFormat(cfg.Appearance.ClockFormat, result)
 	validateBorderColors(cfg, result)
 	validateSelectionColors(cfg, result)
 	validateScrollbar(cfg, result)
+	validateScrollColumnPresets(cfg, result)
 	validateDockModeIcons(cfg, result)
 	validateBackgrounds(cfg, result)
+	warnColours(result, "appearance", "The cursor row keeps the theme's background",
+		"sidebar.cursor_background", cfg.Appearance.Sidebar.CursorBackground)
 }
 
 // validateBackgrounds warns about a background option that is neither a
@@ -508,26 +554,6 @@ func validateGlyphSet(cfg *UserConfig, result *ValidationResult) {
 	}
 }
 
-// validateDimUnfocused warns when the dim is asked for and cannot do its whole
-// job.
-//
-// With no theme set, tuios emits colour indices and the host terminal decides
-// what they look like, so a cell drawn in the terminal's own default has no RGB
-// here to carry anywhere. Those cells are left alone rather than guessed at,
-// which on a plain shell prompt is most of them, so the setting looks broken
-// unless somebody says this out loud.
-func validateDimUnfocused(cfg *UserConfig, result *ValidationResult) {
-	if cfg.Appearance.DimUnfocused <= 0 || theme.Themed(cfg.Appearance.Theme) {
-		return
-	}
-	result.Warnings = append(result.Warnings, ValidationError{
-		Field: "appearance",
-		Key:   "dim_unfocused",
-		Message: "no theme is set, so a cell drawn in the terminal's own default colour has no colour " +
-			"tuios knows and is left undimmed; only cells a program coloured itself are quieted",
-	})
-}
-
 // validateClockFormat warns about a layout that formats to nothing.
 //
 // Go's time layouts have no syntax to be wrong at: any string is a layout, and
@@ -588,7 +614,11 @@ func validateBorderColors(cfg *UserConfig, result *ValidationResult) {
 	a := &cfg.Appearance
 	warnColours(result, "appearance", "The border uses the theme colour",
 		"border_focused_color", a.BorderFocusedColor,
+		"border_focused_color_window", a.BorderFocusedColorWindow,
+		"border_focused_color_terminal", a.BorderFocusedColorTerminal,
 		"border_unfocused_color", a.BorderUnfocusedColor)
+	warnColours(result, "appearance", "Overlay frames keep their default colour",
+		"overlay_border_color", a.OverlayBorderColor)
 	if a.BorderFocusedGradient == "" {
 		return
 	}
@@ -662,6 +692,22 @@ func validateDockModeIcons(cfg *UserConfig, result *ValidationResult) {
 			Key:   icon.key,
 			Message: fmt.Sprintf("%q is not a usable icon. Use at most %d cells and no control characters. The dock shows the default icon",
 				*icon.value, DockModeIconMaxWidth),
+		})
+	}
+}
+
+// validateScrollColumnPresets warns about a column width preset outside 1 to
+// 100 percent. ScrollColumnPresetFractions drops it, and the cycle steps
+// through the rest.
+func validateScrollColumnPresets(cfg *UserConfig, result *ValidationResult) {
+	for _, p := range cfg.Appearance.ScrollColumnPresets {
+		if p > 0 && p <= ScrollColumnWidthCeiling {
+			continue
+		}
+		result.Warnings = append(result.Warnings, ValidationError{
+			Field:   "appearance",
+			Key:     "scroll_column_presets",
+			Message: fmt.Sprintf("%d is not a width from 1 to %d percent. tuios ignores it", p, ScrollColumnWidthCeiling),
 		})
 	}
 }
@@ -784,6 +830,7 @@ func keySections(kb *KeybindingsConfig) []keySection {
 		{"mail", kb.Mail},
 		{"transfers", kb.Transfers},
 		{"copy_mode", kb.CopyMode},
+		{"review", kb.Review},
 		{"global", kb.Global},
 		{"script", kb.Script},
 		{"lists", kb.Lists},
@@ -802,7 +849,8 @@ type DroppedKey struct {
 	File string `json:"file"`
 	// Section is the config table, or "keybindings" for the leader.
 	Section string `json:"section"`
-	// Action is the action the key was bound to, or "leader_key".
+	// Action is the action the key was bound to, or "leader_key" or
+	// "nest_exit_key".
 	Action string `json:"action"`
 	Key    string `json:"key"`
 	// Problem is what is wrong, in the validator's words.
@@ -840,8 +888,8 @@ func (d DroppedKey) Outcome() string {
 // Warning is the line the TUI logs for the dropped key.
 func (d DroppedKey) Warning() string {
 	name := d.Key
-	if d.IsLeader() {
-		name = "leader_key = " + d.Key
+	if d.IsLeader() || d.Action == "nest_exit_key" {
+		name = d.Action + " = " + d.Key
 	}
 	return fmt.Sprintf("%s: [%s] %s: %s. tuios ignores this key. %s", d.File, d.Section, name, d.Problem, d.Outcome())
 }
@@ -896,6 +944,17 @@ func DropUnreadableKeys(cfg *UserConfig, lc *LayeredConfig) []DroppedKey {
 				Key: kb.LeaderKey, Problem: msg, Fallback: []string{defaults.LeaderKey},
 			})
 			kb.LeaderKey = defaults.LeaderKey
+		}
+	}
+	// A nest exit key that cannot be read goes back to F12, for the same
+	// reason: nest mode must always have a way out.
+	if kb.NestExitKey != "" {
+		if ok, msg := normalizer.ValidateKey(kb.NestExitKey); !ok {
+			dropped = append(dropped, DroppedKey{
+				File: fileOf("keybindings", "nest_exit_key"), Section: "keybindings", Action: "nest_exit_key",
+				Key: kb.NestExitKey, Problem: msg, Fallback: []string{DefaultNestExitKey},
+			})
+			kb.NestExitKey = ""
 		}
 	}
 
@@ -1017,6 +1076,8 @@ func hasKeybinding(cfg *UserConfig, sectionName, action string) bool {
 		section = cfg.Keybindings.System
 	case "prefix_mode":
 		section = cfg.Keybindings.PrefixMode
+	case "terminal_mode":
+		section = cfg.Keybindings.TerminalMode
 	case "window_prefix":
 		section = cfg.Keybindings.WindowPrefix
 	case "minimize_prefix":

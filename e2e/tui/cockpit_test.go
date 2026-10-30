@@ -2,6 +2,9 @@ package tuie2e
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"image"
 	"image/png"
 	"os"
@@ -54,10 +57,21 @@ const cockpitApproval = `{"hook_event_name":"PermissionRequest","session_id":"e2
 // is given.
 func startCockpitFleet(t *testing.T, cols, rows int, env []string) (*tuitest.Terminal, string, *bytes.Buffer, chan error) {
 	t.Helper()
+	return startCockpitFleetWith(t, cols, rows, env, "")
+}
+
+// startCockpitFleetWith is startCockpitFleet with more config before the
+// fleet's own.
+func startCockpitFleetWith(t *testing.T, cols, rows int, env []string, conf string) (*tuitest.Terminal, string, *bytes.Buffer, chan error) {
+	t.Helper()
 	base := t.TempDir()
 	killDaemon(t, base)
 	useShippedLooks(base)
-	writeConfig(t, base, "[agents.approvals]\nenabled = [\"claude-code\"]\nhold_seconds = 300\n")
+	// after-settle writes each settle to a file, so a test can see the
+	// daemon ran it.
+	settleLog := filepath.Join(base, "settled.log")
+	writeConfig(t, base, conf+"[agents.approvals]\nenabled = [\"claude-code\"]\nhold_seconds = 300\n"+
+		"[hooks]\nafter-settle = 'printf \"%s %s\\\\n\" \"$TUIOS_WINDOW_NAME\" \"$TUIOS_SETTLE_REASON\" >> "+settleLog+"'\n")
 	for _, s := range []string{"home", "api", "docs", "cache", "misc"} {
 		if out, err := tuiosCLI(t, base, "new", s, "--detach"); err != nil {
 			t.Fatalf("create session %s: %v\n%s", s, err, out)
@@ -103,7 +117,13 @@ func startCockpitFleet(t *testing.T, cols, rows int, env []string) (*tuitest.Ter
 	t.Cleanup(func() { _ = hook.Process.Kill() })
 	go func() { exited <- hook.Wait() }()
 	waitForAttention(t, base, nil, "go test ./internal/auth/...")
+	return openCockpitClient(t, base, cols, rows, env), base, &stdout, exited
+}
 
+// openCockpitClient attaches a client to home at cols x rows and opens the
+// cockpit on the fleet.
+func openCockpitClient(t *testing.T, base string, cols, rows int, env []string) *tuitest.Terminal {
+	t.Helper()
 	term := startIn(t, base, startOpts{args: []string{"attach", "home"}, cols: cols, rows: rows, shippedLooks: true, env: env})
 	if err := term.WaitFor(func(s tuitest.Screen) bool { return countWindows(s) == 1 }, bootTimeout); err != nil {
 		t.Fatalf("client never attached: %v\n%s", err, term.Snapshot())
@@ -117,20 +137,22 @@ func startCockpitFleet(t *testing.T, cols, rows int, env []string) (*tuitest.Ter
 	}, uiTimeout); err != nil {
 		t.Fatalf("ASSERTION: the cockpit never showed the four groups: %v\n%s", err, term.Snapshot())
 	}
-	return term, base, &stdout, exited
+	return term
 }
 
 // TestCockpitGroupsTheFleet opens the cockpit on twelve agents. The groups
 // come in the order of what each needs from the person, the approval's row
 // says the verb and the command, a click selects a row and leaves the cockpit
-// open, a answers the approval from the card, and a double-click goes to the
-// pane.
+// open, a answers the approval from the card, D settles an agent (see
+// cockpitSettleRoundTrip), and a double-click goes to the pane.
 //
 // Negative controls, each recorded in NEGATIVE_CONTROLS.md: with the groups
 // drawn in the rail's state order the order check fails; with a click going
-// to the pane (the agents view's old rule) the click check fails.
+// to the pane (the agents view's old rule) the click check fails; with the
+// daemon's wake of a settled agent cut, the agent goes back on the shelf;
+// with the settle's carry across a client push cut, the push clears it.
 func TestCockpitGroupsTheFleet(t *testing.T) {
-	term, _, hookOut, exited := startCockpitFleet(t, 200, 55, nil)
+	term, base, hookOut, exited := startCockpitFleet(t, 200, 55, nil)
 	s := term.Screen()
 	order := []string{"Needs you", "Ready for review", "Working", "Idle"}
 	last := -1
@@ -187,6 +209,8 @@ func TestCockpitGroupsTheFleet(t *testing.T) {
 		t.Fatalf("ASSERTION: the hook did not get an allow: %q", hookOut.String())
 	}
 
+	cockpitSettleRoundTrip(t, term, base)
+
 	// A double-click goes to the pane and closes the cockpit.
 	row, col = findText(t, term, "docs-cli")
 	clickAt(t, term, col, row, 2)
@@ -200,7 +224,14 @@ func TestCockpitGroupsTheFleet(t *testing.T) {
 
 // TestCockpitNarrowFoldsRows opens the cockpit at 100x30: the fleet's rows are
 // one line and the focus is beside them. At 16 colours the cursor row is
-// reverse video.
+// reverse video. F folds Working from one of its rows and opens it from the
+// folded heading, and a new client opens the view with the fold kept. With
+// [agents] fold_working on, Working opens folded, and a group the person
+// opens stays open when the view opens again.
+//
+// Negative controls, recorded in NEGATIVE_CONTROLS.md: with the fold not
+// saved, the new client check fails; with the folded heading not taking the
+// cursor, F cannot open the group again.
 func TestCockpitNarrowFoldsRows(t *testing.T) {
 	for _, d := range []chromeDepth{{name: "truecolor", env: []string{"TERM=xterm-256color", "COLORTERM=truecolor"}}, chromeDepths[0]} {
 		t.Run(d.name, func(t *testing.T) {
@@ -213,6 +244,310 @@ func TestCockpitNarrowFoldsRows(t *testing.T) {
 			saveCockpitFrames(t, term, "cockpit-100x30-"+d.name)
 		})
 	}
+
+	// F folds the group of the row under the cursor, F on the folded
+	// heading opens it, and the fold outlives the client.
+	t.Run("fold", func(t *testing.T) {
+		env := []string{"TERM=xterm-256color", "COLORTERM=truecolor"}
+		term, base, _, _ := startCockpitFleet(t, 100, 30, env)
+		cursorTo(t, term, func(line string) bool { return containsAny(line, cockpitWorking...) })
+		pressFold(t, term, "fold Working", workingFolded)
+		saveCockpitFrames(t, term, "cockpit-100x30-folded")
+		// The cursor rests on the folded heading, so F opens it again.
+		pressFold(t, term, "open Working", workingOpen)
+		pressFold(t, term, "fold Working again", workingFolded)
+
+		// A new client opens the view with Working still folded.
+		if err := term.Close(); err != nil {
+			t.Fatalf("close the client: %v", err)
+		}
+		term = openCockpitClient(t, base, 100, 30, env)
+		if err := term.WaitFor(workingFolded, uiTimeout); err != nil {
+			t.Fatalf("ASSERTION: Working was not folded in a new client: %v\n%s", err, term.Snapshot())
+		}
+	})
+
+	// With [agents] fold_working on, the view opens with Working folded.
+	// A fold the person opens stays open when the view opens again.
+	t.Run("fold_working", func(t *testing.T) {
+		env := []string{"TERM=xterm-256color", "COLORTERM=truecolor"}
+		term, _, _, _ := startCockpitFleetWith(t, 100, 30, env, "[agents]\nfold_working = true\n")
+		if err := term.WaitFor(workingFolded, uiTimeout); err != nil {
+			t.Fatalf("ASSERTION: fold_working did not fold Working: %v\n%s", err, term.Snapshot())
+		}
+		saveCockpitFrames(t, term, "cockpit-100x30-fold-working")
+		cursorTo(t, term, func(line string) bool { return strings.Contains(line, "Working") })
+		pressFold(t, term, "open Working", workingOpen)
+		if err := term.SendKeys("q"); err != nil {
+			t.Fatalf("close the view: %v", err)
+		}
+		if err := term.WaitFor(func(s tuitest.Screen) bool { return !strings.Contains(s.Text(), "Ready for review") }, uiTimeout); err != nil {
+			t.Fatalf("the view did not close: %v\n%s", err, term.Snapshot())
+		}
+		if err := term.SendKeys(tuitest.Ctrl('b'), "i"); err != nil {
+			t.Fatalf("open the view again: %v", err)
+		}
+		if err := term.WaitFor(func(s tuitest.Screen) bool {
+			return strings.Contains(s.Text(), "Ready for review") && workingOpen(s)
+		}, uiTimeout); err != nil {
+			t.Fatalf("ASSERTION: Working did not stay open: %v\n%s", err, term.Snapshot())
+		}
+	})
+}
+
+// cockpitWorking are the fleet's working agents, as the narrow fleet
+// column cuts their names.
+var cockpitWorking = []string{"cache-1", "cache-2", "cache-3", "bench-idle", "ws-reconn", "migrate-c"}
+
+// ckFleetCols is the fleet column's width at 100 columns.
+const ckFleetCols = 38
+
+// fleetCol is row r's fleet column.
+func fleetCol(s tuitest.Screen, r int) string {
+	line := []rune(s.Line(r))
+	return string(line[:min(len(line), ckFleetCols)])
+}
+
+// workingFolded reports a folded Working group: its heading with its count,
+// and none of its agents in the fleet column.
+func workingFolded(s tuitest.Screen) bool {
+	_, rows := s.Size()
+	head := false
+	for r := range rows {
+		col := fleetCol(s, r)
+		if containsAny(col, cockpitWorking...) {
+			return false
+		}
+		head = head || strings.Contains(col, "Working  6")
+	}
+	return head
+}
+
+// workingOpen reports an open Working group: every agent in the fleet
+// column.
+func workingOpen(s tuitest.Screen) bool {
+	_, rows := s.Size()
+	seen := 0
+	for _, want := range cockpitWorking {
+		for r := range rows {
+			if strings.Contains(fleetCol(s, r), want) {
+				seen++
+				break
+			}
+		}
+	}
+	return seen == len(cockpitWorking)
+}
+
+// containsAny reports whether s holds any of parts.
+func containsAny(s string, parts ...string) bool {
+	for _, p := range parts {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// cursorTo presses j until the cursor's fleet row matches want. The cursor
+// row starts with the cursor bar.
+func cursorTo(t *testing.T, term *tuitest.Terminal, want func(line string) bool) {
+	t.Helper()
+	for range 16 {
+		s := term.Screen()
+		_, rows := s.Size()
+		for r := range rows {
+			if col := fleetCol(s, r); strings.HasPrefix(strings.TrimLeft(col, " │"), "▌") && want(col) {
+				return
+			}
+		}
+		if err := term.SendKeys("j"); err != nil {
+			t.Fatalf("press j: %v", err)
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	t.Fatalf("the cursor never reached the row\n%s", term.Snapshot())
+}
+
+// pressFold presses F and waits for done.
+func pressFold(t *testing.T, term *tuitest.Terminal, what string, done func(tuitest.Screen) bool) {
+	t.Helper()
+	if err := term.SendKeys("F"); err != nil {
+		t.Fatalf("press F: %v", err)
+	}
+	if err := term.WaitFor(done, uiTimeout); err != nil {
+		t.Fatalf("ASSERTION: F did not %s: %v\n%s", what, err, term.Snapshot())
+	}
+}
+
+// cockpitSettleRoundTrip settles an idle agent with D, undoes it with u and
+// settles it again; a second client draws the same shelf, and its own push of
+// the session's state keeps the settle; the agent asks a
+// question and comes back to Needs you by itself, and once it is at rest
+// again it stays off the shelf, because the daemon cleared the settle.
+func cockpitSettleRoundTrip(t *testing.T, term *tuitest.Terminal, base string) {
+	t.Helper()
+	settle := func() {
+		t.Helper()
+		row := fleetRowWith(term.Screen(), "scratch")
+		if row < 0 {
+			t.Fatalf("ASSERTION: scratch has no row\n%s", term.Snapshot())
+		}
+		col := strings.Index(string([]rune(term.Screen().Line(row))[:56]), "scratch")
+		mouseClick(t, term, len([]rune(term.Screen().Line(row)[:col])), row, tuitest.MouseLeft, 0)
+		time.Sleep(500 * time.Millisecond)
+		if err := term.SendKeys("D"); err != nil {
+			t.Fatalf("press D: %v", err)
+		}
+	}
+	inGroup := func(term *tuitest.Terminal, group, what string) {
+		t.Helper()
+		if err := term.WaitFor(func(s tuitest.Screen) bool { return fleetGroupOf(s, "scratch") == group }, uiTimeout); err != nil {
+			t.Fatalf("ASSERTION: %s: scratch is in %q, not %q: %v\n%s", what, fleetGroupOf(term.Screen(), "scratch"), group, err, term.Snapshot())
+		}
+	}
+	settle()
+	inGroup(term, "Settled", "D did not settle it")
+	saveCockpitFrames(t, term, "cockpit-settled")
+	if err := term.SendKeys("u"); err != nil {
+		t.Fatalf("press u: %v", err)
+	}
+	inGroup(term, "Idle", "u did not undo the settle")
+	saveCockpitFrames(t, term, "cockpit-settle-undone")
+	settle()
+	inGroup(term, "Settled", "D did not settle it again")
+
+	// The hook ran for each settle, as the person's.
+	deadline := time.Now().Add(uiTimeout)
+	var log []byte
+	for time.Now().Before(deadline) {
+		log, _ = os.ReadFile(filepath.Join(base, "settled.log"))
+		if strings.Count(string(log), "scratch person\n") == 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := strings.Count(string(log), "scratch person\n"); got != 2 {
+		t.Fatalf("ASSERTION: after-settle ran %d times for two settles, want 2: %q", got, log)
+	}
+
+	// A second client, attached to the agent's own session, draws the same
+	// shelf, and its pushes of that session keep the settle.
+	other := startIn(t, base, startOpts{args: []string{"attach", "misc"}, cols: 200, rows: 55, shippedLooks: true})
+	if err := other.WaitFor(func(s tuitest.Screen) bool { return countWindows(s) >= 1 }, bootTimeout); err != nil {
+		t.Fatalf("the second client never attached: %v\n%s", err, other.Snapshot())
+	}
+	windowManagementMode(t, other)
+	if err := other.SendKeys(tuitest.Ctrl('b'), "i"); err != nil {
+		t.Fatalf("open the cockpit in the second client: %v", err)
+	}
+	inGroup(other, "Settled", "the second client does not draw the settle")
+	saveCockpitFrames(t, other, "cockpit-settled-second-client")
+
+	// The second client pushes the session's state: it leaves the view and
+	// moves the focus to another pane. Its push carries no settle, as no
+	// client's does, and the agent must still be settled after it.
+	before, _ := miscFocusAndSettle(t, base)
+	// esc leaves the reply line first, then closes the view.
+	for range 3 {
+		if !strings.Contains(other.Screen().Text(), "Ready for review") {
+			break
+		}
+		if err := other.SendKeys(tuitest.Esc); err != nil {
+			t.Fatalf("close the second client's view: %v", err)
+		}
+		_ = other.WaitFor(func(s tuitest.Screen) bool { return !strings.Contains(s.Text(), "Ready for review") }, 2*time.Second)
+	}
+	if strings.Contains(other.Screen().Text(), "Ready for review") {
+		t.Fatalf("esc never closed the second client's view\n%s", other.Snapshot())
+	}
+	moved := false
+	for range 3 {
+		if err := other.SendKeys(tuitest.Tab); err != nil {
+			t.Fatalf("press tab: %v", err)
+		}
+		deadline := time.Now().Add(uiTimeout)
+		for time.Now().Before(deadline) {
+			if f, _ := miscFocusAndSettle(t, base); f != before {
+				moved = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if moved {
+			break
+		}
+	}
+	if !moved {
+		t.Fatalf("ASSERTION: tab in the second client never moved the session's focus from %q\n%s", before, other.Snapshot())
+	}
+	if _, settled := miscFocusAndSettle(t, base); !settled {
+		t.Fatalf("ASSERTION: a push from the second client cleared the settle: list-agents says scratch is not settled")
+	}
+	if err := other.SendKeys(tuitest.Ctrl('b'), "i"); err != nil {
+		t.Fatalf("open the cockpit in the second client again: %v", err)
+	}
+	inGroup(other, "Settled", "the second client lost the settle after its own push")
+	inGroup(term, "Settled", "the first client lost the settle after the second client's push")
+
+	// The agent asks: it comes back to Needs you by itself.
+	if out, err := tuiosCLI(t, base, "set-agent-state", "needs_input", "-s", "misc", "-w", "scratch", "--kind", "question", "-m", "Which branch?"); err != nil {
+		t.Fatalf("scratch asks: %v\n%s", err, out)
+	}
+	inGroup(term, "Needs you", "a settled agent that asks did not come back")
+	saveCockpitFrames(t, term, "cockpit-settled-asks")
+	// Answered and at rest again, it is off the shelf: the daemon cleared
+	// the settle, so neither client puts it back.
+	if out, err := tuiosCLI(t, base, "set-agent-state", "idle", "-s", "misc", "-w", "scratch"); err != nil {
+		t.Fatalf("scratch rests: %v\n%s", err, out)
+	}
+	inGroup(term, "Idle", "the agent went back on the shelf after it asked")
+	inGroup(other, "Idle", "the second client put the agent back on the shelf after it asked")
+}
+
+// miscFocusAndSettle is the misc session's focused pane, as list-agents
+// --all marks it, and whether scratch is settled there.
+func miscFocusAndSettle(t *testing.T, base string) (focused string, settled bool) {
+	t.Helper()
+	out, err := tuiosCLI(t, base, "list-agents", "--all", "-s", "misc", "--json")
+	if err != nil {
+		t.Fatalf("list-agents: %v\n%s", err, out)
+	}
+	var payload struct {
+		Agents []struct {
+			ID      string `json:"window_id"`
+			Name    string `json:"name"`
+			Focused bool   `json:"focused"`
+			Settled bool   `json:"settled"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("list-agents json: %v\n%s", err, out)
+	}
+	for _, a := range payload.Agents {
+		if a.Focused {
+			focused = a.ID
+		}
+		if a.Name == "scratch" {
+			settled = a.Settled
+		}
+	}
+	return focused, settled
+}
+
+// fleetGroupOf is the heading of the fleet group that holds the first row
+// with want, empty when there is none.
+func fleetGroupOf(s tuitest.Screen, want string) string {
+	row := fleetRowWith(s, want)
+	for r := row - 1; r >= 0 && row >= 0; r-- {
+		line := strings.TrimSpace(string([]rune(s.Line(r))[:min(len([]rune(s.Line(r))), 56)]))
+		for _, g := range []string{"Needs you", "Ready for review", "Working", "Idle", "Settled", "Snoozed"} {
+			if strings.HasPrefix(strings.TrimLeft(line, "▾▸› "), g) {
+				return g
+			}
+		}
+	}
+	return ""
 }
 
 // fleetRowWith is the first row whose fleet column, the first 56 cells,
@@ -230,7 +565,10 @@ func fleetRowWith(s tuitest.Screen, want string) int {
 
 // saveCockpitFrames saves the screen as text and as a PNG drawn by
 // tuios.dev/shot, in the font named by TUIOS_E2E_FONT_DIR when it is set.
-func saveCockpitFrames(t *testing.T, term *tuitest.Terminal, name string) {
+//
+// pics are the kitty pictures the host shows (hostPictures), drawn over the
+// cells as the host draws them.
+func saveCockpitFrames(t *testing.T, term *tuitest.Terminal, name string, pics ...shot.Image) {
 	t.Helper()
 	dir := artifactDir(t)
 	saveArtifact(t, term, dir, name)
@@ -238,6 +576,7 @@ func saveCockpitFrames(t *testing.T, term *tuitest.Terminal, name string) {
 	p := shot.XTermPalette()
 	cols, rows := s.Size()
 	g := shot.NewGrid(cols, rows, p.FG, p.BG)
+	g.Images = pics
 	for y := range rows {
 		for x := range cols {
 			c := s.Cell(x, y)
@@ -260,15 +599,27 @@ func saveCockpitFrames(t *testing.T, term *tuitest.Terminal, name string) {
 	var f *shot.Frame
 	regularPath, boldPath := os.Getenv("TUIOS_E2E_FONT_REGULAR"), os.Getenv("TUIOS_E2E_FONT_BOLD")
 	if fonts := os.Getenv("TUIOS_E2E_FONT_DIR"); fonts != "" && regularPath == "" {
-		regularPath = filepath.Join(fonts, "GeistMonoNerdFontMono-Regular.otf")
-		boldPath = filepath.Join(fonts, "GeistMonoNerdFontMono-Bold.otf")
+		regularPath = filepath.Join(fonts, "JetBrainsMonoNerdFontMono-Regular.ttf")
+		boldPath = filepath.Join(fonts, "JetBrainsMonoNerdFontMono-Bold.ttf")
+	}
+	if regularPath == "" {
+		regularPath, boldPath = frameFontPaths()
 	}
 	if regularPath != "" {
 		regular, err1 := os.ReadFile(regularPath)
 		bold, err2 := os.ReadFile(boldPath)
 		if err1 == nil && err2 == nil {
+			// TUIOS_E2E_FONT_FALLBACK lists more font files, split by the
+			// path list separator, for glyphs the main font has no glyph
+			// for, such as Hangul, CJK and emoji.
+			var fallback []shot.Font
+			for _, path := range filepath.SplitList(os.Getenv("TUIOS_E2E_FONT_FALLBACK")) {
+				if data, err := os.ReadFile(path); err == nil {
+					fallback = append(fallback, shot.Font{Data: data})
+				}
+			}
 			f = shot.BuildFrame(shot.FrameSpec{Frame: "window", Title: "tuios", Padding: 28, Radius: 10, Shadow: true, Controls: "macos",
-				Font: shot.Font{Data: regular}, BoldFont: shot.Font{Data: bold}}, shot.FrameInputs{Palette: p})
+				Font: shot.Font{Data: regular}, BoldFont: shot.Font{Data: bold}, Fallback: fallback}, shot.FrameInputs{Palette: p})
 			if missing, err := shot.MissingGlyphs(g, f); err == nil && len(missing) > 0 {
 				t.Errorf("ASSERTION: the font has no glyph for %q", string(missing))
 			}
@@ -599,6 +950,414 @@ func TestCockpitReplyAreaAndImageView(t *testing.T) {
 	mouseClick(t, term, col, row, tuitest.MouseLeft, 0)
 	waitText(t, term, "the closed area after Send", "Write a reply.")
 	alive(t, term, "after the reply area and the image view")
+}
+
+// TestCockpitReplyClipboardImageFirstPaste pastes a clipboard image into the
+// reply with ctrl+v, on a host with kitty graphics, and opens it. The
+// thumbnail and the image view each show their picture on the first try,
+// with no other key or click to bring it out.
+//
+// The picture is prepared off the update loop, and it lands in a frame whose
+// cells equal the last one: the box was drawn blank a frame earlier. The
+// renderer writes nothing for such a frame, and the picture was queued
+// behind it, so it waited for the next key or click. The screen is let go
+// quiet before the paste, so no other frame can carry the picture out.
+//
+// Negative control, recorded in NEGATIVE_CONTROLS.md: with FlushIfDrawn
+// returning at once, no thumbnail is placed after the paste.
+func TestCockpitReplyClipboardImageFirstPaste(t *testing.T) {
+	base := t.TempDir()
+	killDaemon(t, base)
+	useShippedLooks(base)
+	for _, s := range []string{"home", "docs"} {
+		if out, err := tuiosCLI(t, base, "new", s, "--detach"); err != nil {
+			t.Fatalf("create session %s: %v\n%s", s, err, out)
+		}
+	}
+	for _, args := range [][]string{
+		{"set-window", "-s", "docs", "-w", "0", "--name", "docs-cli"},
+		{"set-agent-state", "idle", "-s", "docs", "-w", "docs-cli", "--harness", "claude-code"},
+	} {
+		if out, err := tuiosCLI(t, base, args...); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	// A wl-paste that offers one PNG and no text stands in for the
+	// clipboard, so the person's own clipboard is never read.
+	bin := t.TempDir()
+	clip := filepath.Join(bin, "clip.png")
+	if err := os.WriteFile(clip, gradientPNG(t, 640, 360), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\ncase \"$*\" in\n*--list-types*) echo image/png ;;\n*) cat '" + clip + "' ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(bin, "wl-paste"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	host := &lockedBuffer{}
+	term := startIn(t, base, startOpts{args: []string{"attach", "home"}, cols: 200, rows: 55, shippedLooks: true, out: host,
+		env: []string{"TERM=xterm-256color", "COLORTERM=truecolor", "PATH=" + bin + ":" + os.Getenv("PATH"), "WAYLAND_DISPLAY=wayland-e2e"}})
+	if err := term.WaitFor(func(s tuitest.Screen) bool { return countWindows(s) == 1 }, bootTimeout); err != nil {
+		t.Fatalf("client never attached: %v\n%s", err, term.Snapshot())
+	}
+	windowManagementMode(t, term)
+	if err := term.SendKeys(tuitest.Ctrl('b'), "i"); err != nil {
+		t.Fatal(err)
+	}
+	row, col := findText(t, term, "Write a reply.")
+	mouseClick(t, term, col, row, tuitest.MouseLeft, 0)
+	waitText(t, term, "the open reply editor", "Type your reply.")
+	waitBufferQuiet(t, host, 1500*time.Millisecond)
+
+	mark := len(host.String())
+	if err := term.SendKeys(tuitest.Ctrl('v')); err != nil {
+		t.Fatal(err)
+	}
+	waitText(t, term, "the image chip", "Image 1.png  640×360", "click to view", "[Image #1 · 640×360 png]")
+	// The thumbnail is placed on the box above its #1 label, with no other
+	// input.
+	var label struct{ row, col int }
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		label.row = -1
+		for i, line := range strings.Split(s.Text(), "\n") {
+			if before, _, ok := strings.Cut(line, "#1"); ok && !strings.Contains(line, "[Image") {
+				label.row, label.col = i, len([]rune(before))
+			}
+		}
+		want := fmt.Sprintf("\x1b[%d;%dH\x1b_Ga=p,i=", label.row-draftThumbRows+1, label.col+1)
+		return label.row >= 0 && strings.Contains(host.String()[mark:], want)
+	}, 5*time.Second); err != nil {
+		saveCockpitFrames(t, term, "clipboard-thumb-missing", hostPictures(t, []byte(host.String()))...)
+		t.Fatalf("ASSERTION: the first paste placed no thumbnail (label at %+v): %v\n%s", label, err, term.Snapshot())
+	}
+	saveCockpitFrames(t, term, "clipboard-thumb-200x55", hostPictures(t, []byte(host.String()))...)
+
+	// The chip opens the image view, and its picture is placed with no
+	// other input.
+	row, col = findText(t, term, "Image 1.png  640×360")
+	mark = len(host.String())
+	mouseClick(t, term, col+2, row, tuitest.MouseLeft, 0)
+	waitText(t, term, "the image view", "pasted by you for docs-cli", "Click outside the picture to close it.")
+	if err := term.WaitFor(func(tuitest.Screen) bool {
+		for _, pic := range hostPictures(t, []byte(host.String())) {
+			if pic.Cols > 40 && pic.Rows > draftThumbRows {
+				return strings.Contains(host.String()[mark:], "a=p,")
+			}
+		}
+		return false
+	}, 5*time.Second); err != nil {
+		saveCockpitFrames(t, term, "clipboard-view-missing", hostPictures(t, []byte(host.String()))...)
+		t.Fatalf("ASSERTION: the image view placed no picture: %v\n%s", err, term.Snapshot())
+	}
+	saveCockpitFrames(t, term, "clipboard-view-200x55", hostPictures(t, []byte(host.String()))...)
+	alive(t, term, "after the clipboard image")
+}
+
+// waitBufferQuiet waits until the client has written nothing to the host for
+// quiet: a notification's countdown, say, has run out. waitHostQuiet is the
+// same for a sixelHost.
+func waitBufferQuiet(t *testing.T, host *lockedBuffer, quiet time.Duration) {
+	t.Helper()
+	last, since := -1, time.Now()
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if n := len(host.String()); n != last {
+			last, since = n, time.Now()
+		} else if time.Since(since) >= quiet {
+			return
+		}
+	}
+	t.Fatalf("the client never stopped writing to the host")
+}
+
+// placedAPC is one kitty graphics command, with the cursor move just before
+// it, which is where a placement goes.
+var placedAPC = regexp.MustCompile(`(?:\x1b\[(\d+);(\d+)H)?\x1b_G([^;\x1b]*)(?:;([^\x1b]*))?\x1b\\`)
+
+// hostPictures replays the kitty graphics in stream as the host does and
+// returns the pictures placed at the end, for a frame.
+func hostPictures(t *testing.T, stream []byte) []shot.Image {
+	t.Helper()
+	type placed struct {
+		row, col, cols, rows int
+	}
+	data := map[uint32][]byte{}
+	decoded := map[uint32]image.Image{}
+	live := map[gfxKey]placed{}
+	var sending uint32
+	for _, m := range placedAPC.FindAllSubmatch(stream, -1) {
+		p := kittyParams(string(m[3]))
+		id := atoiU32(p["i"])
+		switch p["a"] {
+		case "t", "T":
+			sending = id
+			data[id] = append([]byte(nil), m[4]...)
+		case "":
+			// A chunk after the first names no image: it is the one being
+			// sent.
+			data[sending] = append(data[sending], m[4]...)
+		case "p":
+			r, _ := strconv.Atoi(string(m[1]))
+			c, _ := strconv.Atoi(string(m[2]))
+			cols, _ := strconv.Atoi(p["c"])
+			rows, _ := strconv.Atoi(p["r"])
+			live[gfxKey{id, atoiU32(p["p"])}] = placed{row: r - 1, col: c - 1, cols: cols, rows: rows}
+		case "d":
+			keep := map[gfxKey]bool{}
+			for k := range live {
+				keep[k] = true
+			}
+			del(keep, p, id)
+			for k := range live {
+				if !keep[k] {
+					delete(live, k)
+				}
+			}
+		}
+	}
+	var out []shot.Image
+	for k, pl := range live {
+		img, ok := decoded[k.img]
+		if !ok {
+			raw, err := base64.StdEncoding.DecodeString(string(data[k.img]))
+			if err == nil {
+				img, err = png.Decode(bytes.NewReader(raw))
+			}
+			if err != nil {
+				t.Errorf("ASSERTION: image %d is placed but its picture does not decode: %v", k.img, err)
+				continue
+			}
+			decoded[k.img] = img
+		}
+		out = append(out, shot.Image{Pixels: img, Col: pl.col, Row: pl.row, Cols: pl.cols, Rows: pl.rows})
+	}
+	return out
+}
+
+// TestCockpitReplyMentions works the reply editor's @ list as a person does.
+// The selected entry carries a marker and the lit ground, and the draft line
+// gives up its own ground while the list is open. The arrows move the
+// selection, typing filters, enter puts the entry in and sends nothing, esc
+// closes the list and keeps the text, deleting the @ closes it, and a click
+// on an entry puts it in. The list leaves out the agent the reply is for,
+// and a pane name with a space goes in quoted as a shell word that -w takes.
+// Around the list: ? opens the help and esc on it comes back to the agents
+// view, the footer leaves the keys the reply area shows to the reply area,
+// enter on an empty draft says why nothing was sent, and a draft kept by
+// esc shows in the closed reply area. At 16 colours the marker alone shows
+// the selection.
+//
+// Negative controls, recorded in NEGATIVE_CONTROLS.md.
+func TestCockpitReplyMentions(t *testing.T) {
+	for _, depth := range []struct {
+		name string
+		env  []string
+	}{
+		{"truecolor", []string{"TERM=xterm-256color", "COLORTERM=truecolor"}},
+		{"16", []string{"TERM=xterm", "COLORTERM="}},
+	} {
+		t.Run(depth.name, func(t *testing.T) { replyMentions(t, depth.name == "16", depth.env) })
+	}
+}
+
+// replyMentions is TestCockpitReplyMentions at one colour depth. At 16
+// colours it stops after the selection checks.
+func replyMentions(t *testing.T, plain bool, env []string) {
+	base := t.TempDir()
+	killDaemon(t, base)
+	useShippedLooks(base)
+	for _, s := range []string{"home", "docs", "api", "web"} {
+		if out, err := tuiosCLI(t, base, "new", s, "--detach"); err != nil {
+			t.Fatalf("create session %s: %v\n%s", s, err, out)
+		}
+	}
+	// docs-cli is ready for review, so its group comes first and the reply
+	// is for it.
+	for _, args := range [][]string{
+		{"set-window", "-s", "docs", "-w", "0", "--name", "docs-cli"},
+		{"set-agent-state", "done", "-s", "docs", "-w", "docs-cli", "--harness", "claude-code"},
+		{"set-window", "-s", "api", "-w", "0", "--name", "api-auth"},
+		{"set-agent-state", "idle", "-s", "api", "-w", "api-auth", "--harness", "codex"},
+		{"set-window", "-s", "web", "-w", "0", "--name", "web-ui"},
+		{"set-agent-state", "idle", "-s", "web", "-w", "web-ui", "--harness", "codex"},
+	} {
+		if out, err := tuiosCLI(t, base, args...); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	term := startIn(t, base, startOpts{args: []string{"attach", "home"}, cols: 160, rows: 45, shippedLooks: true, env: env})
+	if err := term.WaitFor(func(s tuitest.Screen) bool { return countWindows(s) == 1 }, bootTimeout); err != nil {
+		t.Fatalf("client never attached: %v\n%s", err, term.Snapshot())
+	}
+	windowManagementMode(t, term)
+	send := func(keys ...any) {
+		t.Helper()
+		if err := term.SendKeys(keys...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	frame := func(name string) {
+		t.Helper()
+		_ = term.WaitStable(uiTimeout)
+		saveCockpitFrames(t, term, name)
+	}
+	send(tuitest.Ctrl('b'), "i")
+	waitText(t, term, "the closed reply area", "Reply to docs-cli", "Write a reply.")
+
+	if !plain {
+		// ? opens the help, and closing it comes back to the agents view.
+		send("?")
+		waitText(t, term, "the help", "Keybindings")
+		send(tuitest.Esc)
+		waitText(t, term, "the agents view after the help", "Reply to docs-cli", "Write a reply.")
+		frame("help-closed")
+	}
+
+	send("r")
+	waitText(t, term, "the open reply editor", "Type your reply.")
+	if !plain {
+		// The footer leaves send, new line and image to the reply area's
+		// own line.
+		_, rows := term.Screen().Size()
+		foot := term.Screen().Line(rows - 1)
+		if !strings.Contains(foot, "undo") || strings.Contains(foot, "paste image") || strings.Contains(foot, "new line") {
+			t.Fatalf("ASSERTION: the footer repeats the reply area's keys: %q\n%s", foot, term.Snapshot())
+		}
+		// enter on an empty draft says why nothing was sent.
+		send(tuitest.Enter)
+		waitText(t, term, "the empty-reply notice", "The reply is empty. Type a message to send it.")
+		frame("reply-empty-enter")
+	}
+
+	// entries are the list's rows, top down: the line and whether it
+	// carries the selection marker in front of its badge.
+	type entry struct {
+		row      int
+		label    string
+		selected bool
+		bg       tuitest.Color
+	}
+	entries := func(s tuitest.Screen) []entry {
+		var out []entry
+		_, rows := s.Size()
+		for r := range rows {
+			line := s.Line(r)
+			for _, badge := range []string{"agent ", "pane  "} {
+				before, after, ok := strings.Cut(line, badge)
+				// The fleet column, when the view has one, ends at a rule.
+				lead := before
+				if i := strings.LastIndex(lead, "│"); i >= 0 {
+					lead = lead[i+len("│"):]
+				}
+				if !ok || strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(lead), "›")) != "" {
+					continue
+				}
+				label, _, _ := strings.Cut(strings.TrimSpace(after), "  ")
+				col := len([]rune(before)) + len(badge)
+				out = append(out, entry{row: r, label: label, selected: strings.Contains(lead, "›"), bg: s.Cell(col, r).Bg})
+			}
+		}
+		return out
+	}
+	selectedIs := func(want int) func(tuitest.Screen) bool {
+		return func(s tuitest.Screen) bool {
+			es := entries(s)
+			if len(es) < 3 {
+				return false
+			}
+			for i, e := range es {
+				if e.selected != (i == want) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	send("Ask ", "@")
+	waitText(t, term, "the @ list", "agent api/api-auth", "agent web/web-ui", "pane  home/Terminal", "tab insert")
+	frame("mention-open")
+	if strings.Contains(term.Screen().Text(), "docs/docs-cli") {
+		t.Fatalf("ASSERTION: the list offers the agent the reply is for\n%s", term.Snapshot())
+	}
+	if err := term.WaitFor(selectedIs(0), uiTimeout); err != nil {
+		t.Fatalf("ASSERTION: the first entry does not carry the marker alone: %v\n%s", err, term.Snapshot())
+	}
+	es := entries(term.Screen())
+	first, second := es[0], es[1]
+	if !plain {
+		if first.bg == second.bg {
+			t.Fatalf("ASSERTION: the selected entry's ground is the ground of the others\n%s", term.Snapshot())
+		}
+		row, col := findText(t, term, "Ask @")
+		if term.Screen().Cell(col, row).Bg != second.bg {
+			t.Fatalf("ASSERTION: the draft line keeps a lit ground while the list is open\n%s", term.Snapshot())
+		}
+	}
+	send(tuitest.Down)
+	if err := term.WaitFor(selectedIs(1), uiTimeout); err != nil {
+		t.Fatalf("ASSERTION: down did not move the marker to the second entry: %v\n%s", err, term.Snapshot())
+	}
+	if !plain && entries(term.Screen())[1].bg != first.bg {
+		t.Fatalf("ASSERTION: down did not move the lit ground to the second entry\n%s", term.Snapshot())
+	}
+	frame("mention-down")
+	if plain {
+		return
+	}
+	send(tuitest.Ctrl('p'))
+	if err := term.WaitFor(selectedIs(0), uiTimeout); err != nil {
+		t.Fatalf("ASSERTION: ctrl+p did not move the marker back up: %v\n%s", err, term.Snapshot())
+	}
+
+	// Typing filters, and enter puts the entry in without sending.
+	send("api")
+	waitGone(t, term, "the filtered-out entry", "agent web/web-ui")
+	send(tuitest.Enter)
+	waitText(t, term, "the inserted mention", "Ask api/api-auth")
+	waitGone(t, term, "the closed list", "tab insert")
+	if strings.Contains(term.Screen().Text(), "Write a reply.") {
+		t.Fatalf("ASSERTION: enter on the @ list sent the reply\n%s", term.Snapshot())
+	}
+	frame("mention-inserted")
+
+	// esc closes the list and keeps the text and the editor.
+	send("and @we")
+	waitText(t, term, "the list again", "agent web/web-ui")
+	send(tuitest.Esc)
+	waitGone(t, term, "the list after esc", "agent web/web-ui")
+	waitText(t, term, "the text after esc", "Ask api/api-auth and @we")
+	// Deleting the @ closes a list opened again.
+	send(tuitest.Backspace, tuitest.Backspace, tuitest.Backspace, "@")
+	waitText(t, term, "the list on a new @", "agent web/web-ui")
+	send(tuitest.Backspace)
+	waitGone(t, term, "the list after the @ is deleted", "agent web/web-ui")
+
+	// A click on an entry puts it in. The pane's name has a space, so it
+	// goes in quoted, and -w takes the name inside the quotes.
+	send("@")
+	row, col := findText(t, term, "pane  home/Terminal")
+	mouseClick(t, term, col+8, row, tuitest.MouseLeft, 0)
+	waitText(t, term, "the clicked mention", "Ask api/api-auth and home/'Terminal ")
+	waitGone(t, term, "the list after the click", "tab insert")
+	frame("mention-clicked")
+	_, after, _ := strings.Cut(term.Screen().Text(), "home/'Terminal ")
+	name, _, ok := strings.Cut(after, "'")
+	if !ok {
+		t.Fatalf("ASSERTION: the pane name is not closed by a quote\n%s", term.Snapshot())
+	}
+	if out, err := tuiosCLI(t, base, "capture-pane", "-s", "home", "-w", "Terminal "+name); err != nil {
+		t.Fatalf("ASSERTION: -w does not take the quoted name %q: %v\n%s", "Terminal "+name, err, out)
+	}
+
+	// esc keeps the draft, and the closed area shows it.
+	send(tuitest.Esc)
+	waitText(t, term, "the kept draft in the closed area", "Draft: Ask api/api-auth and home/'Terminal")
+	frame("reply-draft-kept")
+	send("r")
+	waitGone(t, term, "the closed area", "Draft: Ask")
+
+	// With the list closed, enter sends.
+	send(tuitest.Enter)
+	waitText(t, term, "the closed area after the send", "Write a reply.")
+	alive(t, term, "after the @ list")
 }
 
 // gradientPNG is a w by h PNG of soft colour bands, a picture that reads as

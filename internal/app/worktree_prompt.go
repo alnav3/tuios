@@ -8,7 +8,9 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/textedit"
 )
 
 // The rail's worktree dialog: a branch name asked over a repository, and a
@@ -23,9 +25,10 @@ import (
 // and the branch, so the client can derive it exactly.
 //
 // The folder is neither asked for nor previewed. The verb takes no path; it
-// puts the worktree under its own worktree.DefaultDir, read in the daemon's
-// environment, which need not be this client's (TUIOS_WORKTREE_DIR set in one
-// and not the other, on the same machine, is enough). A preview derived here
+// places the worktree by the [worktree] path the daemon read, or under
+// TUIOS_WORKTREE_DIR from the daemon's environment, and neither need be this
+// client's (a config reload the daemon has not seen yet, or the variable set in
+// one process and not the other, is enough). A preview derived here
 // would be a guess, so the folder is said once, from the verb's reply, in the
 // notification that reports the create.
 
@@ -105,6 +108,58 @@ func (m *OS) BeginWorktreePromptForRepo(repo string) {
 	m.openWorktreePrompt(root)
 }
 
+// BeginWorktreePromptForFocusedPane opens the dialog on the repository the
+// focused pane's directory is in: the new_worktree key, herdr's leader+G. The
+// repository is found by gitstate.Locate, which reads .git entries walking up
+// and never runs git, so it is cheap enough for the Update goroutine. From a
+// linked worktree the answer is its main checkout, the root the verb would
+// resolve too, so the dialog's repository name and derived session name match
+// what the daemon makes.
+//
+// A pane on another machine is refused: its directory is on that machine, and
+// reading it here would look at some other folder or none.
+func (m *OS) BeginWorktreePromptForFocusedPane() {
+	w := m.GetFocusedWindow()
+	if w == nil {
+		m.ShowNotification("No pane is focused.", "info", m.Settings.NotificationDuration)
+		return
+	}
+	if !m.paneIsLocal(w) {
+		m.ShowNotification("This pane is on another machine. Run tuios worktree new on that machine.", "info", m.Settings.NotificationDuration)
+		return
+	}
+	var root string
+	if m.learnFiles() {
+		root = m.learn.RepoRoot(m.paneDir(w))
+	} else {
+		root = repoRootOf(m.paneDir(w))
+	}
+	if root == "" {
+		m.ShowNotification("This pane is not in a git repository.", "info", m.Settings.NotificationDuration)
+		return
+	}
+	m.openWorktreePrompt(root)
+}
+
+// repoRootOf is the main checkout of the repository dir is in, or "" when dir
+// is empty or in no repository. The shared git directory of a main checkout
+// or a linked worktree is <root>/.git. Anything else (a submodule, whose git
+// directory sits under the parent's .git/modules) answers with the work tree
+// the .git entry was found in, which the daemon resolves again anyway.
+func repoRootOf(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	_, common, top, ok := gitstate.Locate(dir)
+	if !ok {
+		return ""
+	}
+	if filepath.Base(common) == ".git" {
+		return filepath.Dir(common)
+	}
+	return top
+}
+
 // openWorktreePrompt captures the repository and opens on an empty branch.
 func (m *OS) openWorktreePrompt(repoRoot string) {
 	m.worktreePrompt = worktreePromptState{RepoRoot: repoRoot}
@@ -118,7 +173,29 @@ func (m *OS) sessionWorktreeInfo(name string) *session.WorktreeInfo {
 	if m.DaemonClient == nil || name == "" {
 		return nil
 	}
-	return m.DaemonClient.SessionWorktree(name)
+	info := m.DaemonClient.SessionWorktree(name)
+	// A main-checkout record is a record only for a rail that has opted into
+	// it (group_main). With the option off, every surface here reads it as no
+	// record, which is what they saw before main checkouts were detected at
+	// all; without this, the quit menu and the close dialog would grow rows
+	// that offer to delete the repository's own working tree.
+	if info != nil && info.Main && !m.Settings.SidebarGroupMain {
+		return nil
+	}
+	return info
+}
+
+// sessionDeletableWorktree is the worktree record a delete-worktree surface
+// may act on: a linked worktree, never the repository's main checkout, which
+// the daemon's remove-worktree refuses. The quit menu, the close dialog and
+// the session menu read this, so they offer the delete row only where it can
+// run.
+func (m *OS) sessionDeletableWorktree(name string) *session.WorktreeInfo {
+	info := m.sessionWorktreeInfo(name)
+	if info == nil || info.Main {
+		return nil
+	}
+	return info
 }
 
 // worktreeRepoRoot finds the main checkout a repository's group header stands
@@ -191,6 +268,15 @@ func (m *OS) WorktreePromptBackspace() {
 	}
 }
 
+// WorktreePromptDeleteWord drops the last word of the active field, by the rule
+// of DropLastWord.
+func (m *OS) WorktreePromptDeleteWord() {
+	if buf := m.worktreeActiveField(); buf != nil && *buf != "" {
+		*buf = textedit.DropLastWord(*buf)
+		m.worktreePrompt.Err = ""
+	}
+}
+
 // WorktreePromptClearInput empties the active field.
 func (m *OS) WorktreePromptClearInput() {
 	if buf := m.worktreeActiveField(); buf != nil {
@@ -238,6 +324,10 @@ func (m *OS) WorktreePromptSubmit() tea.Cmd {
 	}
 	repoRoot := m.worktreePrompt.RepoRoot
 	m.WorktreePromptCancel()
+	if m.learnFiles() {
+		m.learnNewWorktree(repoRoot, branch)
+		return nil
+	}
 	// Acknowledge the hand-off at once: the dialog is closed, and checking out
 	// a large repository can take a while, so without this the enter reads as
 	// lost until the worktreeCreatedMsg comes back.
@@ -260,13 +350,15 @@ func (m *OS) createWorktreeCmd(repoRoot, branch, sessionName string) tea.Cmd {
 	}
 	return func() tea.Msg {
 		var res struct {
-			Session string `json:"session"`
-			Path    string `json:"path"`
+			Session   string `json:"session"`
+			Path      string `json:"path"`
+			Warning   string `json:"warning"`
+			HookError string `json:"hook_error"`
 		}
 		if err := callWorktreeVerb(dial, "new-worktree", "create the worktree", params, 5*time.Minute, &res); err != nil {
 			return worktreeCreatedMsg{Err: err}
 		}
-		return worktreeCreatedMsg{Session: res.Session, Path: res.Path}
+		return worktreeCreatedMsg{Session: res.Session, Path: res.Path, Warning: res.Warning, HookError: res.HookError}
 	}
 }
 
@@ -297,8 +389,15 @@ type worktreeCreatedMsg struct {
 	// Path is the worktree's directory as the daemon made it: the only
 	// honest answer to where it went, since the daemon's environment chose it.
 	Path string
+	// Warning is what the daemon says about the worktree's place, such as a
+	// folder inside the repository that git does not ignore. Empty when
+	// there is nothing to say.
+	Warning string
 	// Err is what went wrong, nil on success.
 	Err error
+	// HookError is why the after-new-worktree hook failed, empty when it
+	// succeeded or none is set. The session was made all the same.
+	HookError string
 }
 
 // handleWorktreeCreated says what became of a create: attach to the session it
@@ -317,13 +416,24 @@ func (m *OS) handleWorktreeCreated(msg worktreeCreatedMsg) tea.Cmd {
 	if msg.Path != "" {
 		note += " in " + shortenHome(msg.Path)
 	}
-	m.ShowNotification(note+", attaching.", "info", m.Settings.NotificationDuration)
+	if msg.HookError != "" {
+		// The hook's failure outranks the plain "created": the person has to
+		// know the tree is not set up the way the hook should have left it.
+		// The error leads, because the dock cuts a long message at its end.
+		m.ShowNotification(capitalize(msg.HookError)+". The session '"+msg.Session+"' is kept.", "warning", m.Settings.NotificationDuration*2)
+	} else {
+		m.ShowNotification(note+", attaching.", "info", m.Settings.NotificationDuration)
+	}
 	if err := m.SwitchToSession(msg.Session); err != nil {
 		m.ShowNotification("Could not attach to "+msg.Session+": "+err.Error(), "warning", m.Settings.NotificationDuration*2)
 	} else {
 		// The daemon already opened the worktree's first pane, but nobody
 		// has arranged it. Apply [startup] just as other session creates do.
 		m.applyStartupToUnarranged()
+	}
+	// After the note, so the dock shows the warning as the newest message.
+	if msg.Warning != "" {
+		m.ShowNotification(msg.Warning, "warning", m.Settings.NotificationDuration*2)
 	}
 	// The listing the rail reads is refreshed off this goroutine; the new
 	// session joins its repository's group when it lands.

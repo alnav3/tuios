@@ -16,16 +16,24 @@ const (
 
 // The copy-mode motions a config can bind, in [keybindings.copy_mode]. They
 // are live only while a pane is in copy mode, in normal and visual selection.
-// The vim keys 0 and $ do the same and are not bindings: copy mode reads them
-// itself, with the other vim motions.
+// The vim keys 0, ^ and $ do the same and are not bindings: copy mode reads
+// them itself, with the other vim motions. The line end and ^ go to the last
+// and first nonblank characters of the row, not to the pane edge.
 const (
-	ActionCopyModeLineStart = "copy_mode_line_start"
-	ActionCopyModeLineEnd   = "copy_mode_line_end"
+	ActionCopyModeLineStart     = "copy_mode_line_start"
+	ActionCopyModeFirstNonBlank = "copy_mode_first_nonblank"
+	ActionCopyModeLineEnd       = "copy_mode_line_end"
 )
 
 // ActionEditScrollback writes the focused pane's scrollback to a file and
 // opens it in the editor. It is bound after the leader and in copy mode.
 const ActionEditScrollback = "edit_scrollback"
+
+// ActionClearScrollback clears the focused pane's scrollback and the rows
+// above its prompt, as cmd+k does in Ghostty and iTerm2. It has no default
+// key: the host terminal takes cmd+k for itself unless told not to. Bind it
+// in any section, global for a key that works while typing.
+const ActionClearScrollback = "clear_scrollback"
 
 // copyModeFixedKeys are the keys copy mode reads itself, in
 // internal/input/copymode_handlers.go and copymode_multi.go, besides the
@@ -41,12 +49,13 @@ var copyModeFixedKeys = map[string]bool{
 	"ctrl+u": true, "ctrl+d": true, "ctrl+b": true, "ctrl+f": true,
 	"pgup": true, "pgdown": true, "ctrl+l": true,
 	"/": true, "?": true, "n": true, "N": true,
-	"v": true, "V": true, "y": true, "Y": true, "c": true,
-	"i": true, "q": true, "esc": true, "tab": true,
+	"v": true, "V": true, "o": true, "y": true, "Y": true, "c": true,
+	"i": true, "q": true, "esc": true, "ctrl+c": true, "tab": true,
 }
 
-// copyModeFixedKey reports whether copy mode reads key itself.
-func copyModeFixedKey(key string) bool {
+// CopyModeFixedKey reports whether copy mode reads key itself. A focus key
+// on one of them keeps its copy-mode meaning while a pane is in copy mode.
+func CopyModeFixedKey(key string) bool {
 	return copyModeFixedKeys[key] || len(key) == 1 && key[0] >= '0' && key[0] <= '9'
 }
 
@@ -56,6 +65,11 @@ type CopyModeProblem struct {
 	Action  string `json:"action"`
 	Key     string `json:"key"`
 	Problem string `json:"problem"`
+	// Override is a key copy mode reads itself, taken on purpose by the
+	// binding. The binding works, so it is reported by the doctor and not
+	// warned about at startup. A key a copy pipe also uses is not an override:
+	// the binding never runs.
+	Override bool `json:"override,omitempty"`
 }
 
 // CopyModeProblems lists the [keybindings.copy_mode] keys that a copy pipe
@@ -73,8 +87,8 @@ func (k *KeybindingsConfig) CopyModeProblems() []CopyModeProblem {
 			case piped:
 				out = append(out, CopyModeProblem{Action: action, Key: key, Problem: fmt.Sprintf(
 					"A [[keybindings.copy_pipe]] entry uses the key %s. The copy pipe runs, and %s does not. Use a different key.", key, action)})
-			case copyModeFixedKey(canon):
-				out = append(out, CopyModeProblem{Action: action, Key: key, Problem: fmt.Sprintf(
+			case CopyModeFixedKey(canon):
+				out = append(out, CopyModeProblem{Action: action, Key: key, Override: true, Problem: fmt.Sprintf(
 					"Copy mode uses the key %s. This binding takes the key from copy mode. Use a different key, for example home or end.", key)})
 			}
 		}
@@ -82,10 +96,14 @@ func (k *KeybindingsConfig) CopyModeProblems() []CopyModeProblem {
 	return out
 }
 
-// validateCopyModeKeys warns about each copy_mode key that another copy-mode
-// key also uses.
+// validateCopyModeKeys warns about each copy_mode key a copy pipe entry also
+// uses, so the binding never runs. A key taken from copy mode's own keys is a
+// choice that works, and only `tuios keybinds doctor` lists it.
 func validateCopyModeKeys(cfg *UserConfig, result *ValidationResult) {
 	for _, p := range cfg.Keybindings.CopyModeProblems() {
+		if p.Override {
+			continue
+		}
 		result.Warnings = append(result.Warnings, ValidationError{Field: "keybindings.copy_mode." + p.Action, Key: p.Key, Message: p.Problem})
 	}
 }

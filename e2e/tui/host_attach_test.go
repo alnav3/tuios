@@ -3,7 +3,9 @@ package tuie2e
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,7 +56,9 @@ func writeFakeSSHTo(t *testing.T, dir, remoteBase string) string {
 }
 
 // remoteMachine is the second daemon: its isolation root, with the XDG
-// directories made and a cleanup that kills it.
+// directories made and a cleanup that kills it. The root is kept for the
+// test, so breakTheLink and freezeTheLink reach this test's links and no
+// other's.
 func remoteMachine(t *testing.T) string {
 	t.Helper()
 	base := t.TempDir()
@@ -62,7 +66,54 @@ func remoteMachine(t *testing.T) string {
 		xdgDir(base, key)
 	}
 	killDaemon(t, base)
+	remotesOfTests.add(t, base)
 	return base
+}
+
+// remotesOfTests is the far machines each running test made, keyed by the
+// top-level test's name, so a subtest finds the machines its parent made.
+var remotesOfTests = &remoteRegistry{byTest: map[string][]string{}}
+
+type remoteRegistry struct {
+	mu     sync.Mutex
+	byTest map[string][]string
+}
+
+func topTestName(t *testing.T) string {
+	name, _, _ := strings.Cut(t.Name(), "/")
+	return name
+}
+
+func (r *remoteRegistry) add(t *testing.T, base string) {
+	name := topTestName(t)
+	r.mu.Lock()
+	r.byTest[name] = append(r.byTest[name], base)
+	r.mu.Unlock()
+	t.Cleanup(func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.byTest[name] = slices.DeleteFunc(r.byTest[name], func(b string) bool { return b == base })
+		if len(r.byTest[name]) == 0 {
+			delete(r.byTest, name)
+		}
+	})
+}
+
+// testProxies is every stdio-proxy that serves a far machine this test made.
+//
+// The suite runs in parallel processes on one machine, so a match on the
+// binary's command line, which every link of every test shares, ends links
+// of tests that have nothing to do with this one.
+func testProxies(t *testing.T) []int {
+	t.Helper()
+	remotesOfTests.mu.Lock()
+	remotes := slices.Clone(remotesOfTests.byTest[topTestName(t)])
+	remotesOfTests.mu.Unlock()
+	var pids []int
+	for _, remote := range remotes {
+		pids = append(pids, farProxies(remote)...)
+	}
+	return pids
 }
 
 // writeOneHostConfig names one host, build, that the stand-in routes to the
@@ -186,11 +237,25 @@ func railRows(s tuitest.Screen, wants ...string) map[string]int {
 // drawn, with build hoisted to the top of the section and this machine's
 // sessions pushed down into a group of their own, so the clicked row moved out
 // from under the pointer.
+//
+// Then next_host and prev_host, bound to alt+. and alt+, step between the two
+// machines. The step onto build lands on far-shell, the session this client
+// last showed there, while another client is attached to far-other there. A
+// build that does not remember the session lands on far-other.
 func TestRailAttachesARemoteSessionInThisClient(t *testing.T) {
 	base := t.TempDir()
 	remote := remoteMachine(t)
 	ssh := writeFakeSSHTo(t, base, remote)
 	writeOneHostConfig(t, base, tuiosBin)
+	cfg := filepath.Join(base, "XDG_CONFIG_HOME", "tuios", "config.toml")
+	body, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	body = append(body, "\n[keybindings.window_management]\nnext_host = [\"alt+.\"]\nprev_host = [\"alt+,\"]\n"...)
+	if err := os.WriteFile(cfg, body, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 	env := []string{"TUIOS_SSH=" + ssh}
 
 	if out, err := tuiosCLI(t, remote, "new", "far-shell", "--detach"); err != nil {
@@ -279,4 +344,31 @@ func TestRailAttachesARemoteSessionInThisClient(t *testing.T) {
 		}
 	}
 	alive(t, term, "after coming back from build")
+
+	// Another client on build holds far-other, so build's attached session is
+	// not the one this client left. far-mark is made after that attach, and
+	// the rail showing it says the host listing in hand is newer than the
+	// attach.
+	if out, err := tuiosCLI(t, remote, "new", "far-other", "--detach"); err != nil {
+		t.Fatalf("create far-other: %v\n%s", err, out)
+	}
+	attachIn(t, remote, "far-other", startOpts{cols: 80, rows: 24})
+	if out, err := tuiosCLI(t, remote, "new", "far-mark", "--detach"); err != nil {
+		t.Fatalf("create far-mark: %v\n%s", err, out)
+	}
+	railShows(t, term, "far-mark")
+
+	// next_host: to build, on the session this client last showed there.
+	if err := term.SendKeys(tuitest.Alt('.')); err != nil {
+		t.Fatalf("press alt+.: %v", err)
+	}
+	waitRailCurrent(t, term, "far-shell")
+	saveFrame(t, term, "next-host")
+	// prev_host: two machines, so it wraps back to this one, on home.
+	if err := term.SendKeys(tuitest.Alt(',')); err != nil {
+		t.Fatalf("press alt+,: %v", err)
+	}
+	waitRailCurrent(t, term, "home")
+	noNestedClient(t, "far-shell")
+	alive(t, term, "after stepping between machines")
 }

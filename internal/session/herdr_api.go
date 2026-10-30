@@ -208,33 +208,37 @@ type herdrWorktreeSource struct {
 // under the verb's name. Name and Focus are pointers because the empty name
 // and focus false are values the verbs read.
 type herdrArgs struct {
-	Session   string            `json:"session,omitempty"`
-	Window    string            `json:"window,omitempty"`
-	Name      *string           `json:"name,omitempty"`
-	Workspace int               `json:"workspace,omitempty"`
-	ToSession string            `json:"to_session,omitempty"`
-	Focus     *bool             `json:"focus,omitempty"`
-	Cwd       string            `json:"cwd,omitempty"`
-	Text      string            `json:"text,omitempty"`
-	Keys      string            `json:"keys,omitempty"`
-	Literal   bool              `json:"literal,omitempty"`
-	Paste     bool              `json:"paste,omitempty"`
-	Submit    bool              `json:"submit,omitempty"`
-	Source    string            `json:"source,omitempty"`
-	Styled    bool              `json:"styled,omitempty"`
-	Lines     int               `json:"lines,omitempty"`
-	Direction string            `json:"direction,omitempty"`
-	Order     []int             `json:"order,omitempty"`
-	Condition string            `json:"condition,omitempty"`
-	Pattern   string            `json:"pattern,omitempty"`
-	Until     string            `json:"until,omitempty"`
-	Timeout   *int64            `json:"timeout,omitempty"`
-	Repo      string            `json:"repo,omitempty"`
-	Branch    string            `json:"branch,omitempty"`
-	Base      string            `json:"base,omitempty"`
-	Force     bool              `json:"force,omitempty"`
-	Command   string            `json:"command,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
+	Session   string  `json:"session,omitempty"`
+	Window    string  `json:"window,omitempty"`
+	Name      *string `json:"name,omitempty"`
+	Workspace int     `json:"workspace,omitempty"`
+	ToSession string  `json:"to_session,omitempty"`
+	Focus     *bool   `json:"focus,omitempty"`
+	Cwd       string  `json:"cwd,omitempty"`
+	Text      string  `json:"text,omitempty"`
+	Keys      string  `json:"keys,omitempty"`
+	Literal   bool    `json:"literal,omitempty"`
+	Paste     bool    `json:"paste,omitempty"`
+	Submit    bool    `json:"submit,omitempty"`
+	// AllowBlocked is set on the pane input calls only: the herdr API has
+	// no flag for it, and its clients type to answer what the pane shows.
+	// respond is still needed for a pane on needs_input.
+	AllowBlocked bool              `json:"allow_blocked,omitempty"`
+	Source       string            `json:"source,omitempty"`
+	Styled       bool              `json:"styled,omitempty"`
+	Lines        int               `json:"lines,omitempty"`
+	Direction    string            `json:"direction,omitempty"`
+	Order        []int             `json:"order,omitempty"`
+	Condition    string            `json:"condition,omitempty"`
+	Pattern      string            `json:"pattern,omitempty"`
+	Until        string            `json:"until,omitempty"`
+	Timeout      *int64            `json:"timeout,omitempty"`
+	Repo         string            `json:"repo,omitempty"`
+	Branch       string            `json:"branch,omitempty"`
+	Base         string            `json:"base,omitempty"`
+	Force        bool              `json:"force,omitempty"`
+	Command      string            `json:"command,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
 }
 
 // herdrMethod answers one method for cs.
@@ -1007,14 +1011,14 @@ func (d *Daemon) herdrSend(cs *connState, id, text string, keys []string, fail s
 	}
 	if text != "" {
 		args := herdrWin(sess, win.ID)
-		args.Text, args.Paste = text, true
+		args.Text, args.Paste, args.AllowBlocked = text, true, true
 		if _, herr := d.herdrVerb(cs, "send-text", args, fail); herr != nil {
 			return nil, herr
 		}
 	}
 	for _, r := range runs {
 		args := herdrWin(sess, win.ID)
-		args.Keys, args.Literal = r.keys, r.literal
+		args.Keys, args.Literal, args.AllowBlocked = r.keys, r.literal, true
 		if _, verr := d.callVerb(cs, "send-keys", args); verr != nil {
 			if verr.Code == ErrVerbInvalidParams {
 				return nil, herdrErr("invalid_key", verr.Message)
@@ -1285,17 +1289,22 @@ func (d *Daemon) herdrAgentWait(cs *connState, in *herdrIn) (*herdrResult, *herd
 	})
 }
 
-// herdrAgentPrompt types a prompt into an agent at rest and presses Enter,
-// as herdr does. An agent that works or waits on a prompt is refused with
-// agent_not_idle, and nothing is typed.
+// herdrAgentPrompt types a prompt into an agent and presses Enter, as herdr
+// does. Like herdr (validate_agent_prompt), it refuses only an agent that
+// waits on a prompt, with agent_blocked, because the Enter would answer the
+// prompt. A working agent gets the prompt typed: the harness queues it for
+// its next turn (Claude Code and Codex both do), and herdr clients such as
+// herdr-projects rely on that. tuios's own ask-agent keeps its stricter rule.
 func (d *Daemon) herdrAgentPrompt(cs *connState, in *herdrIn) (*herdrResult, *herdrError) {
 	return d.herdrAgent(cs, in, func(id string) (*herdrResult, *herdrError) {
 		res, herr := d.herdrAgentResult(cs, "agent_prompted", id)
 		if herr != nil {
 			return nil, herr
 		}
-		if s := res.Agent.AgentStatus; s == "working" || s == "blocked" {
-			return nil, herdrErr("agent_not_idle", "agent "+res.Agent.PaneID+" is "+s+". Nothing was typed")
+		// send-text refuses a blocked pane only for a caller in a pane, so
+		// the check is made here for every caller.
+		if res.Agent.AgentStatus == "blocked" {
+			return nil, herdrErr("agent_blocked", "agent "+res.Agent.PaneID+" is blocked and needs interactive input. Nothing was typed")
 		}
 		// send-text submit is the prompt path ask-agent types with: one
 		// paste, a wait for it to be taken in, and the harness's submit key.

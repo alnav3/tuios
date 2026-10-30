@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 	"github.com/Gaurav-Gosain/tuios/pkg/applist"
 )
@@ -94,7 +95,7 @@ func (m *OS) applyPathApps(entries []applist.Entry) {
 // stableSortByBoost orders items by launch history, strongest first, keeping
 // the input order between equal ones.
 func stableSortByBoost(items []LauncherItem, hist *applist.Frecency) {
-	slices.SortStableFunc(items, func(a, b LauncherItem) int {
+	sortx.SortStableFunc(items, func(a, b LauncherItem) int {
 		return hist.Boost(b.Entry.Name) - hist.Boost(a.Entry.Name)
 	})
 }
@@ -121,6 +122,13 @@ func (m *OS) RunProgram(e applist.Entry) tea.Cmd {
 		return cmd
 	}
 	save := m.noteLaunch(e.Name)
+	// launcher.keep_open: the daemon keeps the pane after the program exits
+	// and writes the exit status under its output. Without a daemon nothing
+	// would keep it, so the pane closes as before.
+	if m.UserConfig != nil && m.UserConfig.Launcher.KeepOpen && m.IsDaemonSession && m.DaemonClient != nil {
+		m.addDaemonWindowWith("", e.Name, "", e.Argv(), true)
+		return save
+	}
 	// The pane is named after the program so the dock and the rail say what is
 	// running in it before the program has printed anything.
 	m.AddWindow(e.Name, e.Argv()...)

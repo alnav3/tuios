@@ -204,6 +204,14 @@ func (m *OS) sidebarSignature() uint64 {
 	mixB(m.filesView.Loading)
 	mixI(m.SidebarScrollF)
 	mixU(m.filesView.Gen)
+	// The row a drag carries is drawn picked up.
+	mixS(m.fileDragHeldKey())
+	// The tree: its style, and every open, close and read of an open folder.
+	mixS(m.Settings.SidebarFilesStyle)
+	mixU(m.filesTree.gen)
+	if m.filesTreeOn() {
+		mixS(m.sidebarCurrentSessionID())
+	}
 	// The custom section: its rows change when its command's output does,
 	// which is the generation, and the section scrolls like the others.
 	if m.sidebarDrawing {
@@ -212,6 +220,20 @@ func (m *OS) sidebarSignature() uint64 {
 		mixU(m.railCustom.gen)
 	}
 	mixI(m.SidebarScrollC)
+	// The pane section: its output, which is the generation, whether it has
+	// the keyboard (the dim and the cursor change), and the line it draws
+	// when there is no pane.
+	mixU(m.railPaneView.gen)
+	mixB(m.RailPaneFocused())
+	mixB(m.railPaneView.stopped)
+	mixS(m.railPaneView.err)
+	mixS(m.railPaneView.windowID)
+	if !m.sidebarDrawing && m.UserConfig != nil {
+		pane := m.railPaneConfig()
+		mixS(pane.Command)
+		mixS(pane.Title)
+		mixI(pane.Height)
+	}
 	// The git section scrolls like the others once it is given fewer lines
 	// than its two rows.
 	mixI(m.SidebarScrollG)
@@ -256,6 +278,12 @@ func (m *OS) sidebarSignature() uint64 {
 	// depend on it, so a focus change or a cursor move must rebuild.
 	mixB(m.sidebarRailFocused())
 	mixI(m.SidebarCursor)
+	// A row the keyboard moved to and this frame has to scroll to.
+	mixB(m.sidebarCursorWantSet)
+	if m.sidebarCursorWantSet {
+		mixI(int(m.sidebarCursorWant.Kind))
+		mixS(m.sidebarCursorWant.WindowID)
+	}
 
 	// The switch numbers are drawn state, on while show_numbers is set.
 	mixB(m.Settings.SidebarShowNumbers)
@@ -293,11 +321,17 @@ func (m *OS) sidebarSignature() uint64 {
 	}
 	mixU(wsFold)
 
-	// Session identity and the user's drag-defined order.
+	// Session identity and the user's drag-defined order, and whose order
+	// the rail draws: the daemon's, or this client's while a move of its own
+	// is on its way (see session_order.go). A failed move flips the second
+	// with nothing else changing.
 	mixS(m.SessionName)
 	for _, o := range m.SidebarOrder {
 		mixS(o)
 	}
+	attached := m.attachedMachine()
+	mixB(m.sessionOrderPending(attached))
+	mixB(m.sessionOrderFromDaemon(attached))
 
 	// The worktree groups. Which repositories are folded decides which rows the
 	// sessions section draws at all, and the attached session's own record is
@@ -364,6 +398,8 @@ func (m *OS) sidebarSignature() uint64 {
 	// under, and like its worktree record it arrives on the session state, so
 	// the client's cache generation below does not speak for it.
 	mixS(m.SessionSpace)
+	// The attached session's note rides the state push the same way.
+	mixS(m.SessionNote)
 
 	// Foreign-session data, folded by generation instead of by locking the client.
 	if m.DaemonClient != nil {
@@ -440,6 +476,12 @@ func (m *OS) sidebarSignature() uint64 {
 		// nothing queued folds nothing, like the meta.
 		if w.AgentQueued > 0 {
 			mixI(w.AgentQueued)
+		}
+		if w.AgentDraftHeld {
+			mixI(1)
+		}
+		if w.AgentSettled {
+			mixS("settled")
 		}
 		if w.AgentSubagents > 0 {
 			mixI(w.AgentSubagents)

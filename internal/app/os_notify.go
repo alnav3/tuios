@@ -171,7 +171,7 @@ const maxLiveNotifications = 16
 // A non-positive duration means "do not show this", but only for info and
 // success. Copy mode pushes its state indicators that way ("VISUAL", a bare
 // "f", the pending count), and they stay invisible; promoting them to
-// six-second dock messages is a copy-mode decision.
+// full dock messages is a copy-mode decision.
 //
 // A warning or an error is shown whatever duration it was handed. Passing zero
 // for one of those is never a considered choice, it is a caller reaching for
@@ -258,19 +258,37 @@ func (m *OS) showNotification(message, notifType, agentState string, duration ti
 	effective, sticky := notificationLifetime(notifType, duration, &m.Settings)
 	shown := effective > 0 || sticky
 
+	// Calm mode keeps a message from a pane, an agent or mail off the dock
+	// unless it needs the person. It is logged so it can be read later, and
+	// counted so the dock can say that something is waiting. See calm.go.
+	if shown && m.calmHolds(notifType, agentState, target) {
+		m.appendLog(LogMessage{Time: time.Now(), Level: "INFO", Message: message, Source: source})
+		m.calm.held++
+		m.MarkAllDirty()
+		return
+	}
+
+	// A message below notifications.level is only logged, and with
+	// notifications.log_hidden off not even that. A warning or an error was
+	// logged above. A message from a pane, an agent or mail is not held to the
+	// level: [notifications.agent] and [notifications.mail] decide those, and
+	// someone who quiets tuios's own notices still wants to hear an agent
+	// finish.
+	belowLevel := target == nil && notifSeverityRank(notifType) < notifLevelRank(m.Settings.NotificationLevel)
+
 	// An info or a success message is logged when the dock shows it. It used
 	// to be logged only with verbose logging on, so a message that went by
 	// too fast to read was nowhere to be found afterwards. The ones the dock
 	// does not show (copy mode's state marks, such as "VISUAL") stay out of
 	// the log unless it is verbose, or they would fill it.
-	if notifSeverityRank(notifType) < 2 {
+	if notifSeverityRank(notifType) < 2 && (!belowLevel || m.Settings.NotificationLogHidden) {
 		if shown {
 			m.appendLog(LogMessage{Time: time.Now(), Level: "INFO", Message: message, Source: source})
 		} else {
 			m.LogInfo("%s", message)
 		}
 	}
-	if !shown {
+	if !shown || belowLevel {
 		return
 	}
 
@@ -398,6 +416,21 @@ func (m *OS) ClearNotification(message string) bool {
 	clear(m.Notifications[len(kept):])
 	m.Notifications = kept
 	return removed
+}
+
+// clearRestartNotice takes the version notice off the dock. It names the
+// build of the daemon the client was attached to, so it has to leave when that
+// daemon does: a restart from the command line ends the mismatch and leaves
+// the sticky notice behind otherwise.
+func (m *OS) clearRestartNotice() {
+	kept := m.Notifications[:0]
+	for _, n := range m.Notifications {
+		if !isRestartNotice(n.Target) {
+			kept = append(kept, n)
+		}
+	}
+	clear(m.Notifications[len(kept):])
+	m.Notifications = kept
 }
 
 // dismissVisibleNotification pops the message the block is currently drawing,

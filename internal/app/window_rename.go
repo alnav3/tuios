@@ -10,6 +10,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	"github.com/Gaurav-Gosain/tuios/internal/textedit"
 )
 
 // RenameKind names what an in-progress rename points at. There is one rename
@@ -27,6 +28,9 @@ const (
 	RenameSession
 	// RenameWorkspace targets a workspace's name. The number stays its identity.
 	RenameWorkspace
+	// RenameNote edits a session's return note, which the daemon owns. The
+	// same one-line editor, and an empty note clears it.
+	RenameNote
 )
 
 // Renaming reports whether a rename editor is open, whatever it targets.
@@ -57,6 +61,17 @@ func (m *OS) BeginRenameSession(name string) {
 	m.RenameBuffer = m.SessionLabel(name)
 }
 
+// BeginEditNote opens the one-line editor on a session's return note, seeded
+// with the note it has now.
+func (m *OS) BeginEditNote(name string) {
+	if name == "" {
+		return
+	}
+	m.RenameKind = RenameNote
+	m.RenameTargetID = name
+	m.RenameBuffer = m.sessionNote(name)
+}
+
 // BeginRenameWorkspace starts a rename of a workspace, seeded with its current
 // name. An unnamed workspace opens empty: its number is not a name it was given.
 func (m *OS) BeginRenameWorkspace(ws int) {
@@ -85,6 +100,10 @@ func (m *OS) RenameAppend(text string) {
 	if add == "" || combiningOnly(add) {
 		return
 	}
+	if m.RenameKind == RenameNote && len(m.RenameBuffer)+len(add) > session.NoteMaxBytes {
+		// The daemon keeps no more than this, so the editor takes no more.
+		return
+	}
 	m.RenameBuffer += add
 	if t := m.RenameTarget(); t != nil {
 		t.InvalidateCache()
@@ -108,6 +127,18 @@ func (m *OS) RenameClear() {
 		return
 	}
 	m.RenameBuffer = ""
+	if t := m.RenameTarget(); t != nil {
+		t.InvalidateCache()
+	}
+}
+
+// RenameDeleteWord drops the last word of the buffer, with the blanks after
+// it, so a name can be taken back a word at a time.
+func (m *OS) RenameDeleteWord() {
+	if !m.Renaming() || m.RenameBuffer == "" {
+		return
+	}
+	m.RenameBuffer = textedit.DropLastWord(m.RenameBuffer)
 	if t := m.RenameTarget(); t != nil {
 		t.InvalidateCache()
 	}
@@ -172,6 +203,8 @@ func (m *OS) RenameDialogTitle() string {
 		return "rename session"
 	case RenameWorkspace:
 		return "rename workspace " + m.RenameTargetID
+	case RenameNote:
+		return "note for " + m.SessionLabel(m.RenameTargetID)
 	default:
 		return "rename"
 	}
@@ -192,6 +225,12 @@ func (m *OS) CommitRename() tea.Cmd {
 			w.InvalidateCache()
 		}
 		return nil
+	}
+	if kind == RenameNote {
+		if target == "" || label == m.sessionNote(target) {
+			return nil
+		}
+		return labelVerbCmd(m.verbDialer(), "Note", "set-note", map[string]any{"session": target, "note": label})
 	}
 	if kind == RenameSession && label == m.SessionLabel(target) {
 		// Nothing changed, so there is nothing to send. A session that

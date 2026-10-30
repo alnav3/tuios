@@ -7,6 +7,8 @@ import (
 	"image/color"
 	"io"
 
+	"github.com/Gaurav-Gosain/tuios/internal/dnd"
+
 	"log"
 	"maps"
 	"os"
@@ -44,6 +46,19 @@ func debugLog(format string, args ...any) {
 	if debugEnabled() {
 		log.Printf(format, args...)
 	}
+}
+
+// KeptFlags are the flags of an agent's command line that its manifest keeps
+// across a resume (harness.Resume.KeepFlags and KeepOptions), such as
+// --model opus, and the harness they were read from: a resume of any other
+// harness ignores them. The detector reads them on the poll that already
+// reads the agent's process, and replaces them each time it sees the harness
+// again, so an agent started with no kept flags clears them. A value is
+// replaced whole and never changed in place, since copies of a window share
+// it.
+type KeptFlags struct {
+	Harness string   `json:"harness"`
+	Flags   []string `json:"flags,omitempty"`
 }
 
 // WindowState represents the serializable state of a window.
@@ -124,12 +139,24 @@ type WindowState struct {
 	// daemon fixes it when it makes the window, and the shell's cd and OSC 7
 	// never move it, so a grant can be held to it. Clients never set it.
 	StartDir string `json:"start_dir,omitempty"`
+	// Note is the pane's return note: one short line that says what the pane
+	// is for or what comes next. Only the set-note verb writes it, so a client
+	// sync never moves it, and it is saved with the session. Empty for none.
+	Note string `json:"note,omitempty"`
 	// CwdHost names the machine the pane's shell last reported its folder on,
 	// when that is not the machine the pane runs on: the pane is running ssh.
 	// Empty otherwise. A live fact, filled into every snapshot and never
 	// stored. A client lists no files for such a pane, because Cwd is not a
 	// folder on any disk it can reach.
 	CwdHost string `json:"cwd_host,omitempty"`
+	// DnDAccepts and DnDOffers say the pane's program registered for drag
+	// and drop (OSC 72): it takes drops, or offers drags. DnDID is the
+	// multiplexer id it used. A live fact like CwdHost: a client that
+	// attached after the program started never saw the registration. See
+	// dnd_registration.go.
+	DnDAccepts bool `json:"dnd_accepts,omitempty"`
+	DnDOffers  bool `json:"dnd_offers,omitempty"`
+	DnDID      int  `json:"dnd_id,omitempty"`
 	// Unplaced marks a window the daemon created whose X/Y/Width/Height are a
 	// nominal box rather than a position anyone chose. The daemon has no viewport
 	// and cannot place a window; a client that receives an unplaced window puts it
@@ -157,6 +184,13 @@ type WindowState struct {
 	// meaningless in any other state. Daemon-owned like AgentState, and empty in
 	// older state, which reads as "not said".
 	AgentKind string `json:"agent_kind,omitempty"`
+	// AgentReason is why the state a reader is shown differs from AgentState,
+	// empty when it does not. The one value is AgentReasonSilent: a pane whose
+	// hooks reported working and then stopped reporting, shown as unknown
+	// while AgentState stays working underneath (see agent_silent.go). The
+	// next state the daemon sets clears it. Daemon-owned like AgentState.
+	// Additive: an older peer drops it and keeps drawing working.
+	AgentReason string `json:"agent_reason,omitempty"`
 	// AgentStateAt is the unix-nano time AgentState was last set. It is stamped
 	// daemon-side and drives the output-stall heuristic (see applyStallHeuristic).
 	// A title or screen look that reads back its own claim unchanged does not
@@ -191,6 +225,11 @@ type WindowState struct {
 	// AgentSessionID. Empty in state written before it existed, and a resume
 	// then falls back to AgentHarness.
 	AgentSessionHarness string `json:"agent_session_harness,omitempty"`
+	// AgentFlags are the flags the pane's agent was started with that its
+	// manifest keeps across a resume. Kept when the agent exits, like
+	// AgentSessionID. Daemon-owned. A pointer, because WindowState is copied
+	// by value all over the daemon and this is rarely set.
+	AgentFlags *KeptFlags `json:"agent_flags,omitempty"`
 	// AgentMeta is what the pane reported about its agent through
 	// set-agent-meta (model, context, cost, a summary), in the order the keys
 	// first arrived. Daemon-owned like AgentState, display only, and cleared
@@ -202,6 +241,19 @@ type WindowState struct {
 	// AgentMeta and never set by a client. Additive: zero, which is what an
 	// older daemon sends, means nothing is queued. See verb_queue.go.
 	AgentQueued int `json:"agent_queued,omitempty"`
+	// AgentDraftHeld is true while the person's draft in the agent's input
+	// box holds the next queued message (agent_queue_draft.go). Daemon-owned
+	// like AgentQueued. Additive: false, which is what an older daemon sends,
+	// means nothing is held.
+	AgentDraftHeld bool `json:"agent_draft_held,omitempty"`
+	// AgentSettled marks an agent the person put away: the agents view draws
+	// it on the Settled shelf until it needs the person again. Only
+	// mark-attention settle and unsettle set it, and the daemon clears it when
+	// the agent asks, errors, finishes a turn, sends the person mail or leaves
+	// the pane (see agent_settle.go). Daemon-owned like AgentQueued and never
+	// set by a client. Additive: false, which is what an older daemon sends,
+	// means not settled.
+	AgentSettled bool `json:"agent_settled,omitempty"`
 	// AgentSubagents is how many subagents the pane's agent is running, as its
 	// hooks reported them (see agent_subagents.go). Daemon-owned like
 	// AgentQueued and never set by a client. Additive: zero, which is what an
@@ -260,6 +312,15 @@ type WindowState struct {
 	// of type scratch. A session has at most one scratch pane per name. It is
 	// the daemon's, like Scratch.
 	ScratchName string `json:"scratch_name,omitempty"`
+	// Rail marks the pane a client draws in its rail's pane section, and
+	// holds the command line the client's config gave it, which is how a
+	// client tells its own pane from one another config asked for. Empty for
+	// every other window. The pane sits on a scratch-range workspace that no
+	// client shows, so no layout, tiler or workspace list reaches it, and
+	// the lists a user reads leave it out. It is set at creation by the
+	// rail-pane verb and is the daemon's, like Scratch: a push cannot set or
+	// clear it. See verb_rail_pane.go.
+	Rail string `json:"rail,omitempty"`
 	// Stack and StackIndex put the window in a stack: panes that share one
 	// tile of the split tree, one open and the others as title rows. Every
 	// client lays the stack out from them, as from IsFloating, so a client
@@ -357,6 +418,12 @@ type SerializedBSPTree struct {
 // SessionState represents the complete serializable state of a session.
 type SessionState struct {
 	Name string `json:"name"`
+	// Tasks are the session's task cards, oldest first, and NextTaskID
+	// numbers the next one. Daemon-owned: only the task verbs write them,
+	// and retainDaemonExclusive keeps them through a client sync. They are
+	// saved, so a card and its history survive a restart. See task.go.
+	Tasks      []TaskState `json:"tasks,omitempty"`
+	NextTaskID uint64      `json:"next_task_id,omitempty"`
 	// DisplayName is an optional user-facing label. Name stays the identity: it
 	// keys the session map, names the resurrection file, is exported as
 	// TUIOS_SESSION into every pane, and is what every verb's session parameter
@@ -405,6 +472,11 @@ type SessionState struct {
 	// It lives here rather than in a client-side file because it has to survive a
 	// reattach and be the same for every client attached to this session.
 	Accent string `json:"accent,omitempty"`
+	// Note is the session's return note: one short line that says what the
+	// session is for or what comes next, shown when a person comes back to
+	// it. Only the set-note verb writes it, so canonical state wins over any
+	// client sync, and it is saved with the session. Empty for none.
+	Note string `json:"note,omitempty"`
 	// Restored marks a session the daemon rebuilt from saved state and that no
 	// client has attached to since. Nothing else at session level says so: the
 	// layout is back but every shell under it is new, and the only evidence was
@@ -436,10 +508,20 @@ type SessionState struct {
 	// request to leave. Empty is what every older client and every state file
 	// written before it reads back as.
 	Space string `json:"space,omitempty"`
+	// Rank is the session's place in the session order every client lists:
+	// 1 is first. Zero is a session nobody placed, which lists after every
+	// placed one, in creation order. One order for the daemon, so a session
+	// moved up on one client's rail moves on every rail, the phone's over SSH
+	// too, and stays there across a daemon restart.
+	//
+	// Daemon-owned: only set-session-order writes it, so a client sync never
+	// moves it. Zero is what every older client and every state file written
+	// before it reads back as.
+	Rank int `json:"rank,omitempty"`
 	// StartDir is the session's start directory (see Session.startDir), as
 	// it was when the state was saved. ResurrectionState stamps it, and a
-	// restore sets it again, so a session made with tuios new --cwd keeps
-	// its directory across a daemon restart. Only the save reads this field:
+	// restore sets it again, so the chosen start directory survives a daemon
+	// restart. Only the save reads this field:
 	// a client push may carry a copy of it into canonical state, and
 	// ResurrectionState writes the in-memory value over that copy before
 	// every save. Empty in state written before it existed, and such a
@@ -915,10 +997,20 @@ type PTY struct {
 	// buffer holds the stream's last outputPos bytes ending at outputSeq. It is
 	// what lets a resubscribing client be resumed where it left off instead of
 	// being handed the buffer from the top.
+	// The ring starts empty and grows with the output, by powers of two from
+	// 1 KiB, until it reaches outputRingMax; from there it is a fixed ring that
+	// shifts in half steps. It holds what a ring of outputRingMax would hold at
+	// every point, so a pane that prints only a prompt keeps a few KiB, not 64.
+	// The slice header is written by appendToBuffer under outputMu, and only
+	// with streamMu held, which is how broadcast reads its length without
+	// outputMu.
 	outputMu     sync.RWMutex
 	outputBuffer []byte
 	outputPos    int
 	outputSeq    int64
+	// outputTaps get a copy of every chunk appended after they were added.
+	// Guarded by outputMu. See output_tap.go.
+	outputTaps []*outputTap
 	// resizeMarks are the stream positions resizes took effect at, oldest
 	// first, kept while the ring still holds bytes either side of them plus
 	// the newest one behind the ring, which is the width the ring's first
@@ -1058,7 +1150,7 @@ type PTY struct {
 	// exitedAlone is told, before onExit, when the process exits without
 	// the PTY having been closed and the window will not be kept open. See
 	// Session.notePaneExitedAlone.
-	exitedAlone func(ptyID string, shell bool)
+	exitedAlone func(ptyID string, shell bool, signal int)
 	// ownShell is set when the pane runs the daemon's own shell on this
 	// machine: it was started with no command and without close_on_exit.
 	// That process ends when a person types exit, which is a person's close.
@@ -1076,6 +1168,15 @@ type PTY struct {
 	// is written on the PTY read goroutine and read by the daemon's output-stall
 	// heuristic, so it is an atomic rather than guarded by a lock.
 	lastOutput atomic.Int64
+
+	// humanKeyAt is the unix-nano time a person last typed into this pane
+	// through a client, focus and mouse reports left out. The delivery queue
+	// waits for it to be queueTypingQuiet old. draftWatch, when set, runs on
+	// every output chunk and every such key: the queue sets it while a draft
+	// holds its next entry, so a change in the box re-arms the look. See
+	// agent_queue_draft.go.
+	humanKeyAt atomic.Int64
+	draftWatch atomic.Pointer[func()]
 
 	// lastAgentProbe is the unix-nano time of the last output-driven agent-exit
 	// probe. It throttles the /proc read the probe does so a busy pane does not
@@ -1142,6 +1243,9 @@ type PTY struct {
 	// place is where the shell is: its directory from OSC 7 (seeded from the
 	// spawn directory) and the git branch there. See session_place.go.
 	place placeRecord
+	// dnd is what the program said about drag and drop. See
+	// dnd_registration.go.
+	dnd dndRegistration
 	// marks is the emulator's OSC 133 marker list, kept for its origin: a
 	// command's prompt row is stored against it. See shell_commands.go.
 	marks *vt.SemanticMarkerList
@@ -1255,11 +1359,11 @@ type Session struct {
 	persistMu sync.Mutex
 	// startDir is the directory a new local window starts in when nothing
 	// else names one: no cwd from the caller and no focused pane to inherit
-	// from. tuios new --cwd and the new-session verb's cwd set it, so every
-	// window of a session made for a project starts in the project, not in
-	// whatever directory the daemon was started from. Empty keeps the
-	// daemon's own directory. Saved as SessionState.StartDir and set again
-	// on a restore, so it survives a daemon restart.
+	// from. A bare local attach creating the default session, tuios new --cwd,
+	// and the new-session verb's cwd set it, so later windows start in the
+	// session's original directory. Empty keeps the daemon's own directory.
+	// Saved as SessionState.StartDir and set again on a restore, so it survives
+	// a daemon restart.
 	startDir atomic.Pointer[string]
 
 	// PTYs managed by this session
@@ -1353,6 +1457,10 @@ type Session struct {
 	// See notePaneExitedAlone.
 	exitedAloneMu sync.Mutex
 	exitedAlone   map[string]bool
+	// signalHold is when the last pane killed from outside by a signal
+	// stops holding the saved layout, in unix nanoseconds. See
+	// holdingCheckpoint.
+	signalHold atomic.Int64
 	// tabKeys is the state's WorkspaceTabKeys as last written, readable
 	// without stateMu, for a shell started while the state is being written.
 	// See herdrTabFor.
@@ -1497,6 +1605,11 @@ type Session struct {
 	// now. Read and written under stateMu, so it needs no lock of its own.
 	agentClaims map[string]agentClaim
 
+	// askShows records, by window ID, the question from ask-human a pane
+	// shows as its agent state while its call waits, and the state beneath
+	// it. Read and written under stateMu. See askShow.
+	askShows map[string]askShow
+
 	// agentHarnessPIDs records, by window ID, the pid of the harness process
 	// whose hook last set the window's AgentSessionID, as the hook reported it.
 	// sessionGuard reads it to tell a new conversation in the same harness
@@ -1601,6 +1714,9 @@ type Session struct {
 	// hostShown reports whether the session is on a screen. See
 	// SetHostShownProbe.
 	hostShown atomic.Pointer[func() bool]
+	// taskAuto reports whether cards move on their own. See
+	// SetTaskAutoProbe.
+	taskAuto atomic.Pointer[func() bool]
 }
 
 // SetGraphicsCapabilities records the graphics protocols tuios can forward to
@@ -1624,6 +1740,11 @@ func (s *Session) SetGraphicsCapabilities(kitty, sixel bool) {
 // daemon had answered DA1, which is where a probing guest stops reading. A
 // nested tuios then took the refusal for keys and typed it into its pane.
 func (s *Session) SetKittyAnimation(ok bool) { s.kittyAnimation.Store(ok) }
+
+// dragAndDrop reports whether [panes] drag_and_drop is on for this session.
+func (s *Session) dragAndDrop() bool {
+	return s.config != nil && s.config.DragAndDrop != nil && s.config.DragAndDrop()
+}
 
 // SetSixelAdvertised records whether a sixel image a pane draws will be shown:
 // true while any attached client's terminal draws sixel or kitty graphics,
@@ -1685,6 +1806,10 @@ type SessionConfig struct {
 	// stamps it with its own getter, so a config reload reaches every
 	// session. Nil means on.
 	ReturnWhenEmpty func() bool
+	// DragAndDrop reports whether [panes] drag_and_drop is on, read each
+	// time so a reload applies. Off, the daemon neither records what a
+	// pane's program says about drag and drop nor answers its query.
+	DragAndDrop func() bool
 	// HerdrEnv returns the herdr protocol variables a pane with the given
 	// window id that runs the given command is started with, nil for none.
 	// See Manager.HerdrEnv.
@@ -1725,6 +1850,9 @@ type SessionConfig struct {
 	// sets it from the state file, because the client sync the restore goes
 	// through keeps the new session's own value.
 	Space string
+	// Rank is the session's place in the session order, set by a restore
+	// from the state file for the reason Space is. See SessionState.Rank.
+	Rank int
 	// restoreID is the id a restored session had before the daemon
 	// restarted, from its state file. A session made with it keeps that id,
 	// so a client's ids for it stay valid. Empty, or an id already in use,
@@ -1932,6 +2060,7 @@ func NewSession(name string, cfg *SessionConfig, width, height int) (*Session, e
 	}
 	if cfg != nil {
 		session.state.Space = cfg.Space
+		session.state.Rank = cfg.Rank
 	}
 
 	session.setName(name)
@@ -1971,6 +2100,9 @@ func (s *Session) persist(state *SessionState) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
 	if state == nil || state.Name != s.Name() {
+		return nil
+	}
+	if s.holdingCheckpoint() {
 		return nil
 	}
 	state.SessionID = s.ID
@@ -2452,30 +2584,29 @@ func (s *Session) installPTY(ctx context.Context, cancel context.CancelFunc, id 
 	}
 
 	pty := &PTY{
-		ID:           id,
-		sessionID:    s.ID,
-		host:         sp.host,
-		pty:          ptyInstance,
-		cmd:          cmd,
-		ctx:          ctx,
-		cancel:       cancel,
-		terminal:     terminal,
-		width:        width,
-		height:       height,
-		spawnW:       width,
-		spawnH:       height,
-		outputBuffer: make([]byte, 64*1024), // 64KB ring buffer
-		subscribers:  make(map[string]*ptySubscriber),
-		paceWake:     make(chan struct{}, 1),
-		vtWriteChan:  make(chan vtChunk, 256),
-		vtDone:       make(chan struct{}),
-		respWake:     make(chan struct{}, 1),
-		onExit:       sp.onExit,
-		exitedAlone:  s.notePaneExitedAlone,
-		ownShell:     len(sp.command) == 0 && !sp.closeOnExit && sp.host == "",
-		debug:        debugEnabled(),
-		rawLog:       newPTYLogger(id),
-		spawnedAt:    time.Now(),
+		ID:          id,
+		sessionID:   s.ID,
+		host:        sp.host,
+		pty:         ptyInstance,
+		cmd:         cmd,
+		ctx:         ctx,
+		cancel:      cancel,
+		terminal:    terminal,
+		width:       width,
+		height:      height,
+		spawnW:      width,
+		spawnH:      height,
+		subscribers: make(map[string]*ptySubscriber),
+		paceWake:    make(chan struct{}, 1),
+		vtWriteChan: make(chan vtChunk, 256),
+		vtDone:      make(chan struct{}),
+		respWake:    make(chan struct{}, 1),
+		onExit:      sp.onExit,
+		exitedAlone: s.notePaneExitedAlone,
+		ownShell:    len(sp.command) == 0 && !sp.closeOnExit && sp.host == "",
+		debug:       debugEnabled(),
+		rawLog:      newPTYLogger(id),
+		spawnedAt:   time.Now(),
 	}
 	if sp.keepOpen {
 		pty.keepOpen = newExitNote()
@@ -2561,6 +2692,19 @@ func (s *Session) installPTY(ctx context.Context, cancel context.CancelFunc, id 
 		// An OSC 7501 report, or a full reset: stored at once, in order with
 		// the prompt marks, and handed on by the vtWriter after the write.
 		ProgramStatus: pty.noteProgramStatus,
+		// A drag and drop registration is kept for the clients that attach
+		// later, and a query is answered here, once. Not for a pane on
+		// another machine: the daemon that runs its program answers there,
+		// and an answer from here would be a second one. See
+		// dnd_registration.go.
+		PrivateOSC: func(cmd int, data []byte) {
+			if cmd != dnd.Code || sp.host != "" || !s.dragAndDrop() {
+				return
+			}
+			if reply := pty.dnd.note(data); reply != nil {
+				terminal.WriteResponse(reply)
+			}
+		},
 	})
 
 	// DA1 and XTSMGRAPHICS answer from what the attached clients can show.
@@ -2823,6 +2967,9 @@ func (s *Session) fillLiveFacts(state *SessionState) {
 		w := &state.Windows[i]
 		place := live[w.PTYID].place
 		w.CwdHost = place.elsewhere
+		// The drag and drop registration is live too, and the daemon's alone.
+		dnd := live[w.PTYID].dnd
+		w.DnDAccepts, w.DnDOffers, w.DnDID = dnd.accepts, dnd.offers, dnd.id
 		switch {
 		case place.cwd != "":
 			w.Cwd = place.cwd
@@ -2895,6 +3042,7 @@ type placeFact struct {
 type paneFact struct {
 	title string
 	place placeFact
+	dnd   dndRegistrationFact
 }
 
 // livePaneFacts is each pane's live facts by PTY id, in one pass over the
@@ -2910,13 +3058,14 @@ func (s *Session) livePaneFacts() map[string]paneFact {
 	for id, pty := range s.ptys {
 		var fact paneFact
 		fact.title = pty.Title()
+		fact.dnd = pty.dnd.fact()
 		if _, remote := pty.pty.(*remotePane); !remote {
 			fact.place = placeFact{cwd: pty.place.announcedCwd(), elsewhere: pty.place.Elsewhere()}
 			if fact.place.cwd == "" {
 				fact.place.seed = pty.place.Cwd()
 			}
 		}
-		if fact != (paneFact{}) {
+		if fact.title != "" || fact.place != (placeFact{}) || fact.dnd.accepts || fact.dnd.offers {
 			out[id] = fact
 		}
 	}
@@ -3034,6 +3183,8 @@ func (s *Session) snapshotStateLocked() *SessionState {
 	if s.state.WorkspaceOrder != nil {
 		stateCopy.WorkspaceOrder = slices.Clone(s.state.WorkspaceOrder)
 	}
+	// A card's history and block are never written in place (TaskState.note).
+	stateCopy.Tasks = slices.Clone(s.state.Tasks)
 	stateCopy.WindowMoves = slices.Clone(s.state.WindowMoves)
 	if s.state.WorkspaceMasterRatio != nil {
 		stateCopy.WorkspaceMasterRatio = maps.Clone(s.state.WorkspaceMasterRatio)
@@ -3093,6 +3244,50 @@ func (s *Session) SetAccent(accent string) error {
 	})
 }
 
+// SetNote records the session's return note, or the note of the window
+// target names when target is not empty, propagated and persisted exactly as
+// SetDisplayName is. The note is stored as given: the verb cleans it.
+// It returns the window id the note went on, empty for the session.
+func (s *Session) SetNote(target, note string) (string, error) {
+	var id string
+	err := s.mutateState(func(st *SessionState) error {
+		if target == "" {
+			st.Note = note
+			return nil
+		}
+		idx, err := findWindowStateIndex(st.Windows, target)
+		if err != nil {
+			return err
+		}
+		if idx < 0 {
+			return fmt.Errorf("no window found matching %q", target)
+		}
+		st.Windows[idx].Note = note
+		id = st.Windows[idx].ID
+		return nil
+	})
+	return id, err
+}
+
+// RestoreNotes puts saved notes back on a session a restore just rebuilt.
+// UpdateState keeps the daemon's own copy of the notes (see
+// retainDaemonExclusive), and a new session has none, so the restore cannot
+// hand them in through the state it pushes.
+func (s *Session) RestoreNotes(sessionNote string, windowNotes map[string]string) {
+	if sessionNote == "" && len(windowNotes) == 0 {
+		return
+	}
+	_ = s.mutateState(func(st *SessionState) error {
+		st.Note = sessionNote
+		for i := range st.Windows {
+			if n, ok := windowNotes[st.Windows[i].ID]; ok {
+				st.Windows[i].Note = n
+			}
+		}
+		return nil
+	})
+}
+
 // SetSpace files the session under the named space, propagated and persisted
 // exactly as SetDisplayName is. An empty space takes it out of any.
 func (s *Session) SetSpace(space string) error {
@@ -3100,6 +3295,22 @@ func (s *Session) SetSpace(space string) error {
 		st.Space = space
 		return nil
 	})
+}
+
+// SetRank records the session's place in the session order, propagated and
+// persisted exactly as SetDisplayName is. Zero takes it out of the order.
+func (s *Session) SetRank(rank int) error {
+	return s.mutateState(func(st *SessionState) error {
+		st.Rank = rank
+		return nil
+	})
+}
+
+// rank is the session's place in the session order, zero for none.
+func (s *Session) rank() int {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.state.Rank
 }
 
 // MarkRestored records that this session was rebuilt from saved state. It runs
@@ -3455,7 +3666,9 @@ func (s *Session) mutateStateLocked(fn func(state *SessionState) error) (*Sessio
 		return nil, err
 	}
 	s.noteAgentTurnsLocked(before, time.Now().UnixNano())
+	clearStaleSilenceLocked(before, s.state)
 	clearNowAtRestLocked(before, s.state)
+	wakeSettledLocked(before, s.state)
 	s.forgetSubagentsLocked(s.state)
 	pruneDeadLeaves(s.state)
 	// A daemon-side mutation is exactly what a client sync must not undo, so it
@@ -3483,6 +3696,9 @@ func (s *Session) mutateStateLocked(fn func(state *SessionState) error) (*Sessio
 // channel sends; it never re-enters the session.
 func (s *Session) emitLifecycleLocked(before lifecycleSnapshot) {
 	events := diffLifecycle(before, snapshotLifecycle(s.state))
+	// A task card held by a pane that closed, or whose agent left, is let
+	// go here, in the change that closed it. See releasedTaskEvents.
+	events = append(events, releasedTaskEvents(s, s.state, events, time.Now().UnixNano())...)
 	moving := s.movingWindow
 	s.movingWindow = ""
 	for _, ev := range events {
@@ -3510,14 +3726,18 @@ func (s *Session) Stop() {
 	// difference between it coming back and not; it is reported rather than
 	// dropped even though Stop cannot act on it.
 	final := s.ResurrectionState()
-	if err := s.persist(final); err != nil {
-		LogError("Final resurrection save for session %q failed, it will not come back: %v", s.Name(), err)
+	if s.holdingCheckpoint() {
+		log.Printf("Session %q keeps its last saved layout: panes were killed by a signal just before the stop", s.Name())
+	} else {
+		if err := s.persist(final); err != nil {
+			LogError("Final resurrection save for session %q failed, it will not come back: %v", s.Name(), err)
+		}
+		// Every pane with output since its last save, whatever the interval:
+		// this is the save a restart restores from.
+		s.persistMu.Lock()
+		s.saveHistory(final, true)
+		s.persistMu.Unlock()
 	}
-	// Every pane with output since its last save, whatever the interval: this
-	// is the save a restart restores from.
-	s.persistMu.Lock()
-	s.saveHistory(final, true)
-	s.persistMu.Unlock()
 
 	// Before the panes go, so a hold cannot publish a state against a session
 	// that has already saved and stopped.
@@ -3641,7 +3861,8 @@ func (s *Session) Info() SessionInfo {
 	windows := s.windowSummaries()
 
 	s.stateMu.RLock()
-	displayName, accent, space := s.state.DisplayName, s.state.Accent, s.state.Space
+	displayName, accent, space, rank := s.state.DisplayName, s.state.Accent, s.state.Space, s.state.Rank
+	note := s.state.Note
 	currentWorkspace := s.state.CurrentWorkspace
 	restored := s.state.Restored
 	focusedPTY := ""
@@ -3669,10 +3890,12 @@ func (s *Session) Info() SessionInfo {
 		Windows:          windows,
 		DisplayName:      displayName,
 		Accent:           accent,
+		Note:             note,
 		CurrentWorkspace: currentWorkspace,
 		Restored:         restored,
 		Global:           s.isGlobal(),
 		Space:            space,
+		Rank:             rank,
 		Dir:              dir,
 		Branch:           branch,
 		Worktree:         s.worktreeListing(),
@@ -3713,7 +3936,8 @@ func (s *Session) windowSummaries() []WindowSummary {
 		out = append(out, WindowSummary{
 			ID:            w.ID,
 			Title:         title,
-			AgentState:    string(w.AgentState),
+			AgentState:    string(w.ShownAgentState()),
+			AgentReason:   w.AgentReason,
 			AgentStateAt:  w.AgentStateAt,
 			AgentHarness:  w.AgentHarness,
 			AgentMessage:  w.AgentMessage,
@@ -3721,12 +3945,17 @@ func (s *Session) windowSummaries() []WindowSummary {
 			CompletionSeq: w.CompletionSeq,
 			AgentMeta:     w.AgentMeta,
 			AgentQueued:   w.AgentQueued,
+			DraftHeld:     w.AgentDraftHeld,
+			AgentSettled:  w.AgentSettled,
 			Subagents:     w.AgentSubagents,
 			SubagentList:  w.AgentSubagentList,
 			ProgramStatus: w.ProgramStatus,
 			ForegroundCmd: fg,
 			Workspace:     w.Workspace,
-			Scratch:       w.Scratch,
+			// The rail pane is left out of a rail's rows as the scratch
+			// terminal is, and an older reader knows only this mark.
+			Scratch: w.Scratch || w.Rail != "",
+			Note:    w.Note,
 		})
 	}
 	return out
@@ -3836,7 +4065,7 @@ func (s *Session) buildEnvFor(windowID string, workspace int, restored bool, ext
 	env = append(env, "COLORTERM="+colorTerm)
 	kitty, sixel := s.GraphicsCapabilities()
 	env = append(env, "TERM_PROGRAM="+guestenv.TermProgramFor(command, kitty, sixel))
-	env = append(env, "TERM_PROGRAM_VERSION=0.1.0")
+	env = append(env, "TERM_PROGRAM_VERSION="+guestenv.TermProgramVersion())
 	env = append(env, "TUIOS_SESSION="+s.Name())
 	// TUIOS_HOST names the machine this pane runs on. A pane is always local
 	// to the daemon that made it, so this is the daemon's own hostname, on
@@ -4958,6 +5187,9 @@ func (p *PTY) readOutput() {
 			// Store in ring buffer for reconnection
 			p.outputMu.Lock()
 			seq := p.appendToBuffer(data)
+			for _, tap := range p.outputTaps {
+				tap.add(data)
+			}
 			p.outputMu.Unlock()
 
 			// Broadcast to subscribers
@@ -4989,6 +5221,9 @@ func (p *PTY) readOutput() {
 			// anything that can block, so a demotion decision is made against when
 			// output actually arrived.
 			p.lastOutput.Store(time.Now().UnixNano())
+			if f := p.draftWatch.Load(); f != nil {
+				(*f)()
+			}
 
 			// Raise a control-plane output-activity event. This is a lightweight
 			// signal (byte count only, no content) that drives wait-for-output and
@@ -5065,17 +5300,40 @@ func (p *PTY) vtWriter() {
 	}
 }
 
+// outputRingMax is the most the catch-up ring holds.
+const outputRingMax = 64 * 1024
+
+// outputRingSize is the size the catch-up ring grows to for n bytes: a power
+// of two from 1 KiB that holds them, up to outputRingMax.
+func outputRingSize(n int) int {
+	size := 1024
+	for size < n && size < outputRingMax {
+		size *= 2
+	}
+	return min(size, outputRingMax)
+}
+
 // appendToBuffer records a chunk in the catch-up buffer and returns the stream
-// position it ends at.
+// position it ends at. Callers hold streamMu, so the ring may be reassigned
+// here while broadcast reads its length.
 func (p *PTY) appendToBuffer(data []byte) int64 {
 	p.unbroadcast.Add(int64(len(data)))
 	p.outputSeq += int64(len(data))
 	// Marks the ring has rolled past stop being split points, but the newest
 	// of them is still the width the ring's first byte was laid out at, so a
 	// catch-up can start a rolled client at it.
-	bufStart := p.outputSeq - int64(len(p.outputBuffer))
+	// A ring that is still growing prunes as the full ring would, so it keeps
+	// the marks the full ring keeps.
+	bufStart := p.outputSeq - int64(max(len(p.outputBuffer), outputRingMax))
 	for len(p.resizeMarks) > 1 && p.resizeMarks[1].seq <= bufStart {
 		p.resizeMarks = p.resizeMarks[1:]
+	}
+	// Grow before anything shifts: a ring below its bound gets room for this
+	// chunk, so it never drops a byte the full ring would still hold.
+	if len(p.outputBuffer)-p.outputPos < len(data) && len(p.outputBuffer) < outputRingMax {
+		grown := make([]byte, outputRingSize(p.outputPos+len(data)))
+		copy(grown, p.outputBuffer[:p.outputPos])
+		p.outputBuffer = grown
 	}
 	bufLen := len(p.outputBuffer)
 	// If data is bigger than the buffer, keep only the tail
@@ -5135,7 +5393,9 @@ func (p *PTY) broadcast(chunk ptyChunk, seq int64) {
 	p.reads++
 	p.unbroadcast.Add(-int64(len(chunk.data)))
 	segs, saw := p.gfx.scan(chunk.data, seq)
-	p.gfx.pruneSpans(seq - int64(len(p.outputBuffer)))
+	// Read without outputMu: appendToBuffer reassigns the ring only with
+	// streamMu held, and so does every caller of broadcast.
+	p.gfx.pruneSpans(seq - int64(max(len(p.outputBuffer), outputRingMax)))
 	if saw {
 		p.graphicsAt.Store(time.Now().UnixNano())
 	}
@@ -5182,7 +5442,7 @@ func (p *PTY) noteExit(code int) {
 	}
 
 	if p.exitedAlone != nil && p.ctx.Err() == nil && p.keepOpen == nil {
-		p.exitedAlone(p.ID, p.ownShell)
+		p.exitedAlone(p.ID, p.ownShell, p.ExitSignal())
 	}
 
 	// Notify callback (used by daemon to inform clients)

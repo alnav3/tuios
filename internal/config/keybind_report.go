@@ -320,6 +320,9 @@ type KeybindReport struct {
 	// CopyModeProblems are the [keybindings.copy_mode] keys that a copy pipe
 	// entry or one of copy mode's own keys also uses.
 	CopyModeProblems []CopyModeProblem `json:"copy_mode_problems"`
+	// ReviewProblems are the [keybindings.review] keys that the review
+	// overlay also reads itself.
+	ReviewProblems []ReviewProblem `json:"review_problems"`
 	// EvidenceNote is the report explaining its own tiers. It ships inside the
 	// payload because a consumer that only ever sees the JSON has nowhere else
 	// to learn that one third of it is a curated list.
@@ -334,7 +337,8 @@ type KeybindReport struct {
 	// Yielded are new default bindings tuios left off because the key was
 	// already bound to another action in the same table.
 	Yielded []YieldedDefault `json:"yielded_defaults,omitempty"`
-	// Retired are bindings to actions tuios no longer has.
+	// Retired are the user's bindings dropped on load: to an action tuios no
+	// longer has, or a key another action took as its default.
 	Retired []RetiredKeybind `json:"retired,omitempty"`
 }
 
@@ -376,6 +380,7 @@ func (r *KeybindRegistry) Report(facts PaneFacts) KeybindReport {
 
 		CommandProblems:  r.config.Keybindings.CommandProblems(),
 		CopyModeProblems: r.config.Keybindings.CopyModeProblems(),
+		ReviewProblems:   r.config.Keybindings.ReviewProblems(),
 	}
 
 	seen := map[string]bool{}
@@ -422,6 +427,9 @@ func (rep KeybindReport) Summary() string {
 	}
 	if n := len(rep.CopyModeProblems); n > 0 {
 		parts = append(parts, plural.CountAs(n, "copy mode key used twice", "copy mode keys used twice"))
+	}
+	if n := len(rep.ReviewProblems); n > 0 {
+		parts = append(parts, plural.CountAs(n, "review key used twice", "review keys used twice"))
 	}
 	if n := len(rep.Collisions); n > 0 {
 		parts = append(parts, plural.CountAs(n, "key claimed twice", "keys claimed twice"))
@@ -502,6 +510,9 @@ func (r *KeybindRegistry) OptionKeys() []KeyReadAs {
 	if kb.LeaderKey != "" {
 		check("keybindings", "leader_key", kb.LeaderKey)
 	}
+	if kb.NestExitKey != "" {
+		check("keybindings", "nest_exit_key", kb.NestExitKey)
+	}
 	for _, name := range kb.SectionNamesFor() {
 		section := kb.section(name)
 		actions := make([]string, 0, len(section))
@@ -548,6 +559,9 @@ func (r *KeybindRegistry) KeyProblems() []KeyProblem {
 	}
 	if kb.LeaderKey != "" {
 		check("keybindings", "leader_key", kb.LeaderKey)
+	}
+	if kb.NestExitKey != "" {
+		check("keybindings", "nest_exit_key", kb.NestExitKey)
 	}
 	for _, name := range kb.SectionNamesFor() {
 		section := kb.section(name)

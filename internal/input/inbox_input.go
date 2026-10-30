@@ -20,7 +20,8 @@ import (
 // left, p passes on held mail, f steps the filter, / searches, m opens the
 // whole mailbox, z snoozes (then 1 to 4 for how long) or wakes a snoozed
 // item, u undoes the last dismiss or snooze, S shows the snoozed items, x
-// marks an agent for a bulk answer, ? opens help, and esc or q closes. The
+// marks an agent or a resume offer for a bulk answer (with marks, y resumes
+// every marked offer), ? opens help, and esc or q closes. The
 // digits are the numbers the prompt shows, so they are not bindings.
 func handleInboxInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// A question that opened the Inbox by itself a moment ago: the key was
@@ -39,6 +40,11 @@ func handleInboxInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// The comparison of a fan's attempts takes every key while it is up.
 	if o.CockpitCompareOpen() {
 		return o, o.CockpitCompareKey(msg.String())
+	}
+	// A TML surface drawn in the view takes every key while the person is
+	// in it; esc it does not use gives them back.
+	if o.CockpitArtifactFocused() {
+		return o, o.CockpitArtifactKey(msg.String())
 	}
 	// A risky allow's first press waits for the same key again; any other
 	// key resets it.
@@ -70,11 +76,11 @@ func handleInboxInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	action := lookupAction(o, msg, overlayKeys(o).GetInboxAction)
 	switch action {
 	case config.ActionInboxMark:
-		o.NoteAction(action)
+		noteInboxAction(o, action)
 		o.InboxAgentsToggleMark()
 		return o, nil
 	case config.ActionInboxMarkAll:
-		o.NoteAction(action)
+		noteInboxAction(o, action)
 		o.InboxAgentsMarkAll()
 		return o, nil
 	}
@@ -99,7 +105,7 @@ func handleInboxInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	}
 	// The cockpit's own actions: a A r on an approval, n, tab, the moves.
 	if cmd, handled := o.CockpitKey(action); handled {
-		o.NoteAction(action)
+		noteInboxAction(o, action)
 		return o, cmd
 	}
 	if action == "" {
@@ -116,11 +122,11 @@ func handleInboxInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if app.InboxWorkActions[action] {
 		cmd, handled := o.InboxWorkAction(action)
 		if handled {
-			o.NoteAction(action)
+			noteInboxAction(o, action)
 		}
 		return o, cmd
 	}
-	o.NoteAction(action)
+	noteInboxAction(o, action)
 	switch action {
 	case config.ActionInboxSelect:
 		o.InboxStartSelect()
@@ -134,6 +140,9 @@ func handleInboxInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		}
 		return o, o.InboxDismiss()
 	case config.ActionInboxResume:
+		if marks {
+			return o, o.InboxAgentsBulkResume()
+		}
 		return o, o.InboxResume()
 	case config.ActionInboxPassOn:
 		return o, o.InboxRelease()
@@ -212,7 +221,7 @@ func handleInboxPeekInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if action == "" {
 		return o, nil
 	}
-	o.NoteAction(action)
+	noteInboxAction(o, action)
 	switch action {
 	case config.ActionPeekBack:
 		o.InboxPeekBack()
@@ -230,4 +239,14 @@ func handleInboxPeekInput(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		return o, o.InboxPeekRefresh()
 	}
 	return o, nil
+}
+
+// noteInboxAction records an action of the agents view as run: for a crash
+// report, and for the browser build's tour, which hears it as it hears a
+// keybinding's.
+func noteInboxAction(o *app.OS, action string) {
+	o.NoteAction(action)
+	if o.OnAction != nil {
+		o.OnAction(action)
+	}
 }

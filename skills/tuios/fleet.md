@@ -28,6 +28,8 @@ and a comma gives alternatives.
 | `host:` | the machine: `local`, or a host name, a glob |
 | `name:` | the window's name, a glob |
 | `cwd:` | the directory or anything under it; `~` is the home directory |
+| `task:` | a task card the pane holds, by id, a glob (`tuios --skill tasks`) |
+| `stage:` | the stage of a task card the pane holds |
 
 A glob's `*` does not cross a slash. A term the pane cannot answer does not
 match. `list-agents --all-hosts --select` reads every machine.
@@ -69,6 +71,10 @@ tuios worktree diff api-feat-retry --stat
 ```
 
 The session is named `<repo>-<branch>` with slashes turned into hyphens.
+The folder is where the person's `[worktree] path` puts it, so read `path`
+from the result rather than guess it. A `warning` in the result says the
+folder is inside the repository and git does not ignore it. Tell the person;
+do not edit `.gitignore` for them.
 `--agent` names an agent CLI the way you type it and starts it instead of a
 shell. `worktree ls` (the `list-worktrees` verb) reports each session's rolled-up
 `state` and `gone` when the directory was removed; the verb with
@@ -76,6 +82,9 @@ shell. `worktree ls` (the `list-worktrees` verb) reports each session's rolled-u
 and reports `merged`: true when the branch has commits of its own and its base,
 or the upstream of the base, already holds them. `merged_into` names that ref.
 A merge commit, a fast-forward, a rebase and a squash all count. No fetch runs.
+
+A person makes the same from the client: `Ctrl+B U` (action `new_worktree`)
+asks for a branch name and uses the repository of the focused pane's folder.
 
 ## Fan-out
 
@@ -96,8 +105,10 @@ it is most often a first-run choice only the person can answer), `sent`,
 `not_sent` or `stalled`. A stalled prompt may sit in the agent's input box: look
 before sending it again. `--wait` blocks until every prompt is sent or given up.
 
-`--agent` takes several agents, comma separated, cycled across the sessions, and
-`--prompt` once per session gives each its own prompt:
+`--task t3` stamps a task card with the fan, so its checks and pull requests
+move the card; `tuios --skill tasks` has the stages. `--agent` takes several
+agents, comma separated, cycled across the sessions, and `--prompt` once per
+session gives each its own prompt:
 
 ```sh
 tuios fan 3 --agent 'claude,codex --model o5,gemini' 'Add a retry with backoff.'

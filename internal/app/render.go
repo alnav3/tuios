@@ -217,25 +217,14 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 		isFocused := m.FocusedWindow == i && m.FocusedWindow >= 0 && m.FocusedWindow < len(m.Windows)
 		isMultifocused := len(m.MultifocusSet) > 0 && m.MultifocusSet[window.ID]
 		var borderColorObj color.Color
-		tint, quietTint, tinted := m.sessionBorderTint()
+		_, _, quietTint, tinted := m.sessionBorderTint()
 		var stateColor color.Color
 		if isFocused {
 			stateColor = m.focusedStateBorder(window)
 		}
 		switch {
-		case stateColor != nil:
-			// Copy mode or an agent that waits, in a colour the theme names
-			// for it, outranks the mode and the session.
-			borderColorObj = stateColor
-		case isFocused && m.Mode == TerminalMode:
-			// The mode colour outranks the session's. This border says the keys
-			// are going into the guest, which is the more urgent fact and the
-			// one a person checks before typing.
-			borderColorObj = theme.BorderFocusedTerminalOn(m.host.bg)
-		case isFocused && tinted:
-			borderColorObj = tint
 		case isFocused:
-			borderColorObj = theme.BorderFocusedWindowOn(m.host.bg)
+			borderColorObj = m.focusedBorderColor(stateColor)
 		case m.MultiCopyParked(window.ID):
 			// A pane multi copy mode's search found nothing in drops the
 			// multifocus colour: it is out of the selection until a search
@@ -436,6 +425,17 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 			layers = append(layers, label)
 		}
 
+		// A row of the files section held over the panes names where it
+		// would land. Only drawn while that drag is under way.
+		if label := m.renderFileDragLabel(); label != nil {
+			layers = append(layers, label)
+		}
+
+		// The label of a drag between panes, at the pointer. See dnd_drag.go.
+		if label := m.renderDnDLabel(); label != nil {
+			layers = append(layers, label)
+		}
+
 		// The mark that this client shows only part of the session.
 		if mark := m.renderViewMark(); mark != nil {
 			layers = append(layers, mark)
@@ -443,6 +443,8 @@ func (m *OS) GetCanvas(render bool) *frameCanvas {
 
 		// The part of this client's pane area a smaller session leaves.
 		layers = m.renderLeftover(layers)
+
+		m.kittyChrome = chromeRectsAbovePanes(m.kittyChrome[:0], layers[paneLayers:])
 	} else {
 		// Off the render path (e.g. state snapshots) nothing draws the sidebar,
 		// so last frame's hit geometry must not linger and mis-route a click.
@@ -863,7 +865,7 @@ func (m *OS) fullscreenFastWindow() (*terminal.Window, bool) {
 	// so a panel added there cannot open over a lone pane unseen while it
 	// takes every key. The rest are the surfaces that list does not carry.
 	if m.AnyOverlayOpen() || m.ShowScrollbackBrowser || m.ShowCacheStats || m.ShowTapeManager || m.ShowTapeReview ||
-		m.PrefixActive || m.ContextMenu != nil || m.Capture.Active || m.review.open {
+		m.PrefixActive || m.ContextMenu != nil || m.pathPicker != nil || m.Capture.Active || m.review.open {
 		return nil, false
 	}
 	if m.TapeRecorder != nil && m.TapeRecorder.IsRecording() {
@@ -992,10 +994,35 @@ func (m *OS) fastPathPaints() bool {
 		(m.surfaceGround(surfaceDock).on() && m.Settings.DockbarPosition != "hidden")
 }
 
-// focusedStateBorder is the focused pane's border for a state the theme
-// names a colour for: border.copy in copy mode, status.attention while the
-// pane's agent waits for input. Nil when the pane is in neither state, or
-// the theme names no colour for it, and the mode's colour is drawn.
+// focusedBorderColor is the colour the focused pane's border is drawn in, given
+// what focusedStateBorder said for it. Copy mode or an agent that waits, in a
+// colour the theme names for it, outranks the mode and the session. The mode
+// colour outranks the session's: in terminal mode the border says the keys are
+// going into the guest, which is the more urgent fact and the one a person
+// checks before typing. A session's terminal mode colour is held apart in
+// lightness from its window mode one, and is the louder of the two: a session
+// that drew a green would otherwise look the same in both modes.
+func (m *OS) focusedBorderColor(state color.Color) color.Color {
+	if state != nil {
+		return state
+	}
+	tint, tintTerminal, _, tinted := m.sessionBorderTint()
+	switch {
+	case m.Mode == TerminalMode && tinted:
+		return tintTerminal
+	case m.Mode == TerminalMode:
+		return theme.BorderFocusedTerminalOn(m.host.bg)
+	case tinted:
+		return tint
+	}
+	return theme.BorderFocusedWindowOn(m.host.bg)
+}
+
+// focusedStateBorder is the focused pane's border for a state with a colour
+// of its own: border.copy in copy mode, the info colour in nest mode,
+// status.attention while the pane's agent waits for input. Nil when the pane
+// is in none of them, or the theme names no colour for it, and the mode's
+// colour is drawn.
 func (m *OS) focusedStateBorder(w *terminal.Window) color.Color {
 	if w == nil {
 		return nil
@@ -1004,6 +1031,12 @@ func (m *OS) focusedStateBorder(w *terminal.Window) color.Color {
 		if c := theme.BorderFocusedCopy(); c != nil {
 			return c
 		}
+	}
+	// Nest mode's border is the dock pill's colour, whatever the theme says:
+	// a client whose leader goes to the pane must not look like one whose
+	// leader works. See nest_mode.go.
+	if m.Nested() {
+		return theme.UI().Info
 	}
 	if c := theme.BorderFocusedAttention(); c != nil && m.windowMarkState(w) == "needs_input" {
 		return c
@@ -1167,6 +1200,9 @@ func (m *OS) View() tea.View {
 		// client with that section at about 110 context switches a second.
 		if content != m.cachedViewContent {
 			composed = true
+			if m.PostRenderWriter != nil {
+				m.PostRenderWriter.FrameComposed()
+			}
 		}
 		m.cachedViewContent = content
 		if composed && !m.quietFrame {
@@ -1180,8 +1216,11 @@ func (m *OS) View() tea.View {
 		// Cleared here rather than on the motion path so a frame composed for
 		// any other reason (a keystroke, pane output) counts too, and it starts
 		// the motion frame budget over for the same reason.
+		//
+		// The budget runs from the end of the compose, not its start, and
+		// from the end of the write after that: see motionBudgetFrom.
 		m.pointerMotionPending = false
-		m.lastInteractionRender = composeStart
+		m.lastInteractionRender = time.Now()
 		m.zenHidden = m.zenBordersHidden(false)
 		view.SetContent(content)
 		return true
@@ -1256,6 +1295,11 @@ func (m *OS) View() tea.View {
 	// and prevents tearing between text and graphics updates.
 	if !m.renderSkipped {
 		m.flushGraphicsForView()
+		// A frame equal to the last one is not written, so nothing would
+		// carry what the graphics queued for it.
+		if !composed && m.PostRenderWriter != nil {
+			m.PostRenderWriter.FlushIfDrawn()
+		}
 	}
 
 	return view
@@ -1315,15 +1359,16 @@ func (m *OS) flushGraphicsForView() {
 		m.ShowWorkspaceSwitcher || m.gotoPicker.open || m.buffers.open || m.navigator.open || m.ShowLayoutPicker || m.ShowHostPicker || m.ShowQuitMenu || m.DaemonRestartOpen() || m.ShowScrollbackBrowser ||
 		m.ShowLogs || m.msgView.open || m.ShowCacheStats || m.ShowAggregateView ||
 		m.ShowSettings || m.ShowThemePicker || m.themeEditor.open || m.presetPicker.open || m.ShowKeybindManager || m.ShowAccentPicker || m.ShowTapeManager || m.ShowTapeReview ||
-		m.ShotPreview.Open || m.review.open
+		m.ShotPreview.Open || m.review.open || m.quickLook.open
 	if m.KittyPassthrough != nil {
 		// Self-placed remote video images are hidden/dropped here, not by
 		// HideAllPlacements (they are not in `placements`).
 		m.KittyPassthrough.SetOverlayActive(hideImages)
-		// Chrome that leaves the panes showing. Set every frame, and nil
-		// once capture mode closes, so the images get their full rectangle
-		// back on the next refresh.
-		m.KittyPassthrough.SetChromeOccluders(m.pipOccluders(m.captureOccluders()))
+		// Chrome that leaves the panes showing: popovers, dialogs, the
+		// rail, the dock, capture mode's marquee. Set every frame from the
+		// layers the frame drew, so an image gets its full rectangle back on
+		// the refresh after the chrome closes.
+		m.KittyPassthrough.SetChromeOccluders(m.pipOccluders(m.kittyChrome))
 	}
 
 	// The launcher's own icons run past the hide above rather than through it.
@@ -1440,6 +1485,10 @@ func (m *OS) GetKittyGraphicsCmd() tea.Cmd {
 				if announcedW <= 0 || announcedH <= 0 {
 					announcedW, announcedH = w.ContentWidth(), w.ContentHeight()
 				}
+				// WindowZ is the rank the pane is drawn at, not its raw Z. A
+				// float or a popup is lifted into a band above every tile, so
+				// its raw Z can be below the Z of the tile it covers, and the
+				// image in that tile was then drawn over it.
 				backing[n] = WindowPositionInfo{
 					WindowX:            w.X + view.dx,
 					WindowY:            w.Y + view.dy,
@@ -1453,7 +1502,7 @@ func (m *OS) GetKittyGraphicsCmd() tea.Cmd {
 					ScrollbackLen:      scrollbackLen,
 					ScrollOffset:       w.ScrollbackOffset,
 					IsBeingManipulated: w.IsBeingManipulated,
-					WindowZ:            w.Z,
+					WindowZ:            HitZ(w),
 					IsAltScreen:        w.IsAltScreen(),
 					ScreenWidth:        screenWidth,
 					ScreenHeight:       screenHeight,

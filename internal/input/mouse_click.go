@@ -37,6 +37,13 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		}
 	}
 
+	// The path picker is modal to the mouse the same way: a press on a row
+	// types that path, and a press anywhere else closes it. Either way the
+	// press stops here.
+	if o.PathPickerClick(X, Y) {
+		return o, nil
+	}
+
 	// Ctrl or shift + right-click opens the context menu on a pane, on the press
 	// itself. This is the only way in over a pane whose app requested mouse
 	// tracking, where the right button belongs to that app; elsewhere a plain
@@ -51,6 +58,12 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// nothing, a click anywhere else cancels. Ahead of the overlays because the
 	// dialog is anchored to its target rather than stacked with them.
 	if o.RenameMouseClick(X, Y) {
+		return o, nil
+	}
+
+	// Quick look keeps a press on its panel, and closes for a press anywhere
+	// else, which then goes on to what it was aimed at.
+	if o.QuickLookMouseClick(X, Y) {
 		return o, nil
 	}
 
@@ -100,7 +113,7 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			o.FocusSidebarSession(edge)
 			if w := o.SidebarSessionPaneAt(X, Y); w != nil {
 				o.FocusSidebarSessionPane(w)
-				if w.Terminal != nil && w.Terminal.HasMouseMode() {
+				if paneTakesMouse(o, w) {
 					if tx, ty, inside := w.ScreenToTerminal(X, Y); inside {
 						sendMouseToWindow(o, w, uv.MouseClickEvent{X: tx, Y: ty, Button: uv.MouseButton(mouse.Button), Mod: uv.KeyMod(mouse.Mod)})
 					}
@@ -396,7 +409,7 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			return o, nil
 		}
 		// Forward mouse only when app explicitly requested mouse tracking (DECSET 1000-1003)
-		if clickedWindow.Terminal != nil && clickedWindow.Terminal.HasMouseMode() {
+		if paneTakesMouse(o, clickedWindow) {
 			// Convert to terminal-relative coordinates (0-based)
 			termX, termY, inContent := clickedWindow.ScreenToTerminal(X, Y)
 			// Check if click is within terminal content area
@@ -413,6 +426,11 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 				}
 				// Send to the terminal (uses PTY for daemon windows)
 				sendMouseToWindow(o, clickedWindow, adjustedMouse)
+				// A left press in a pane whose program offers drags arms the
+				// drag gesture; the press itself still went to the program.
+				if mouse.Button == tea.MouseLeft {
+					o.DnDNotePress(clickedWindow, X, Y, termX, termY)
+				}
 				return o, nil
 			}
 		}
@@ -465,6 +483,9 @@ func handleMouseClick(msg tea.MouseClickMsg, o *app.OS) (*app.OS, tea.Cmd) {
 				o.CloseWindowByHand(clickedWindowIndex)
 			case app.WindowButtonMinimize:
 				o.MinimizeWindow(clickedWindowIndex)
+			case app.WindowButtonFloat:
+				o.FocusWindow(clickedWindowIndex)
+				o.ToggleFloating()
 			case app.WindowButtonZoom:
 				// On a tiled pane the control is the zoom. A full-screen snap
 				// there would fight the tiler, which owns the rectangle and

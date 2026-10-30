@@ -146,6 +146,9 @@ type detection struct {
 	// visited lists the group members that were read, in the order they were
 	// read, whether or not one of them matched.
 	visited []foregroundInfo
+	// flags are the flags of proc's command line that harness's manifest
+	// keeps across a resume. Only identifyKept reads them.
+	flags []string
 }
 
 // identifyDetail names the harness a pane's foreground process is running,
@@ -173,6 +176,19 @@ func (m agentMatcher) identifyDetail(info foregroundInfo) (detection, bool) {
 		return hinted, true
 	}
 	return d, false
+}
+
+// identifyKept is identifyDetail plus the flags the matched process was
+// started with that its manifest keeps across a resume. Only the detection
+// poll calls it, which reads the process anyway; the path that runs on a
+// pane's output does not pay for it. A process named by the TUIOS_AGENT hint
+// is a wrapper, so its command line is not the harness's and is not read.
+func (m agentMatcher) identifyKept(info foregroundInfo) (detection, bool) {
+	d, ok := m.identifyDetail(info)
+	if ok && d.tier == identityManifest && m.registry != nil {
+		d.flags = m.registry.KeptFlags(d.harness, d.proc.argv)
+	}
+	return d, ok
 }
 
 // matchHint attributes a pane to the harness its foreground process's
@@ -521,10 +537,18 @@ func foregroundProcess(shellPid int) (foregroundInfo, bool) {
 // exited: a pid from another pid namespace, an agent in a container say, or
 // on a platform that reads no processes, has none, and is never taken for
 // gone.
+//
+// gone marks a record made from a report whose harness had already left the
+// pane when the report arrived (harnessLeftPane). A hook runs on its own, so
+// one started just before the harness quit can land after it: Pi spawns one
+// for its session_start, and a quick quit beat it to the daemon. The report
+// then named a harness that was no longer its ancestor, so no start time was
+// read, and the claim it set never lapsed.
 type harnessProc struct {
 	pid   int
 	start uint64
 	timed bool
+	gone  bool
 }
 
 // readHarnessProc records pid with its start time, if it can be read.
@@ -538,6 +562,9 @@ func readHarnessProc(pid int) harnessProc {
 // no longer reads, or reads different, which is another process that was given
 // the pid.
 func (h harnessProc) exited() bool {
+	if h.gone {
+		return true
+	}
 	if !h.timed {
 		return false
 	}
@@ -749,6 +776,17 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 		}
 		det := r.det
 		detected := running && r.isAgent
+		// The kept flags ride the same poll: the command line was read to
+		// find the agent. They are noted whoever owns the claim, since a
+		// hooked harness reports its own state and this is still its
+		// process, and they change only when the harness or its flags do.
+		if detected && det.tier == identityManifest && det.harness != "" &&
+			(w.AgentFlags == nil || w.AgentFlags.Harness != det.harness || !slices.Equal(w.AgentFlags.Flags, det.flags)) {
+			if write {
+				w.AgentFlags = &KeptFlags{Harness: det.harness, Flags: det.flags}
+			}
+			out.labels++
+		}
 		// A pane back at its shell has no harness left to protect, so the
 		// shared-server guard forgets its conversations. The stored
 		// AgentSessionID stays, for a later resume. A guard armed after the
@@ -795,6 +833,19 @@ func (s *Session) detectionPass(st *SessionState, readings map[string]detectRead
 				s.setAgentClaim(w.ID, agentClaim{
 					source: AgentSourceDetect, harness: det.harness, identity: det.tier, auto: true,
 				})
+			} else if w.AgentHarness == "" && det.harness != "" && claim.source != AgentSourceReport {
+				// A pane's own sequence set the state first and named no
+				// harness: Codex sends an OSC 7501 idle before it runs a
+				// hook. The state stays the sequence's, but the pane is the
+				// harness its process is. Without it the pane has no screen
+				// rules, and the herdr front lists no agent in it. A report
+				// is a caller's word, and one that named no harness is left
+				// as it is.
+				out.changed++
+				if !write {
+					continue
+				}
+				w.AgentHarness = det.harness
 			}
 		case detected && owned:
 			// Still here. A miss count from an editor it opened is forgotten.
@@ -1058,3 +1109,26 @@ var errNoAgentDetectChange = agentDetectNoChange{}
 type agentDetectNoChange struct{}
 
 func (agentDetectNoChange) Error() string { return "no agent-detection change" }
+
+// ForegroundProgram is the base name of the program that holds the terminal
+// the shell with pid shellPid runs on: the shell itself while it sits at its
+// prompt, unlike WindowState.ForegroundCmd, which leaves every shell out.
+// "" when it cannot be read, which a caller must treat as not known.
+//
+// The client asks this of a pane on its own machine when it has to know which
+// shell will read what it types, such as the quoting of a dropped path. The
+// process name comes first: a script's argv[0] is its interpreter, and the
+// name is what the person ran.
+func ForegroundProgram(shellPid int) string {
+	info, ok := foregroundProcess(shellPid)
+	if !ok {
+		return ""
+	}
+	if name := agentBaseName(info.comm); name != "" {
+		return name
+	}
+	if len(info.argv) > 0 {
+		return agentBaseName(info.argv[0])
+	}
+	return ""
+}

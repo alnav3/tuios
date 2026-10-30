@@ -45,6 +45,11 @@ const (
 	// navigatorListTop is the body line the first list line is on: under the
 	// search box and the list box's top border.
 	navigatorListTop = 4
+	// navigatorMarginRows is the rows the navigator leaves free above and
+	// below it. It is the one panel tall enough to fill the room between the
+	// docks, and drawn flush against both it read as pushed down under the top
+	// bar, while the columns beside it showed a margin.
+	navigatorMarginRows = 1
 )
 
 // navigatorHints are the footer's keys, in the order of their worth.
@@ -75,7 +80,7 @@ func (m *OS) navigatorHints() []overlay.Hint {
 // the list lines the screen has room for.
 func (m *OS) navigatorGeometry() (width, listW, previewW, lines int, hints []overlay.Hint) {
 	width = m.panelWidth(navigatorWidth)
-	lines, hints = m.panelBody(navigatorRowsWanted, navigatorChrome, width, nil, m.navigatorHints())
+	lines, hints = m.panelBody(navigatorRowsWanted, navigatorChrome+2*navigatorMarginRows, width, nil, m.navigatorHints())
 	listW = max(width-2, 1)
 	// Two boxes side by side cost five cells: two borders each and the gap.
 	if width-5-navigatorListMin >= navigatorPreviewMin {
@@ -102,7 +107,7 @@ func (m *OS) navigatorVisibleRows() int {
 // renderNavigator draws the navigator and returns the panel, its geometry and
 // the list rows' hit areas.
 func (m *OS) renderNavigator() (string, overlay.Geometry, []overlayRowHit) {
-	pal := theme.UI()
+	pal := m.overlayUI()
 	bg := pal.Surface
 	nav := &m.navigator
 	width, listW, previewW, lines, hints := m.navigatorGeometry()
@@ -614,9 +619,9 @@ func navSSHTarget(cmdline string) string {
 // running command after a rule in the informational ink. byFolder is
 // navPaneLabel's.
 func (m *OS) navPaneName(s *navSession, p *navPane, selected bool, k navInks) (string, bool) {
-	mark := k.ink(k.fg).Render("  ")
+	mark := k.ink(k.fg).Render(strings.Repeat(" ", agentMarkLead()))
 	if glyph, c := agentMark(p.AgentState, p.DoneSeen, p.Subagents, theme.UI()); glyph != "" {
-		mark = k.ink(theme.Readable(c, k.ground)).Bold(sidebarAttention(p.AgentState)).Render(glyph) + k.ink(k.fg).Render(" ")
+		mark = k.ink(theme.Readable(c, k.ground)).Bold(sidebarAttention(p.AgentState)).Render(glyph) + k.ink(k.fg).Render(agentMarkGap(glyph))
 	}
 	label, byFolder, quiet := navPaneLabel(p)
 	ink := k.fg
@@ -728,7 +733,7 @@ func (m *OS) navigatorPreview(r navRow, width, height int, bg color.Color, pal o
 	if p.Focused && s.Current {
 		facts = k.ink(k.current).Render("current")
 	}
-	out = append(out, pad+navSpans(width-2, k.ink(k.mute).Render("  "+where), facts, k))
+	out = append(out, pad+navSpans(width-2, k.ink(k.mute).Render(strings.Repeat(" ", agentMarkLead())+where), facts, k))
 	out = append(out, pad+overlay.DashRule(width-2, bg, pal))
 
 	room := height - len(out)

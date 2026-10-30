@@ -46,8 +46,13 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	// placed beside the meters it behaves like, so the two cannot double up.
 	// An armed leader shows on the dock's mode pill when the dock has one.
 	// The badge stays the way to see it with the dock hidden.
-	prefixBadge := m.PrefixActive && !m.prefixPillShown()
-	if isRecording || prefixBadge {
+	// In lock mode the badge also says unlocked, for every menu the leader
+	// opens and for a menu held after a repeatable action.
+	unlockBadge := m.lockPillShown() && m.prefixArmed() && !m.prefixPillShown()
+	prefixBadge := (m.PrefixActive || unlockBadge) && !m.prefixPillShown()
+	// Nest mode goes on the badge when no mode pill can carry it.
+	nestBadge := m.Nested() && !m.modePillShown()
+	if isRecording || prefixBadge || nestBadge {
 		// The reading comes from the clock component, so the badge and a clock
 		// cell on the dock can never disagree, and so the format is the one
 		// [dock.clock] asked for rather than the one that used to be spelled
@@ -57,8 +62,12 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 
 		if isRecording {
 			statusText = config.TapeRecordingIndicator + " | " + currentTime
+		} else if unlockBadge {
+			statusText = "PREFIX " + m.Settings.GetDockLockIcon(false) + " | " + currentTime
 		} else if prefixBadge {
 			statusText = "PREFIX | " + currentTime
+		} else if nestBadge {
+			statusText = m.nestLabel() + " | " + currentTime
 		} else {
 			statusText = currentTime
 		}
@@ -78,6 +87,8 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 			timeStyle = timeStyle.Background(pal.Warn).Foreground(theme.ContrastText(pal.Warn))
 		case prefixBadge:
 			timeStyle = timeStyle.Background(pal.Warning).Foreground(theme.ContrastText(pal.Warning))
+		case nestBadge:
+			timeStyle = timeStyle.Background(pal.Info).Foreground(theme.ContrastText(pal.Info))
 		}
 
 		renderedTime := timeStyle.Render(statusText)
@@ -394,6 +405,13 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 		layers = m.placeOverlayPanel(layers, "sessionclose", content, geo, rows)
 	}
 
+	// Quick look sits under every dialog: it follows the rail's cursor and
+	// takes no key, so a dialog opened from the rail has to draw over it.
+	if m.quickLook.open {
+		content, x, y := m.renderQuickLook()
+		layers = append(layers, lipgloss.NewLayer(content).X(x).Y(y).Z(config.ZIndexLogs).ID(overlayKindQuickLook))
+	}
+
 	if m.FilePromptOpen() {
 		content, geo, rows := m.renderFileDialog()
 		layers = m.placeOverlayPanel(layers, "filedialog", content, geo, rows)
@@ -414,6 +432,11 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 		layers = m.placeOverlayPanel(layers, overlayKindPluginApproval, content, geo, rows)
 	}
 
+	if m.IntegrationAskOpen() {
+		content, geo, rows := m.renderIntegrationAsk()
+		layers = m.placeOverlayPanel(layers, overlayKindIntegrationAsk, content, geo, rows)
+	}
+
 	if m.ShowHelp {
 		content, geo := m.RenderHelpMenu()
 		layers = m.placeOverlayPanel(layers, "help", content, geo, nil)
@@ -432,7 +455,7 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	if m.ShowCacheStats {
 		stats := GetGlobalStyleCache().GetStats()
 
-		pal := theme.UI()
+		pal := m.overlayUI()
 		bg := pal.Surface
 		labelStyle := overlay.Style(bg).Foreground(pal.FgDim).Render
 		valueStyle := overlay.Style(bg).Foreground(pal.Fg).Bold(true).Render
@@ -704,6 +727,7 @@ func (m *OS) renderOverlays() []*lipgloss.Layer {
 	// The context menu is placed last so it sits above everything else it may
 	// have been opened on top of, and so its recorded bounds are from the frame
 	// the user is actually looking at.
+	layers = m.placePathPicker(layers)
 	layers = m.placeContextMenu(layers)
 	m.forgetClosedOverlayAnchors()
 

@@ -70,7 +70,7 @@ func (m *OS) currentSessionInput() sessiontree.SessionInput {
 	for i, w := range m.Windows {
 		// The scratch terminal has no row, shown or hidden. It is reached by
 		// its key, and a row for it read as one more pane of the layout.
-		if w == nil || isScratch(w) {
+		if w == nil || hiddenFromLists(w) {
 			continue
 		}
 		state, seen := m.railAgentState(w.ID, w.AgentState, w.AgentCompletionSeq)
@@ -83,9 +83,12 @@ func (m *OS) currentSessionInput() sessiontree.SessionInput {
 			StateAt:      w.AgentStateAt,
 			Harness:      w.AgentHarness,
 			Message:      message,
+			Reason:       w.AgentReason,
 			AgentKind:    kind,
 			Meta:         w.AgentMeta,
 			Queued:       w.AgentQueued,
+			DraftHeld:    w.AgentDraftHeld,
+			Settled:      w.AgentSettled,
 			Subagents:    w.AgentSubagents,
 			SubagentList: w.AgentSubagentList,
 			Program:      w.ProgramStatus,
@@ -105,6 +108,7 @@ func (m *OS) currentSessionInput() sessiontree.SessionInput {
 	return sessiontree.SessionInput{
 		Name:             name,
 		DisplayName:      m.SessionDisplayName,
+		Named:            sessionNamed(name, m.SessionDisplayName, m.SessionWorktree),
 		Dir:              dir,
 		Branch:           branch,
 		Attached:         true,
@@ -112,8 +116,9 @@ func (m *OS) currentSessionInput() sessiontree.SessionInput {
 		Restored:         m.SessionRestored,
 		Global:           m.SessionGlobal,
 		CurrentWorkspace: m.dockWorkspace(),
-		Worktree:         worktreeRef(m.SessionWorktree),
+		Worktree:         m.worktreeRef(m.SessionWorktree),
 		Space:            m.SessionSpace,
+		Note:             m.SessionNote,
 		Windows:          windows,
 	}
 }
@@ -142,9 +147,12 @@ func (m *OS) foreignSessionInput(client *session.TUIClient, name string) session
 			StateAt:      w.AgentStateAt,
 			Harness:      w.AgentHarness,
 			Message:      message,
+			Reason:       w.AgentReason,
 			AgentKind:    kind,
 			Meta:         agentMetaFromWire(nil, w.AgentMeta),
 			Queued:       w.AgentQueued,
+			DraftHeld:    w.DraftHeld,
+			Settled:      w.AgentSettled,
 			Subagents:    w.Subagents,
 			SubagentList: subagentsFromWire(nil, w.SubagentList),
 			Program:      programStatusFromWire(nil, w.ProgramStatus),
@@ -156,13 +164,15 @@ func (m *OS) foreignSessionInput(client *session.TUIClient, name string) session
 	return sessiontree.SessionInput{
 		Name:             name,
 		DisplayName:      display,
+		Named:            sessionNamed(name, display, client.SessionWorktree(name)),
 		Dir:              dir,
 		Branch:           branch,
 		Restored:         client.SessionRestored(name),
 		Global:           client.SessionGlobal(name),
 		CurrentWorkspace: client.SessionCurrentWorkspace(name),
-		Worktree:         worktreeRef(client.SessionWorktree(name)),
+		Worktree:         m.worktreeRef(client.SessionWorktree(name)),
 		Space:            client.SessionSpace(name),
+		Note:             client.SessionNote(name),
 		Windows:          windows,
 	}
 }
@@ -293,7 +303,7 @@ func (m *OS) SwitchToSessionByIndex(n int) {
 // palette and the title bar never disagree about what a glyph means.
 func sessionPaletteLabel(prefix, name, agentState string, doneSeen bool, running int) string {
 	if glyph := agentStateIndicator(displayState(agentState, doneSeen, running)); glyph != "" {
-		return prefix + glyph + " " + name
+		return prefix + glyph + agentMarkGap(glyph) + name
 	}
 	return prefix + name
 }

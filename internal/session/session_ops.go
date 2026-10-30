@@ -240,6 +240,11 @@ type NewWindowOptions struct {
 	Scratch bool
 	// ScratchName is the scratch pane's name. See WindowState.ScratchName.
 	ScratchName string
+	// Rail makes the window the session's rail pane, keyed by this command
+	// line. See WindowState.Rail. The window goes on a free scratch-range
+	// workspace and its process starts at RailWidth by RailHeight cells.
+	Rail                  string
+	RailWidth, RailHeight int
 	// stdout, when set, is the process's standard output in place of the PTY.
 	// See createPTY. It is unexported: only the popup verb's capture sets it.
 	stdout *os.File
@@ -249,8 +254,9 @@ type NewWindowOptions struct {
 	extraFiles []*os.File
 	// keepOpen keeps the window after its process exits and writes a line
 	// with the exit status under the last output. See keep_open.go. It is
-	// unexported: only new-window sets it, and the caller's onExit must not
-	// close the window for it to mean anything.
+	// unexported: only new-window and a client's NewWindow with KeepOpen set
+	// it, and the caller's onExit must not close the window for it to mean
+	// anything.
 	keepOpen bool
 	// closeOnExit is new-window's close_on_exit: the daemon closes the
 	// window when its process exits. It is unexported, like keepOpen: the
@@ -289,6 +295,13 @@ type NewWindowOptions struct {
 	// WindowState.Kind. With no Command, its program is the placeholder.
 	Kind string
 	URI  string
+	// Cols and Rows are the content size the client that asked will give the
+	// pane, zero when it did not say. The process starts at that size. A
+	// shell started at the session's size and then resized once the client
+	// placed the pane took a SIGWINCH while it was still starting, and zsh
+	// then drew its prompt twice (#1205). A popup ignores them: it has a
+	// size of its own.
+	Cols, Rows int
 }
 
 // WindowKinds are the kinds a window can be. Empty is "terminal".
@@ -345,6 +358,17 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 	if opts.Popup {
 		ptyWidth, ptyHeight = popupContentSize(width, height, s.LayoutReserve(), opts.PopupWidth, opts.PopupHeight)
 		width, height = ptyWidth+2, ptyHeight+2
+	} else if opts.Cols > 0 && opts.Rows > 0 {
+		// The box is the PTY's plus a border, for the reason a popup's is.
+		// The PTY is never larger than the session.
+		ptyWidth, ptyHeight = min(opts.Cols, ptyWidth+2), min(opts.Rows, ptyHeight+2)
+		width, height = ptyWidth+2, ptyHeight+2
+	}
+	// The rail pane starts at the size of the section it is drawn in, so its
+	// program draws its first frame for the rail and not for the session.
+	if opts.Rail != "" && opts.RailWidth > 0 && opts.RailHeight > 0 {
+		ptyWidth, ptyHeight = opts.RailWidth, opts.RailHeight
+		width, height = ptyWidth+2, ptyHeight+2
 	}
 
 	windowID := uuid.New().String()
@@ -373,8 +397,8 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 	if cwd == "" && opts.Host == "" {
 		cwd = s.inheritedCwd()
 	}
-	// With nothing to inherit, the session's own start directory: the one
-	// tuios new --cwd named. A local path, so a window with a host skips it
+	// With nothing to inherit, use the directory set when the session was
+	// created. A local path, so a window with a host skips it
 	// for the reason above.
 	if cwd == "" && opts.Host == "" {
 		cwd = s.StartDir()
@@ -444,8 +468,8 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 		if detectIn == "" {
 			detectIn, _ = pty.ProcessCwd()
 		}
-		if info, ok := worktree.Detect(detectIn); ok {
-			detected = &WorktreeInfo{Info: info}
+		if info, main, ok := worktree.DetectEither(detectIn); ok {
+			detected = &WorktreeInfo{Info: info, Main: main}
 		}
 	}
 
@@ -472,6 +496,16 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 				return errNoScratchGroup(opts.Workspace)
 			}
 			scratch, scratchName = true, name
+		}
+		// One rail pane per session, checked under the state lock for the
+		// reason the scratch check is. It goes on a workspace nobody is on.
+		if opts.Rail != "" {
+			for i := range state.Windows {
+				if state.Windows[i].Rail != "" {
+					return ErrRailPaneExists
+				}
+			}
+			opts.Workspace = freeScratchWorkspace(state)
 		}
 		if first && (state.Worktree == nil || !state.Worktree.Managed) {
 			state.Worktree = detected
@@ -532,6 +566,7 @@ func (s *Session) AddDaemonWindowWith(opts NewWindowOptions, onExit func(ptyID s
 			PopupDim:    opts.PopupDim,
 			Scratch:     scratch,
 			ScratchName: scratchName,
+			Rail:        opts.Rail,
 			Kind:        opts.Kind,
 			URI:         opts.URI,
 		}
@@ -580,6 +615,9 @@ var windowSpawnedHook func(*PTY)
 // that has a pane already. The caller treats it as a success that did
 // nothing. See ExecuteCommandPayload.FocusIfShown.
 var ErrWorkspaceHasPane = errors.New("the workspace has a pane already")
+
+// ErrRailPaneExists is the refusal of a second rail pane in a session.
+var ErrRailPaneExists = errors.New("this session already has a rail pane")
 
 // ErrScratchExists is the refusal of a second scratch terminal in a session.
 var ErrScratchExists = errors.New("this session already has a scratch terminal of this name. Press its key to show it")

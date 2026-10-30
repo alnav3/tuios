@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/hooks"
 	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
@@ -83,8 +85,8 @@ var fanReadyStates = map[string]bool{
 
 // worktreeTarget is what every worktree verb needs from a session: the
 // session itself and its record, or the error saying it has none.
-func (d *Daemon) worktreeTarget(name string) (*Session, *WorktreeInfo, *verbError) {
-	sess, verr := d.resolveVerbSession(name)
+func (d *Daemon) worktreeTarget(cs *connState, name string) (*Session, *WorktreeInfo, *verbError) {
+	sess, verr := d.resolveVerbSession(cs, name)
 	if verr != nil {
 		return nil, nil, verr
 	}
@@ -97,14 +99,27 @@ func (d *Daemon) worktreeTarget(name string) (*Session, *WorktreeInfo, *verbErro
 			Available: d.worktreeSessionNames(),
 		})
 	}
+	// The main checkout rides the record for the listing's sake, but it is not
+	// a worktree: git refuses to remove it, and a remove that first stashed
+	// its changes would be stashing a working tree nobody asked to touch.
+	if info.Main {
+		return nil, nil, hintedVerbError(ErrVerbNotWorktree, "session "+sess.Name()+" is in the repository's main checkout, which is not a worktree", &VerbHint{
+			Param:     "session",
+			Verb:      "list-worktrees",
+			Command:   "tuios worktree ls",
+			Available: d.worktreeSessionNames(),
+		})
+	}
 	return sess, info, nil
 }
 
-// worktreeSessionNames lists the sessions that are in a worktree.
+// worktreeSessionNames lists the sessions that are in a worktree. The main
+// checkout is not one a worktree verb can act on, so it stays out of the
+// hints.
 func (d *Daemon) worktreeSessionNames() []string {
 	var out []string
 	for _, s := range d.manager.ListSessions() {
-		if s.Worktree != nil {
+		if s.Worktree != nil && !s.Worktree.Main {
 			out = append(out, s.Name)
 		}
 	}
@@ -128,6 +143,33 @@ func repoRootParam(dir string) (string, *verbError) {
 	return root, nil
 }
 
+// SetWorktreePath sets [worktree] path, the template new worktrees are placed
+// by. Empty is the default layout.
+func (d *Daemon) SetWorktreePath(template string) {
+	d.worktreePath.Store(&template)
+}
+
+// worktreeTemplate is what SetWorktreePath last set, or "".
+func (d *Daemon) worktreeTemplate() string {
+	if t := d.worktreePath.Load(); t != nil {
+		return *t
+	}
+	return ""
+}
+
+// worktreePathFor is where a worktree of root on branch goes by template. A
+// template that does not render is the config's fault, and the error says
+// where to fix it.
+func worktreePathFor(template, root, branch string) (string, *verbError) {
+	path, err := worktree.PathFor(template, root, branch)
+	if err != nil {
+		return "", hintedVerbError(ErrVerbInternal, "[worktree] path in config.toml: "+err.Error(), &VerbHint{
+			Detail: "The [worktree] path template in config.toml cannot place a worktree. Nothing was created. Fix it, or leave it empty for the default folder.",
+		})
+	}
+	return path, nil
+}
+
 // createWorktreeSession is what new-worktree and fan share: the worktree, then
 // the session in it, then the record that ties them. The worktree is never
 // removed on a later failure. It exists on disk and git lists it, and taking
@@ -135,7 +177,11 @@ func repoRootParam(dir string) (string, *verbError) {
 // caller asked for and can still use. The session gets the caller's terminal
 // from its hello, as one made by new-session does.
 func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
-	path := worktree.PathFor(worktree.DefaultDir(), root, branch)
+	template := d.worktreeTemplate()
+	path, verr := worktreePathFor(template, root, branch)
+	if verr != nil {
+		return nil, verr
+	}
 	if _, err := os.Lstat(path); err == nil {
 		return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
 			Param:  "branch",
@@ -194,6 +240,14 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 	// session on the window's push already sees it under its repository.
 	_ = sess.SetWorktree(info)
 
+	// The after-new-worktree hook runs before the first window, and the call
+	// waits for it, so what it puts into the tree is there when the shell or
+	// agent starts. Nothing is locked here: CreateSession and SetWorktree have
+	// returned, and a fan's reservation is a name, not a mutex, so other
+	// clients and verbs go on while the hook runs. A hook that fails keeps the
+	// worktree and the session, and its error goes back with the result.
+	hookErr := d.runWorktreeHook(sess.Name(), info, created)
+
 	sessionID := sess.ID
 	onExit := func(ptyID string) { d.notifyPTYClosed(sessionID, ptyID) }
 	win, err := sess.AddDaemonWindowWith(NewWindowOptions{
@@ -208,7 +262,7 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 			Detail: "Both are kept. Open a window in the session with: tuios new-window -s " + sessionName + " --cwd " + path,
 		})
 	}
-	return map[string]any{
+	out := map[string]any{
 		"session":        sess.Name(),
 		"session_id":     sess.ID,
 		"repo":           info.Repo,
@@ -218,7 +272,70 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 		"path":           path,
 		"window_id":      win.ID,
 		"pty_id":         win.PTYID,
-	}, nil
+	}
+	if hookErr != "" {
+		out["hook_error"] = hookErr
+	}
+	if warning := unignoredWorktreeWarning(template, root, path); warning != "" {
+		out["warning"] = warning
+	}
+	return out, nil
+}
+
+// unignoredWorktreeWarning says so when a worktree was put inside its own
+// repository where git does not ignore it, and what to ignore. tuios never
+// edits the ignore files itself: they are the user's.
+//
+// The hint names the folder that holds every branch's worktree, so one line
+// covers the next worktree too, and nothing beside that folder is ignored with
+// it: for .claude/worktrees/{{ branch | slug }} it is /.claude/worktrees/, not
+// /.claude/, which holds files people commit.
+func unignoredWorktreeWarning(template, root, path string) string {
+	if !worktree.UnignoredInRepo(root, path) {
+		return ""
+	}
+	rel := ""
+	if dir, err := worktree.HoldingDir(template, root); err == nil {
+		rel, _ = filepath.Rel(root, dir)
+	}
+	// A worktree straight in the main checkout has no folder of its own to
+	// ignore, so the hint names the worktree.
+	if rel == "" || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		rel, _ = filepath.Rel(root, path)
+	}
+	rel = filepath.ToSlash(rel)
+	return filepath.Join(root, rel) + " is inside the repository and git does not ignore it, so the main checkout lists the worktree as untracked. Add /" + rel + "/ to .gitignore or .git/info/exclude."
+}
+
+// worktreeHookTimeout bounds the after-new-worktree hook. Hooks have no
+// timeout option, and a fixed one keeps it that way: a minute covers copying
+// ignored files and a cached install, and stays well inside the five minutes
+// the CLI and the rail wait for the whole verb.
+const worktreeHookTimeout = time.Minute
+
+// runWorktreeHook runs the after-new-worktree hook in the worktree and waits
+// for it. It returns the hook's error for the caller to show, or empty when no
+// hook is set or the hook succeeded.
+func (d *Daemon) runWorktreeHook(sessionName string, info *WorktreeInfo, created bool) string {
+	if d.hooks == nil || !d.hooks.HasEvent(hooks.AfterNewWorktree) {
+		return ""
+	}
+	createdBranch := "0"
+	if created {
+		createdBranch = "1"
+	}
+	err := d.hooks.Run(hooks.AfterNewWorktree, hooks.Context{
+		SessionID:             sessionName,
+		WorktreePath:          info.Path,
+		WorktreeBranch:        info.Branch,
+		WorktreeRepoRoot:      info.RepoRoot,
+		WorktreeCreatedBranch: createdBranch,
+		Dir:                   info.Path,
+	}, worktreeHookTimeout)
+	if err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func (d *Daemon) verbNewWorktree(cs *connState, params json.RawMessage) (any, *verbError) {
@@ -308,6 +425,7 @@ func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *
 			"fan_id":        wt.FanID,
 			"managed":       wt.Managed,
 			"gone":          wt.Gone,
+			"main":          wt.Main,
 			"state":         state,
 			"harness":       harnessID,
 			"windows":       s.WindowCount,
@@ -371,7 +489,7 @@ func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *
 	}, nil
 }
 
-func (d *Daemon) verbRemoveWorktree(_ *connState, params json.RawMessage) (any, *verbError) {
+func (d *Daemon) verbRemoveWorktree(cs *connState, params json.RawMessage) (any, *verbError) {
 	var p struct {
 		Session     string `json:"session"`
 		Force       bool   `json:"force"`
@@ -386,7 +504,7 @@ func (d *Daemon) verbRemoveWorktree(_ *connState, params json.RawMessage) (any, 
 			"session is required (remove-worktree never guesses which worktree to remove)",
 			&VerbHint{Param: "session", Command: "tuios worktree ls", Available: d.worktreeSessionNames()})
 	}
-	sess, info, verr := d.worktreeTarget(p.Session)
+	sess, info, verr := d.worktreeTarget(cs, p.Session)
 	if verr != nil {
 		return nil, verr
 	}
@@ -566,8 +684,7 @@ func fanStem(prompt string) string {
 // repository and on disk: stem, then stem-2, stem-3, and so on, skipping any
 // that exist. Numbering from 2 keeps the first name bare, so a fan of one
 // reads like a worktree made by hand.
-func fanBranches(root, stem string, count int) []string {
-	dir := worktree.DefaultDir()
+func fanBranches(template, root, stem string, count int) []string {
 	names := make([]string, 0, count)
 	for i := 1; len(names) < count && i < count+100; i++ {
 		name := stem
@@ -577,8 +694,11 @@ func fanBranches(root, stem string, count int) []string {
 		if worktree.BranchExists(root, name) {
 			continue
 		}
-		if _, err := os.Lstat(worktree.PathFor(dir, root, name)); err == nil {
-			continue
+		// A template that does not render is reported by the create.
+		if path, err := worktree.PathFor(template, root, name); err == nil {
+			if _, err := os.Lstat(path); err == nil {
+				continue
+			}
 		}
 		names = append(names, name)
 	}
@@ -599,6 +719,9 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 		ReadyTimeout int               `json:"ready_timeout"`
 		Env          map[string]string `json:"env"`
 		Grants       []string          `json:"grants"`
+		Task         string            `json:"task"`
+		TaskSession  string            `json:"task_session"`
+		HumanNonce   string            `json:"human_nonce"`
 	}
 	if verr := decodeParams(params, &p); verr != nil {
 		return nil, verr
@@ -608,6 +731,17 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	grants, verr := d.launchGrants(cs, p.Grants)
 	if verr != nil {
 		return nil, verr
+	}
+	// The card the fan works on, checked before anything is made, so a
+	// refused stamp costs no worktree. See task_auto.go.
+	var task *taskParam
+	if p.TaskSession != "" && p.Task == "" {
+		return nil, invalidParam("task_session", "task_session names the session of task, so it takes a task")
+	}
+	if p.Task != "" {
+		if task, verr = d.admitTaskParam(cs, "fan", p.TaskSession, p.Task, p.HumanNonce, true); verr != nil {
+			return nil, verr
+		}
 	}
 	// One prompt for every session, or one per session: prompts sets the
 	// count when count is left out.
@@ -708,7 +842,11 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	// The name is held from the check until the call's sessions exist, so
 	// two calls cannot both take it as new.
 	defer release()
-	branches := fanBranches(root, stem, p.Count)
+	template := d.worktreeTemplate()
+	if _, verr := worktreePathFor(template, root, stem); verr != nil {
+		return nil, verr
+	}
+	branches := fanBranches(template, root, stem, p.Count)
 	if len(branches) < p.Count {
 		return nil, invalidParam("name", "could not find "+strconv.Itoa(p.Count)+" free branch names from "+stem)
 	}
@@ -721,6 +859,21 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	}
 
 	sessions := make([]map[string]any, 0, p.Count)
+	var warnings []string
+	// stamp writes the fan onto the card once a session of it exists, and
+	// returns a line saying what became of the card.
+	stamp := func(out map[string]any) string {
+		if task == nil || len(sessions) == 0 {
+			return ""
+		}
+		if row, ok := d.stampFan(task, stem, fanID); ok {
+			out["task"] = row
+			return "Task card " + task.id + " is stamped with the fan."
+		}
+		note := "Task card " + task.id + " was removed while the fan was made, so nothing was stamped."
+		out["task_note"] = note
+		return note
+	}
 	for i, branch := range branches {
 		launch, prompt := launches[i%len(launches)], promptFor(i)
 		out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
@@ -743,6 +896,9 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 				}
 				verr.Hint.Available = names
 				verr.Message = "fan stopped at " + branch + ": " + verr.Message + " Sessions already started are kept."
+				if note := stamp(map[string]any{}); note != "" {
+					verr.Hint.Detail = strings.TrimSpace(verr.Hint.Detail + " " + note)
+				}
 			}
 			return nil, verr
 		}
@@ -750,14 +906,21 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 		windowID := out["window_id"].(string)
 		d.noteStartedBy(cs, windowID)
 		go d.deliverFanPrompt(sess, windowID, launch.harness, prompt, readyTimeout)
-		sessions = append(sessions, map[string]any{
+		if w, ok := out["warning"].(string); ok && !slices.Contains(warnings, w) {
+			warnings = append(warnings, w)
+		}
+		row := map[string]any{
 			"session":   out["session"],
 			"branch":    branch,
 			"path":      out["path"],
 			"window_id": windowID,
 			"agent":     launch.harness,
 			"command":   launch.command(),
-		})
+		}
+		if hookErr, ok := out["hook_error"]; ok {
+			row["hook_error"] = hookErr
+		}
+		sessions = append(sessions, row)
 	}
 	// agent, command and prompt name the first session's, which for a fan of
 	// one agent and one prompt is every session's, as they always were. The
@@ -777,6 +940,10 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	if cloned {
 		out["cloned"] = true
 	}
+	if len(warnings) > 0 {
+		out["warning"] = strings.Join(warnings, " ")
+	}
+	stamp(out)
 	return out, nil
 }
 

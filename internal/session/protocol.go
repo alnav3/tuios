@@ -421,9 +421,9 @@ type AttachPayload struct {
 	// renderer commands (for example a session shown in a sidebar rail).
 	// Command routing skips it; its viewport does not size the shared session.
 	Passive bool `json:"passive,omitempty"`
-	// Cwd is the start directory of a session this attach creates (CreateNew
-	// and no session by that name). See NewPayload.Cwd. An attach to a
-	// session that exists ignores it.
+	// Cwd is the start directory of a session this attach creates, whether
+	// unnamed/default or named with CreateNew. See NewPayload.Cwd. An attach
+	// to a session that exists ignores it.
 	Cwd string `json:"cwd,omitempty"`
 	// DetachOthers takes every other client off the session as this one
 	// attaches, as tuios attach -d asks. See detach_client.go. An older
@@ -541,6 +541,11 @@ type WindowSummary struct {
 	ID         string `json:"id"`
 	Title      string `json:"title"`
 	AgentState string `json:"agent_state,omitempty"`
+	// AgentReason is why AgentState is what it is when it is not the state
+	// the agent last gave: "silent" for a hooked pane that stopped
+	// reporting, whose AgentState here is unknown. Additive and omitted when
+	// empty. See WindowState.AgentReason.
+	AgentReason string `json:"agent_reason,omitempty"`
 	// AgentStateAt is when the pane entered AgentState (Unix nanoseconds).
 	// Additive and omitted when zero, so an older peer just reads no elapsed time.
 	AgentStateAt int64 `json:"agent_state_at,omitempty"`
@@ -574,6 +579,13 @@ type WindowSummary struct {
 	// rail watching another session can say so. Additive and omitted when zero,
 	// which is what an older peer sends.
 	AgentQueued int `json:"agent_queued,omitempty"`
+	// DraftHeld is WindowState.AgentDraftHeld. Additive and omitted when
+	// false, which is what an older peer sends.
+	DraftHeld bool `json:"agent_draft_held,omitempty"`
+	// AgentSettled is WindowState.AgentSettled, so the agents view of a
+	// client watching another session draws the agent on the Settled shelf
+	// too. Additive and omitted when false, which is what an older peer sends.
+	AgentSettled bool `json:"agent_settled,omitempty"`
 	// Subagents is how many subagents the pane's agent is running, so a rail
 	// watching another session can say so. Additive and omitted when zero,
 	// which is what an older peer sends.
@@ -601,6 +613,9 @@ type WindowSummary struct {
 	// leaves the row out, as the attached client does. Additive and omitted
 	// when false.
 	Scratch bool `json:"scratch,omitempty"`
+	// Note is the pane's return note (WindowState.Note). Additive and omitted
+	// when empty, which is what an older peer sends.
+	Note string `json:"note,omitempty"`
 }
 
 // ClientInfo describes one daemon connection for listing.
@@ -631,6 +646,10 @@ type SessionInfo struct {
 	// how a client reads "fall back to Name".
 	DisplayName string `json:"display_name,omitempty"`
 	Accent      string `json:"accent,omitempty"`
+	// Note is the session's return note (SessionState.Note), so a client can
+	// show it for a session it is not attached to. Omitted when empty, which
+	// is also what an older daemon sends.
+	Note string `json:"note,omitempty"`
 	// CurrentWorkspace is the workspace the session is showing, which is what
 	// decides whether one of its panes counts as "here" and so goes untagged.
 	// Additive and omitted when zero; a client reading zero tags nothing, which
@@ -656,6 +675,11 @@ type SessionInfo struct {
 	// Omitted when the session is in none, which is also what an older daemon
 	// sends.
 	Space string `json:"space,omitempty"`
+	// Rank is the session's place in the daemon's session order, which the
+	// listing is already sorted by. See SessionState.Rank. Omitted for a
+	// session nobody placed, and always by an older daemon: a listing with no
+	// rank anywhere is one whose order a client may still seed.
+	Rank int `json:"rank,omitempty"`
 	// Worktree is set for a session whose directory is a git worktree: which
 	// repository, which branch, and whether the directory still exists. It is
 	// what the rail groups by. Omitted for every other session, which is also
@@ -844,6 +868,12 @@ type ExecuteCommandPayload struct {
 	// current one. A client in a scratch group sends the group's workspace,
 	// which is never the session's current one. An older daemon ignores it.
 	Workspace int `json:"workspace,omitempty"`
+	// Cols and Rows are the size a NewWindow's pane will have once the
+	// client places it. The daemon starts the process at this size, so a
+	// shell is not resized while it starts. Zero leaves the session's size.
+	// An older daemon ignores them.
+	Cols int `json:"cols,omitempty"`
+	Rows int `json:"rows,omitempty"`
 	// SSHFrom names the window a NewWindow follows into ssh. When that
 	// window's pane runs an ssh or mosh client, the new window runs the same
 	// client to the same destination instead of a shell. When it does not,
@@ -874,6 +904,11 @@ type ExecuteCommandPayload struct {
 	// the request lands. The key still names it. An older daemon ignores it
 	// and reads Workspace.
 	TabKey int `json:"tab_key,omitempty"`
+	// KeepOpen keeps a NewWindow that runs a command after the command
+	// exits, with a line that shows the exit status, as new-window's
+	// keep_open does. See keep_open.go. An older daemon ignores it and
+	// closes the window when the command exits.
+	KeepOpen bool `json:"keep_open,omitempty"`
 }
 
 // CommandResultPayload contains the result of a remote command execution.

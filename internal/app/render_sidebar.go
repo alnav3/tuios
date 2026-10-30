@@ -1,6 +1,7 @@
 package app
 
 import (
+	"image"
 	"image/color"
 	"slices"
 	"sort"
@@ -14,7 +15,9 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	"github.com/Gaurav-Gosain/tuios/internal/theme"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -133,6 +136,10 @@ const (
 	// Activating it opens or shuts the rows. It carries the pane's session
 	// and window. See SidebarToggleSubagents.
 	sidebarRowSubagentToggle
+	// sidebarRowRailPaneStart is the line the pane section draws when its
+	// program stopped or did not start. Activating it starts it again. See
+	// rail_pane.go.
+	sidebarRowRailPaneStart
 )
 
 // sidebarAddGlyph is the mark both add controls wear. One cell, so it costs a
@@ -152,21 +159,43 @@ type sidebarRowState struct {
 	Cursor  bool // the keyboard cursor is on this row
 	Hover   bool // the pointer is over this row
 	Focused bool // the rail owns the keyboard
+	// CursorBg is appearance.sidebar.cursor_background as written, empty
+	// when unset. It is a string so a row state stays cheap to build per row;
+	// sidebarRowBg resolves it against the palette the row is drawn with.
+	CursorBg string
 }
 
 // lit reports whether the row is drawing any band at all, which is what the
 // parts of a row that only care about being on a ground ask.
 func (st sidebarRowState) lit() bool { return st.Cursor || st.Hover }
 
-// mark applies the 16-colour form of the row's state to a finished row (see
-// overlay.RowState). At other depths the row's ground already says it.
+// mark applies the row's state to a finished row in attributes (see
+// overlay.RowState). At 16 colours that is the whole cursor treatment. At
+// other depths the ground says it, and the cursor row also underlines its
+// text in the cursor's colour, since a see-through terminal or a rail with
+// its background off can show that ground as almost nothing. The underline
+// starts after the gutter and the state glyph, so the focus mark, the
+// severity mark and the foreign tint in the gutter keep their own meaning.
 func (st sidebarRowState) mark(pal overlay.Palette, row string) string {
-	return pal.Mark(row, overlay.RowState{Cursor: st.Cursor, Focused: st.Focused, Hover: st.Hover})
+	rs := overlay.RowState{Cursor: st.Cursor, Focused: st.Focused, Hover: st.Hover}
+	return pal.CursorText(pal.Mark(row, rs), rs, sidebarNameCol()-1)
 }
 
 // railRowState reads the rail's focus once so a row site does not have to.
 func (m *OS) railRowState(hover, cursor bool) sidebarRowState {
-	return sidebarRowState{Cursor: cursor, Hover: hover, Focused: m.sidebarRailFocused()}
+	return sidebarRowState{Cursor: cursor, Hover: hover, Focused: m.sidebarRailFocused(), CursorBg: m.Settings.SidebarCursorBackground}
+}
+
+// railCursorBg is the ground appearance.sidebar.cursor_background asks for on
+// pal, or nil when it is unset, not a colour, or the depth is 16 colours. At
+// 16 colours every ground is the terminal's own and the focused cursor is
+// reverse video (see sidebarRowState.mark), so a colour there would paint a
+// band the reverse video then inverts into something nobody chose.
+func railCursorBg(v string, pal overlay.Palette) color.Color {
+	if v == "" || pal.Depth == overlay.Depth16 {
+		return nil
+	}
+	return theme.ConfigColorOn(v, &pal)
 }
 
 // sidebarRowBg is the ground a row paints. Three steps, not one.
@@ -178,7 +207,7 @@ func (m *OS) railRowState(hover, cursor bool) sidebarRowState {
 // of a highlighted row.
 //
 // The cursor on a focused rail takes Surface, the strongest of the three
-// grounds. The cursor on an unfocused rail drops to RowSel, so a rail that does
+// grounds, or appearance.sidebar.cursor_background when that is set. The cursor on an unfocused rail drops to RowSel, so a rail that does
 // not own the keyboard stops claiming that it does while still saying where the
 // cursor will be when it gets it back. The mouse wash takes RowSel too, and is
 // told apart from an unfocused cursor by extent rather than by strength.
@@ -189,6 +218,9 @@ func (m *OS) railRowState(hover, cursor bool) sidebarRowState {
 func sidebarRowBg(st sidebarRowState, pal overlay.Palette) color.Color {
 	switch {
 	case st.Cursor && st.Focused:
+		if c := railCursorBg(st.CursorBg, pal); c != nil {
+			return c
+		}
 		return pal.Surface
 	case st.Cursor, st.Hover:
 		return pal.RowSel
@@ -250,6 +282,10 @@ const (
 	// the enum sizes every per-section array in this package, and one more
 	// value fits all of them as they are. See sidebar_custom.go.
 	sidebarSectionCustom
+	// sidebarSectionPane draws a live terminal pane, configured in
+	// [appearance.sidebar.pane]. Its rows are the pane's own rows, and the
+	// pane is sized to the lines the section is given. See rail_pane.go.
+	sidebarSectionPane
 	sidebarSectionCount
 )
 
@@ -504,11 +540,20 @@ type sidebarAgentEntry struct {
 	// AgentKind is what sort of block a needs_input pane is on ("approval",
 	// "question"), empty when the source did not say. The need token draws it.
 	AgentKind string
+	// Reason is why State is not the state the agent gave: "silent" for a
+	// hooked pane that stopped reporting. The need token says so.
+	Reason string
 	// Meta is what the pane reported about its agent through set-agent-meta,
 	// in the order the pane holds it. The meta and $key row tokens draw it.
 	Meta []sessiontree.MetaToken
 	// Queued is how many messages wait in the pane's delivery queue.
 	Queued int
+	// DraftHeld is true while the person's draft in the input box holds that
+	// queue. The agents view says so on the row.
+	DraftHeld bool
+	// Settled marks an agent the person put away: the agents view draws it
+	// on the Settled shelf until it needs the person again.
+	Settled bool
 	// Subagents is how many subagents the pane's agent is running, which the
 	// subagents row token draws.
 	Subagents int
@@ -527,9 +572,8 @@ type sidebarAgentEntry struct {
 	Foreign bool
 	// Host is the machine the pane's session is on, empty for this one.
 	Host string
-	// Focused marks the attached session's focused pane. On a compact rail the
-	// terminals section leaves agent panes to this section, so the focus mark
-	// goes on this row.
+	// Focused marks the attached session's focused pane. When the terminals
+	// section does not draw that pane's row, the focus mark goes on this row.
 	Focused bool
 	// Fold is set on the one entry that stands for the rows at rest the
 	// section folded away: how many, and FoldNames names them. It is no pane.
@@ -634,26 +678,21 @@ func sidebarFit(s string, cw int, bg color.Color) string {
 	return s
 }
 
-// chromeGlyphs are the symbol codepoints we draw ourselves: the agent-state
-// marks. They sit inside the decorative blocks printableTitle strips, so they
-// are named rather than kept by range. Read off agentStateMarks rather than
-// listed: the list was written by hand and left out unknown's "□", so the
-// palette's row for an agent in that state lost its mark.
-var chromeGlyphs = func() map[rune]bool {
-	out := make(map[rune]bool, len(agentStateMarks))
-	for _, m := range agentStateMarks {
-		for _, r := range m.glyph {
-			out[r] = true
-		}
-	}
-	return out
-}()
+// chromeGlyph reports whether r is part of an agent-state mark: one of ours,
+// or one the active glyph set names. The marks sit inside the decorative
+// blocks printableTitle strips, so they are named rather than kept by range,
+// and they are read off the marks themselves rather than listed: the list was
+// written by hand and left out unknown's "□", so the palette's row for an
+// agent in that state lost its mark.
+func chromeGlyph(r rune) bool {
+	return config.IsAgentMarkRune(r, overlay.UseASCII())
+}
 
 // printableTitle strips what a terminal cannot be trusted to render out of a
 // title before it is shown as chrome (sidebar rows, the window title badge, the
-// command palette, the dock): control characters and private-use codepoints
-// (nerd-font icons shells love to put in titles, which show as tofu boxes
-// without the right font), decorative symbol and emoji codepoints (an agent
+// command palette, the dock): control characters, private-use codepoints
+// while Nerd Fonts are off (nerd-font icons, which show as tofu boxes without
+// the right font; see printableRune), decorative symbol and emoji codepoints (an agent
 // setting a dingbat or emoji in its title otherwise tofus wherever we echo it),
 // plus everything non-ASCII when ASCII-only rendering is on. Titles are foreign
 // data; our own chrome glyphs are audited, so they are kept by codepoint.
@@ -697,13 +736,17 @@ func printableRune(r rune, ascii bool) bool {
 		// override reorders what follows it, so a name holding one reads as
 		// something it is not.
 		return false
-	case r >= 0xe000 && r <= 0xf8ff:
-		// BMP private use area.
-		return false
-	case r >= 0xf0000:
-		// Plane 15/16 private use.
-		return false
-	case r >= 0x25a0 && r <= 0x2bff && !chromeGlyphs[r]:
+	case r >= 0xe000 && r <= 0xf8ff, r >= 0xf0000:
+		// The private use area: the BMP block and planes 15 and 16. Nerd
+		// Font icons live here, and a person puts them in a session or
+		// workspace name on purpose. They are kept while Nerd Fonts are on,
+		// which is when tuios draws its own icons from the same font, so a
+		// terminal that shows those shows these. Each is one cell to
+		// ansi.StringWidth, the emulator and the host terminal alike, so
+		// keeping them moves no column. With Nerd Fonts off (ASCII mode, or
+		// a font with none) they would be tofu boxes, so they go.
+		return overlay.UseNerdFonts()
+	case r >= 0x25a0 && r <= 0x2bff && !chromeGlyph(r):
 		// Geometric Shapes through Miscellaneous Symbols and Arrows. Agents
 		// park spinners and status ornaments in here (Claude Code alone uses
 		// U+2733 idle and a U+2802/U+2810 Braille spinner) and they tofu in
@@ -713,7 +756,7 @@ func printableRune(r rune, ascii bool) bool {
 	case r >= 0xfe00 && r <= 0xfe0f:
 		// Variation Selectors (VS1-16), including the emoji VS16.
 		return false
-	case r >= 0x1f000 && r <= 0x1faff:
+	case r >= 0x1f000 && r <= 0x1faff && !chromeGlyph(r):
 		// Emoji and pictographic planes (Regional Indicator flag halves
 		// U+1F1E6-1F1FF sit inside this span).
 		return false
@@ -723,14 +766,16 @@ func printableRune(r rune, ascii bool) bool {
 	return true
 }
 
-// sidebarNameCol is the column every rail row's text starts on: gutter, glyph,
-// one cell of air. One spine for all three sections, which is what the flat
-// layout buys over the tree.
-const sidebarNameCol = 3
+// sidebarNameCol is the column every rail row's text starts on: gutter, then
+// the mark and its gap (agentMarkLead), the same whichever mark the row
+// wears. One spine for all three sections, which is what the flat layout buys
+// over the tree.
+func sidebarNameCol() int { return 1 + agentMarkLead() }
 
 // sidebarGlyph returns the styled agent-state glyph for a row, or a single
-// space on the row background when there is no state or glyphs are disabled,
-// so rows stay aligned. It always occupies exactly one cell.
+// space on the row background when there is no state or glyphs are disabled.
+// It is one cell, or two for a glyph set's two-cell mark; sidebarMarkCell
+// follows it with the gap that keeps the rows aligned.
 //
 // running is how many subagents the pane's agent is running, which turns a
 // pane at rest into waiting (see displayState).
@@ -1212,13 +1257,19 @@ func sidebarComposeRow(gutter, glyph, name, right string, cw int, bg color.Color
 // step is what says the rows are somebody's.
 func sidebarComposeGroupRow(indent int, gutter, glyph, name, right string, cw int, bg color.Color) string {
 	row := gutter + sidebarStyle(bg, nil).Render(strings.Repeat(" ", max(indent, 0))) +
-		glyph + sidebarStyle(bg, nil).Render(" ") + name
+		sidebarMarkCell(glyph, bg) + name
 	if rw := lipgloss.Width(right); rw > 0 {
 		gap := max(cw-lipgloss.Width(row)-rw-1, 0)
 		row += sidebarStyle(bg, nil).Render(strings.Repeat(" ", gap)) +
 			right + sidebarStyle(bg, nil).Render(" ")
 	}
 	return sidebarFit(row, cw, bg)
+}
+
+// sidebarMarkCell is a row's styled glyph and the gap after it, which end on
+// the name spine whether the glyph is one cell or two (agentMarkGap).
+func sidebarMarkCell(glyph string, bg color.Color) string {
+	return glyph + sidebarStyle(bg, nil).Render(agentMarkGap(glyph))
 }
 
 // sidebarRuleInk is the ink a heading's rule takes. The rule is a separator, so
@@ -1244,7 +1295,7 @@ func sidebarRuleInk(bg color.Color, pal overlay.Palette) color.Color {
 // on.
 func sidebarComposeRuledRow(indent int, gutter, glyph, name, right string, cw int, bg color.Color, pal overlay.Palette, s *config.Settings) string {
 	row := gutter + sidebarStyle(bg, nil).Render(strings.Repeat(" ", max(indent, 0))) +
-		glyph + sidebarStyle(bg, nil).Render(" ") + name
+		sidebarMarkCell(glyph, bg) + name
 	rw := lipgloss.Width(right)
 	pad := 1
 	if rw > 0 {
@@ -1280,7 +1331,7 @@ func sidebarNameAvailIn(cw, rightW, indent int) int {
 	if rightW > 0 {
 		rightW += 2 // the inset cell, and the gap in front of the figure
 	}
-	return max(cw-sidebarNameCol-max(indent, 0)-rightW, 1)
+	return max(cw-sidebarNameCol()-max(indent, 0)-rightW, 1)
 }
 
 // renderSidebar composes the vertical session sidebar as a single layer, the way
@@ -1428,7 +1479,7 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 	// While the rail owns the keyboard its edge rule burns accent instead of the
 	// dock's muted hairline, so the focus is legible at the frame, not only on a
 	// single highlighted row.
-	if m.sidebarRailFocused() {
+	if m.sidebarRailFocused() || !m.sidebarDrawing && m.RailPaneFocused() {
 		edge = lipgloss.NewStyle().Foreground(pal.Accent).Render(m.Settings.GetWindowBorderLeft())
 	}
 
@@ -1484,6 +1535,10 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 	switch {
 	case m.sidebarFollowSession != "":
 		cursorTarget = sidebarNavRow{Kind: sidebarRowSession, SessionID: m.sidebarFollowSession}
+		haveCursorTarget = true
+	case m.sidebarCursorWantSet:
+		// A row the keyboard moved to that this frame may have to scroll to.
+		cursorTarget = m.sidebarCursorWant
 		haveCursorTarget = true
 	case m.SidebarCursor >= 0 && m.SidebarCursor < len(m.SidebarNav):
 		cursorTarget = m.SidebarNav[m.SidebarCursor]
@@ -1615,6 +1670,21 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 	if nC == 0 && m.railCustomEnabled() {
 		nC = 1
 	}
+	// The pane section asks for the rows its height names, or for the whole
+	// rail when it names none, so its share in the layout is what sizes it.
+	// With no pane yet it keeps one row, for the line that says why.
+	paneWin := m.railPaneWindow()
+	nP := 0
+	if m.railPaneEnabled() && cw >= config.SidebarPaneMinCols {
+		switch {
+		case paneWin == nil || paneWin.Rail != m.railPaneConfig().CommandLine():
+			nP = 1
+		case m.railPaneConfig().Height > 0:
+			nP = m.railPaneConfig().Height
+		default:
+			nP = height
+		}
+	}
 	rowsIn := [sidebarSectionCount]int{
 		sidebarSectionSessions:  nS,
 		sidebarSectionTerminals: nT,
@@ -1622,6 +1692,7 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 		sidebarSectionFiles:     filesRows,
 		sidebarSectionGit:       len(gitRows),
 		sidebarSectionCustom:    nC,
+		sidebarSectionPane:      nP,
 	}
 	// The last section in the configured layout is the one pinned to the rail's
 	// bottom: the slack rides above it, and it wears a blank line of its own so
@@ -1644,7 +1715,7 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 	agentRowH := 1
 	// Row heights per section, which is what turns a section's line budget into
 	// the rows it can show and a st.lit() line back into the row under it.
-	rowH := [sidebarSectionCount]int{1, 1, agentRowH, 1, 1, 1}
+	rowH := [sidebarSectionCount]int{1, 1, agentRowH, 1, 1, 1, 1}
 
 	// The chrome each drawn section costs before a row of it appears: its own
 	// header, plus the floating blank in front of the pinned block.
@@ -1844,13 +1915,42 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 	if m.sidebarRailFocused() && haveCursorTarget {
 		if sec, idx, ok := m.sidebarCursorIndex(cursorTarget, sessionRows, terminals, agents, files); ok {
 			if rows := capRows[sec]; rows > 0 {
+				// A section with rows below its fold spends its last line on
+				// the "+N" row, so only rows-1 of its rows are drawn. The
+				// cursor on the row under that line was not drawn at all
+				// (issue #1102), so the fold is a line higher than the budget
+				// unless the window already reaches the section's end.
+				fold := rows
+				if rows > 1 && rowsIn[sec] > rows && *scroll[sec] < rowsIn[sec]-rows {
+					fold = rows - 1
+				}
 				if idx < *scroll[sec] {
 					*scroll[sec] = idx
-				} else if idx >= *scroll[sec]+rows {
-					*scroll[sec] = idx - rows + 1
+				} else if idx >= *scroll[sec]+fold {
+					*scroll[sec] = idx - rows + 2
+					if idx == rowsIn[sec]-1 || rows == 1 {
+						*scroll[sec] = idx - rows + 1
+					}
 				}
 			}
 		}
+	}
+	// The pane is sized to the lines it was given, so it has no rows below
+	// a fold: no "+N" line and no scroll thumb.
+	rowsIn[sidebarSectionPane] = min(rowsIn[sidebarSectionPane], capRows[sidebarSectionPane])
+	if !m.sidebarDrawing && m.railPaneEnabled() {
+		// Where the pane's cells land, for the pointer and for the size the
+		// pane is given. No lines, or no pane yet, is a pane off the screen.
+		m.railPaneView.cols, m.railPaneView.rows, m.railPaneView.rect = 0, 0, image.Rectangle{}
+		if p := place[sidebarSectionPane]; p.header >= 0 && p.lines > 0 && paneWin != nil && paneWin.Rail == m.railPaneConfig().CommandLine() {
+			lines := min(p.lines, height-p.top)
+			if lines > 0 {
+				y0 := topMargin + p.top
+				m.railPaneView.cols, m.railPaneView.rows = cw, lines
+				m.railPaneView.rect = image.Rect(contentX0, y0, contentX0+cw, y0+lines)
+			}
+		}
+		m.railPaneApply()
 	}
 	var start, count, hidden [sidebarSectionCount]int
 	for s := range rowsIn {
@@ -1859,6 +1959,21 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 	}
 	m.sidebarRecordAgentAnchor(agents, start[sidebarSectionAgents], count[sidebarSectionAgents])
 	m.sidebarRecordReveal()
+	// Whether this frame draws the focused pane's terminals row, which is the
+	// row that carries the focus mark. When it does not, the agents row of that
+	// pane carries the mark instead, so the rail never loses the pane you are
+	// in: the layout may leave terminals out, the compact rule may take the
+	// pane out of it, a short rail may scroll the row away, and a peek shows
+	// another session's panes in its place.
+	focusDrawn := false
+	if !peeking && !emptyPeek {
+		for i := range count[sidebarSectionTerminals] {
+			if terminals[start[sidebarSectionTerminals]+i].Focused {
+				focusDrawn = true
+				break
+			}
+		}
+	}
 
 	// The scroll thumb of every section with rows out of view, drawn in the
 	// edge rule's own cell beside the section's rows. It takes no column from
@@ -1969,7 +2084,7 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 	overflowRow := func(n, indent int) string {
 		// Stands in for the rows it hides, so it starts where their names do.
 		more := overlay.Ellipsis() + " +" + strconv.Itoa(n)
-		return compose(sidebarFit(strings.Repeat(" ", sidebarNameCol+indent)+
+		return compose(sidebarFit(strings.Repeat(" ", sidebarNameCol()+indent)+
 			sidebarStyle(nil, pal.FgMute).Render(more), cw, nil))
 	}
 	// recordToken publishes a header control's rectangle and its nav row, the
@@ -2150,6 +2265,18 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 				st.Cursor = st.Cursor || isCursor(row.Kind, "", row.Key)
 				recordHit(row.Kind, "", row.Key, row.Index, 1)
 			}
+			// The row a drag carries looks picked up: the hover ground, and
+			// at 16 colours its underline, until the drop or the cancel.
+			if m.fileRowHeld(row) {
+				st.Hover = true
+			}
+			if row.Tree {
+				// A tree row's name starts past its guides and marks, and only
+				// the name takes the cursor's underline.
+				rs := overlay.RowState{Cursor: st.Cursor, Focused: st.Focused, Hover: st.Hover}
+				lines = append(lines, compose(pal.CursorText(pal.Mark(m.sidebarFileRow(row, cw, pal, st), rs), rs, m.fileTreeNameCol(row))))
+				continue
+			}
 			lines = append(lines, compose(st.mark(pal, m.sidebarFileRow(row, cw, pal, st))))
 		}
 		if h := hidden[sidebarSectionFiles]; h > 0 {
@@ -2262,12 +2389,12 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 			st := m.railRowState(idx == hoverRow[sidebarSectionAgents], isCursor(sidebarRowAgent, e.SessionID, e.WindowID))
 			tall := rowH[sidebarSectionAgents] > 1
 			recordHit(sidebarRowAgent, e.SessionID, e.WindowID, e.WindowIndex, rowH[sidebarSectionAgents])
-			row, bodyW := m.sidebarAgentRow(e, variant, cw, pal, st, tall)
+			row, bodyW := m.sidebarAgentRow(e, variant, cw, pal, st, tall, e.Focused && !focusDrawn)
 			// A working agent's name is where the shimmer sweeps. Recorded
 			// only for that state, so a rail with no working agent records
 			// nothing and the motion clock never starts. See shimmer.go.
 			if e.State == "working" && bodyW > 0 {
-				x0 := contentX0 + sidebarNameCol
+				x0 := contentX0 + sidebarNameCol()
 				m.motion.rail = append(m.motion.rail, shimmerSpan{
 					y: topMargin + len(lines), x0: x0, x1: min(x0+bodyW, contentX0+cw),
 				})
@@ -2282,6 +2409,31 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 		}
 	}
 
+	drawPane := func() {
+		title := m.railPaneConfig().ResolvedTitle()
+		lines = append(lines, compose(sidebarHeaderRowRuled(title, "", cw, pal, &m.Settings)))
+		n := count[sidebarSectionPane]
+		if n <= 0 {
+			return
+		}
+		if w := m.railPaneWindow(); m.railPaneView.rows > 0 && w != nil {
+			for _, line := range m.railPaneLines(w, cw, n) {
+				lines = append(lines, compose(line))
+			}
+			return
+		}
+		note, restart := m.railPaneNote()
+		st := m.railRowState(hoverRow[sidebarSectionPane] == 0, false)
+		if restart {
+			recordHit(sidebarRowRailPaneStart, "", "", -1, 1)
+		}
+		row := sidebarStyle(nil, pal.FgMute).Render(" " + ansi.Truncate(note, max(cw-1, 1), "…"))
+		lines = append(lines, compose(st.mark(pal, sidebarFit(row, cw, nil))))
+		for range n - 1 {
+			lines = append(lines, blank)
+		}
+	}
+
 	draw := [sidebarSectionCount]func(){
 		sidebarSectionSessions:  drawSessions,
 		sidebarSectionTerminals: drawTerminals,
@@ -2289,6 +2441,7 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 		sidebarSectionFiles:     drawFiles,
 		sidebarSectionGit:       drawGit,
 		sidebarSectionCustom:    drawCustom,
+		sidebarSectionPane:      drawPane,
 	}
 	drawnAt := 0
 	for i, p := range plans {
@@ -2368,6 +2521,16 @@ func (m *OS) sidebarPanelLinesForTree(tree sessiontree.Tree) ([]string, int) {
 // across a relayout (reorder, switch, filter, peek). A follow request is
 // consumed here, once the row it named exists in the new layout.
 func (m *OS) sidebarPublishNav(nav []sidebarNavRow, target sidebarNavRow, haveTarget bool) {
+	// A row the keyboard moved to that this frame could not draw (a name gone
+	// from the listing) leaves the cursor on the row it was on, not on the
+	// rail's first row.
+	if m.sidebarCursorWantSet {
+		m.sidebarCursorWantSet = false
+		if !slices.ContainsFunc(nav, func(r sidebarNavRow) bool { return sidebarNavRowsEqual(r, target) }) &&
+			m.SidebarCursor >= 0 && m.SidebarCursor < len(m.SidebarNav) {
+			target = m.SidebarNav[m.SidebarCursor]
+		}
+	}
 	m.SidebarNav = nav
 	m.sidebarFollowSession = ""
 	// A pending walk into or out of a folder outranks the tracked row, because
@@ -2378,6 +2541,13 @@ func (m *OS) sidebarPublishNav(nav []sidebarNavRow, target sidebarNavRow, haveTa
 			m.SidebarCursor = i
 			return
 		}
+	}
+	if haveTarget && isFileListRow(target.Kind) {
+		// A name that left the section (its folder closed or was deleted, or
+		// the style changed) hands the cursor to the nearest row it was under,
+		// not to the rail's first row: a d pressed next must not land on a
+		// session.
+		target = sidebarFileFallback(nav, target)
 	}
 	if haveTarget {
 		m.SidebarCursor = 0
@@ -2391,6 +2561,31 @@ func (m *OS) sidebarPublishNav(nav []sidebarNavRow, target sidebarNavRow, haveTa
 	if m.SidebarCursor >= len(nav) {
 		m.SidebarCursor = max(len(nav)-1, 0)
 	}
+}
+
+// sidebarFileFallback is target when nav holds it, else the row of the
+// nearest folder above it that nav holds, else the files section's first row,
+// else target.
+func sidebarFileFallback(nav []sidebarNavRow, target sidebarNavRow) sidebarNavRow {
+	has := func(r sidebarNavRow) bool {
+		return slices.ContainsFunc(nav, func(n sidebarNavRow) bool { return sidebarNavRowsEqual(n, r) })
+	}
+	if has(target) {
+		return target
+	}
+	for key := fileTreeParentKey(target.WindowID); key != ""; key = fileTreeParentKey(key) {
+		for _, r := range nav {
+			if r.Kind == sidebarRowFileEntry && r.WindowID == key {
+				return r
+			}
+		}
+	}
+	for _, r := range nav {
+		if isFileListRow(r.Kind) {
+			return r
+		}
+	}
+	return target
 }
 
 // sidebarFileRowIndex is the index of the named entry in the files section, or
@@ -2570,9 +2765,12 @@ func (m *OS) agentEntries(sessions []sessiontree.Node) []sidebarAgentEntry {
 				StateAt:      win.StateAt,
 				Harness:      win.Harness,
 				Message:      win.Message,
+				Reason:       win.Reason,
 				AgentKind:    win.AgentKind,
 				Meta:         win.Meta,
 				Queued:       win.Queued,
+				DraftHeld:    win.DraftHeld,
+				Settled:      win.Settled,
 				Subagents:    win.Subagents,
 				Children:     win.SubagentList,
 				Program:      win.Program,
@@ -2765,7 +2963,7 @@ func (m *OS) sidebarFooter(variant, cw int, pal overlay.Palette,
 	// corners, so which of them is built first depends on which side the rail is
 	// on, and recording them in construction order put the outer one's rectangle
 	// before the inner one's on a left-hand rail.
-	slices.SortFunc(items, func(a, b placed) int { return a.zone.X0 - b.zone.X0 })
+	sortx.ShortStableFunc(items, func(a, b placed) int { return a.zone.X0 - b.zone.X0 })
 
 	zones := make([]sidebarFooterZone, 0, len(items))
 	for _, it := range items {
@@ -2810,6 +3008,10 @@ func (m *OS) windowIndexByID(id string) int {
 //
 // A drag in progress keeps the band on the dragged row while it rides the
 // pointer.
+// railNoteMin is the fewest cells a return note is drawn in after a name:
+// fewer than that says nothing but an ellipsis.
+const railNoteMin = 4
+
 func (m *OS) sidebarSessionRow(node sessiontree.Node, sessionIdx, variant, cw int, pal overlay.Palette, st sidebarRowState, dragged, showCounts bool) string {
 	rowBg := sidebarRowBg(st, pal)
 	if dragged {
@@ -2869,7 +3071,8 @@ func (m *OS) sidebarSessionRow(node sessiontree.Node, sessionIdx, variant, cw in
 	indent := m.sidebarNodeIndent(node)
 	// A worktree session is named by its branch under its repository's row,
 	// behind the mark that says whether the group goes on below it. The branch
-	// is the whole label there, so nothing rides after it.
+	// is the whole label there, so nothing rides after it. A Named session
+	// keeps its own name there, and the branch rides after it as on any row.
 	grouped := false
 	if label, ok := m.sidebarWorktreeLabel(node); ok {
 		title, grouped = label, true
@@ -2880,8 +3083,20 @@ func (m *OS) sidebarSessionRow(node sessiontree.Node, sessionIdx, variant, cw in
 	// name in the row's budget, see railRowFit, and the figures on the right
 	// are offered their cells before it.
 	b := ""
-	if !grouped && variant == sidebarVariantFull {
-		b = printableTitle(node.Branch)
+	if variant == sidebarVariantFull {
+		switch {
+		case !grouped:
+			b = printableTitle(node.Branch)
+		case node.Named:
+			b = printableTitle(node.Worktree.Branch)
+		}
+	}
+	// A return note takes the branch's slot. It is cut to whatever room the
+	// name leaves rather than kept whole or dropped, so it costs the name no
+	// cells: it is not a token of the fit.
+	note := ""
+	if node.Note != "" && variant == sidebarVariantFull {
+		note, b = printableTitle(node.Note), ""
 	}
 	s := &m.railFit
 	s.tokens = append(s.tokens[:0], railToken{Whole: true})
@@ -2913,8 +3128,11 @@ func (m *OS) sidebarSessionRow(node sessiontree.Node, sessionIdx, variant, cw in
 	keep, avail := railRowFitInto(s.keep, titleW, railNameKeep(titleW), s.tokens, sidebarNameAvailIn(cw, 0, indent)-markW-capsW)
 	s.keep = keep
 	branch := ""
-	if keep[0] {
+	if keep[0] && b != "" {
 		branch = sidebarStyle(rowBg, nil).Render(" ") + sidebarStyle(rowBg, pal.FgMute).Render(b)
+	}
+	if room := avail - titleW - 1; note != "" && room >= railNoteMin {
+		branch = sidebarStyle(rowBg, nil).Render(" ") + sidebarStyle(rowBg, pal.FgMute).Render(overlay.Truncate(note, room))
 	}
 	right := sidebarJoinFigures(figures[:], keep[1:], sidebarStyle(rowBg, pal.FgMute))
 	shown := m.sidebarMarquee("s:"+node.ID, title, max(avail, 1), st.Cursor)
@@ -3096,7 +3314,7 @@ func (m *OS) sidebarAgentsEmptyRow(total, cw int, pal overlay.Palette, st sideba
 		sep = " . "
 	}
 	text := "none here" + sep + strconv.Itoa(total) + " all"
-	return sidebarFit(sidebarStyle(rowBg, nil).Render(strings.Repeat(" ", sidebarNameCol))+
+	return sidebarFit(sidebarStyle(rowBg, nil).Render(strings.Repeat(" ", sidebarNameCol()))+
 		sidebarStyle(rowBg, fg).Render(overlay.Truncate(text, sidebarNameAvail(cw, 0))), cw, rowBg)
 }
 
@@ -3142,7 +3360,7 @@ func sidebarAgentName(e sidebarAgentEntry) string {
 // sentence.
 func (m *OS) sidebarAgentNoteRow(e sidebarAgentEntry, variant, cw int, pal overlay.Palette, st sidebarRowState) string {
 	rowBg := sidebarRowBg(st, pal)
-	indent := sidebarNameCol + 1
+	indent := sidebarNameCol() + 1
 	avail := sidebarNameAvail(cw, 0) - 1
 	plan := m.sidebarAgentTokensFor(e, variant, true, time.Now())
 	quiet := sidebarStyle(rowBg, pal.FgMute)
@@ -3316,7 +3534,10 @@ func sidebarNoteSentence(name string) bool {
 //
 // It also returns how many columns the name and the tokens around it take, from
 // sidebarNameCol, which is the span the working shimmer sweeps.
-func (m *OS) sidebarAgentRow(e sidebarAgentEntry, variant, cw int, pal overlay.Palette, st sidebarRowState, tall bool) (string, int) {
+//
+// focusMark puts the focus mark in the row's gutter. The caller sets it on the
+// focused pane's row when no terminals row on the rail marks that pane.
+func (m *OS) sidebarAgentRow(e sidebarAgentEntry, variant, cw int, pal overlay.Palette, st sidebarRowState, tall, focusMark bool) (string, int) {
 	var rowBg color.Color
 	fg := pal.FgDim
 	if e.State == "done" && !e.DoneSeen {
@@ -3414,7 +3635,7 @@ func (m *OS) sidebarAgentRow(e sidebarAgentEntry, variant, cw int, pal overlay.P
 		right += sidebarStyle(rowBg, pal.AccentBright).Render(mail)
 	}
 	// An agent row is only ever "current" through the pane it points at, which
-	// the terminals section already marks, so its gutter carries severity, and
+	// the terminals section usually marks, so its gutter carries severity, and
 	// below that the fact that the pane is somewhere else. The mark is drawn on
 	// foreign rows only, so it says "not from here" on a terminal with no colour
 	// and says which session on one with colour. It is the answer the prefix
@@ -3425,9 +3646,10 @@ func (m *OS) sidebarAgentRow(e sidebarAgentEntry, variant, cw int, pal overlay.P
 			gutter = sidebarStyle(rowBg, tint).Render(accentMark())
 		}
 	}
-	// On a compact rail this is the pane's only row, so it carries the focus
-	// mark the terminals row would have.
-	if e.Focused && m.GetSidebarWidth() <= sidebarCompactWidth && sidebarLayoutHas(sidebarSectionTerminals, &m.Settings) {
+	// When no terminals row marks the focused pane, this row carries the mark
+	// the terminals row would have. The state glyph and the bold name still
+	// say that the pane wants a human.
+	if focusMark {
 		gutter = sidebarGutterTinted(true, e.State, m.sessionTint(e.SessionID, m.rowGround(rowBg)), rowBg, pal, &m.Settings)
 	}
 	body := shown +

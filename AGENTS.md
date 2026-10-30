@@ -98,6 +98,23 @@ Run `just check --changed` before you mark a pull request ready. It runs
 diff first. `go fix -diff ./...` prints the patches. Fix a finding at the
 root. A `//nolint` needs its reason on the same line.
 
+### What CI runs on a pull request
+
+`.github/workflows/ci.yml` starts with a changes job. The job runs
+`scripts/ci-changes.sh`, which reads the diff and names the jobs and the Go
+packages the change can affect. A package is affected when it changed, or when
+its test binary builds a package that changed. A job that the changes job does
+not name shows as skipped. A change to a module file beyond the library pins,
+to a CI file, or to a path no rule names runs everything. A push to main runs
+every job, except ghostty-vt, learn-web, clienttests, the image build and the
+Nix vendor hash. Those run on main only when the push changed their inputs.
+The e2e suite selects its own tests (see Testing Approach). See what a branch
+runs:
+
+```bash
+CHANGES_BASE=origin/main scripts/ci-changes.sh
+```
+
 ### Browser build (Learn tuios)
 
 `cmd/tuios-wasm` is tuios compiled to WebAssembly for the guided tour at
@@ -107,10 +124,19 @@ tuios.dev/learn: the real app in Learn mode, with a fake shell
 three directories, so the native build is unchanged. The page API and event
 contract are in [cmd/tuios-wasm/README.md](cmd/tuios-wasm/README.md).
 
+The lessons are data in `internal/learn/lessons`: `tracks.json` and one
+`tracks/<id>.json` per track, with a rule per step that says when it is done.
+The lesson engine there is the only one, and the page draws its `lesson.*`
+events. Edit a track there, never in tuios-docs, then run `go generate
+./internal/learn/lessons`, which packs the files into the archive the binary
+embeds. The `tuioslint` gate checks every action, overlay, event and key a lesson names, so a rename that breaks
+a lesson fails the change that renames it.
+
 ```bash
 cmd/tuios-wasm/build.sh out/                  # the files the docs site needs
 node cmd/tuios-wasm/serve.mjs out/ 8765       # try it at http://127.0.0.1:8765
-go test ./internal/webshell/ ./internal/learn/  # native tests of the Go side
+go test ./internal/webshell/ ./internal/learn/...  # native tests of the Go side
+node cmd/tuios-wasm/smoke-lessons.mjs out/ frames/ basics  # a track by show me
 ```
 
 A change to `internal/app` or `internal/input` can break the js build without
@@ -213,14 +239,16 @@ tuios/
 │   ├── release/            # Finds published releases and verifies a downloaded binary (tuios update)
 │   ├── netutil/            # Small network helpers the servers share
 │   ├── memtrim/            # Gives the heap a burst left behind back to the OS once the process settles
+│   ├── dnd/                # The kitty drag and drop protocol (OSC 72) on the wire: parse, join chunks, write
 │   ├── harness/            # Agent harness manifests and detection
 │   ├── herdrplugin/        # herdr plugins: manifest, discovery, the command runner (the host is internal/session/plugin_host.go)
 │   ├── integration/        # Wires harness hooks, plugins and MCP entries (tuios integration)
 │   ├── mcp/                # The MCP server behind tuios mcp
 │   ├── risk/               # Marks an approval risky by the shipped and configured rules
 │   ├── agentproto/         # Headless agents over ACP and the Codex app-server: the pane program of start-agent --protocol
-│   ├── learn/              # Learn tuios: tour model, event contract, page commands
+│   ├── learn/              # Learn tuios: tour model, event contract, page commands, lessons/ (the tracks as data and the engine)
 │   ├── webshell/           # In-memory pty and fake shell for the browser build
+│   ├── tutor/              # tuios tutor: Learn mode in this terminal, in a sandbox, with the coach card
 │   ├── hooks/              # Shell hooks on window/session/agent events
 │   ├── tmuxcompat/         # The opt-in tmux shim (tuios tmux-shim) and its pane holder; see docs/TMUX_SHIM.md
 │   ├── shimlink/           # The tmux and herdr links that run tuios as another program
@@ -387,6 +415,16 @@ The E2E suite runs a real `tuios` binary against real daemons. It is under
 ```bash
 go build -o /tmp/tuios ./cmd/tuios
 cd e2e/tui && TUIOS_E2E=1 TUIOS_E2E_BIN=/tmp/tuios go test -count=1 -timeout 40m .
+```
+
+A pull request runs only the e2e tests its change can reach. `e2e/tui/testselect`
+reads the diff and `e2e/tui/testselect/testmap.txt`, which records the functions
+each test ran in a coverage run. The e2e-tui test map workflow refreshes the map
+every week. CI files, the harness, `go.mod` beyond library pins, and any path no
+rule names run the whole suite. Main always runs the whole suite.
+
+```bash
+cd e2e/tui && TUIOS_E2E=1 go test -list '^Test' . | go run ./testselect -base origin/main
 ```
 
 A test that claims to cover a bug must fail on a build with the fix removed.

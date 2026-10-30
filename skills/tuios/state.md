@@ -16,8 +16,16 @@ tuios set-agent-state none -s "$TUIOS_SESSION" -w "$TUIOS_PANE_ID"    # clear it
 The states are `none`, `working`, `needs_input`, `idle`, `done`, `errored` and
 `unknown`. `unknown` is what the daemon writes to a pane it has lost track of:
 an agent is there and nothing says what it is doing, so `ask-agent` and `fan`
-do not type into it. With no `-w` the report lands on the focused window, which
-is wrong when you are not the focused pane.
+do not type into it. From inside a pane, a report with no `-s` and no `-w` is
+about that pane. From outside every pane, it lands on the focused window.
+
+A pane that reported `working` and then sends no report for
+`[agents] silent_after` (default `10m`) shows as `unknown` with
+`reason: silent` in `get-agent-state`, `list-agents` and the `agent-state`
+event. Its rail row reads "No report for N min". The state underneath stays
+`working`, so nothing types into the pane. Your next report clears it, even
+one that its `if_state` refuses. Report at each step of a long task, so that
+a long step does not read as a hang.
 
 `get-agent-state` and `list-agents` also report `needs_you` (true for
 `needs_input` and `errored`), `blocked_by` (`approval`, `question` or `auth`,
@@ -153,6 +161,11 @@ and gives up after 500ms, so a dead daemon never slows the harness.
 now runs the same reporter. Outside tuios, with `TUIOS_ENV` unset, it reports
 nothing.
 
+Pi's version 3 integration also tells Tuios which entry of the session tree Pi
+has selected, `/tree` changes included, so the Inbox shows that branch. Reload Pi
+after updating its managed integration. Only the person reads the conversation:
+this gives an agent no way to read another pane's transcript.
+
 To report the same things by hand from another harness's hooks:
 
 ```sh
@@ -261,5 +274,8 @@ tuios resume-agent -s work -w build             # type it into that pane's shell
 
 `resume-agent` types only into a shell at its prompt (`not_ready` otherwise) and
 answers `not_resumable` for a pane with no id, a harness with no `[resume]`
-block, or a pane on another machine. The command comes from the manifest and
-the stored id only.
+block, or a pane on another machine. The command comes from the manifest, the
+stored id, and the flags the agent was started with that the manifest keeps
+(`--model` and `--permission-mode` for Claude Code, for example). A kept flag
+that turns approvals off is named on the Resume row, and `auto` leaves that
+agent for the person.

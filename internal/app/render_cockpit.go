@@ -48,6 +48,10 @@ type ckLookKey struct {
 	// The palette's grounds and inks: with theme none they follow the host
 	// terminal's colours, which change with no new theme generation.
 	canvas, panel, fg, accent color.Color
+	// The glyph set, whose state marks the cockpit draws (ckStateMark). A
+	// selected set is a new value, so a change of set rebuilds the look and
+	// with it every frame keyed on the look.
+	glyphs *theme.GlyphSet
 }
 
 // cockpitLook is the look for the depth in force, built again only when the
@@ -57,7 +61,7 @@ func (m *OS) cockpitLook() ckLook {
 	ck := &m.Inbox.ck
 	pal := theme.UI()
 	key := ckLookKey{theme: theme.Generation(), depth: pal.Depth, ascii: overlay.UseASCII(), plain: m.Settings.NoNerdFont,
-		canvas: pal.Canvas, panel: pal.Panel, fg: pal.Fg, accent: pal.Accent}
+		canvas: pal.Canvas, panel: pal.Panel, fg: pal.Fg, accent: pal.Accent, glyphs: theme.Glyphs()}
 	if ck.lookAt != key || ck.look.pal.Canvas == nil {
 		ck.look, ck.lookAt = m.buildCockpitLook(pal), key
 		ck.lookGen++
@@ -157,21 +161,40 @@ func (l ckLook) g(gl ckGlyph) string {
 	return gl.uni
 }
 
+// ckStateMark is the mark the cockpit draws for an agent state: the glyph
+// set's when the set names one the terminal can draw, and the cockpit's own
+// design otherwise. The cockpit's marks are not the rail's (a Nerd Font check
+// for a finished agent, a dot for one that needs you), so a set that names
+// nothing leaves the cockpit looking as it was designed, and a set that does
+// name a state is obeyed here as it is everywhere else.
+func (l ckLook) ckStateMark(state string, def ckGlyph) string {
+	if g := config.SetAgentStateMark(state, l.ascii); g != "" {
+		return g
+	}
+	return l.g(def)
+}
+
 // ckMark is the mark and colour of an agent state, by the design's table.
 func (l ckLook) ckMark(state string, doneSeen bool) (string, color.Color) {
 	switch state {
 	case "needs_input":
-		return l.g(ckGlyphNeeds), l.pal.Attention
+		return l.ckStateMark(state, ckGlyphNeeds), l.pal.Attention
 	case "errored":
-		return l.g(ckGlyphFailed), l.pal.Warn
+		return l.ckStateMark(state, ckGlyphFailed), l.pal.Warn
 	case "working":
-		return l.g(ckGlyphWorking), l.pal.Busy
+		return l.ckStateMark(state, ckGlyphWorking), l.pal.Busy
 	case "done":
 		if !doneSeen {
-			return l.g(ckGlyphReview), l.pal.Success
+			return l.ckStateMark(state, ckGlyphReview), l.pal.Success
+		}
+	case "unknown":
+		// The design folds unknown into idle; a set that names unknown's mark
+		// is asking for it to be told apart.
+		if g := config.SetAgentStateMark(state, l.ascii); g != "" {
+			return g, l.pal.FgMute
 		}
 	}
-	return l.g(ckGlyphIdle), l.pal.FgMute
+	return l.ckStateMark("idle", ckGlyphIdle), l.pal.FgMute
 }
 
 // ckItemMark is the mark and colour of an Inbox item.
@@ -180,15 +203,18 @@ func (l ckLook) ckItemMark(it session.AttentionItem) (string, color.Color) {
 	case session.AttentionMail:
 		return sidebarMailGlyph(), l.pal.AccentBright
 	case session.AttentionErrored:
-		return l.g(ckGlyphFailed), l.pal.Warn
+		return l.ckStateMark("errored", ckGlyphFailed), l.pal.Warn
 	case session.AttentionFinished:
-		return l.g(ckGlyphReview), l.pal.Success
+		return l.ckStateMark("done", ckGlyphReview), l.pal.Success
 	case session.AttentionResume:
+		if len(it.RiskyFlags) > 0 {
+			return l.g(ckGlyphResume), l.pal.Warn
+		}
 		return l.g(ckGlyphResume), l.pal.AccentBright
 	case session.AttentionOutbox:
 		return inboxKindGlyph(it.Kind), l.pal.AccentBright
 	}
-	return l.g(ckGlyphNeeds), l.pal.Attention
+	return l.ckStateMark("needs_input", ckGlyphNeeds), l.pal.Attention
 }
 
 // ckFrameKey is what a frame was drawn from.
@@ -207,6 +233,9 @@ type ckFrameKey struct {
 	hosts                uint64
 	depth                overlay.Depth
 	ascii, nerd, snoozes bool
+	// tml moves with every repaint of a surface, which the Artifacts tab
+	// may draw, and art with the tab's own state.
+	tml, art uint64
 }
 
 // renderCockpit draws the cockpit over the screen between the dock's rows,
@@ -234,6 +263,7 @@ func (m *OS) renderCockpit() (string, int, int, int) {
 		list: st.agents.listAt, minute: now.Unix() / 60, theme: theme.Generation(), live: st.Live, liveGen: ck.liveGen,
 		open: st.threads.open, daemon: m.IsDaemonSession, keys: m.KeybindRegistry, hosts: m.federationGen,
 		depth: l.pal.Depth, ascii: l.ascii, nerd: l.nerd, snoozes: st.life.ShowSnoozed,
+		tml: m.tml.gen + m.tml.setGen<<32, art: ck.art.gen,
 	}
 	if e, ok := m.cockpitAgent(); ok {
 		if t := st.threads.byKey[agentKey(e)]; t != nil {
@@ -243,7 +273,7 @@ func (m *OS) renderCockpit() (string, int, int, int) {
 	if ed := st.reply.editor; ed != nil {
 		// At the width the last frame drew it, so the composer's own cache
 		// answers, and Drawn moves only when the draft or the cursor did.
-		ed.comp.Render(max(ck.edW-4, 8), composerStyles(l.pal), l.panel)
+		ed.comp.Render(max(ck.edW-4, 8), replyStyles(l), l.panel)
 		key.editor = ed.comp.Drawn() + 1
 	}
 	// A state that moves with the clock or the keyboard is drawn afresh.
@@ -265,6 +295,12 @@ func (m *OS) renderCockpit() (string, int, int, int) {
 		m.drawCockpit(c, l, top, now)
 	}
 	ck.frame, ck.frameAt = c.render(), key
+	if transient {
+		// The key holds none of what makes a frame transient, so the next
+		// frame after the peek or a sheet closes would match it and show
+		// what was closed. A transient frame is never reused.
+		ck.frameAt = ckFrameKey{}
+	}
 	return ck.frame, top, w, h
 }
 
@@ -312,11 +348,12 @@ func (m *OS) drawCockpit(c *ckCanvas, l ckLook, top int, now time.Time) {
 		return
 	}
 	rows := m.cockpitRows()
-	agents := 0
+	agents, folded := 0, false
 	for _, r := range rows {
 		if r.selectable() {
 			agents++
 		}
+		folded = folded || r.folded
 	}
 	m.drawCockpitHeader(c, l, hdrY, top)
 
@@ -336,7 +373,9 @@ func (m *OS) drawCockpit(c *ckCanvas, l ckLook, top int, now time.Time) {
 	case c.w < ckWide:
 		fleetW = 48
 	}
-	strip := c.w >= ckOneColumn && agents <= 2 && !ck.needsOnly && st.Filter == "" && st.Select == "" && st.agents.query == ""
+	// The strip draws no headings, so a folded group keeps the fleet
+	// column: it shows the fold, and the cursor can open it there.
+	strip := c.w >= ckOneColumn && agents <= 2 && !folded && !ck.board && !ck.needsOnly && st.Filter == "" && st.Select == "" && st.agents.query == ""
 	focusX, focusW := fleetW+3, c.w-fleetW-5
 	switch {
 	case strip:
@@ -385,29 +424,33 @@ func (m *OS) drawCockpitHeader(c *ckCanvas, l ckLook, y, top int) {
 	pal := l.pal
 	x := c.text(2, y, 0, ckSeg{t: "Agents", fg: pal.Fg, attrs: ckBold}) + 3
 	var counts [ckGroups]int
-	for _, r := range ck.rows {
-		if r.kind == ckRowHead {
-			counts[r.group] = r.count
+	if ck.board {
+		counts = m.ckAgentCounts()
+	} else {
+		for _, r := range ck.rows {
+			if r.kind == ckRowHead {
+				counts[r.group] = r.count
+			}
 		}
 	}
 	type cnt struct {
-		g     ckGlyph
+		g     string
 		ink   color.Color
 		n     int
 		words string
 	}
 	cnts := []cnt{
-		{ckGlyphNeeds, pal.Attention, counts[ckNeeds], "needs you"},
-		{ckGlyphWorking, pal.Busy, counts[ckWorking], "working"},
-		{ckGlyphReview, pal.Success, counts[ckReview], "to review"},
-		{ckGlyphIdle, pal.FgMute, counts[ckIdle] + counts[ckEarlier], "idle"},
+		{l.ckStateMark("needs_input", ckGlyphNeeds), pal.Attention, counts[ckNeeds], "needs you"},
+		{l.ckStateMark("working", ckGlyphWorking), pal.Busy, counts[ckWorking], "working"},
+		{l.ckStateMark("done", ckGlyphReview), pal.Success, counts[ckReview], "to review"},
+		{l.ckStateMark("idle", ckGlyphIdle), pal.FgMute, counts[ckIdle] + counts[ckSettled], "idle"},
 	}
 	// The counts say their words when the row has room for them beside the
 	// search and the button, and only their marks otherwise.
 	full := x
 	for i, k := range cnts {
 		if k.n > 0 || i == 0 {
-			full += ckWidth(ckSeg{t: l.g(k.g) + " " + strconv.Itoa(k.n) + " " + k.words}) + 3
+			full += ckWidth(ckSeg{t: k.g + " " + strconv.Itoa(k.n) + " " + k.words}) + 3
 		}
 	}
 	compact := full > c.w-2-ckWidth(ckSeg{t: " + New agent "})-16
@@ -415,7 +458,7 @@ func (m *OS) drawCockpitHeader(c *ckCanvas, l ckLook, y, top int) {
 		if k.n == 0 && i > 0 {
 			continue
 		}
-		segs := []ckSeg{{t: l.g(k.g) + " ", fg: k.ink}, {t: strconv.Itoa(k.n), fg: pal.Fg, attrs: ckBold}}
+		segs := []ckSeg{{t: k.g + " ", fg: k.ink}, {t: strconv.Itoa(k.n), fg: pal.Fg, attrs: ckBold}}
 		if !compact {
 			segs = append(segs, ckSeg{t: " " + k.words, fg: pal.FgDim})
 		}
@@ -432,9 +475,19 @@ func (m *OS) drawCockpitHeader(c *ckCanvas, l ckLook, y, top int) {
 		}
 		x = c.text(x, y, 0, ckSeg{t: what, fg: pal.FgDim}) + 3
 	}
-	if n := len(m.markedAgents()); n > 0 {
+	if n := m.markedShown(); n > 0 {
 		x = c.text(x, y, 0, ckSeg{t: strconv.Itoa(n) + " marked", fg: pal.AccentBright, attrs: ckBold}) + 3
 	}
+	// The board's switch: the word names the view a click opens, as the
+	// footer's b does.
+	view := "Board"
+	if ck.board {
+		view = "Agents"
+	}
+	bx0 := x
+	x = c.text(x, y, 0, ckSeg{t: view + " ", fg: pal.FgDim}, ckSeg{t: l.g(ckGlyphOpen), fg: pal.FgMute})
+	ck.hits = append(ck.hits, ckHit{x0: bx0, y0: top + y, x1: x, y1: top + y + 1, kind: ckHitAction, action: "board"})
+	x += 3
 	if !st.Live {
 		x = c.text(x, y, 0, ckSeg{t: "not connected", fg: pal.Warning}) + 3
 	}
@@ -551,7 +604,7 @@ func (m *OS) drawFleet(c *ckCanvas, l ckLook, w, y0, y1, top int) {
 			break
 		}
 		line += r.lines
-		m.drawFleetRow(c, l, r, r.key == sel.key && r.selectable(), r.key == ck.hover, 0, y, w, top)
+		m.drawFleetRow(c, l, r, r.key == sel.key && r.cursorable(), r.key == ck.hover, 0, y, w, top)
 	}
 	// At 16 colours the columns have no grounds, so a hairline parts them.
 	if pal.Depth == overlay.Depth16 && w < c.w {
@@ -736,6 +789,42 @@ func (m *OS) cockpitNextScope() {
 	m.CockpitScope(next)
 }
 
+// ckRowMark is the mark and colour of an agent's or an item's row.
+func (m *OS) ckRowMark(l ckLook, r ckRow, e sidebarAgentEntry) (string, color.Color) {
+	if m.ckArtFormRow(r, e) != "" {
+		return l.g(ckGlyphNeeds), l.pal.Attention
+	}
+	if r.hasItem && (r.agent < 0 || r.group == ckNeeds || r.group == ckSnoozed) {
+		return l.ckItemMark(r.item)
+	}
+	return l.ckMark(e.State, e.DoneSeen)
+}
+
+// drawFoldMarks draws the marks of the rows a folded heading hides from x,
+// as many as fit before right, and returns where they end. A card has no
+// mark: the board's heading shows its count alone.
+func (m *OS) drawFoldMarks(c *ckCanvas, l ckLook, r ckRow, x, y, right int) int {
+	end := x - 2
+	for i, h := range r.hidden {
+		if h.kind == ckRowCard {
+			break
+		}
+		var e sidebarAgentEntry
+		if h.agent >= 0 {
+			e = m.Inbox.ck.agents[h.agent]
+		}
+		g, ink := m.ckRowMark(l, h, e)
+		left := len(r.hidden) - i
+		if x+ckWidth(ckSeg{t: g})+ckWidth(ckSeg{t: " +" + strconv.Itoa(left)})+2 > right {
+			end = c.text(x, y, right, ckSeg{t: "+" + strconv.Itoa(left), fg: l.pal.FgMute})
+			break
+		}
+		end = c.text(x, y, right, ckSeg{t: g, fg: ink})
+		x = end + 1
+	}
+	return end
+}
+
 // drawFleetRow draws one row of the fleet at x, y, w cells wide.
 func (m *OS) drawFleetRow(c *ckCanvas, l ckLook, r ckRow, cursor, hover bool, x, y, w, top int) {
 	ck := &m.Inbox.ck
@@ -749,37 +838,57 @@ func (m *OS) drawFleetRow(c *ckCanvas, l ckLook, r ckRow, cursor, hover bool, x,
 		return
 	case ckRowHead:
 		mark := ""
-		if ck.folded[r.group] {
+		if r.folded {
 			mark = l.g(ckGlyphFold) + " "
+			// The cursor rests on a folded heading, so F opens it again.
+			if cursor {
+				c.fill(x, y, w, 1, l.cursor)
+				c.text(x, y, 0, ckSeg{t: "▌", fg: pal.Accent})
+				defer c.mark(pal, x+1, y, w-1, 1, overlay.RowState{Cursor: true, Focused: true})
+			}
 		}
-		title := ckGroupTitles[r.group]
-		if f := m.Inbox.Filter; f != "" && r.group == ckNeeds {
+		var title string
+		if ck.board {
+			title = ckStageTitle(r.group)
+		} else {
+			title = ckGroupTitles[r.group]
+		}
+		if f := m.Inbox.Filter; !ck.board && f != "" && r.group == ckNeeds {
 			// Narrowed to one kind, as ctrl+b M opens on mail: the heading
 			// names the kind.
 			title = inboxGroupTitle(f)
 		}
 		end := c.text(x+2, y, right, ckSeg{t: mark + title, fg: pal.FgDim, attrs: ckBold}, ckSeg{t: "  " + strconv.Itoa(r.count), fg: pal.FgMute})
+		if r.folded {
+			// A folded group shows the state of each row it hides, so a
+			// row in trouble is seen without opening the group.
+			end = m.drawFoldMarks(c, l, r, end+2, y, right)
+		}
 		c.hline(end+2, y, right-end-2, hzGlyph(), l.edgePanel)
 		ck.hits = append(ck.hits, ckHit{x0: x, y0: top + y, x1: x + w, y1: top + y + 1, kind: ckHitHead, group: r.group})
 		return
 	case ckRowMore:
 		words := "+" + strconv.Itoa(r.count) + " more"
 		if r.group >= 0 {
-			words += " " + strings.ToLower(ckGroupTitles[r.group])
+			if ck.board {
+				words += " in " + strings.ToLower(ckStageTitle(r.group))
+			} else {
+				words += " " + strings.ToLower(ckGroupTitles[r.group])
+			}
 			ck.hits = append(ck.hits, ckHit{x0: x, y0: top + y, x1: x + w, y1: top + y + 1, kind: ckHitMore, group: r.group})
 		}
 		c.text(x+5, y, right, ckSeg{t: words, fg: pal.FgMute})
 		return
 	case ckRowChild:
-		g, ink := l.g(ckGlyphWorking), overlay.MixColors(pal.Busy, l.panel, 0.3)
+		g, ink := l.ckStateMark("working", ckGlyphWorking), overlay.MixColors(pal.Busy, l.panel, 0.3)
 		if !r.child.Running() {
-			g, ink = l.g(ckGlyphReview), pal.FgMute
+			g, ink = l.ckStateMark("done", ckGlyphReview), pal.FgMute
 		}
 		what := r.child.Now
 		if what == "" {
 			what = r.child.Description
 		}
-		c.text(x+4, y, right, ckSeg{t: ckTree(l, r.last), fg: l.edgePanel}, ckSeg{t: g + " ", fg: ink},
+		c.text(x+4, y, right, ckSeg{t: ckTree(l, r.last), fg: l.edgePanel}, ckSeg{t: g + agentMarkGap(g), fg: ink},
 			ckSeg{t: printableTitle(firstNonEmptyStr(r.child.Type, "agent")), fg: pal.FgDim}, ckSeg{t: "  " + printableTitle(what), fg: pal.FgMute})
 		return
 	case ckRowFan:
@@ -794,6 +903,9 @@ func (m *OS) drawFleetRow(c *ckCanvas, l ckLook, r ckRow, cursor, hover bool, x,
 		if r.lines > 1 {
 			c.text(x+5, y+1, right, ckSeg{t: ckTrunc(wt.prompt, right-x-5), fg: pal.FgMute})
 		}
+		return
+	case ckRowCard:
+		m.drawCardRow(c, l, r, cursor, hover, x, y, w, top)
 		return
 	}
 
@@ -816,22 +928,21 @@ func (m *OS) drawFleetRow(c *ckCanvas, l ckLook, r ckRow, cursor, hover bool, x,
 	var e sidebarAgentEntry
 	if r.agent >= 0 {
 		e = ck.agents[r.agent]
-		// A marked agent shows its mark beside the cursor bar, and a click
-		// there marks or unmarks it.
-		if m.Inbox.agents.marks[agentKey(e)] {
+	}
+	// A marked row shows its mark beside the cursor bar, and a click there
+	// marks or unmarks it.
+	if k, ok := m.ckMarkKey(r); ok {
+		if m.Inbox.agents.marks[k] {
 			c.text(x+1, y, 0, ckSeg{t: l.g(ckGlyphMarked), fg: pal.AccentBright, attrs: ckBold})
 		}
 		ck.hits = append(ck.hits, ckHit{x0: x + 1, y0: top + y, x1: x + 2, y1: top + y + 1, kind: ckHitMark, key: r.key})
 	}
 	ck.hits = append(ck.hits, ckHit{x0: x, y0: top + y, x1: x + w, y1: top + y + r.lines, kind: ckHitRow, key: r.key})
 	name, harness, place, wait := m.ckRowFacts(r, e)
-	g, gInk := l.ckMark(e.State, e.DoneSeen)
-	if r.hasItem && (r.agent < 0 || r.group == ckNeeds || r.group == ckSnoozed) {
-		g, gInk = l.ckItemMark(r.item)
-	}
+	g, gInk := m.ckRowMark(l, r, e)
 	nameInk := pal.Fg
 	down := e.Host != "" && m.ckLinkDown(e.Host)
-	if r.group == ckIdle || r.group == ckEarlier || r.group == ckSnoozed || r.item.Stale || down {
+	if r.group == ckIdle || r.group == ckSettled || r.group == ckSnoozed || r.item.Stale || down {
 		nameInk = pal.FgDim
 	}
 	if down {
@@ -843,8 +954,8 @@ func (m *OS) drawFleetRow(c *ckCanvas, l ckLook, r ckRow, cursor, hover bool, x,
 	if r.attempt {
 		// One attempt of a fan, under the fan's row: its tree mark, state,
 		// name, agent and machine, and its diff at the end.
-		ax := c.text(x+2, y, right, ckSeg{t: ckTree(l, r.last), fg: l.edgePanel}, ckSeg{t: g, fg: gInk})
-		ax = c.text(ax+1, y, right, ckSeg{t: ckPad(ckTrunc(name, 11), 12), fg: ink(nameInk)})
+		ax := c.text(x+2, y, right, ckSeg{t: ckTree(l, r.last), fg: l.edgePanel}, ckSeg{t: g + agentMarkGap(g), fg: gInk})
+		ax = c.text(ax, y, right, ckSeg{t: ckPad(ckTrunc(name, 11), 12), fg: ink(nameInk)})
 		rx := right
 		if diff := ckDiffSegs(l, e); diff != nil {
 			rx = c.textR(right, y, diff...) - 2
@@ -858,12 +969,21 @@ func (m *OS) drawFleetRow(c *ckCanvas, l ckLook, r ckRow, cursor, hover bool, x,
 		nameW = 13
 	}
 	c.text(x+2, y, right, ckSeg{t: g, fg: gInk})
-	nx := x + 5
-	if r.lines == 1 && w < 48 {
-		nx = x + 4
+	// The name starts in the same column whichever mark the row wears: past the
+	// set's widest mark and its gap (agentMarkLead). Where there is room the
+	// gap is two blanks, and a two-cell mark takes the first of them.
+	nx := x + 2 + agentMarkLead()
+	if r.lines != 1 || w >= 48 {
+		nx = max(nx, x+5)
 	}
 	c.text(nx, y, nx+nameW-1, ckSeg{t: ckTrunc(name, nameW-1), fg: ink(nameInk), attrs: ckBold})
 	rx := c.textR(right, y, ckSeg{t: wait, fg: ink(pal.FgMute)})
+	if r.agent >= 0 && m.ckArtifactNew(e, false) {
+		// A surface the person has not seen: the chip opens it.
+		cx := c.textR(rx-2, y, ckSeg{t: l.g(ckGlyphNeeds) + " " + ckArtChip, fg: ink(pal.Attention), attrs: ckBold})
+		ck.hits = append([]ckHit{{x0: cx, y0: top + y, x1: rx - 2, y1: top + y + 1, kind: ckHitAction, action: "artrow:" + r.key}}, ck.hits...)
+		rx = cx
+	}
 	if r.lines == 1 && w < 48 {
 		c.text(nx+nameW, y, rx-1, ckSeg{t: ckTrunc(place, rx-1-nx-nameW), fg: ink(pal.FgMute)})
 		return
@@ -1017,6 +1137,17 @@ func (m *OS) ckMachine(host string) string {
 	if host != "" {
 		return ckHostLabel(host)
 	}
+	return m.ckLocalLabel()
+}
+
+// ckLocalLabel is this machine's name: its host name, or in Learn mode the
+// name the tour gives it.
+func (m *OS) ckLocalLabel() string {
+	if m.LearnMode && m.learnSpawn != nil {
+		if n := m.learnSpawn().Machine; n != "" {
+			return n
+		}
+	}
 	return ckLocalName()
 }
 
@@ -1103,13 +1234,26 @@ func (m *OS) ckRowLine2(l ckLook, r ckRow, e sidebarAgentEntry) (verb, rest stri
 		if r.item.Kind == session.AttentionMail || r.item.Kind == session.AttentionResume {
 			ink = pal.AccentBright
 		}
+		if r.item.Kind == session.AttentionResume && len(r.item.RiskyFlags) > 0 {
+			// The resume turns approvals off: the row says so first.
+			ink = pal.Warn
+		}
+		if r.item.Kind == session.AttentionResume && m.Inbox.agents.resuming[r.item.ID] {
+			// Sent to the daemon: the row stays until the offer closes.
+			verb, ink = "Resuming", pal.FgDim
+		}
 		return verb, rest, ink, nil
+	}
+	if title := m.ckArtFormRow(r, e); title != "" {
+		return "Form waiting", printableTitle(title), pal.Attention, nil
 	}
 	ink = pal.FgDim
 	if ctx := ckMeta(e, "context"); ctx != "" {
 		right = []ckSeg{{t: "ctx " + ctx, fg: pal.FgMute}}
 	}
 	switch {
+	case e.Reason == session.AgentReasonSilent:
+		return "", silentNote(e.StateAt, time.Now()), pal.Warn, right
 	case e.State == "working":
 		if now := ckMeta(e, "now"); now != "" {
 			if tool, target, ok := strings.Cut(now, ": "); ok {
@@ -1130,6 +1274,11 @@ func (m *OS) ckRowLine2(l ckLook, r ckRow, e sidebarAgentEntry) (verb, rest stri
 		return "", "working", ink, right
 	case sidebarAttention(e.State):
 		return capitalize(agentRowStateWords(e)), printableTitle(e.Message), pal.Attention, right
+	}
+	if e.DraftHeld {
+		// A queued message waits for the person's draft. See
+		// agent_queue_draft.go in internal/session.
+		return ckDraftVerb, session.DraftHeldSummary, pal.Attention, right
 	}
 	wt := m.ckWorktreeOf(e)
 	br := wt.branch
@@ -1192,6 +1341,9 @@ func ckItemVerb(it session.AttentionItem) (verb, rest string) {
 	case session.AttentionPlan:
 		return "Plan", inboxPlanRowText(it)
 	case session.AttentionQuestion, session.AttentionAsk:
+		if it.Summary == session.DraftHeldSummary {
+			return ckDraftVerb, sum
+		}
 		return "Asks", sum
 	case session.AttentionMail:
 		if it.HeldID != 0 {
@@ -1201,12 +1353,19 @@ func ckItemVerb(it session.AttentionItem) (verb, rest string) {
 	case session.AttentionErrored:
 		return "Error", sum
 	case session.AttentionResume:
+		if warn := session.ResumeWarning(it.RiskyFlags); warn != "" {
+			return printableTitle(warn), sum
+		}
 		return "Resume", sum
 	case session.AttentionOutbox:
 		return "To send", sum
 	}
 	return capitalize(inboxKindWords(it)), sum
 }
+
+// ckDraftVerb fronts the row of an agent whose queue the person's draft holds:
+// "Waits: your draft is in the prompt box".
+const ckDraftVerb = "Waits:"
 
 // ckWorktree is what the cockpit shows of an agent's worktree session.
 type ckWorktree struct {
@@ -1277,8 +1436,27 @@ func (m *OS) ckBranch(e sidebarAgentEntry) string {
 }
 
 // ckWorktreeOf is the agent's worktree session, zero when it is not in one.
+//
+//go:noinline
 func (m *OS) ckWorktreeOf(e sidebarAgentEntry) ckWorktree {
+	if m.LearnMode && e.Host == "" {
+		// The tour's attempts are panes of its one session.
+		if w, ok := m.Inbox.ck.branches["\x00"+e.SessionID+"\x00"+e.WindowID]; ok {
+			return w
+		}
+	}
 	return m.Inbox.ck.branches[e.Host+"\x00"+e.SessionID]
+}
+
+// ckAgentSession is the session an agent's row stands for in a fan: its
+// session, or in Learn mode the name its attempt has in place of one.
+func (m *OS) ckAgentSession(e sidebarAgentEntry) string {
+	if m.LearnMode {
+		if n := m.ckWorktreeOf(e).name; n != "" {
+			return n
+		}
+	}
+	return e.SessionID
 }
 
 // ckBranches reads every worktree session's record once per rebuild of the
@@ -1292,6 +1470,13 @@ func (m *OS) ckBranches() map[string]ckWorktree {
 				pick: w.Pick, judgeWindow: w.JudgeWindow, verdictAt: w.VerdictAt, name: s.ID}
 		}
 	}
+	if m.LearnMode {
+		for win, w := range m.learnFans {
+			if m.windowByID(win) != nil {
+				out["\x00"+m.sidebarCurrentSessionID()+"\x00"+win] = w
+			}
+		}
+	}
 	return out
 }
 
@@ -1303,9 +1488,11 @@ func (m *OS) ckHasLine2(r ckRow, e sidebarAgentEntry) bool {
 		return true
 	case r.agent < 0:
 		return r.hasItem && r.item.Summary != ""
+	case m.ckArtFormRow(r, e) != "":
+		return true
 	case e.State == "working":
 		return ckMeta(e, "now") != "" || e.Message != "" || e.Subagents > 0
-	case sidebarAttention(e.State):
+	case sidebarAttention(e.State), e.DraftHeld:
 		return true
 	}
 	return m.ckBranch(e) != "" || e.PR != "" || e.Message != "" || (r.hasItem && r.item.Summary != "")
@@ -1331,6 +1518,9 @@ func (m *OS) drawCockpitStrip(c *ckCanvas, l ckLook, y, top int) int {
 		if r.hasItem {
 			g, gInk = l.ckItemMark(r.item)
 		}
+		if m.ckArtFormRow(r, e) != "" {
+			g, gInk = l.g(ckGlyphNeeds), pal.Attention
+		}
 		bg, nameInk := l.panel, pal.FgDim
 		if r.key == sel.key {
 			bg, nameInk = l.cursor, pal.Fg
@@ -1339,6 +1529,12 @@ func (m *OS) drawCockpitStrip(c *ckCanvas, l ckLook, y, top int) int {
 		x = c.text(x, y, 0, ckSeg{t: " " + g + " ", fg: gInk, bg: bg}, ckSeg{t: name + " ", fg: overlay.Readable(nameInk, bg), bg: bg, attrs: ckBold})
 		c.mark(pal, x0, y, x-x0, 1, overlay.RowState{Cursor: r.key == sel.key, Focused: true})
 		ck.hits = append(ck.hits, ckHit{x0: x0, y0: top + y, x1: x, y1: top + y + 1, kind: ckHitRow, key: r.key})
+		if r.agent >= 0 && m.ckArtifactNew(e, false) {
+			// A surface the person has not seen: the chip opens it.
+			cx := x + 1
+			x = c.text(cx, y, 0, ckSeg{t: l.g(ckGlyphNeeds) + " " + ckArtChip, fg: pal.Attention, attrs: ckBold})
+			ck.hits = append([]ckHit{{x0: cx, y0: top + y, x1: x, y1: top + y + 1, kind: ckHitAction, action: "artrow:" + r.key}}, ck.hits...)
+		}
 		x += 2
 	}
 	return y + 1
@@ -1353,10 +1549,13 @@ func (m *OS) cockpitEmptyLines(rows []ckRow) []string {
 			return nil
 		}
 	}
+	if st.ck.board && !st.Unsupported && m.IsDaemonSession {
+		return m.ckBoardEmptyLines()
+	}
 	switch {
 	case st.Unsupported:
 		return []string{"This daemon is too old for the agents view.", m.restartHint()}
-	case !m.IsDaemonSession:
+	case !m.IsDaemonSession && !m.LearnMode:
 		return []string{"The agents view needs the daemon.", "Start a daemon session with: tuios new"}
 	case st.Filter == session.AttentionMail:
 		return []string{"No unread mail for you.", "m opens the mailbox, with every thread between agents too."}
@@ -1468,6 +1667,8 @@ func (m *OS) drawCockpitHints(c *ckCanvas, l ckLook, y int, now time.Time) {
 func (m *OS) cockpitHints(now time.Time) []overlay.Hint {
 	st := &m.Inbox
 	switch {
+	case st.ck.art.focus:
+		return []overlay.Hint{{Key: "esc", Label: "back to the agents", Priority: overlay.HintEssential}}
 	case st.ck.cmp != nil:
 		n := "1"
 		if res := st.ck.cmp.res; res != nil && len(res.Rows) > 1 {
@@ -1496,9 +1697,15 @@ func (m *OS) cockpitHints(now time.Time) []overlay.Hint {
 	if m.InboxReasonOpen() {
 		return []overlay.Hint{{Key: overlay.EnterKey(), Label: "send"}, {Key: "esc", Label: "cancel"}}
 	}
-	var hints []overlay.Hint
+	// Resume all comes first while the fleet shows more than one offer:
+	// after a restart it is the one thing to do.
+	hints := m.resumeAllHint()
 	r, ok := m.cockpitSelected()
-	if ok {
+	if ok && r.kind == ckRowHead {
+		hints = append(hints, m.keyHints(config.ActionInboxFold, "open group")...)
+	} else if ok && r.kind == ckRowCard {
+		hints = m.ckCardHints(st.ck.cards[r.card])
+	} else if ok {
 		if it, held := m.cockpitHeldItem(); held && !m.inboxCut(it) {
 			words := [4]string{"allow", "always", "reject", "say why"}
 			if it.Kind == session.AttentionPlan {
@@ -1530,6 +1737,9 @@ func (m *OS) cockpitHints(now time.Time) []overlay.Hint {
 			goLabel = "open"
 		}
 		hints = append(hints, m.keyHints(config.ActionInboxGo, goLabel)...)
+		if label := m.settleLabel(r); label != "" {
+			hints = append(hints, m.keyHints(config.ActionInboxSettle, label)...)
+		}
 		if r.hasItem && inboxPeekable(r.item) && r.item.RequestID == "" {
 			hints = append(hints, m.keyHints(config.ActionInboxPeek, "peek")...)
 		}
@@ -1541,7 +1751,7 @@ func (m *OS) cockpitHints(now time.Time) []overlay.Hint {
 			switch {
 			case r.item.HeldID != 0:
 				hints = append(hints, m.keyHints(config.ActionInboxPassOn, "pass on")...)
-			case r.item.Kind == session.AttentionResume:
+			case r.item.Kind == session.AttentionResume && !m.Inbox.agents.resuming[r.item.ID]:
 				hints = append(hints, m.keyHints(config.ActionInboxResume, "resume")...)
 			}
 			switch {
@@ -1559,10 +1769,82 @@ func (m *OS) cockpitHints(now time.Time) []overlay.Hint {
 			hints = append(hints, m.keyHints(config.ActionInboxCompare, "compare")...)
 		}
 	}
-	hints = append(hints, m.keyHints(config.ActionInboxNewAgent, "new agent", config.ActionInboxReview, "review",
+	board := "board"
+	if st.ck.board {
+		board = "agents"
+	}
+	hints = append(hints, m.keyHints(config.ActionInboxNewAgent, "new agent", config.ActionInboxBoard, board, config.ActionInboxReview, "review",
 		config.ActionInboxFilter, "filter", config.ActionInboxSelect, "search")...)
+	if ok && r.kind != ckRowHead {
+		// Optional, so a narrow footer gives it up first: ? lists it too.
+		hints = append(hints, overlay.Optional(m.keyHints(config.ActionInboxFold, "fold group"))...)
+	}
 	hints = append(hints, overlay.Hint{Key: "?", Label: "all keys"})
 	return append(hints, m.keyHints(config.ActionInboxClose, "close")...)
+}
+
+// cockpitNote is the return note the focus shows for a row: its pane's note,
+// else its session's. A pane on another machine has none here: the link
+// does not carry notes.
+func (m *OS) cockpitNote(r ckRow, e sidebarAgentEntry) string {
+	sessionName, windowID, host := e.SessionID, e.WindowID, e.Host
+	if r.agent < 0 {
+		if !r.hasItem {
+			return ""
+		}
+		sessionName, windowID, host = r.item.Session, r.item.Window, r.item.Host
+	}
+	if sessionName == "" || host != "" {
+		return ""
+	}
+	return m.paneNote(sessionName, windowID)
+}
+
+// drawFoldFocus draws a folded group in the focus: its title, how many rows
+// it hides, each row's mark and name, and the key that opens it.
+func (m *OS) drawFoldFocus(c *ckCanvas, l ckLook, r ckRow, x, y, w, y1 int) {
+	ck := &m.Inbox.ck
+	pal := l.pal
+	right := x + w
+	title := ckGroupTitles[r.group]
+	if ck.board {
+		title = ckStageTitle(r.group)
+	}
+	c.text(x, y, right, ckSeg{t: title, fg: pal.Fg, attrs: ckBold}, ckSeg{t: "  " + strconv.Itoa(r.count), fg: pal.FgMute})
+	words := "The group is folded."
+	if key := m.inboxKey(config.ActionInboxFold); key != "" {
+		words += " Press " + key + " to open it."
+	}
+	c.text(x, y+1, right, ckSeg{t: words, fg: pal.FgDim})
+	line := y + 3
+	for i, h := range r.hidden {
+		if line >= y1 {
+			break
+		}
+		if line == y1-1 && i < len(r.hidden)-1 {
+			c.text(x, line, right, ckSeg{t: "+" + strconv.Itoa(len(r.hidden)-i) + " more", fg: pal.FgMute})
+			break
+		}
+		var e sidebarAgentEntry
+		if h.agent >= 0 {
+			e = ck.agents[h.agent]
+		}
+		var segs []ckSeg
+		place := ""
+		if h.kind == ckRowCard {
+			segs = []ckSeg{{t: printableTitle(ck.cards[h.card].Title), fg: pal.Fg}}
+		} else {
+			var name string
+			name, _, place, _ = m.ckRowFacts(h, e)
+			g, ink := m.ckRowMark(l, h, e)
+			segs = []ckSeg{{t: g + " ", fg: ink}, {t: name, fg: pal.Fg}}
+		}
+		if place != "" {
+			segs = append(segs, ckSeg{t: "  " + place, fg: pal.FgDim})
+		}
+		c.text(x, line, right, segs...)
+		line++
+	}
 }
 
 // drawFocus draws the selected row's work: its header, the thread, the card
@@ -1572,6 +1854,14 @@ func (m *OS) drawFocus(c *ckCanvas, l ckLook, x, y, w, y1, top int, now time.Tim
 	pal := l.pal
 	r, ok := m.cockpitSelected()
 	if !ok {
+		return
+	}
+	if r.kind == ckRowHead {
+		m.drawFoldFocus(c, l, r, x, y, w, y1)
+		return
+	}
+	if r.kind == ckRowCard && (r.agent < 0 || m.cockpitTab() == "Card") {
+		m.drawCardFocus(c, l, r, st.ck.cards[r.card], x, y, w, y1, top, now)
 		return
 	}
 	var e sidebarAgentEntry
@@ -1585,9 +1875,10 @@ func (m *OS) drawFocus(c *ckCanvas, l ckLook, x, y, w, y1, top int, now time.Tim
 		hx = c.text(hx, y, right, ckSeg{t: "   " + harness, fg: pal.FgDim})
 	}
 	if model := ckMeta(e, "model"); model != "" {
-		c.text(hx, y, right, ckSeg{t: " · " + model, fg: pal.FgMute})
+		hx = c.text(hx, y, right, ckSeg{t: " · " + model, fg: pal.FgMute})
 	}
-	m.drawStatePill(c, l, r, e, right, y)
+	pill := m.drawStatePill(c, l, r, e, right, y)
+	m.drawSettleButton(c, l, r, hx, pill, y, top)
 	// The second line: branch, machine, folder, diff, context and cost. A
 	// line too long for the focus cuts the folder from the left first, then
 	// drops whole fields from the right: a field is never cut in half.
@@ -1646,31 +1937,17 @@ func (m *OS) drawFocus(c *ckCanvas, l ckLook, x, y, w, y1, top int, now time.Tim
 	if c.h < 30 {
 		rule = y + 2
 	}
-	tabs := m.cockpitTabs(e, r)
-	if len(tabs) > 0 {
-		rule++
-		ty, tx := rule-1, x
-		for i, tab := range tabs {
-			x0 := tx
-			if i == m.cockpitTabIndex() {
-				tx = c.text(tx, ty, right, ckSeg{t: tab, fg: pal.Fg, attrs: ckBold})
-			} else {
-				// A count beside an idle tab is quieter than its name.
-				name, count, _ := strings.Cut(tab, " ")
-				segs := []ckSeg{{t: name, fg: pal.FgMute}}
-				if count != "" {
-					segs = append(segs, ckSeg{t: " " + count, fg: overlay.Shown(overlay.MixColors(pal.FgMute, l.canvas, 0.25))})
-				}
-				tx = c.text(tx, ty, right, segs...)
-			}
-			st.ck.hits = append(st.ck.hits, ckHit{x0: x0, y0: top + ty, x1: tx, y1: top + ty + 1, kind: ckHitTab, group: i})
-			if i == m.cockpitTabIndex() {
-				defer c.hline(x0, rule, tx-x0, "━", pal.Accent)
-			}
-			tx += 4
+	// The third line: the pane's return note, else its session's, dim. The
+	// rule moves down to make room for it when the header is tight.
+	if note := m.cockpitNote(r, e); note != "" {
+		c.text(x, y+2, right, ckSeg{t: overlay.Truncate(printableTitle(note), max(w, 1)), fg: pal.FgDim})
+		rule = max(rule, y+3)
+		if c.h >= 30 {
+			// The gap under the header stays, one line lower.
+			rule = y + 4
 		}
 	}
-	c.hline(x, rule, w, hzGlyph(), l.edge)
+	rule = m.drawFocusTabs(c, l, m.cockpitTabs(e, r), x, w, rule, top)
 	bodyTop := rule + 2
 	if c.h < 30 {
 		bodyTop = rule + 1
@@ -1714,6 +1991,11 @@ func (m *OS) drawFocus(c *ckCanvas, l ckLook, x, y, w, y1, top int, now time.Tim
 	// The side column's pieces as focus tabs, narrower than it, above the
 	// card.
 	switch m.cockpitTab() {
+	case ckArtTab:
+		if cardTop-1-bodyTop >= 2 {
+			m.drawArtifacts(c, l, e, x, bodyTop, w, cardTop-1, top, now)
+		}
+		return
 	case "Checkpoints":
 		if room := cardTop - 1 - bodyTop; room >= 2 {
 			m.drawCheckpoints(c, l, e, x, bodyTop, w, max((room-1)/2, 1))
@@ -1754,9 +2036,56 @@ func (m *OS) drawFocus(c *ckCanvas, l ckLook, x, y, w, y1, top int, now time.Tim
 	}
 }
 
+// drawFocusTabs draws the focus tabs above the rule, which moves down a line
+// for them, and the rule. It returns the rule's row.
+func (m *OS) drawFocusTabs(c *ckCanvas, l ckLook, tabs []string, x, w, rule, top int) int {
+	pal := l.pal
+	right := x + w
+	var under func()
+	if len(tabs) > 0 {
+		rule++
+		ty, tx := rule-1, x
+		for i, tab := range tabs {
+			x0 := tx
+			if i == m.cockpitTabIndex() {
+				tx = c.text(tx, ty, right, ckSeg{t: tab, fg: pal.Fg, attrs: ckBold})
+			} else {
+				// A count beside an idle tab is quieter than its name.
+				name, count, _ := strings.Cut(tab, " ")
+				segs := []ckSeg{{t: name, fg: pal.FgMute}}
+				if count != "" {
+					segs = append(segs, ckSeg{t: " " + count, fg: overlay.Shown(overlay.MixColors(pal.FgMute, l.canvas, 0.25))})
+				}
+				tx = c.text(tx, ty, right, segs...)
+			}
+			m.Inbox.ck.hits = append(m.Inbox.ck.hits, ckHit{x0: x0, y0: top + ty, x1: tx, y1: top + ty + 1, kind: ckHitTab, group: i})
+			if i == m.cockpitTabIndex() {
+				// Drawn after the rule, over this tab alone: tx moves on.
+				x1 := tx
+				under = func() { c.hline(x0, rule, x1-x0, "━", pal.Accent) }
+			}
+			tx += 4
+		}
+	}
+	c.hline(x, rule, w, hzGlyph(), l.edge)
+	if under != nil {
+		under()
+	}
+	return rule
+}
+
 // cockpitTabs are the focus tabs for the selected row: the thread and the
-// last turn's changes, for an agent whose transcript tuios reads.
+// last turn's changes, for an agent whose transcript tuios reads. A card's
+// are Card, then its holder's.
 func (m *OS) cockpitTabs(e sidebarAgentEntry, r ckRow) []string {
+	if r.kind == ckRowCard {
+		tabs := []string{"Card"}
+		if r.agent >= 0 {
+			r.kind = ckRowAgent
+			tabs = append(tabs, m.cockpitTabs(e, r)...)
+		}
+		return tabs
+	}
 	if r.agent < 0 || e.Host != "" {
 		return nil
 	}
@@ -1768,6 +2097,9 @@ func (m *OS) cockpitTabs(e sidebarAgentEntry, r ckRow) []string {
 	// Changes waits for a transcript page: a pane the daemon turns out to have
 	// no file for would lose the tab again, and a ] pressed meanwhile would
 	// land on it and then fall back to Thread.
+	if arts := m.ckArtTabLabel(e); arts != "" {
+		side = append([]string{arts}, side...)
+	}
 	t := m.Inbox.threads.byKey[agentKey(e)]
 	if !m.threadReadsTranscript(e) || t == nil || !t.read {
 		return append([]string{"Thread"}, side...)
@@ -1819,11 +2151,15 @@ func (m *OS) ckApprovalLines(it session.AttentionItem, where string, width int, 
 }
 
 // drawStatePill draws the focus header's state, its word beside its colour.
-func (m *OS) drawStatePill(c *ckCanvas, l ckLook, r ckRow, e sidebarAgentEntry, right, y int) {
+func (m *OS) drawStatePill(c *ckCanvas, l ckLook, r ckRow, e sidebarAgentEntry, right, y int) int {
 	pal := l.pal
 	g, ink := l.ckMark(e.State, e.DoneSeen)
 	words, bg := sidebarStateWords(e.State), l.panel
 	switch {
+	case m.ckArtFormRow(r, e) != "":
+		// The row is in Needs you for a form, not for the agent's state.
+		g, ink = l.g(ckGlyphNeeds), pal.Attention
+		words, bg = "form waiting", l.attnTint
 	case r.hasItem && r.group == ckNeeds:
 		g, ink = l.ckItemMark(r.item)
 		words, bg = "needs you", l.attnTint
@@ -1840,10 +2176,14 @@ func (m *OS) drawStatePill(c *ckCanvas, l ckLook, r ckRow, e sidebarAgentEntry, 
 		words, bg = "error", l.warnTint
 	}
 	if r.agent < 0 && !r.hasItem {
-		return
+		return right
+	}
+	if e.Settled && r.group == ckSettled {
+		words = "settled"
 	}
 	x := c.textR(right, y, ckSeg{t: " " + g + " " + words + " ", fg: overlay.Readable(ink, bg), bg: bg, attrs: ckBold})
 	c.mark(pal, x, y, right-x, 1, ckOn)
+	return x
 }
 
 // drawItemCard draws the card of what the row's item asks, at the bottom of
@@ -1900,6 +2240,12 @@ func (m *OS) drawItemCard(c *ckCanvas, l ckLook, r ckRow, x, w, y0, y1, top int,
 	} else {
 		for _, l := range wrapPlain(printableTitle(it.Summary), inner) {
 			detail = append(detail, "  "+l)
+		}
+		// The card has room for the whole warning the row may cut.
+		if warn := session.ResumeWarning(it.RiskyFlags); warn != "" {
+			for _, l := range wrapPlain(printableTitle(warn), inner) {
+				detail = append(detail, "  "+l)
+			}
 		}
 	}
 	type btn struct{ key, label, action string }
@@ -1993,6 +2339,13 @@ func (m *OS) drawItemCard(c *ckCanvas, l ckLook, r ckRow, x, w, y0, y1, top int,
 		c.text(x, i, 0, ckSeg{t: "▌", fg: barInk})
 	}
 	verb, _ := ckItemVerb(it)
+	if it.Kind == session.AttentionResume {
+		// The warning is in the detail and on the risky badge.
+		verb = "Resume"
+	}
+	if it.Kind == session.AttentionResume && m.Inbox.agents.resuming[it.ID] {
+		verb = "Resuming"
+	}
 	title := verb
 	switch {
 	case held && it.Kind == session.AttentionPlan:
@@ -2019,7 +2372,7 @@ func (m *OS) drawItemCard(c *ckCanvas, l ckLook, r ckRow, x, w, y0, y1, top int,
 		when = ", snoozed " + inboxSnoozedWhen(it.SnoozedUntil, now)
 	}
 	c.text(tx, ty, x+w-14, ckSeg{t: "   " + inboxWho(it) + when, fg: pal.FgMute})
-	if inboxRisky(it) {
+	if inboxRisky(it) || len(it.RiskyFlags) > 0 {
 		c.textR(x+w-2, ty, ckSeg{t: " risky ", fg: overlay.Readable(pal.Warn, l.warnTint), bg: l.warnTint, attrs: ckBold})
 	}
 	yy := by

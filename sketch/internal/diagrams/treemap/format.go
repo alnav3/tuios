@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/treemap/format.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/treemap/format.ts at 8aff183be57021b533f319a29341a529be934b08.
 //
 // RE_SPEC is a hand matcher: every part after the fill and alignment is optional and
 // greedy, and none can start with what the part after it takes, so only the fill and

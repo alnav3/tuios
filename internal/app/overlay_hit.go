@@ -43,7 +43,7 @@ type overlayPanelHit struct {
 // row opens each of them over the panel too. The guard against a fourth is
 // TestEveryOverlayKindHasAPlaceInTheStack, which reads eachOverlayGate itself
 // rather than a second copy of this list.
-var overlayKindOrder = []string{"help", "palette", "launcher", "session", "goto", "navigator", "agentmail", "inbox", "workspace", overlayKindBuffers, overlayKindTransfers, "layout", "hostpicker", "aggregate", "settings", "keybinds", "themepicker", "themeeditor", "presetpicker", "glyphpicker", "effectpicker", "dockeditor", "sectioneditor", "accent", "screenshot", "quit", "sessionclose", overlayKindRestart, "filedialog", overlayKindCopyDialog, "worktreeprompt", overlayKindPluginApproval, overlayKindLogs, overlayKindMessage}
+var overlayKindOrder = []string{"help", "palette", "launcher", "session", "goto", "navigator", "agentmail", "inbox", "workspace", overlayKindBuffers, overlayKindTransfers, "layout", "hostpicker", "aggregate", "settings", "keybinds", "themepicker", "themeeditor", "presetpicker", "glyphpicker", "effectpicker", "dockeditor", "sectioneditor", "accent", "screenshot", "quit", "sessionclose", overlayKindRestart, "filedialog", overlayKindCopyDialog, "worktreeprompt", overlayKindPluginApproval, overlayKindIntegrationAsk, overlayKindLogs, overlayKindMessage}
 
 // overlayGate pairs a draggable overlay kind with whether it is shown.
 type overlayGate struct {
@@ -91,6 +91,7 @@ func (m *OS) eachOverlayGate(yield func(kind string, open bool) bool) {
 		{overlayKindCopyDialog, m.CopyDialogOpen()},
 		{"worktreeprompt", m.WorktreePromptOpen()},
 		{overlayKindPluginApproval, m.PluginApprovalOpen()},
+		{overlayKindIntegrationAsk, m.IntegrationAskOpen()},
 		{overlayKindLogs, m.ShowLogs},
 		{overlayKindMessage, m.msgView.open},
 	}
@@ -216,12 +217,17 @@ func (m *OS) centerOrigin(w, h int) (int, int) {
 // shifted by that kind's drag offset, and clamped so the panel stays on screen.
 func (m *OS) overlayOrigin(kind string, geo overlay.Geometry) (int, int) {
 	rw, rh := m.GetRenderWidth(), m.GetRenderHeight()
-	// Centred in the rows under a dock at the top, and kept below it while it
-	// fits there. See panelRoomHeight.
-	top := min(m.viewReserve().Top, max(rh-geo.Height, 0))
+	// Centred in the rows between the docks, where panelRoomHeight fits it,
+	// and kept below a dock at the top while it fits under it.
+	r := m.viewReserve()
+	top := min(r.Top, max(rh-geo.Height, 0))
+	room := rh - top
+	if geo.Height <= rh-r.Top-r.Bottom {
+		room -= r.Bottom
+	}
 	off := m.overlayOffset(kind)
 	x := m.panelCenterX(geo.Width, rw) + off[0]
-	y := top + m.overlayAnchorY(kind, geo.Height, rh-top) + off[1]
+	y := top + m.overlayAnchorY(kind, geo.Height, room) + off[1]
 	x = max(min(x, rw-geo.Width), 0)
 	y = max(min(y, rh-geo.Height), top)
 	return x, y
@@ -341,6 +347,7 @@ func (m *OS) centeredBoxLayer(box string, z int, id string) *lipgloss.Layer {
 // as surely as one set in the config file.
 func syncOverlaySettings(s *config.Settings) {
 	overlay.SetASCII(s.UseASCIIOnly)
+	overlay.SetNerdFonts(!s.NerdFontsOff())
 	b := s.OverlayBorder()
 	overlay.SetFrame(overlay.Frame{
 		TopLeft: b.TopLeft, TopRight: b.TopRight,

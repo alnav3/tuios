@@ -162,7 +162,22 @@ func reachSections(t *testing.T) []bindingSection {
 		{name: "transfers", binds: k.Transfers, modes: bothModes, newOS: reachTransfersOS},
 		// Copy mode owns the keyboard in either mode while a pane is in it.
 		{name: "copy_mode", binds: k.CopyMode, modes: bothModes, newOS: reachCopyModeOS},
+		// The review overlay owns the keyboard in either mode while it is open.
+		{name: "review", binds: k.Review, modes: bothModes, newOS: reachReviewOS},
 	}
+}
+
+// reachReviewOS is a client with the review overlay open on a diff.
+func reachReviewOS(t *testing.T) *app.OS {
+	t.Helper()
+	o, _, _ := reviewInputOS(t)
+	k := config.DefaultConfig().Keybindings
+	o = pressRun(t, o, k.LeaderKey)
+	o = pressRun(t, o, "v")
+	if !o.ReviewOpen() {
+		t.Fatal("ctrl+b v did not open the review on the test pane")
+	}
+	return o
 }
 
 // reachCopyModeOS is a client whose focused pane is in copy mode, which is the
@@ -449,6 +464,7 @@ var actionsWithNoDefaultBinding = map[string]string{
 	"restart_daemon":        "command palette row, rail machine menu row, settings row, version notice",
 	"paste_clipboard":       "context menu row",
 	"repo_new_worktree":     "rail repo header menu row",
+	"repo_toggle_fold":      "rail repo header menu row",
 	"session_new_worktree":  "rail session row menu row",
 	"rename_session":        "context menu row",
 	"screenshot_window":     "context menu row",
@@ -518,6 +534,9 @@ var actionsWithNoDefaultBinding = map[string]string{
 	// them too.
 	"copy_mode_search_forward":  "user binding and palette row",
 	"copy_mode_search_backward": "user binding and palette row",
+	// cmd+k in other terminals, which the host terminal usually keeps for
+	// itself, so it ships unbound.
+	"clear_scrollback": "user binding and palette row",
 	// Hints on every pane at once. The plain hints key does the same with
 	// hints.all_panes on (issue #248).
 	"hints_all_panes": "user binding and palette row",
@@ -533,6 +552,9 @@ var actionsWithNoDefaultBinding = map[string]string{
 	// surface; a user who wants h/l cycle binds these.
 	"next_workspace": "palette row, user binding",
 	"prev_workspace": "palette row, user binding",
+	// Machine cycling (#896). The rail and the switcher cover it by default.
+	"next_host": "palette row, user binding",
+	"prev_host": "palette row, user binding",
 	// Session jumping ships unbound for the same reason; the switcher and the
 	// rail cover it by default, and opt+N is a user binding.
 	"switch_session_1":   "user binding",
@@ -795,9 +817,11 @@ func modeName(m app.Mode) string {
 // sections count as handled through the reachability table, whose test
 // presses every key of them and sees its action run.
 func TestEveryDescribedActionIsHandled(t *testing.T) {
-	handled := map[string]bool{app.HoldModeAction: true}
+	// copy_mode_first_nonblank has no default key, so the copy_mode section
+	// below does not name it; runCopyModeAction runs it through its constant.
+	handled := map[string]bool{app.HoldModeAction: true, config.ActionCopyModeFirstNonBlank: true}
 	k := config.DefaultConfig().Keybindings
-	for _, section := range []map[string][]string{k.Inbox, k.InboxPeek, k.Mail, k.SidebarAgents, k.CopyMode, k.Transfers, k.Lists} {
+	for _, section := range []map[string][]string{k.Inbox, k.InboxPeek, k.Mail, k.SidebarAgents, k.CopyMode, k.Transfers, k.Lists, k.Review} {
 		for action := range section {
 			handled[action] = true
 		}

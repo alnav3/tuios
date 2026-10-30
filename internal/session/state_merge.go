@@ -41,6 +41,9 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 	if incoming.Accent == "" {
 		incoming.Accent = canonical.Accent
 	}
+	// The return note is written only by set-note, so canonical wins
+	// unconditionally: a sync can neither set it nor clear it.
+	incoming.Note = canonical.Note
 	// Restored is set by the restore and cleared by the first attach, both
 	// daemon-side. A bool cannot say "not sent", so canonical simply wins: no
 	// client can either raise the mark or clear it by syncing.
@@ -60,11 +63,16 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 	// canonical wins the same way: no client sync can file a session under a
 	// space or take it out.
 	incoming.Space = canonical.Space
+	// The rank is written only by set-session-order, the same way.
+	incoming.Rank = canonical.Rank
 	// The worktree record is written by detection and by the worktree verbs,
 	// both daemon-side, so canonical wins the same way Restored does.
 	incoming.Worktree = canonical.Worktree
 	// The window moves are recorded by a move between sessions, daemon-side.
 	incoming.WindowMoves = canonical.WindowMoves
+	// The task cards are written only by the task verbs, so canonical wins
+	// and no client sync can add, change or drop one. See task.go.
+	incoming.Tasks, incoming.NextTaskID = canonical.Tasks, canonical.NextTaskID
 	if incoming.WorkspaceNames == nil {
 		incoming.WorkspaceNames = canonical.WorkspaceNames
 	}
@@ -212,6 +220,7 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 		message string
 		harness string
 		at      int64
+		reason  string
 	}
 	agents := make(map[string]agent, len(canonical.Windows))
 	// The kind of a block and the harness's session id are daemon-owned too,
@@ -220,6 +229,7 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 		kind           string
 		sessionID      string
 		sessionHarness string
+		flags          *KeptFlags
 	}
 	agentIDs := make(map[string]agentIdentity, len(canonical.Windows))
 	// Agent metadata is daemon-owned for the same reason, and carried on its
@@ -230,7 +240,11 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 	// a pane, and no client sets it, so canonical wins like the meta. So does
 	// the subagent count, which only the pane's hooks move.
 	queued := make(map[string]int)
-	var subagents map[string]int // most sessions have none
+	var draftHeld map[string]bool // set only while a draft holds a queue
+	var subagents map[string]int  // most sessions have none
+	// Only mark-attention and the daemon's own wake move the settle, so
+	// canonical wins like the queue.
+	var settled map[string]bool
 	var subagentLists map[string][]SubagentInfo
 	// The popup mark, requested size and dim override are stamped once, when
 	// the daemon creates the window, and nothing ever changes them. So canonical
@@ -254,6 +268,8 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 		workspace int
 	}
 	scratches := make(map[string]scratchMark)
+	// The rail pane's mark, the daemon's like the scratch one.
+	var rails map[string]string
 	workspaces := make(map[string]int, len(canonical.Windows))
 	// The machine a window's process runs on is stamped once, when the daemon
 	// creates the window, and nothing moves a process between machines
@@ -289,10 +305,19 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 	// window, and a grant is held to it, so canonical wins unconditionally:
 	// a push can neither set one nor move it, even where canonical has none.
 	startDirs := make(map[string]string, len(canonical.Windows))
+	// A pane's return note is written only by set-note, so canonical wins
+	// unconditionally, like the start folder.
+	var notes map[string]string // most panes have none
 	for i := range canonical.Windows {
 		w := &canonical.Windows[i]
 		if w.StartDir != "" {
 			startDirs[w.ID] = w.StartDir
+		}
+		if w.Note != "" {
+			if notes == nil {
+				notes = make(map[string]string)
+			}
+			notes[w.ID] = w.Note
 		}
 		if w.StartedBy != nil {
 			startedBy[w.ID] = w.StartedBy
@@ -315,6 +340,12 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 		if w.Scratch {
 			scratches[w.ID] = scratchMark{w.ScratchName, w.Workspace}
 		}
+		if w.Rail != "" {
+			if rails == nil {
+				rails = make(map[string]string)
+			}
+			rails[w.ID] = w.Rail
+		}
 		if w.Kind != "" || w.URI != "" {
 			views[w.ID] = viewMark{w.Kind, w.URI}
 		}
@@ -329,16 +360,28 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 			shellPIDs[w.ID] = pid
 		}
 		if w.AgentState != AgentStateNone || w.AgentMessage != "" || w.AgentHarness != "" || w.AgentStateAt != 0 {
-			agents[w.ID] = agent{w.AgentState, w.AgentMessage, w.AgentHarness, w.AgentStateAt}
+			agents[w.ID] = agent{w.AgentState, w.AgentMessage, w.AgentHarness, w.AgentStateAt, w.AgentReason}
 		}
-		if w.AgentKind != "" || w.AgentSessionID != "" || w.AgentSessionHarness != "" {
-			agentIDs[w.ID] = agentIdentity{w.AgentKind, w.AgentSessionID, w.AgentSessionHarness}
+		if w.AgentKind != "" || w.AgentSessionID != "" || w.AgentSessionHarness != "" || w.AgentFlags != nil {
+			agentIDs[w.ID] = agentIdentity{w.AgentKind, w.AgentSessionID, w.AgentSessionHarness, w.AgentFlags}
 		}
 		if len(w.AgentMeta) > 0 {
 			metas[w.ID] = w.AgentMeta
 		}
 		if w.AgentQueued != 0 {
 			queued[w.ID] = w.AgentQueued
+		}
+		if w.AgentDraftHeld {
+			if draftHeld == nil {
+				draftHeld = make(map[string]bool)
+			}
+			draftHeld[w.ID] = true
+		}
+		if w.AgentSettled {
+			if settled == nil {
+				settled = make(map[string]bool)
+			}
+			settled[w.ID] = true
 		}
 		if w.AgentSubagents != 0 {
 			if subagents == nil {
@@ -364,6 +407,7 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 			w.Cwd = cwd
 		}
 		w.StartDir = startDirs[w.ID]
+		w.Note = notes[w.ID]
 		if pid, ok := shellPIDs[w.ID]; ok || w.ShellPID == 0 {
 			w.ShellPID = pid
 		}
@@ -383,6 +427,7 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 		p, ok := popups[w.ID]
 		sm, isScratch := scratches[w.ID]
 		w.Scratch, w.ScratchName = isScratch, sm.name
+		w.Rail = rails[w.ID]
 		switch {
 		case isScratch && IsScratchWorkspace(sm.workspace):
 			w.Workspace = sm.workspace
@@ -409,15 +454,19 @@ func retainDaemonExclusive(incoming, canonical *SessionState) {
 		w.AgentKind = ids.kind
 		w.AgentSessionID = ids.sessionID
 		w.AgentSessionHarness = ids.sessionHarness
+		w.AgentFlags = ids.flags
 		a := agents[w.ID]
 		w.AgentState = a.state
 		w.AgentMessage = a.message
 		w.AgentHarness = a.harness
 		w.AgentStateAt = a.at
+		w.AgentReason = a.reason
 		// Taken from canonical whatever the client sent: no client sets it, so
 		// a value in a client push is an echo of an older state at best.
 		w.AgentMeta = metas[w.ID]
 		w.AgentQueued = queued[w.ID]
+		w.AgentDraftHeld = draftHeld[w.ID]
+		w.AgentSettled = settled[w.ID]
 		w.AgentSubagents = subagents[w.ID]
 		w.AgentSubagentList = subagentLists[w.ID]
 		w.ProgramStatus = programStatus[w.ID]

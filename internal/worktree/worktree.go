@@ -11,11 +11,14 @@
 // every session whose directory changes, and a subprocess per session per
 // change is the kind of cost that makes an idle daemon busy. A linked worktree
 // is recognisable without git: its ".git" is a file naming the gitdir, and that
-// gitdir holds "commondir" and "HEAD".
+// gitdir holds "commondir" and "HEAD". A repository whose refs are in reftable
+// is the exception: HEAD holds a placeholder, and the branch is asked of git
+// through gitstate, which asks again only when the refs have moved.
 package worktree
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -27,12 +30,12 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
 	"github.com/Gaurav-Gosain/tuios/internal/lazyre"
-	"github.com/adrg/xdg"
 )
 
 // Info is what a worktree is, as far as the rest of tuios needs to know.
 type Info struct {
-	// Repo is the repository's name: the base name of its main checkout.
+	// Repo is the repository's name: the base name of its main checkout, or
+	// of a bare repository's project directory (see gitstate.RepoName).
 	Repo string `json:"repo"`
 	// RepoRoot is the main checkout, the directory holding the shared .git.
 	RepoRoot string `json:"repo_root"`
@@ -51,45 +54,76 @@ type Info struct {
 // this package means: the sessions the rail groups are the ones a repository
 // was split into, not the repository itself.
 func Detect(dir string) (Info, bool) {
+	info, main, ok := DetectEither(dir)
+	if main {
+		return Info{}, false
+	}
+	return info, ok
+}
+
+// DetectEither is the one walk up from dir that Detect's answer and the
+// main checkout's share: a single Locate, answering either question. main says the answer is the
+// repository's main checkout — the directory whose .git is the repository's
+// own git directory, which Detect deliberately reports nothing for, because
+// the sessions it groups are the ones a repository was split into, not the
+// repository itself; the rail's group_main option wants the repository itself
+// in the group too, and this is what it reads. A linked worktree is the
+// answer with main false, and a directory outside any repository is no
+// answer at all.
+func DetectEither(dir string) (info Info, main, ok bool) {
 	dir = filepath.Clean(dir)
 	if dir == "" || dir == "." {
-		return Info{}, false
+		return Info{}, false, false
 	}
-	gitdir, commonDir, root, ok := gitstate.Locate(dir)
-	// The two git directories are the same in the main checkout, and when a
-	// ".git" file's gitdir has no commondir pointer. Neither is a linked
-	// worktree.
-	if !ok || gitdir == commonDir {
-		return Info{}, false
+	gitdir, commonDir, root, found := gitstate.Locate(dir)
+	if !found {
+		return Info{}, false, false
 	}
-	// Only a gitdir under <common>/worktrees/<name> is a linked worktree. A
-	// submodule also uses a ".git" file, and its gitdir sits under modules/.
-	if filepath.Base(filepath.Dir(gitdir)) != "worktrees" {
-		return Info{}, false
+	main = gitdir == commonDir
+	// The entry under root tells the two apart. A submodule also answers
+	// gitdir == commonDir: its .git file names a gitdir under modules/ that
+	// carries no commondir pointer, and that gitdir is not a working tree, so
+	// only a .git directory says main checkout. Only a gitdir under
+	// <common>/worktrees/<name> is a linked worktree; a gitdir under modules/
+	// is the submodule again.
+	if main {
+		if st, err := os.Stat(filepath.Join(root, ".git")); err != nil || !st.IsDir() {
+			return Info{}, false, false
+		}
+	} else if filepath.Base(filepath.Dir(gitdir)) != "worktrees" {
+		return Info{}, false, false
 	}
 	repoRoot := commonDir
 	if filepath.Base(commonDir) == ".git" {
 		repoRoot = filepath.Dir(commonDir)
 	}
-	branch := readHead(gitdir)
+	branch := readHead(gitdir, commonDir, root)
 	if branch == "" {
-		return Info{}, false
+		return Info{}, false, false
 	}
 	return Info{
-		Repo:     filepath.Base(repoRoot),
+		Repo:     gitstate.RepoName(commonDir),
 		RepoRoot: repoRoot,
 		Branch:   branch,
 		Path:     root,
-	}, true
+	}, main, true
 }
 
 // readHead names the branch a gitdir's HEAD points at, or "detached@<hash>".
-func readHead(gitdir string) string {
+// root is the worktree, where git is asked when the refs are in reftable.
+func readHead(gitdir, commonDir, root string) string {
 	data, err := os.ReadFile(filepath.Join(gitdir, "HEAD"))
 	if err != nil {
 		return ""
 	}
 	head := strings.TrimSpace(string(data))
+	if gitstate.IsReftableHead(head) {
+		branch, sha, detached := gitstate.ReftableHead(gitdir, commonDir, root)
+		if detached {
+			return "detached@" + sha[:7]
+		}
+		return branch
+	}
 	if ref, ok := strings.CutPrefix(head, "ref: refs/heads/"); ok {
 		return ref
 	}
@@ -119,20 +153,6 @@ func Root(dir string) (string, error) {
 	return common, nil
 }
 
-// DefaultDir is where tuios puts the worktrees it creates:
-// $XDG_DATA_HOME/tuios/worktrees, one directory per repository under it.
-func DefaultDir() string {
-	if override := os.Getenv("TUIOS_WORKTREE_DIR"); override != "" {
-		return override
-	}
-	return filepath.Join(xdg.DataHome, "tuios", "worktrees")
-}
-
-// PathFor is the directory a worktree of repoRoot on branch gets under dir.
-func PathFor(dir, repoRoot, branch string) string {
-	return filepath.Join(dir, filepath.Base(repoRoot), Slug(branch))
-}
-
 var slugStrip = lazyre.New(`[^A-Za-z0-9._]+`)
 
 // Slug turns a branch name into one path component and one session-name
@@ -159,7 +179,7 @@ func ValidBranch(name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("branch name is empty")
 	}
-	cmd := childproc.Command("git", "check-ref-format", "--branch", name)
+	cmd := childproc.Git(context.Background(), "", "check-ref-format", "--branch", name)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%q is not a valid branch name", name)
 	}
@@ -418,11 +438,9 @@ func run(dir string, args ...string) (string, error) {
 
 // runEnv is run with extra environment entries.
 func runEnv(dir string, env []string, args ...string) (string, error) {
-	cmd := childproc.Command("git", args...)
-	cmd.Dir = dir
-	// Nothing here is interactive, and a git that waits on a terminal for a
+	// Git sets nothing interactive: a git that waits on a terminal for a
 	// credential or an editor would hang the daemon.
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_EDITOR=true")
+	cmd := childproc.Git(context.Background(), dir, args...)
 	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

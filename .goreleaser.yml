@@ -65,6 +65,28 @@ builds:
     flags:
       - -trimpath
 
+  # Termux on Android. A linux build stops there with SIGSYS: Go's linux
+  # os/exec calls faccessat2, and Android's seccomp policy for apps traps it.
+  # Go leaves that call out when GOOS is android. android/arm needs cgo, so
+  # only arm64 is built.
+  - id: tuios-android
+    main: ./cmd/tuios
+    binary: tuios
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - android
+    goarch:
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+    flags:
+      - -trimpath
+
   - id: tuios-web
     main: ./cmd/tuios-web
     binary: tuios-web
@@ -289,6 +311,24 @@ archives:
       - src: sketch/raster/fonts/NOTICE
         dst: licenses/sketch/NOTICE
 
+  # Its own archive, so that the AUR and Homebrew entries, which take
+  # tuios-archive, do not see it. tuios update finds it by the same name rule.
+  - id: tuios-android-archive
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- .Arch }}
+    ids:
+      - tuios-android
+    files:
+      - README.md
+      - LICENSE*
+      - src: sketch/LICENSE
+        dst: licenses/sketch/LICENSE
+      - src: sketch/raster/fonts/NOTICE
+        dst: licenses/sketch/NOTICE
+
   - id: tuios-web-archive
     name_template: >-
       {{ .ProjectName }}-web_
@@ -482,7 +522,7 @@ aurs:
   - name: tuios-sketch-bin
     ids:
       - sketch-archive
-    homepage: https://tuios.dev
+    homepage: https://tuios.dev/
     description: "Draw Mermaid diagrams in the terminal, or as SVG or PNG"
     maintainers:
       - "Gaurav Gosain <itsgauravgosain@gmail.com>"
@@ -502,7 +542,7 @@ aurs:
   - name: tuios-plot-bin
     ids:
       - tplot-archive
-    homepage: https://tuios.dev
+    homepage: https://tuios.dev/
     description: "Draw charts in the terminal from CSV, TSV or JSON"
     maintainers:
       - "Gaurav Gosain <itsgauravgosain@gmail.com>"
@@ -521,7 +561,7 @@ aurs:
   - name: tuios-tml-bin
     ids:
       - tml-archive
-    homepage: https://tuios.dev
+    homepage: https://tuios.dev/
     description: "Show TML documents in the terminal"
     maintainers:
       - "Gaurav Gosain <itsgauravgosain@gmail.com>"
@@ -649,7 +689,7 @@ homebrew_casks:
       owner: Gaurav-Gosain
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://tuios.dev
+    homepage: https://tuios.dev/
     description: "Draw Mermaid diagrams in the terminal, or as SVG or PNG"
     commit_author:
       name: goreleaserbot
@@ -671,7 +711,7 @@ homebrew_casks:
       owner: Gaurav-Gosain
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://tuios.dev
+    homepage: https://tuios.dev/
     description: "Draw charts in the terminal from CSV, TSV or JSON"
     commit_author:
       name: goreleaserbot
@@ -693,7 +733,7 @@ homebrew_casks:
       owner: Gaurav-Gosain
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://tuios.dev
+    homepage: https://tuios.dev/
     description: "Show TML documents in the terminal"
     commit_author:
       name: goreleaserbot

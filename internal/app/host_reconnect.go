@@ -161,7 +161,7 @@ func (m *OS) hostReconnectWait() tea.Cmd {
 	}
 	gen := r.gen
 	delay := hostReconnectDelay(r.attempt)
-	return tea.Tick(delay, func(time.Time) tea.Msg { return hostReconnectTickMsg{gen: gen} })
+	return m.tickUntilStop(delay, func(time.Time) tea.Msg { return hostReconnectTickMsg{gen: gen} })
 }
 
 // hostReconnectDelay is the wait before dial number attempt+1: one second, then
@@ -363,13 +363,13 @@ func (m *OS) giveUpOnHost(reason string) tea.Cmd {
 	if m.hostReturn == "" {
 		m.hostReconnectReason = reason
 		m.ExitReason = ExitHostLost
-		return tea.Quit
+		return m.QuitCmd()
 	}
 	if err := m.SwitchToHostSession(federation.LocalHostName, m.hostReturn, false); err != nil {
 		m.LogWarn("Could not return to %q: %v", m.hostReturn, err)
 		m.hostReconnectReason = reason
 		m.ExitReason = ExitHostLost
-		return tea.Quit
+		return m.QuitCmd()
 	}
 	m.ShowNotification(reason, "warning", m.Settings.NotificationWarningDuration*2)
 	return nil

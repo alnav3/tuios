@@ -41,6 +41,24 @@ type Settings struct {
 	// screen, which is the affordance that it is waiting for you.
 	NotificationErrorSticky bool
 
+	// Bell is notifications.bell: what a pane's BEL does. Only the Update
+	// goroutine reads it.
+	Bell string
+
+	// NotificationStyle is notifications.style: NotificationStyleFull draws a
+	// dock message with its severity cap and the countdown on the rule above
+	// it, NotificationStylePlain draws the mark and the text only. A mode
+	// that wants a quieter screen sets it to NotificationStylePlain.
+	NotificationStyle string
+
+	// NotificationLevel is notifications.level: the least severe message the
+	// dock shows. A message below it goes to the log viewer only.
+	NotificationLevel string
+
+	// NotificationLogHidden is notifications.log_hidden: whether an info or
+	// success message below NotificationLevel still goes to the log viewer.
+	NotificationLogHidden bool
+
 	// NormalFPS is the normal refresh rate during regular operation.
 	// Set via appearance.max_fps config (default 60, up to MaxFPSCap).
 	NormalFPS int
@@ -78,6 +96,12 @@ type Settings struct {
 	// MotionFull. Set via appearance.motion, or --no-animations for none.
 	// Read it through MotionAllows, which also honours AnimationsSuppressed.
 	Motion string
+
+	// Calm is appearance.calm: nothing moves or blinks, and only messages
+	// that need the person reach the dock. It sits over Motion rather than
+	// replacing it, so turning calm off gives back the level the person had.
+	// See internal/app/calm.go.
+	Calm bool
 
 	// NoAnimationsFlag records --no-animations, so re-applying the config at
 	// runtime keeps the level at none until something sets the level itself
@@ -128,6 +152,16 @@ type Settings struct {
 	// FramePanels frames every overlay panel in OverlayBorder, not only the
 	// panels at 16 colours that need a frame. Set via appearance.frame_panels.
 	FramePanels bool
+
+	// PaneOverlays draws dialogs and panels like pane windows: framed in the
+	// focused pane's border colour, on the ground an empty pane cell shows.
+	// Set via appearance.pane_overlays.
+	PaneOverlays bool
+
+	// OverlayBorderColor is the colour every overlay frame is drawn in. Empty
+	// keeps the overlay's own, or the focused pane's border under
+	// PaneOverlays. Set via appearance.overlay_border_color.
+	OverlayBorderColor string
 
 	// TilingScheme is the BSP insertion scheme a workspace starts with the
 	// first time it is tiled: one of the TilingScheme* constants (spiral,
@@ -197,6 +231,12 @@ type Settings struct {
 	// SidebarMarquee scrolls a hovered row's title when it overflows its columns.
 	SidebarMarquee bool
 
+	// SidebarPeekEnabled lets hovering a session row, or moving the rail
+	// cursor onto it, show that session's panes in the terminals section.
+	// Off, the section shows the attached session's panes until a click
+	// attaches another one (issue #1227).
+	SidebarPeekEnabled bool
+
 	// SidebarSections is the rail's layout: which sections it stacks, in what
 	// order, and the share of the rail each one may claim. See
 	// SidebarDefaultSections for the syntax.
@@ -215,6 +255,12 @@ type Settings struct {
 	// SidebarFolderClick is what a click on a folder row does: walk the listing
 	// into it, tell the pane to cd there, or both.
 	SidebarFolderClick string
+	// SidebarFileDrag lets a row of the files section be dragged into a pane
+	// to paste its path.
+	SidebarFileDrag bool
+	// SidebarFilesStyle is how the files section draws: "list", one folder at
+	// a time, or "tree", folders opened in place under one root.
+	SidebarFilesStyle string
 	// RailHeaderCase is how the rail's section headers read: "lowercase"
 	// keeps the quiet furniture look they have always had, "uppercase" draws
 	// the heading treatment (bold, secondary ink, the rule glyph and the
@@ -246,6 +292,11 @@ type Settings struct {
 	// done and seen) before the rail folds it into one line with the others.
 	// Zero never folds. From appearance.sidebar.agent_rest_fold.
 	SidebarAgentRestFold time.Duration
+
+	// SidebarGroupMain gathers the repository's main checkout under the repo
+	// row with its worktrees, and points the header's activation at it. From
+	// appearance.sidebar.group_main.
+	SidebarGroupMain bool
 
 	// SidebarSubagents is how the rail draws the subagents under an agent
 	// row: rows or the count, tree lines, the heading line that folds them,
@@ -359,6 +410,12 @@ type Settings struct {
 	// dock's mode pill, "badge" draws the floating PREFIX badge. The badge is
 	// drawn either way when the dock is hidden or has no mode pill.
 	DockPrefixIndicator string
+
+	// DockModePill is what the mode pill shows while tiling is on: "tiling"
+	// draws the tiling icon in both input modes, "input" draws the terminal
+	// or window icon, so the two modes differ by more than colour. The split
+	// letter follows either icon.
+	DockModePill string
 
 	// BorderFocusedGradient and BorderGradientAngle are
 	// appearance.border_focused_gradient and border_gradient_angle. Read the
@@ -492,6 +549,11 @@ type Settings struct {
 	// Set via appearance.nvim_navigation config.
 	NvimNavigation bool
 
+	// FocusWrap lets a directional focus key in a tiled layout wrap to the far
+	// side of the layout when no pane lies that way. It is off by default.
+	// Set via appearance.focus_wrap config.
+	FocusWrap bool
+
 	// FocusFollowsMouse focuses the pane under the cursor as the mouse moves over
 	// it, without a click and without entering terminal mode. It is a divisive
 	// window-manager habit, so it defaults off and users opt in.
@@ -624,6 +686,11 @@ type Settings struct {
 	// Set via appearance.niri_scroll_cells config
 	NiriScrollCells int
 
+	// NiriScrollSnap lines the strip up on the nearest column once a wheel,
+	// a trackpad or a finger has stopped moving it, as niri does at the end
+	// of a gesture. Set via appearance.niri_scroll_snap config
+	NiriScrollSnap bool
+
 	// PrefixRepeatTime is how long the prefix stays armed after a repeatable
 	// prefix command, in milliseconds. Zero turns it off. See
 	// PrefixRepeatTimeDefault.
@@ -637,6 +704,12 @@ type Settings struct {
 	// rather than the binding tables. Empty is the default of each.
 	KeyboardLayout string
 	OptionGlyphs   string
+	// Lock is keybindings.lock: terminal mode gives every key but the leader
+	// to the focused pane.
+	Lock bool
+	// NestExitKey is keybindings.nest_exit_key, the key that ends nest mode.
+	// Empty is DefaultNestExitKey. See GetNestExitKey.
+	NestExitKey string
 
 	// PaneGap is the cells of empty space the tiler keeps between two neighbouring
 	// panes: i3's inner gap, and about the only spacing a terminal window manager
@@ -690,6 +763,13 @@ type Settings struct {
 	// hand carries a zero here, and a clamp against zero pins every column to
 	// the floor.
 	ScrollColumnMax int
+
+	// ScrollColumnPresets are the widths scroll_cycle_width steps through, as
+	// ascending fractions of the screen, from appearance.scroll_column_presets.
+	// Nil means the scrolling layout's built-in presets. Presets above
+	// ScrollColumnMax are skipped by the cycle, not here, so raising the cap
+	// live brings them back.
+	ScrollColumnPresets []float64
 
 	// ZoomSize is how much of the content region a zoomed pane takes, as a
 	// percent. 100, the default, is the whole of it.
@@ -791,6 +871,12 @@ type Settings struct {
 	DockBackground         string
 	SidebarBackground      string
 
+	// SidebarCursorBackground is the ground of the rail's cursor row while
+	// the rail has the keyboard. Empty keeps the palette's Surface. It is
+	// a colour only, with no off or theme: the row is a band on the rail,
+	// not a surface of its own. See sidebarRowBg.
+	SidebarCursorBackground string
+
 	// ClockFormat is the Go time layout the clock overlay draws with. Empty takes
 	// DefaultClockFormat.
 	//
@@ -829,12 +915,62 @@ const ImageSymbolsAuto = "auto"
 // than auto are mosaic.Kind names.
 var ImageSymbolModes = []string{ImageSymbolsAuto, "octant", "sextant", "quadrant", "half", "off"}
 
+// The values of notifications.bell.
+const (
+	// BellToast shows a message in the dock. It is the default, and what
+	// tuios did before the option existed.
+	BellToast = "toast"
+	// BellForward writes the BEL to the terminal tuios runs in.
+	BellForward = "forward"
+	// BellBoth does both.
+	BellBoth = "both"
+	// BellOff does neither.
+	BellOff = "off"
+)
+
+// BellModes is what notifications.bell accepts.
+var BellModes = []string{BellToast, BellForward, BellBoth, BellOff}
+
+// The values of notifications.style.
+const (
+	// NotificationStyleFull draws the severity cap on the message's left and
+	// burns the rule above it down as the message ages. It is the default.
+	NotificationStyleFull = "full"
+	// NotificationStylePlain draws the severity mark and the text, with no cap
+	// and no countdown.
+	NotificationStylePlain = "plain"
+)
+
+// NotificationStyles is what notifications.style accepts.
+var NotificationStyles = []string{NotificationStyleFull, NotificationStylePlain}
+
+// The notifications.level values, least severe first. info shows every
+// message, success included.
+const (
+	NotificationLevelInfo    = "info"
+	NotificationLevelWarning = "warning"
+	NotificationLevelError   = "error"
+)
+
+// NotificationLevels is every notifications.level value.
+var NotificationLevels = []string{NotificationLevelInfo, NotificationLevelWarning, NotificationLevelError}
+
+// NotificationsPlain reports whether a dock message is drawn without its cap
+// and countdown.
+func (s *Settings) NotificationsPlain() bool {
+	return s.NotificationStyle == NotificationStylePlain
+}
+
 func DefaultSettings() Settings {
 	return Settings{
-		NotificationDuration:        6 * time.Second,
+		NotificationDuration:        2 * time.Second,
 		NotificationWarningDuration: 8 * time.Second,
 		NotificationErrorDuration:   15 * time.Second,
 		NotificationErrorSticky:     true,
+		Bell:                        BellToast,
+		NotificationStyle:           NotificationStyleFull,
+		NotificationLevel:           NotificationLevelInfo,
+		NotificationLogHidden:       true,
 		NormalFPS:                   DefaultFPS,
 		UseASCIIOnly:                false,
 		Motion:                      MotionFull,
@@ -861,10 +997,13 @@ func DefaultSettings() Settings {
 		SidebarShowCounts:           true,
 		SidebarShowNumbers:          false,
 		SidebarMarquee:              true,
+		SidebarPeekEnabled:          true,
 		SidebarSections:             SidebarDefaultSections,
 		SidebarFileIcons:            true,
 		SidebarFileIconColors:       true,
 		SidebarFolderClick:          SidebarFolderClickNavigate,
+		SidebarFileDrag:             true,
+		SidebarFilesStyle:           SidebarFilesList,
 		SidebarFileActions:          true,
 		SidebarFileDelete:           SidebarFileDeleteTrash,
 		SidebarAgentRow:             DefaultSidebarAgentRow(),
@@ -884,6 +1023,7 @@ func DefaultSettings() Settings {
 		DockPillCaps:                true,
 		DockModeSplitLetter:         true,
 		DockPrefixIndicator:         DefaultDockPrefixIndicator,
+		DockModePill:                DefaultDockModePill,
 		BorderGradientAngle:         DefaultBorderGradientAngle,
 		HideWindowButtons:           false,
 		WindowButtonStyle:           WindowButtonStyleDots,
@@ -967,6 +1107,18 @@ const DefaultScrollbackLines = 10000
 // asking "what does tuios bind when nobody said otherwise", which is one answer
 // for the whole program and not one per session.
 const DefaultLeaderKey = "ctrl+b"
+
+// DefaultNestExitKey is the key that ends nest mode when
+// keybindings.nest_exit_key is unset: F12, tmux-matryoshka's.
+const DefaultNestExitKey = "f12"
+
+// GetNestExitKey returns the key that ends nest mode.
+func (s *Settings) GetNestExitKey() string {
+	if s.NestExitKey == "" {
+		return DefaultNestExitKey
+	}
+	return s.NestExitKey
+}
 
 // Global is the process seed: the config file and the CLI flags are applied to
 // it once at startup, single-threaded, and every session copies it at

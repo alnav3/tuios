@@ -82,6 +82,9 @@ type Node struct {
 	// files"), empty when it reported none. Never rolled up, for the same
 	// reason Harness is not.
 	Message string
+	// Reason is why AgentState is not the state the agent gave: "silent"
+	// for a hooked pane that stopped reporting. Never rolled up.
+	Reason string
 	// AgentKind is what sort of block a needs_input pane is on: "approval",
 	// "question", or empty when the source did not say. Meaningless in any
 	// other state, and never rolled up.
@@ -92,6 +95,12 @@ type Node struct {
 	// Queued is how many messages wait in the pane's delivery queue to be
 	// typed when its agent comes to rest. Never rolled up.
 	Queued int
+	// DraftHeld is true while the person's draft in the input box holds the
+	// pane's queue. Never rolled up.
+	DraftHeld bool
+	// Settled marks an agent the person put away on the Settled shelf.
+	// Never rolled up.
+	Settled bool
 	// Subagents is how many subagents the pane's agent is running. On a
 	// session node it belongs to the window that won the roll-up, like
 	// DoneSeen, so the session's mark says "waiting" when that pane is at
@@ -123,6 +132,9 @@ type Node struct {
 	// it is not in a checkout or the daemon did not say. Always empty for
 	// window nodes.
 	Branch string
+	// Note is the session's return note, empty for none. Always empty for
+	// window nodes.
+	Note string
 	// Host is the machine a node belongs to, empty for anything on this one. It
 	// is set on a KindHost header and on every session node under it.
 	Host string
@@ -148,8 +160,12 @@ type Node struct {
 	Global bool
 	// Worktree is the git worktree this session sits in, nil for a session
 	// that is not one. It is what puts the row under a repository parent and
-	// labels it with its branch.
+	// labels it with its branch, unless the session is Named.
 	Worktree *WorktreeRef
+	// Named says the session wears a label a person gave it: a display name,
+	// or a name tuios did not make up. A worktree row keeps such a label and
+	// shows the branch after it, rather than taking the branch as its label.
+	Named bool
 	// GroupLast marks the last member of a repository group, so the row can
 	// draw the tree glyph that closes the group. Set by GroupByRepo and
 	// meaningless anywhere else.
@@ -210,6 +226,9 @@ type WindowInput struct {
 	Harness string
 	// Message is the note the pane reported with its state, empty for none.
 	Message string
+	// Reason is why AgentState is not the state the agent gave, empty when
+	// it is.
+	Reason string
 	// AgentKind is what sort of block a needs_input pane is on ("approval",
 	// "question"), empty when the source did not say.
 	AgentKind string
@@ -218,6 +237,10 @@ type WindowInput struct {
 	Meta []MetaToken
 	// Queued is how many messages wait in the pane's delivery queue.
 	Queued int
+	// DraftHeld is true while the person's draft holds that queue.
+	DraftHeld bool
+	// Settled marks an agent the person put away on the Settled shelf.
+	Settled bool
 	// Subagents is how many subagents the pane's agent is running.
 	Subagents int
 	// SubagentList is the pane's subagents themselves, in start order. Nil
@@ -271,8 +294,12 @@ type SessionInput struct {
 	// Worktree is the git worktree this session sits in, nil for a session
 	// that is not one.
 	Worktree *WorktreeRef
+	// Named says a person chose the session's label. See Node.Named.
+	Named bool
 	// Space is the space the session is filed under, empty for none.
-	Space   string
+	Space string
+	// Note is the session's return note, empty for none.
+	Note    string
 	Windows []WindowInput
 }
 
@@ -351,6 +378,7 @@ func BuildSession(s SessionInput) Node {
 		ID:          s.Name,
 		Title:       title,
 		Branch:      s.Branch,
+		Note:        s.Note,
 		Attached:    s.Attached,
 		IsCurrent:   s.IsCurrent,
 		WindowCount: s.WindowCount,
@@ -358,6 +386,7 @@ func BuildSession(s SessionInput) Node {
 		Restored:    s.Restored,
 		Global:      s.Global,
 		Worktree:    s.Worktree,
+		Named:       s.Named,
 		Space:       s.Space,
 	}
 	if len(s.Windows) == 0 {
@@ -376,9 +405,12 @@ func BuildSession(s SessionInput) Node {
 			StateAt:      w.StateAt,
 			Harness:      w.Harness,
 			Message:      w.Message,
+			Reason:       w.Reason,
 			AgentKind:    w.AgentKind,
 			Meta:         w.Meta,
 			Queued:       w.Queued,
+			DraftHeld:    w.DraftHeld,
+			Settled:      w.Settled,
 			Subagents:    w.Subagents,
 			SubagentList: w.SubagentList,
 			Program:      w.Program,

@@ -1,6 +1,10 @@
 package app
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/Gaurav-Gosain/tuios/internal/crashexit"
+)
 
 // windowExitQueue parks the window exits that did not fit in WindowExitChan.
 type windowExitQueue struct {
@@ -22,7 +26,9 @@ type windowExitQueue struct {
 //
 // Both callers are OnPTYClosed handlers, which the daemon client runs on its
 // read loop: the one goroutine that also carries pane output and every
-// round-trip response. A send that blocks there does not delay one window's
+// round-trip response. (A PTY that closed before its window was placed runs
+// the handler on the Update goroutine instead, where a blocking send would
+// deadlock: the same reason not to block.) A send that blocks there does not delay one window's
 // teardown, it stops the client outright.
 //
 // A larger WindowExitChan would only move the number, since killing a session
@@ -58,6 +64,7 @@ func (m *OS) queueWindowExit(windowID string) {
 }
 
 func (m *OS) drainWindowExits(stop chan struct{}) {
+	defer crashexit.Recover()
 	q := &m.windowExits
 	for {
 		q.mu.Lock()

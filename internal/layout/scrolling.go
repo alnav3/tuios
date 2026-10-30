@@ -70,11 +70,16 @@ type ScrollingLayout struct {
 	ZoomProportion float64
 }
 
+// DefaultPresetWidths are the widths CycleWidth steps through when
+// appearance.scroll_column_presets sets none. Callers share it, so nothing may
+// write to it.
+var DefaultPresetWidths = []float64{0.333, 0.5, 0.55, 0.667, 0.9, 1.0}
+
 // NewScrollingLayout creates a new scrolling layout with sensible defaults.
 func NewScrollingLayout() *ScrollingLayout {
 	return &ScrollingLayout{
 		DefaultWidth: 0.55,
-		PresetWidths: []float64{0.333, 0.5, 0.55, 0.667, 0.9, 1.0},
+		PresetWidths: DefaultPresetWidths,
 		ZoomedCol:    -1,
 	}
 }
@@ -359,6 +364,40 @@ func (s *ScrollingLayout) ClampViewport(screenWidth int) {
 	if s.ViewportX > maxScroll {
 		s.ViewportX = maxScroll
 	}
+}
+
+// SnapViewport lines the viewport up on a column: its left edge goes to the
+// start of a column, or to the strip's far end, so the last columns are not
+// pushed back off it. dir is the way the strip was travelling. With dir 0 it
+// goes to the nearest of those. With dir > 0 it goes to the nearest one at or
+// past where it is, and with dir < 0 the nearest one at or before, so a step
+// shorter than half a column still reaches the next one instead of sliding
+// back.
+func (s *ScrollingLayout) SnapViewport(screenWidth, dir int) {
+	if len(s.Columns) == 0 {
+		return
+	}
+	maxScroll := max(s.TotalStripWidth(screenWidth)-screenWidth, 0)
+	best, found := 0, false
+	consider := func(x int) {
+		x = min(x, maxScroll)
+		if (dir > 0 && x < s.ViewportX) || (dir < 0 && x > s.ViewportX) {
+			return
+		}
+		if !found || abs(x-s.ViewportX) < abs(best-s.ViewportX) {
+			best, found = x, true
+		}
+	}
+	for i := range s.Columns {
+		consider(s.columnX(i, screenWidth))
+	}
+	consider(maxScroll)
+	if !found {
+		s.SnapViewport(screenWidth, 0)
+		return
+	}
+	s.ViewportX = best
+	s.ClampViewport(screenWidth)
 }
 
 // scrollPeek is the cells of the neighbouring column kept on screen beside the

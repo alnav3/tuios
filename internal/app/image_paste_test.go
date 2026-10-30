@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,6 +28,14 @@ type fakeClipboard struct {
 	ran []string
 	// hang makes every command wait for its context.
 	hang bool
+	// slowInfo is how long osascript's clipboard info takes, as its start
+	// does on a real Mac.
+	slowInfo time.Duration
+}
+
+// isPowerShell is any of the PowerShells the Windows and WSL backends run.
+func isPowerShell(name string) bool {
+	return name == "powershell" || filepath.Base(name) == "powershell.exe"
 }
 
 func (f *fakeClipboard) env(goos string, vars map[string]string, tools ...string) imageClipboardEnv {
@@ -58,7 +67,17 @@ func (f *fakeClipboard) answer(ctx context.Context, name string, args ...string)
 			return nil, errors.New("exit status 1")
 		}
 		return []byte(strings.Join(f.types, "\n") + "\n"), nil
+	case name == "pbpaste":
+		if slices.Contains(f.types, "text/plain") {
+			return []byte("some text"), nil
+		}
+		return nil, nil
 	case name == "osascript" && strings.Contains(line, "clipboard info"):
+		select {
+		case <-time.After(f.slowInfo):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 		var parts []string
 		for _, t := range f.types {
 			switch t {
@@ -71,9 +90,9 @@ func (f *fakeClipboard) answer(ctx context.Context, name string, args ...string)
 		return []byte(strings.Join(parts, ", ")), nil
 	case name == "osascript":
 		return []byte("«data PNGf" + strings.ToUpper(hexOf(f.image)) + "»\n"), nil
-	case name == "powershell" && strings.Contains(line, "ContainsImage"):
+	case isPowerShell(name) && strings.Contains(line, "ContainsImage"):
 		return []byte(strings.Join(f.types, "\r\n")), nil
-	case name == "powershell":
+	case isPowerShell(name):
 		return []byte(base64.StdEncoding.EncodeToString(f.image) + "\r\n"), nil
 	default:
 		return f.image, nil
@@ -92,6 +111,23 @@ func hexOf(b []byte) string {
 var fakePNG = []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRfake")
 
 var wayland = map[string]string{"XDG_RUNTIME_DIR": "/run/user/1", "WAYLAND_DISPLAY": "wayland-0"}
+
+// wsl is what a shell under WSL2 with WSLg inherits: the distribution and the
+// interop socket, and WSLg's Wayland and X11 displays beside them.
+var wsl = map[string]string{
+	"WSL_DISTRO_NAME": "Debian",
+	"WSL_INTEROP":     "/run/WSL/1804_interop",
+	"XDG_RUNTIME_DIR": "/run/user/1000",
+	"WAYLAND_DISPLAY": "wayland-0",
+	"DISPLAY":         ":0",
+}
+
+// withVars is vars with extra set on top.
+func withVars(vars map[string]string, extra map[string]string) map[string]string {
+	out := maps.Clone(vars)
+	maps.Copy(out, extra)
+	return out
+}
 
 func TestTheImageToolIsChosenPerPlatform(t *testing.T) {
 	f := &fakeClipboard{}
@@ -114,6 +150,13 @@ func TestTheImageToolIsChosenPerPlatform(t *testing.T) {
 		{"far x11 inside ssh", f.env("linux", map[string]string{"DISPLAY": ":0", "SSH_TTY": "/dev/pts/3"}, "xclip"), 0, false},
 		{"ssh -X", f.env("linux", map[string]string{"DISPLAY": "localhost:10.0", "SSH_CONNECTION": "1 2 3 4"}, "xclip"), imageClipX11, true},
 		{"ssh -X on ipv4", f.env("linux", map[string]string{"DISPLAY": "127.0.0.1:10.0", "SSH_TTY": "/dev/pts/3"}, "xclip"), imageClipX11, true},
+		// WSLg's displays carry no image from Windows, so WSL comes first.
+		{"wsl with wslg", f.env("linux", wsl, "wl-paste", "xclip", "powershell.exe"), imageClipWSL, true},
+		{"wsl without the windows path", f.env("linux", wsl, "xclip", wslDefaultPowerShell), imageClipWSL, true},
+		{"wsl named by the interop socket only", f.env("linux", map[string]string{"WSL_INTEROP": "/run/WSL/1_interop"}, "powershell.exe"), imageClipWSL, true},
+		{"wsl with interop off", f.env("linux", wsl, "xclip"), imageClipX11, true},
+		{"wsl inside ssh", f.env("linux", withVars(wsl, map[string]string{"SSH_CONNECTION": "1 2 3 4"}), "powershell.exe", "xclip"), 0, false},
+		{"powershell.exe off wsl", f.env("linux", map[string]string{"DISPLAY": ":0"}, "xclip", "powershell.exe"), imageClipX11, true},
 	}
 	for _, c := range cases {
 		got := detectImageClipboard(c.env)
@@ -135,6 +178,8 @@ func TestEachPlatformReadsTheImageBytes(t *testing.T) {
 		{"macos osascript", "darwin", nil, []string{"osascript"}},
 		{"macos pngpaste", "darwin", nil, []string{"osascript", "pngpaste"}},
 		{"windows", "windows", nil, []string{"powershell"}},
+		{"wsl", "linux", wsl, []string{"xclip", "powershell.exe"}},
+		{"wsl without the windows path", "linux", wsl, []string{wslDefaultPowerShell}},
 	} {
 		f := &fakeClipboard{types: []string{"image/png"}, image: fakePNG}
 		clip := detectImageClipboard(f.env(c.goos, c.vars, c.tool...))
@@ -441,6 +486,34 @@ func TestASlowClipboardToolDoesNotHoldUpATextPaste(t *testing.T) {
 	_ = m.RequestPaste()
 	if len(f.ran) != 0 || !m.pastePending {
 		t.Errorf("the next press asked the slow tool again (%v)", f.ran)
+	}
+}
+
+// osascript takes longer to start than the paste key's bound on most Macs
+// (#1179). pbpaste answers first: with text the key pastes the text and never
+// waits on osascript, and with no text osascript gets the time it needs.
+func TestThePasteKeyWaitsForASlowOsascriptOnlyWithoutText(t *testing.T) {
+	f := &fakeClipboard{types: []string{"image/png"}, image: fakePNG, slowInfo: 2 * imageClipKeyTimeout}
+	m, typed, calls := imagePasteOS(t, f)
+	env := f.env("darwin", nil, "osascript", "pbpaste")
+	m.imagePaste.detect = func() *imageClipboard { return detectImageClipboard(env) }
+	driveImagePaste(t, m, m.RequestPaste())
+	if len(*calls) != 1 || typed.Len() == 0 {
+		t.Fatalf("a slow osascript lost the image (%d calls, %q typed, ran %v)", len(*calls), typed.String(), f.ran)
+	}
+	if m.imagePaste.keyProbeOff {
+		t.Error("a slow osascript stopped the key from asking again")
+	}
+
+	f.types, f.ran = []string{"image/png", "text/plain"}, nil
+	m.pastePending = false
+	start := time.Now()
+	driveImagePaste(t, m, m.RequestPaste())
+	if !m.pastePending {
+		t.Error("the paste key did not paste the text")
+	}
+	if waited := time.Since(start); waited >= f.slowInfo || slices.ContainsFunc(f.ran, func(l string) bool { return strings.HasPrefix(l, "osascript") }) {
+		t.Errorf("the text paste waited %v on osascript (ran %v)", waited, f.ran)
 	}
 }
 

@@ -3,6 +3,7 @@ package text
 import (
 	"math"
 	"slices"
+	"sort"
 
 	"tuios.dev/sketch"
 	"tuios.dev/sketch/internal/types"
@@ -106,6 +107,26 @@ func scaleOf(l *sketch.Layout, kind *graphKind) (sx, sy float64) {
 		} else if dy > 0 {
 			sy = math.Max(sy, 4/dy)
 		}
+	}
+	// A label between two boxes side by side fits the gap between them, so
+	// that it covers neither box: pele leaves that room, as C4 does since
+	// pele 1.9.0.
+	for k := range l.Edges {
+		e := &l.Edges[k]
+		w := widest(e.Label)
+		if w == 0 || e.From == e.To || e.From < 0 || e.To < 0 || e.From >= len(l.Nodes) || e.To >= len(l.Nodes) {
+			continue
+		}
+		a, b := &l.Nodes[e.From], &l.Nodes[e.To]
+		if a.X > b.X {
+			a, b = b, a
+		}
+		left, right := a.X+a.W/2, b.X-b.W/2
+		if a.Group || b.Group || right <= left || e.LabelX < left || e.LabelX > right ||
+			math.Abs(e.LabelY-a.Y) > a.H/2 || math.Abs(e.LabelY-b.Y) > b.H/2 {
+			continue
+		}
+		sx = math.Max(sx, float64(w+4)/(right-left))
 	}
 	// A cell is about twice as tall as it is wide.
 	sy = math.Max(sy, sx*0.45)
@@ -313,15 +334,7 @@ func drawGraph(l *sketch.Layout, opt Options, kind *graphKind) (*canvas, error) 
 		} else {
 			joined = nil
 		}
-		slices.SortStableFunc(list, func(a, b graphEnd) int {
-			switch {
-			case a.at < b.at:
-				return -1
-			case a.at > b.at:
-				return 1
-			}
-			return 0
-		})
+		sort.SliceStable(list, func(i, j int) bool { return list[i].at < list[j].at })
 		lo, hi := b.x0+1, b.x1-1
 		scale := col
 		if sd == 1 || sd == 3 {

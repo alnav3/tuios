@@ -8,6 +8,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/layout"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 	"github.com/Gaurav-Gosain/tuios/internal/theme"
 	"github.com/Gaurav-Gosain/tuios/pkg/fuzzy"
 )
@@ -860,6 +861,14 @@ func GetCommandPaletteItems(s *config.Settings) []CommandPaletteItem {
 				return m, m.EditScrollbackInEditor()
 			},
 		},
+		{
+			Name:     "Clear the scrollback",
+			Bind:     config.ActionClearScrollback,
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.ClearScrollback()
+			},
+		},
 		// Floating
 		{
 			Name:     "Toggle floating",
@@ -939,6 +948,13 @@ func GetCommandPaletteItems(s *config.Settings) []CommandPaletteItem {
 			Category: "Session",
 			Action: func(m *OS) (*OS, tea.Cmd) {
 				return m, m.OpenLookPicker()
+			},
+		},
+		{
+			Name:     "Share my look",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.ShareLook("", "", "")
 			},
 		},
 		{
@@ -1040,6 +1056,27 @@ func GetCommandPaletteItems(s *config.Settings) []CommandPaletteItem {
 			},
 		},
 		{
+			// The machines in the rail's order, as next_host and prev_host
+			// step through them. Neither has a default key, so the palette
+			// is where a person finds them before binding one.
+			Name:     "Next machine",
+			Bind:     "next_host",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.CycleHost(1)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Previous machine",
+			Bind:     "prev_host",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.CycleHost(-1)
+				return m, nil
+			},
+		},
+		{
 			// The agent mailbox: the messages agents leave for each other and
 			// for the person, and the place to answer one.
 			// It was "Mail: open inbox" on prefix+M; the Inbox is its own thing
@@ -1082,6 +1119,27 @@ func GetCommandPaletteItems(s *config.Settings) []CommandPaletteItem {
 			Category: paletteCategoryAgents,
 			Action: func(m *OS) (*OS, tea.Cmd) {
 				return m, m.JumpToNextAttention()
+			},
+		},
+		{
+			// The agent panes in the rail's order, across sessions.
+			Name:     "Agents: next agent",
+			Shortcut: "alt+shift+j",
+			Bind:     "next_agent",
+			Category: paletteCategoryAgents,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.CycleAgent(1)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Agents: previous agent",
+			Shortcut: "alt+shift+k",
+			Bind:     "prev_agent",
+			Category: paletteCategoryAgents,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.CycleAgent(-1)
+				return m, nil
 			},
 		},
 		{
@@ -1161,6 +1219,26 @@ func GetCommandPaletteItems(s *config.Settings) []CommandPaletteItem {
 			},
 		},
 		{
+			Name:     "Session note: what this session is for or what comes next",
+			Shortcut: "prefix+I",
+			Bind:     "set_note",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.BeginEditNote(m.SessionName)
+				return m, nil
+			},
+		},
+		{
+			Name:     "New worktree: a branch and a session in this pane's repository",
+			Shortcut: "prefix+U",
+			Bind:     "new_worktree",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.BeginWorktreePromptForFocusedPane()
+				return m, nil
+			},
+		},
+		{
 			Name:     "Hints: label text on the pane to copy it",
 			Shortcut: "prefix+F",
 			Bind:     "hints",
@@ -1171,12 +1249,30 @@ func GetCommandPaletteItems(s *config.Settings) []CommandPaletteItem {
 			},
 		},
 		{
+			Name:     "Calm mode: stop motion and quiet messages",
+			Shortcut: "prefix+Z",
+			Bind:     "toggle_calm",
+			Category: "View",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.ToggleCalm()
+			},
+		},
+		{
 			Name:     "Scratch: show or hide the scratch terminal",
 			Shortcut: "prefix+g",
 			Bind:     "toggle_scratch",
 			Category: "Session",
 			Action: func(m *OS) (*OS, tea.Cmd) {
 				return m, m.ToggleScratch()
+			},
+		},
+		{
+			Name:     "Path: pick a file or folder and type its path",
+			Shortcut: "alt+;",
+			Bind:     "pick_path",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.OpenPathPicker()
 			},
 		},
 		{
@@ -1469,7 +1565,7 @@ func groupPaletteItems(items []CommandPaletteItem) []CommandPaletteItem {
 		}
 	}
 	out := slices.Clone(items)
-	slices.SortStableFunc(out, func(a, b CommandPaletteItem) int { return rank[a.Category] - rank[b.Category] })
+	sortx.SortStableFunc(out, func(a, b CommandPaletteItem) int { return rank[a.Category] - rank[b.Category] })
 	return out
 }
 

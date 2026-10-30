@@ -64,11 +64,43 @@ func Theme(pal overlay.Palette, ansi [16]color.Color, bg, fg color.Color) *sketc
 		Critical:   mark(red),
 		Radius:     6,
 	}
+	t.FgOnLight, t.FgOnDark = onFills(bg, text)
 	series := []color.Color{red, overlay.MixColors(red, yellow, 0.5), yellow, green, cyan, blue, magenta, overlay.MixColors(magenta, red, 0.4)}
 	for i, c := range series {
 		t.Series[i] = mark(c)
 	}
 	return t
+}
+
+// fillFlip is the grey where pele switches from dark to light text on a fill
+// the diagram sets itself: #1f1f1f and white have the same contrast with it.
+var fillFlip = color.NRGBA{0x7e, 0x7e, 0x7e, 0xff}
+
+// fillFloor is the contrast #1f1f1f and white have with fillFlip, the least
+// that pele's own text colours give on any fill.
+const fillFloor = 4.0
+
+// onFills is the text on fills a diagram sets itself, in the palette's own
+// colours: the darker of bg and fg on a light fill, the lighter on a dark one.
+// Each moves toward black or white until it reaches fillFloor against
+// fillFlip, so it reads on every fill that pele gives it.
+func onFills(bg, fg color.Color) (onLight, onDark color.Color) {
+	dark, light := bg, fg
+	if overlay.ContrastRatio(bg, color.Black) > overlay.ContrastRatio(fg, color.Black) {
+		dark, light = fg, bg
+	}
+	return toward(dark, color.Black), toward(light, color.White)
+}
+
+// toward moves c toward end, black for text on light fills and white for
+// text on dark ones, until it reaches fillFloor against fillFlip.
+func toward(c, end color.Color) color.Color {
+	for t := 0.0; t < 1; t += 0.05 {
+		if k := overlay.MixColors(c, end, t); overlay.ContrastRatio(k, fillFlip) >= fillFloor {
+			return k
+		}
+	}
+	return end
 }
 
 // readableOn moves c toward white or black, whichever reads better on the
@@ -144,9 +176,16 @@ func Sources(name string, data []byte) []string {
 	return []string{text}
 }
 
-// Kitty writes a PNG as a kitty graphics image cols cells wide. The terminal
-// keeps the picture's aspect and moves the cursor below it.
-func Kitty(w io.Writer, png []byte, cols int) error {
+// Kitty writes a PNG as a kitty graphics image in a box of cols by rows
+// cells, and moves the cursor to the line under it.
+//
+// Both sides of the box are given. With the width alone the terminal works out
+// the height from its own cell size, which is not the one the picture was
+// sized for when the pane reports another (a tuios pane on a daemon that a
+// client with another font set up): the picture then came out taller than the
+// screen, its top scrolled away, and the next diagram was drawn into it. A
+// fixed box takes exactly rows lines in every terminal.
+func Kitty(w io.Writer, png []byte, cols, rows int) error {
 	enc := base64.StdEncoding.EncodeToString(png)
 	var b bytes.Buffer
 	const chunk = 4096
@@ -160,6 +199,10 @@ func Kitty(w io.Writer, png []byte, cols int) error {
 		if i == 0 {
 			b.WriteString("a=T,f=100,q=2,c=")
 			b.WriteString(strconv.Itoa(cols))
+			if rows > 0 {
+				b.WriteString(",r=")
+				b.WriteString(strconv.Itoa(rows))
+			}
 			b.WriteString(",")
 		}
 		b.WriteString("m=")

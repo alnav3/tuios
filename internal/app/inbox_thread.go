@@ -175,7 +175,7 @@ type threadWatchEnded struct{ key string }
 // reader internal/transcriptview has.
 func threadTranscriptHarness(h string) bool {
 	switch h {
-	case "claude-code", "codex", "gemini-cli", "qwen", "copilot", "amp", "opencode", "cursor-agent":
+	case "claude-code", "codex", "gemini-cli", "qwen", "copilot", "amp", "opencode", "cursor-agent", "pi":
 		return true
 	}
 	return false
@@ -347,6 +347,29 @@ func (m *OS) applyThreadPage(msg threadPageMsg) tea.Cmd {
 		at[e.ID] = len(t.entries)
 		t.entries = append(t.entries, e)
 	}
+	// A result can arrive on a later page than the call it finishes. Fold it
+	// into retained calls too, otherwise a cached running card hides failures.
+	// Walk backwards to pair each result with its nearest preceding call.
+	results := make(map[string]string)
+	for i := len(t.entries) - 1; i >= 0; i-- {
+		e := &t.entries[i]
+		if e.ToolID == "" {
+			continue
+		}
+		switch e.Kind {
+		case "tool_result":
+			results[e.ToolID] = e.Status
+		case "tool_call":
+			if status, ok := results[e.ToolID]; ok {
+				e.Status = status
+				// A call can draw as several adjacent cards sharing one id (a
+				// multi-file patch), so keep the result until the group ends.
+				if i == 0 || t.entries[i-1].Kind != "tool_call" || t.entries[i-1].ToolID != e.ToolID {
+					delete(results, e.ToolID)
+				}
+			}
+		}
+	}
 	// The thread draws the newest; the page bound holds the rest.
 	if n := len(t.entries); n > 200 {
 		t.entries = append(t.entries[:0], t.entries[n-200:]...)
@@ -447,17 +470,23 @@ func (m *OS) startThreadWatch(t *agentThread) tea.Cmd {
 			}
 		}
 	}()
-	return listenThread(ch, key)
+	return listenThread(m.stopSignal(), ch, key)
 }
 
 // listenThread waits for one delivery from the transcript subscription.
-func listenThread(ch <-chan tea.Msg, key string) tea.Cmd {
+// It returns nil once stop is closed, which is how a session that has ended
+// lets go of it.
+func listenThread(stop <-chan struct{}, ch <-chan tea.Msg, key string) tea.Cmd {
 	return func() tea.Msg {
-		msg, ok := <-ch
-		if !ok {
-			return threadWatchEnded{key: key}
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				return threadWatchEnded{key: key}
+			}
+			return msg
+		case <-stop:
+			return nil
 		}
-		return msg
 	}
 }
 
@@ -477,7 +506,7 @@ func (m *OS) applyThreadGrew(msg threadGrewMsg) tea.Cmd {
 	if ts.watchKey != msg.key || ts.events == nil {
 		return nil
 	}
-	listen := listenThread(ts.events, msg.key)
+	listen := listenThread(m.stopSignal(), ts.events, msg.key)
 	t := ts.byKey[msg.key]
 	if t == nil {
 		return listen

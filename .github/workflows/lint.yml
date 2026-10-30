@@ -7,25 +7,36 @@ name: Lint
 # changed (scripts/check.sh, which `just check` runs locally).
 # The unit test workflow covers gofmt, tidy and vet on linux.
 
+# A pull request and a push to main call this workflow from ci.yml, which
+# runs it when a Go file, an embedded file or a module file changed.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_call:
+    inputs:
+      vet:
+        description: >
+          "false" when only the end-to-end module's Go code changed, which
+          golangci-lint, govulncheck and the cross vet do not read.
+        type: string
+        default: "true"
+      lint_libs:
+        description: >
+          The library folders to lint besides the root module, space
+          separated, "all" or "none". Empty lints all of them.
+        type: string
+        default: all
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  # A pull request's group is its ref, so a newer push cancels the run in
-  # progress. Every other run (main, the nightly, a manual run) gets a group of
-  # its own and is never cancelled or replaced while it waits.
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: true
+# No concurrency group here: ci.yml holds the one for pull requests, and a
+# called workflow's github.workflow is the caller's name, so a group here
+# would be shared with the caller's other jobs.
 
 jobs:
   golangci:
     name: golangci-lint
+    if: inputs.vet != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -46,6 +57,7 @@ jobs:
       # ./... stops at a nested module, so each Go library of this repository
       # is linted from its own folder, with the same .golangci.yml.
       - name: golangci-lint (progstatus)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' progstatus ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -53,6 +65,7 @@ jobs:
           args: --timeout 10m
 
       - name: golangci-lint (vt)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' vt ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -60,6 +73,7 @@ jobs:
           args: --timeout 10m
 
       - name: golangci-lint (swatch)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' swatch ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -67,6 +81,7 @@ jobs:
           args: --timeout 10m
 
       - name: golangci-lint (shot)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' shot ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -74,6 +89,7 @@ jobs:
           args: --timeout 10m
 
       - name: golangci-lint (tml)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' tml ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -81,6 +97,7 @@ jobs:
           args: --timeout 10m
 
       - name: golangci-lint (plot)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' plot ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -88,6 +105,7 @@ jobs:
           args: --timeout 10m
 
       - name: golangci-lint (loom)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' loom ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
@@ -95,18 +113,36 @@ jobs:
           args: --timeout 10m
 
       - name: golangci-lint (sketch)
+        if: inputs.lint_libs == '' || inputs.lint_libs == 'all' || contains(format(' {0} ', inputs.lint_libs), ' sketch ')
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
           working-directory: sketch
           args: --timeout 10m
 
-  bom:
-    name: no byte order mark in Go files
+  sanity:
+    name: govulncheck, BOM, goimports, gopls and modernizers
+    # Small checks that each took longer to set up than to run, in one job:
+    #
+    #   - no literal byte order mark in a Go file;
+    #   - govulncheck for known vulnerabilities in code tuios reaches;
+    #   - the parts of scripts/check.sh no other job runs, on the files the
+    #     pull request changed: goimports, gopls check, and the go fix
+    #     modernizers as a report. gofmt, tidy, vet and golangci-lint have jobs
+    #     of their own.
+    #
+    # Each step after the first runs even when one before it failed, so one
+    # run reports every failure.
+    #
+    # On main it checks the last commit. That also builds the pinned gopls and
+    # goimports into the shared cache, which pull requests only restore.
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The merge base with the target branch decides what changed.
+          fetch-depth: 0
 
       # Go refuses a U+FEFF anywhere but the first bytes of a file ("illegal
       # byte order mark"). Some editors and agent tools turn a \uFEFF escape
@@ -121,29 +157,20 @@ jobs:
             exit 1
           fi
 
-  sanity:
-    name: goimports, gopls and modernizers (changed files)
-    # The parts of scripts/check.sh no other job runs, on the files the pull
-    # request changed: goimports, gopls check, and the go fix modernizers as a
-    # report. gofmt, tidy, vet, golangci-lint and govulncheck have jobs of
-    # their own.
-    #
-    # On main it checks the last commit. That also builds the pinned gopls and
-    # goimports into the shared cache, which pull requests only restore.
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # The merge base with the target branch decides what changed.
-          fetch-depth: 0
-
+      # The go.mod toolchain line sets the stdlib that govulncheck scans, as
+      # it did when govulncheck had a job of its own.
       - uses: ./.github/actions/setup-go
+        if: ${{ !cancelled() }}
         with:
           go-version-file: go.mod
           cache-id: sanity
 
+      - name: govulncheck
+        if: ${{ !cancelled() && inputs.vet != 'false' }}
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
       - name: Check the changed files
+        if: ${{ !cancelled() }}
         env:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
         run: scripts/check.sh --changed "$BASE" --only fmt,fix,gopls
@@ -163,43 +190,33 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  govulncheck:
-    name: govulncheck
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-
-      # The go.mod toolchain line sets the stdlib that govulncheck scans. The
-      # govulncheck action ignores go-version-file and installs "stable".
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-
   cross-vet:
-    name: go vet (${{ matrix.goos }})
+    name: go vet (darwin, windows, freebsd, openbsd)
+    if: inputs.vet != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The release targets besides linux, which go-test.yml vets. A test
-        # file that uses a unix-only syscall without a build tag breaks these
-        # and nothing else.
-        goos: [darwin, windows, freebsd, openbsd]
+    # The release targets besides linux, which go-test.yml vets. A test file
+    # that uses a unix-only syscall without a build tag breaks these and
+    # nothing else. One job vets all four: each vet takes under half a minute,
+    # and a job of its own spent as long again on setup and held a runner
+    # that other pull requests wait for.
     steps:
       - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-go
         with:
           go-version-file: go.mod
-          cache-id: vet-${{ matrix.goos }}
+          cache-id: vet-cross
 
       - name: Vet
-        env:
-          GOOS: ${{ matrix.goos }}
-        run: go vet ./... ./progstatus/... ./vt/... ./swatch/... ./shot/... ./tml/... ./plot/... ./loom/... ./sketch/...
+        run: |
+          status=0
+          for goos in darwin windows freebsd openbsd; do
+            echo "::group::go vet (GOOS=$goos)"
+            if ! GOOS=$goos go vet ./... ./progstatus/... ./vt/... ./swatch/... ./shot/... ./tml/... ./plot/... ./loom/... ./sketch/...; then
+              status=1
+              echo "::error title=go vet failed::go vet failed for GOOS=$goos"
+            fi
+            echo "::endgroup::"
+          done
+          exit $status

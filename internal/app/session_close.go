@@ -46,7 +46,7 @@ const (
 // sessions, and the dialog's destructive extra would have nothing to point at.
 func (m *OS) sessionCloseRowCount() int {
 	if m.SessionCloseWindow == "" && m.SessionCloseWorkspace == 0 &&
-		m.sessionWorktreeInfo(m.sessionCloseTarget()) != nil {
+		m.sessionDeletableWorktree(m.sessionCloseTarget()) != nil {
 		return 3
 	}
 	return 2
@@ -312,7 +312,7 @@ func (m *OS) SessionCloseActivate(idx int) tea.Cmd {
 		return nil
 	}
 	m.QuitSession()
-	return tea.Quit
+	return m.QuitCmd()
 }
 
 // KillOtherSession ends a session this client is not attached to, by identity.
@@ -457,7 +457,7 @@ func (m *OS) worktreeTollCmd(name string) tea.Cmd {
 // unloaded, or when the dialog is not on a session.
 func (m *OS) worktreeTollLine() string {
 	t := m.SessionCloseWorktreeToll
-	if t == nil || !t.Loaded || m.sessionWorktreeInfo(m.sessionCloseTarget()) == nil {
+	if t == nil || !t.Loaded || m.sessionDeletableWorktree(m.sessionCloseTarget()) == nil {
 		return ""
 	}
 	if t.Gone {
@@ -559,7 +559,7 @@ func (m *OS) handleWorktreeRemoved(msg worktreeRemovedMsg) tea.Cmd {
 		// quitting tears the alt screen down with it. Dwell for the
 		// notification's duration, then quit — the tick returns tea.Quit, so
 		// the program ends at the same place, just readable.
-		return tea.Tick(m.Settings.NotificationDuration, func(time.Time) tea.Msg {
+		return m.tickUntilStop(m.Settings.NotificationDuration, func(time.Time) tea.Msg {
 			return worktreeRemoveQuitMsg{Name: msg.Name}
 		})
 	}

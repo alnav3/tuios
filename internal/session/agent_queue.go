@@ -150,6 +150,14 @@ type paneQueue struct {
 	bytes int
 	// timer is the pending look at the pane, nil when none is armed.
 	timer *time.Timer
+	// draftSince is when a look first found the person's draft in the box,
+	// in Unix nanoseconds, 0 while no draft holds the queue. surface fires
+	// once it has held for queueDraftSurface. watched is the pane whose
+	// output and keys re-arm the look while the person's typing or draft
+	// holds the next entry. See agent_queue_draft.go.
+	draftSince int64
+	surface    *time.Timer
+	watched    *PTY
 }
 
 // typedStamp is when the last queued entry was typed into a pane, in Unix
@@ -307,20 +315,20 @@ type queuedResult struct {
 }
 
 // queueFullError is the refusal for a pane whose queue is at its bound.
-func queueFullError(target WindowState, limit int) *verbError {
+func queueFullError(sess *Session, target WindowState, limit int) *verbError {
 	return hintedVerbError(ErrVerbQueueFull, "the queue for window "+shortWindowID(target.ID)+" holds "+strconv.Itoa(limit)+" messages, as many as [agents.queue] max allows", &VerbHint{
 		Verb:    "list-queued",
-		Command: "tuios queue ls -w " + shortWindowID(target.ID),
+		Command: "tuios queue ls " + paneArgs(sess, target.ID),
 		Detail:  "Nothing was queued. Wait for the agent to take what is queued, drop an entry with tuios queue rm, or raise max under [agents.queue] in config.toml.",
 	})
 }
 
 // queueBytesError is the refusal for a message that would take a pane's queue,
 // or every queue together, past its bound in bytes.
-func queueBytesError(target WindowState) *verbError {
+func queueBytesError(sess *Session, target WindowState) *verbError {
 	return hintedVerbError(ErrVerbQueueFull, "the queue for window "+shortWindowID(target.ID)+" holds as many bytes as it may: "+strconv.Itoa(queuePaneMaxBytes>>20)+" MiB a pane and "+strconv.Itoa(queueDaemonMaxBytes>>20)+" MiB in all", &VerbHint{
 		Verb:    "list-queued",
-		Command: "tuios queue ls -w " + shortWindowID(target.ID),
+		Command: "tuios queue ls " + paneArgs(sess, target.ID),
 		Detail:  "Nothing was queued. Wait for the agents to take what is queued, or drop an entry with tuios queue rm.",
 	})
 }
@@ -354,14 +362,14 @@ func (d *Daemon) queuePrompt(sess *Session, target WindowState, e *queueEntry) (
 			delete(q.panes, target.ID)
 		}
 		q.mu.Unlock()
-		return queuedResult{}, queueBytesError(target)
+		return queuedResult{}, queueBytesError(sess, target)
 	}
 	if len(pq.entries) >= limit {
 		if len(pq.entries) == 0 {
 			delete(q.panes, target.ID)
 		}
 		q.mu.Unlock()
-		return queuedResult{}, queueFullError(target, limit)
+		return queuedResult{}, queueFullError(sess, target, limit)
 	}
 	q.seq++
 	e.id = "q" + strconv.FormatUint(q.seq, 10)
@@ -390,10 +398,12 @@ func (d *Daemon) queuePrompt(sess *Session, target WindowState, e *queueEntry) (
 }
 
 // armLocked schedules a look at the pane after wait, replacing one already
-// armed. It holds mu.
+// armed. The pane's one timer is reset rather than replaced: a held pane
+// re-arms on every chunk of output. It holds mu.
 func (q *agentQueues) armLocked(d *Daemon, window string, pq *paneQueue, wait time.Duration) {
 	if pq.timer != nil {
-		pq.timer.Stop()
+		pq.timer.Reset(wait)
+		return
 	}
 	pq.timer = time.AfterFunc(wait, func() { d.deliverQueued(window) })
 }
@@ -421,6 +431,7 @@ func (q *agentQueues) removeLocked(window string, pq *paneQueue, drop func(*queu
 		if pq.timer != nil {
 			pq.timer.Stop()
 		}
+		q.unholdLocked(pq)
 		if q.panes[window] == pq {
 			delete(q.panes, window)
 		}
@@ -458,12 +469,17 @@ func (d *Daemon) publishQueued(windows ...string) {
 				return err
 			}
 			n := d.queue.count(window)
-			if st.Windows[idx].AgentQueued == n {
+			held := d.queue.draftHeld(window)
+			if st.Windows[idx].AgentQueued == n && st.Windows[idx].AgentDraftHeld == held {
 				return errQueueUnchanged
 			}
 			st.Windows[idx].AgentQueued = n
+			st.Windows[idx].AgentDraftHeld = held
 			return nil
 		})
+		if !d.queue.draftHeld(window) {
+			d.attention.closeHeldPrompt(sess.Name(), window, DraftHeldSummary)
+		}
 	}
 }
 
@@ -604,12 +620,24 @@ func (d *Daemon) deliverQueued(window string) {
 		return
 	}
 	rest := d.readPaneRest(sess, target)
+	var gate draftGate
+	if rest.ready {
+		gate = d.readDraftGate(sess, target)
+	}
 
 	q.mu.Lock()
 	pq := q.panes[window]
 	// Nothing is typed while the agent features are off. The switch empties
 	// the queues; this covers a look armed before it did.
 	if d.agentsOff.Load() || pq == nil || pq.delivering || len(pq.entries) == 0 || pq.entries[0].state != queueWaiting {
+		q.mu.Unlock()
+		return
+	}
+	// An ask holds the pane's turn: it typed a question and reads the
+	// answer, or waits to. A prompt typed now would land in that answer.
+	// Look again after a rest.
+	if d.askTurns.busy(window) {
+		q.armLocked(d, window, pq, q.restFor())
 		q.mu.Unlock()
 		return
 	}
@@ -621,6 +649,16 @@ func (d *Daemon) deliverQueued(window string) {
 			q.armLocked(d, window, pq, wait)
 		}
 		q.mu.Unlock()
+		return
+	}
+	// The person is typing, or has a draft in the box. See
+	// agent_queue_draft.go.
+	held, changed := q.holdLocked(d, window, pq, gate, time.Now())
+	if held {
+		q.mu.Unlock()
+		if changed {
+			d.publishQueued(window)
+		}
 		return
 	}
 	e := pq.entries[0]

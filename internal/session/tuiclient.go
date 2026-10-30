@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -169,6 +170,14 @@ type TUIClient struct {
 	// PTY closed handlers, called when a PTY process exits
 	ptyClosedHandlers   map[string]func()
 	ptyClosedHandlersMu sync.RWMutex
+	// ptyClosedEarly are PTYs whose close arrived before a handler was
+	// registered for them, oldest first, guarded by ptyClosedHandlersMu. A
+	// program that exits at once can end before the state push that brings
+	// its window is applied: the close is read on the connection's goroutine
+	// and the window is placed later on the UI goroutine. OnPTYClosed for one
+	// of these runs its handler at once, or the window would stay open with
+	// nothing in it. Bounded by ptyClosedEarlyMax.
+	ptyClosedEarly []string
 
 	// ptyResizeHandlers is told the size the daemon's emulator took, at the
 	// point in the output stream it took it. Registered alongside the output
@@ -1027,11 +1036,27 @@ func (c *TUIClient) OnPTYResized(ptyID string, handler func(width, height int)) 
 }
 
 // OnPTYClosed registers a handler to be called when the PTY process exits.
+//
+// When the PTY closed before this call, handler runs at once, on the caller's
+// goroutine. See ptyClosedEarly.
 func (c *TUIClient) OnPTYClosed(ptyID string, handler func()) {
 	c.ptyClosedHandlersMu.Lock()
+	if i := slices.Index(c.ptyClosedEarly, ptyID); i >= 0 {
+		c.ptyClosedEarly = slices.Delete(c.ptyClosedEarly, i, i+1)
+		c.ptyClosedHandlersMu.Unlock()
+		if handler != nil {
+			handler()
+		}
+		return
+	}
 	c.ptyClosedHandlers[ptyID] = handler
 	c.ptyClosedHandlersMu.Unlock()
 }
+
+// ptyClosedEarlyMax bounds ptyClosedEarly. A close with no handler is also
+// the reply to a close this client asked for, and those are never claimed,
+// so the oldest entries go.
+const ptyClosedEarlyMax = 32
 
 // OnRemoteCommand registers a handler for remote commands from the CLI.
 // The handler should execute the command and return an error if it fails.
@@ -1429,12 +1454,36 @@ func (c *TUIClient) SendIntentIn(cwd, commandType string, args ...string) error 
 // current one. An empty sshFrom follows none. See
 // ExecuteCommandPayload.SSHFrom.
 func (c *TUIClient) SendNewWindowIntent(cwd string, workspace int, sshFrom, commandType string, args ...string) error {
+	return c.SendNewWindowIntentSized(cwd, workspace, 0, 0, sshFrom, commandType, args...)
+}
+
+// SendNewWindowIntentSized is SendNewWindowIntent for a client that knows the
+// size the pane will have: cols and rows are its content size, and the daemon
+// starts the process at it. See ExecuteCommandPayload.Cols.
+func (c *TUIClient) SendNewWindowIntentSized(cwd string, workspace, cols, rows int, sshFrom, commandType string, args ...string) error {
 	return c.sendNewWindow(&ExecuteCommandPayload{
 		CommandType: commandType,
 		Args:        args,
 		Cwd:         cwd,
 		Workspace:   workspace,
+		Cols:        cols,
+		Rows:        rows,
 		SSHFrom:     sshFrom,
+	})
+}
+
+// SendRunIntent asks for a window that runs argv, named name. keepOpen keeps
+// the window after argv exits. See ExecuteCommandPayload.KeepOpen. cwd,
+// workspace, cols and rows are as SendNewWindowIntentSized's.
+func (c *TUIClient) SendRunIntent(cwd string, workspace, cols, rows int, keepOpen bool, name string, argv ...string) error {
+	return c.sendNewWindow(&ExecuteCommandPayload{
+		CommandType: "NewWindow",
+		Args:        append([]string{name}, argv...),
+		Cwd:         cwd,
+		Workspace:   workspace,
+		Cols:        cols,
+		Rows:        rows,
+		KeepOpen:    keepOpen,
 	})
 }
 
@@ -1848,10 +1897,18 @@ func (c *TUIClient) handleMessage(msg *Message) {
 		if err := msg.ParsePayload(&payload); err != nil {
 			return
 		}
-		// Get the closed handler before removing
-		c.ptyClosedHandlersMu.RLock()
-		closedHandler := c.ptyClosedHandlers[payload.PTYID]
-		c.ptyClosedHandlersMu.RUnlock()
+		// Get the closed handler before removing. With none yet, the close
+		// is kept for the window that has not been placed. See
+		// ptyClosedEarly.
+		c.ptyClosedHandlersMu.Lock()
+		closedHandler, registered := c.ptyClosedHandlers[payload.PTYID]
+		if !registered && !slices.Contains(c.ptyClosedEarly, payload.PTYID) {
+			if len(c.ptyClosedEarly) >= ptyClosedEarlyMax {
+				c.ptyClosedEarly = slices.Delete(c.ptyClosedEarly, 0, 1)
+			}
+			c.ptyClosedEarly = append(c.ptyClosedEarly, payload.PTYID)
+		}
+		c.ptyClosedHandlersMu.Unlock()
 
 		// Remove handlers
 		c.ptyHandlersMu.Lock()
@@ -2208,6 +2265,20 @@ func (c *TUIClient) AvailableSessionNames() []string {
 	return names
 }
 
+// SessionOrderSet reports whether the cached listing carries the daemon's
+// session order (set-session-order): a rank on any session. The listing is
+// sorted by it, so a client shows it as it comes.
+func (c *TUIClient) SessionOrderSet() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.availableSessions {
+		if s.Rank > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // SessionLabel returns the cached display name and accent for the named
 // session, both empty when it is unknown or carries neither. The caller falls
 // back to the session name, which stays the identity in every case.
@@ -2276,6 +2347,37 @@ func (c *TUIClient) SessionSpace(name string) string {
 	for _, s := range c.availableSessions {
 		if s.Name == name {
 			return s.Space
+		}
+	}
+	return ""
+}
+
+// SessionNote is the named session's return note from the cached listing,
+// empty when it has none or is unknown.
+func (c *TUIClient) SessionNote(name string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.availableSessions {
+		if s.Name == name {
+			return s.Note
+		}
+	}
+	return ""
+}
+
+// SessionWindowNote is the return note of one pane of the named session, from
+// the cached listing, empty when it has none or is unknown.
+func (c *TUIClient) SessionWindowNote(name, windowID string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.availableSessions {
+		if s.Name != name {
+			continue
+		}
+		for _, w := range s.Windows {
+			if w.ID == windowID {
+				return w.Note
+			}
 		}
 	}
 	return ""
@@ -2482,7 +2584,7 @@ func listingsAgree(a, b []SessionInfo) bool {
 		}
 		// A rename moves no window, so without these a renamed session kept the
 		// old label until something else happened to bump the generation.
-		if a[i].DisplayName != b[i].DisplayName || a[i].Accent != b[i].Accent {
+		if a[i].DisplayName != b[i].DisplayName || a[i].Accent != b[i].Accent || a[i].Note != b[i].Note {
 			return false
 		}
 		// Attaching to a restored session moves no window either, and the tag has
@@ -2497,6 +2599,19 @@ func listingsAgree(a, b []SessionInfo) bool {
 		// Filing a session under a space moves no window, and the rail draws
 		// the row under the space's heading.
 		if a[i].Space != b[i].Space {
+			return false
+		}
+		// A shell that walks into a worktree moves no window either, and the
+		// rail draws the row under its repository from this record. The first
+		// listing can carry the session before the daemon has read its
+		// worktree, so the record that arrives later must count as a change.
+		if !reflect.DeepEqual(a[i].Worktree, b[i].Worktree) {
+			return false
+		}
+		// The first set-session-order can leave the names where they were and
+		// still change what the rail shows: from then on the daemon's order
+		// is applied, not the client's own.
+		if a[i].Rank != b[i].Rank {
 			return false
 		}
 		if !slices.EqualFunc(a[i].Windows, b[i].Windows, windowSummariesAgree) {
@@ -2743,12 +2858,12 @@ func windowSummariesAgree(a, b WindowSummary) bool {
 	return a.ID == b.ID && a.Title == b.Title &&
 		a.AgentState == b.AgentState && a.AgentStateAt == b.AgentStateAt &&
 		a.AgentHarness == b.AgentHarness && a.AgentMessage == b.AgentMessage &&
-		a.AgentKind == b.AgentKind &&
+		a.AgentKind == b.AgentKind && a.AgentReason == b.AgentReason &&
 		a.CompletionSeq == b.CompletionSeq &&
 		slices.Equal(a.AgentMeta, b.AgentMeta) &&
-		a.AgentQueued == b.AgentQueued && a.Subagents == b.Subagents &&
+		a.AgentQueued == b.AgentQueued && a.DraftHeld == b.DraftHeld && a.AgentSettled == b.AgentSettled && a.Subagents == b.Subagents &&
 		slices.Equal(a.SubagentList, b.SubagentList) &&
 		slices.Equal(a.ProgramStatus, b.ProgramStatus) &&
 		a.ForegroundCmd == b.ForegroundCmd && a.Workspace == b.Workspace &&
-		a.Scratch == b.Scratch
+		a.Scratch == b.Scratch && a.Note == b.Note
 }

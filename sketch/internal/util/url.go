@@ -1,4 +1,4 @@
-// Ported from pele src/util/url.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/util/url.ts at 8aff183be57021b533f319a29341a529be934b08.
 //
 // `new URL()` is approximated for http and https: the scheme and host are
 // lowercased and an empty path becomes "/". decodeURIComponent is ported as is.
@@ -8,6 +8,7 @@ package util
 import (
 	"math"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -25,11 +26,12 @@ var (
 	reInvalidProtocol = lazyre.New(`(?im)^([^\w]*)(javascript|data|vbscript)`)
 	reHTMLEntities    = lazyre.New(`&#(\w+)(;)?`)
 	reHTMLCtrlEntity  = lazyre.New(`(?i)&(newline|tab);`)
-	reCtrl            = lazyre.New(`[\x{0}-\x{1F}\x{7F}-\x{9F}\x{2000}-\x{200D}\x{FEFF}]`)
-	reScheme          = lazyre.New(`(?im)^` + js.Dot + `+(:|&colon;)`)
-	reWSEscape        = lazyre.New(`(\\|%5[cC])((%(6[eE]|72|74))|[nrt])`)
-	reSchemeName      = lazyre.New(`(?i)^([a-z][a-z0-9+.-]*):`)
-	reNetworkPath     = lazyre.New(`^[\\/]{2}`)
+	// pele also strips lone surrogates, which valid UTF-8 cannot hold.
+	reCtrl        = lazyre.New(`[\x{0}-\x{1F}\x{7F}-\x{9F}\x{2000}-\x{200D}\x{FEFF}\x{FFFE}\x{FFFF}]`)
+	reScheme      = lazyre.New(`(?im)^` + js.Dot + `+(:|&colon;)`)
+	reWSEscape    = lazyre.New(`(\\|%5[cC])((%(6[eE]|72|74))|[nrt])`)
+	reSchemeName  = lazyre.New(`(?i)^([a-z][a-z0-9+.-]*):`)
+	reNetworkPath = lazyre.New(`^[\\/]{2}`)
 )
 
 // decodeURIComponent, or false where JavaScript throws a URIError.
@@ -103,59 +105,84 @@ func decode(uri string) string {
 	return uri
 }
 
-// SanitizeUrl follows the algorithm of @braintree/sanitize-url, which Mermaid applies to click targets.
+// strip removes every match of re from s. It returns s itself when nothing
+// matches, because ReplaceAllString copies the string even then, and a URL
+// rarely holds anything to remove.
+func strip(re *lazyre.Regexp, s string) string {
+	if !re.MatchString(s) {
+		return s
+	}
+	return re.ReplaceAllString(s, "")
+}
+
+// entityChar is String.fromCharCode of the code in an entity that reHTMLEntities matches.
+func entityChar(m string) string {
+	sub := reHTMLEntities.FindStringSubmatch(m)
+	// String.fromCharCode(dec): the number mod 2^16, or 0 for one that is not a number.
+	n := js.Number(sub[1])
+	code := 0
+	if !math.IsNaN(n) && !math.IsInf(n, 0) {
+		// ToUint16: the truncated number mod 2^16, done in float64 so a
+		// number past the int64 range does not hit an
+		// implementation-defined conversion.
+		m := math.Mod(math.Trunc(n), 65536)
+		if m < 0 {
+			m += 65536
+		}
+		code = int(m)
+	}
+	return string(rune(code))
+}
+
+// unwrap removes the control characters, entity codes and escapes that could hide a scheme, and
+// with `percent`, percent escapes too. ok is false for a URL wrapped too many times to be a real one.
+func unwrap(u string, percent bool) (out string, ok bool) {
+	out = js.Trim(u)
+	if percent {
+		out = decode(out)
+	}
+	rounds := 0
+	for {
+		rounds++
+		if rounds > 32 {
+			return "", false
+		}
+		out = strip(reCtrl, out)
+		if reHTMLEntities.MatchString(out) {
+			out = reHTMLEntities.ReplaceAllStringFunc(out, entityChar)
+		}
+		out = strip(reHTMLCtrlEntity, out)
+		out = strip(reCtrl, out)
+		out = js.Trim(strip(reWSEscape, out))
+		if percent {
+			out = decode(out)
+		}
+		more := reCtrl.MatchString(out) || reHTMLEntities.MatchString(out) ||
+			reHTMLCtrlEntity.MatchString(out) || reWSEscape.MatchString(out)
+		if !more {
+			return out, true
+		}
+	}
+}
+
+// SanitizeUrl refuses what @braintree/sanitize-url refuses, the check Mermaid applies to click
+// targets. Unlike it, it keeps percent escapes, so `file=A%26B` still names the note `A&B`.
 func SanitizeUrl(u string) string {
 	if u == "" {
 		return BLANK
 	}
-	decoded := decode(js.Trim(u))
-	rounds := 0
-	for {
-		// Each round peels one layer of encoding. A URL wrapped this many times is not a real one.
-		rounds++
-		if rounds > 32 {
-			return BLANK
-		}
-		decoded = reCtrl.ReplaceAllString(decoded, "")
-		decoded = reHTMLEntities.ReplaceAllStringFunc(decoded, func(m string) string {
-			sub := reHTMLEntities.FindStringSubmatch(m)
-			// String.fromCharCode(dec): the number mod 2^16, or 0 for one that is not a number.
-			n := js.Number(sub[1])
-			code := 0
-			if !math.IsNaN(n) && !math.IsInf(n, 0) {
-				// ToUint16: the truncated number mod 2^16, done in float64 so a
-				// number past the int64 range does not hit an
-				// implementation-defined conversion.
-				m := math.Mod(math.Trunc(n), 65536)
-				if m < 0 {
-					m += 65536
-				}
-				code = int(m)
-			}
-			return string(rune(code))
-		})
-		decoded = reHTMLCtrlEntity.ReplaceAllString(decoded, "")
-		decoded = reCtrl.ReplaceAllString(decoded, "")
-		decoded = js.Trim(reWSEscape.ReplaceAllString(decoded, ""))
-		decoded = decode(decoded)
-		more := reCtrl.MatchString(decoded) || reHTMLEntities.MatchString(decoded) ||
-			reHTMLCtrlEntity.MatchString(decoded) || reWSEscape.MatchString(decoded)
-		if !more {
-			break
-		}
-	}
-
-	if decoded == "" {
+	decoded, ok := unwrap(u, true)
+	kept, ok2 := unwrap(u, false)
+	if !ok || !ok2 || decoded == "" || kept == "" {
 		return BLANK
 	}
 	if decoded[0] == '.' || decoded[0] == '/' {
-		return decoded
+		return kept
 	}
 
-	trimmed := js.TrimStart(decoded)
-	scheme := reScheme.FindString(trimmed)
+	scheme := reScheme.FindString(js.TrimStart(decoded))
 	if scheme == "" {
-		return decoded
+		return kept
 	}
 
 	protocol := js.Trim(strings.ToLower(scheme))
@@ -163,7 +190,7 @@ func SanitizeUrl(u string) string {
 		return BLANK
 	}
 
-	normalized := strings.ReplaceAll(trimmed, "\\", "/")
+	normalized := strings.ReplaceAll(js.TrimStart(kept), "\\", "/")
 	if protocol == "mailto:" || strings.Contains(protocol, "://") {
 		return normalized
 	}
@@ -195,19 +222,19 @@ var (
 
 // Stricter than Mermaid, which lets any scheme but three through: a diagram in a shared note
 // could otherwise open a local file, a network share, or another application.
-func allow(u string, schemes []string) (string, bool) {
+func allowed(u string, schemes []string) bool {
 	if reNetworkPath.MatchString(u) {
-		return "", false
+		return false
 	}
 	scheme := reSchemeName.FindStringSubmatch(u)
-	if scheme == nil {
+	return scheme == nil || slices.Contains(schemes, strings.ToLower(scheme[1]))
+}
+
+// allow checks the decoded URL too, for an app that decodes the href before opening it.
+func allow(u string, schemes []string) (string, bool) {
+	decoded, ok := unwrap(u, true)
+	if ok && allowed(u, schemes) && allowed(decoded, schemes) {
 		return u, true
-	}
-	name := strings.ToLower(scheme[1])
-	for _, s := range schemes {
-		if s == name {
-			return u, true
-		}
 	}
 	return "", false
 }
@@ -235,6 +262,30 @@ func ImageUrl(u string, options types.RenderOptions) (string, bool) {
 		schemes = imageSchemes
 	}
 	return allow(u, schemes)
+}
+
+// InternalLink reports whether a note name may be written as an href. The href keeps
+// the original name, so sanitizing alone is not enough.
+func InternalLink(name string, options types.RenderOptions) bool {
+	u := SanitizeUrl(name)
+	if u == BLANK {
+		return false
+	}
+	if _, ok := LinkUrl(u, options); !ok {
+		return false
+	}
+	// Match character removal by Esc() and the browser: Esc() drops what XML does not
+	// allow, a browser drops tabs and line breaks and then leading C0 controls and spaces.
+	seen := strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || r == '\r' || r <= 0x08 || r == 0x0b || r == 0x0c ||
+			(r >= 0x0e && r <= 0x1f) || r == 0x7f || r == 0xfffe || r == 0xffff {
+			return -1
+		}
+		return r
+	}, name)
+	seen = strings.TrimLeft(seen, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f ")
+	_, ok := LinkUrl(seen, options)
+	return ok
 }
 
 func Linked(body, u, id string, links *[]types.LinkInfo, options types.RenderOptions, attrs string) string {

@@ -72,6 +72,10 @@ type inboxAgentsState struct {
 	marksGen uint64
 	// sheet is the bulk allow's confirm sheet, nil when it is not up.
 	sheet *bulkSheet
+	// resuming are the resume offers sent to the daemon and not yet gone,
+	// by item id. Their rows say Resuming until the offer closes. A change
+	// moves marksGen, which the frame cache reads.
+	resuming map[string]bool
 	// snooze are the items the snooze picker picks a length for.
 	snooze []string
 }
@@ -82,6 +86,7 @@ type agentsListKey struct {
 	sort           int
 	query, select_ string
 	built          bool
+	cards          uint64
 }
 
 // inboxAgentsTickMsg moves the time labels on. gen is the tick it belongs to:
@@ -103,6 +108,9 @@ func (m *OS) InboxAgentsTick() tea.Cmd {
 	gen := a.tickGen
 	stop := make(chan struct{})
 	a.tickStop = stop
+	// CloseInbox closes stop; Cleanup closes ended, so a session that ends
+	// with the Inbox open does not wait out the minute.
+	ended := m.stopSignal()
 	return func() tea.Msg {
 		t := time.NewTimer(inboxAgentsTick)
 		defer t.Stop()
@@ -110,6 +118,8 @@ func (m *OS) InboxAgentsTick() tea.Cmd {
 		case <-t.C:
 			return inboxAgentsTickMsg{gen: gen}
 		case <-stop:
+			return nil
+		case <-ended:
 			return nil
 		}
 	}
@@ -162,6 +172,10 @@ func (m *OS) inboxAgentsList() []sidebarAgentEntry {
 		sig: m.sidebarSignature(), sort: a.sort,
 		query: a.query, select_: m.Inbox.Select, built: true,
 	}
+	if m.Inbox.Select != "" {
+		// task: and stage: read the cards.
+		key.cards = m.Inbox.ck.cardsGen
+	}
 	if a.listAt == key {
 		return a.list
 	}
@@ -202,7 +216,7 @@ func (m *OS) remoteAgentEntries() []sidebarAgentEntry {
 					SessionID: s.Name, SessionLabel: firstNonEmptyStr(s.DisplayName, s.Name),
 					WindowID: a.ID, Title: a.Title, State: a.State, StateAt: a.StateAt,
 					Harness: a.Harness, Message: a.Message, AgentKind: a.Kind, Meta: a.Meta,
-					Subagents: a.Subagents, WindowIndex: -1, Foreign: true, Host: h.Name,
+					Subagents: a.Subagents, Settled: a.Settled, WindowIndex: -1, Foreign: true, Host: h.Name,
 				})
 			}
 		}
@@ -217,6 +231,11 @@ func (m *OS) agentsKeep(e sidebarAgentEntry) bool {
 		t := session.SelectorTarget{
 			Host: e.Host, Session: e.SessionID, Name: e.Title, State: e.State,
 			Harness: e.Harness, NeedsYou: sidebarAgentGroup(e.State, e.DoneSeen) == sidebarGroupNeedsYou,
+		}
+		if e.Host == "" {
+			for _, c := range m.ckHeldCards()[e.SessionID+"\x00"+e.WindowID] {
+				t.Tasks, t.Stages = append(t.Tasks, c.ID), append(t.Stages, c.Stage)
+			}
 		}
 		if !sel.Match(t) {
 			return false
@@ -309,7 +328,7 @@ func (m *OS) InboxAgentsReply() tea.Cmd {
 	}
 	if e.Host != "" {
 		if e.State == "needs_input" {
-			m.ShowNotification(who+" is waiting on a prompt. Answer it first.", "info", m.Settings.NotificationDuration)
+			m.ShowNotification(who+" is waiting on a prompt. Answer it first.", "warning", m.Settings.NotificationDuration)
 			return nil
 		}
 		m.openHostReply(e.Host, e.SessionID, e.WindowID, who, ctx)

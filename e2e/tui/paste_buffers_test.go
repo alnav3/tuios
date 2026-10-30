@@ -3,6 +3,7 @@ package tuie2e
 import (
 	"encoding/json"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -132,7 +133,9 @@ func waitBufferCount(t *testing.T, base string, n int, what string) pbListing {
 // never prints. With the choose_buffer Register line cut, the chooser never
 // opens. With the bracketed wrap cut from verbPasteBuffer, the marks never
 // show with bracketed paste on. With daemonBuffers in the shim always false,
-// the shim's set-buffer never reaches the daemon.
+// the shim's set-buffer never reaches the daemon. With the hold in
+// holdKeyForPaste cut, the Enter typed after the chooser's Enter runs
+// "echo CHOSEN-" alone (#1016).
 func TestPasteBuffersKeepYanksAndPasteThem(t *testing.T) {
 	base := t.TempDir()
 	term := startPasteBufferClient(t, base, "")
@@ -207,23 +210,36 @@ func TestPasteBuffersKeepYanksAndPasteThem(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(insertGuard)
+	// The client reads the chosen buffer from the daemon after the chooser
+	// closes. An Enter typed right after the chooser's Enter must still come
+	// after the paste, as in tmux (#1016). The daemon is stopped across both
+	// keys, so the read is slow on every run: a client that sends the second
+	// Enter on ahead runs "echo CHOSEN-" alone.
+	daemon := daemonPID(t, base)
+	if err := syscall.Kill(daemon, syscall.SIGSTOP); err != nil {
+		t.Fatalf("stop the daemon: %v", err)
+	}
+	stopped := true
+	resume := func() {
+		if stopped {
+			stopped = false
+			_ = syscall.Kill(daemon, syscall.SIGCONT)
+		}
+	}
+	t.Cleanup(resume)
 	if err := term.SendKeys(tuitest.Enter); err != nil {
 		t.Fatal(err)
 	}
 	if err := term.WaitFor(func(s tuitest.Screen) bool { return !strings.Contains(s.Text(), "Paste buffers") }, uiTimeout); err != nil {
 		t.Fatalf("the chooser did not close after enter\n%s", term.Snapshot())
 	}
-	// The chooser closes before the paste lands: the client reads the
-	// buffer from the daemon first. An Enter sent before the text is on the
-	// line runs "echo CHOSEN-" alone, and the text goes to the next prompt.
-	if err := term.WaitFor(func(s tuitest.Screen) bool { return strings.Contains(s.Text(), "echo CHOSEN-pbalpha42") }, uiTimeout); err != nil {
-		t.Fatalf("the chooser did not put the older buffer on the line: %v\n%s", err, term.Snapshot())
-	}
 	if err := term.SendKeys(tuitest.Enter); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(500 * time.Millisecond)
+	resume()
 	if err := term.WaitFor(func(s tuitest.Screen) bool { return screenHasLine(s, "CHOSEN-pbalpha42") }, shellTimeout); err != nil {
-		t.Fatalf("the chooser did not paste the older buffer: %v\n%s", err, term.Snapshot())
+		t.Fatalf("ASSERTION: the Enter typed after the chooser's Enter ran the line before the paste: %v\n%s", err, term.Snapshot())
 	}
 	saveFrame(t, term, "paste-buffers-pasted")
 
@@ -335,7 +351,9 @@ func TestPasteBufferVerbsFollowPaneGrants(t *testing.T) {
 
 	// read: reading is served, writing is refused.
 	grant("read")
-	runInShell(t, term, "clear; "+bin+" show-buffer | tr a-z A-Z; echo; "+bin+" set-buffer x; echo READ_SET=$?", "READ_SET=1", shellTimeout)
+	// Only the part of the refusal that names the grant reaches the pane:
+	// the whole message is long enough to scroll HUNTER2 off a small pane.
+	runInShell(t, term, "clear; "+bin+" show-buffer | tr a-z A-Z; echo; e=$(mktemp); "+bin+" set-buffer x 2>\"$e\"; s=$?; grep -o 'needs the [a-z]* grant' \"$e\"; echo READ_SET=$s", "READ_SET=1", shellTimeout)
 	text := term.Screen().Text()
 	if !strings.Contains(text, "HUNTER2") {
 		t.Fatalf("a pane with read could not read the buffer\n%s", term.Snapshot())
@@ -344,9 +362,10 @@ func TestPasteBufferVerbsFollowPaneGrants(t *testing.T) {
 		t.Fatalf("the set-buffer refusal does not name the write grant\n%s", term.Snapshot())
 	}
 
-	// write alone: setting is served, reading and pasting are refused.
+	// write alone: setting is served, reading and pasting are refused. The
+	// refusal is cut to its grant again, or it scrolls WRITE_SET off.
 	grant("write")
-	runInShell(t, term, "clear; "+bin+" set-buffer mine-x; echo WRITE_SET=$?; "+bin+" paste-buffer; echo WRITE_PASTE=$?", "WRITE_PASTE=1", shellTimeout)
+	runInShell(t, term, "clear; "+bin+" set-buffer mine-x; echo WRITE_SET=$?; e=$(mktemp); "+bin+" paste-buffer 2>\"$e\"; s=$?; grep -o 'needs the [a-z]* grant' \"$e\"; echo WRITE_PASTE=$s", "WRITE_PASTE=1", shellTimeout)
 	text = term.Screen().Text()
 	if !strings.Contains(text, "WRITE_SET=0") {
 		t.Fatalf("a pane with write could not set a buffer\n%s", term.Snapshot())

@@ -25,7 +25,7 @@ var (
 	// reviewNoteSides are the sides of a diff a note can sit on.
 	reviewNoteSides = []string{"new", "old"}
 	// markAttentionActions are what mark-attention does to an item.
-	markAttentionActions = []string{"snooze", "wake", "unread", "restore"}
+	markAttentionActions = []string{"snooze", "wake", "unread", "restore", "settle", "unsettle"}
 	// approvalKinds are the kinds of hold request-approval takes.
 	approvalKinds = []string{AttentionApproval, AttentionPlan}
 	// activityEvents are the entries set-agent-state's activity reports.
@@ -42,7 +42,7 @@ func agentWorkVerbs() map[string]verbEntry {
 	return map[string]verbEntry{
 		// verb_agent_transcript.go
 		"agent-transcript": {
-			description: "Read the conversation of the agent in a pane, for a client that shows it to the person: prompts, answers, thinking, tool calls with their status, diffs of edits, plans and todo lists, decoded from the transcript the pane is joined to. Only the person can read it, with a live human_nonce, as reply-approval checks it. Claude Code transcripts only. Every string is the agent's or its tools', with control characters removed and likely secrets masked, so the reply is marked untrusted.",
+			description: "Read the conversation of the agent in a pane, for a client that shows it to the person: prompts, answers, thinking, tool calls with their status, diffs of edits, plans and todo lists, decoded from the transcript the pane is joined to. Readers include Claude Code, Codex, Gemini CLI, Qwen Code, Copilot CLI, Amp, OpenCode, Cursor Agent and Pi. Only the person can read it, with a live human_nonce, as reply-approval checks it. Every string is the agent's or its tools', with control characters removed and likely secrets masked, so the reply is marked untrusted.",
 			params: []verbParam{
 				sessionParam,
 				{Name: "window", Type: "string", Required: true, Description: "The pane: a window id or name."},
@@ -199,7 +199,7 @@ func agentWorkVerbs() map[string]verbEntry {
 			params: []verbParam{
 				{Name: "session", Type: "string", Description: "Any session of the fan. Omit for the most recently active session."},
 				{Name: "changes", Type: "bool", Description: "Count the changed files and lines of each attempt, a few git calls per sibling.", Default: "true"},
-				{Name: "detail", Type: "bool", Description: "With changes, also list each attempt's files (file_list, at most 8, most changed first) and its first changed lines (lines, at most 6). Two more git calls per sibling.", Default: "false"},
+				{Name: "detail", Type: "bool", Description: "With changes, also list each attempt's files (file_list, at most 8, most changed first) and its first changed lines (lines, at most 6). Two more git calls per sibling. From a linked machine, detail needs write in its policy.", Default: "false"},
 			},
 			returns: []verbParam{
 				{Name: "group", Type: "string", Description: "The fan's group."},
@@ -306,25 +306,27 @@ func agentWorkVerbs() map[string]verbEntry {
 
 		// attention_lifecycle.go
 		"mark-attention": {
-			description: "Snooze an Inbox item, wake it, mark a finished pane unread, or restore an item closed a moment ago, for the person. Only a client attached right now can, with the nonce from its attach reply: an agent cannot hide or reorder what the person reads.",
+			description: "Snooze an Inbox item, wake it, mark a finished pane unread, restore an item closed a moment ago, or settle an agent, for the person. Only a client attached right now can, with the nonce from its attach reply: an agent cannot hide or reorder what the person reads.",
 			params: []verbParam{
-				{Name: "id", Type: "string", Description: "The item. Or name it with session, window and kind."},
+				{Name: "id", Type: "string", Description: "The item. Or name it with session, window and kind. With unsettle: the id settle returned, to put that item back in the Inbox."},
 				sessionParam,
 				windowParam,
 				{Name: "kind", Type: "string", Description: "The item's kind, with session and window.", Accepted: AttentionKindNames},
-				{Name: "action", Type: "string", Required: true, Description: "snooze hides it until a time or until its fact changes, wake shows it again, unread reopens a finished pane's item, restore reopens an item dismissed or snoozed in the last 10 seconds.", Accepted: markAttentionActions},
+				{Name: "action", Type: "string", Required: true, Description: "snooze hides it until a time or until its fact changes, wake shows it again, unread reopens a finished pane's item, restore reopens an item dismissed or snoozed in the last 10 seconds. settle puts the agent in the pane named by session and window on the Settled shelf until it needs the person again, and closes its finished turn. unsettle takes it off the shelf.", Accepted: markAttentionActions},
 				{Name: "until", Type: "int", Description: "With snooze: when it opens again, in unix milliseconds."},
 				{Name: "for_ms", Type: "int", Description: "With snooze: how long, in milliseconds."},
 				{Name: "until_change", Type: "bool", Description: "With snooze: until the pane's state changes.", Default: "false"},
 				{Name: "human_nonce", Type: "string", Required: true, Description: "The nonce the daemon issued in an attach reply, for a client attached now over the same kind of connection. The TUI sends its own."},
 			},
 			returns: []verbParam{
-				{Name: "id", Type: "string", Description: "The item."},
+				{Name: "id", Type: "string", Description: "The item. With settle: the finished turn it closed, empty for none. With unsettle: the item put back, empty for none."},
 				{Name: "action", Type: "string", Description: "What was done."},
+				{Name: "window", Type: "string", Description: "With settle and unsettle: the pane's window id."},
 				{Name: "snoozed_until", Type: "int", Description: "With snooze: when it opens again, in unix nanoseconds, -1 for until it changes."},
 			},
 			examples: []string{
 				`{"id":1,"verb":"mark-attention","params":{"id":"17","action":"snooze","for_ms":900000,"human_nonce":"<from the attach reply>"}}`,
+				`{"id":2,"verb":"mark-attention","params":{"session":"work","window":"review","action":"settle","human_nonce":"<from the attach reply>"}}`,
 			},
 			handler: (*Daemon).verbMarkAttention,
 		},

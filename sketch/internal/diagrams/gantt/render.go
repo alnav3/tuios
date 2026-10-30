@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/gantt/render.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/gantt/render.ts at 8aff183be57021b533f319a29341a529be934b08.
 //
 // pele's `text` is textSetting here, as the package text is imported. Dates are read in
 // options.Location, or in the host's zone when it is nil.
@@ -148,7 +148,7 @@ func renderGantt(model *GanttDb, config types.Config, options types.RenderOption
 	size := types.Or(options.FontSize, 16)
 	measurer := options.Measurer
 	if measurer == nil {
-		measurer = text.DefaultMeasurer(options.FontFamily, "")
+		measurer = text.DefaultMeasurer(options.FontFamily, options.FontFamilyMono)
 	}
 	pad := types.Or(options.Padding, 8)
 	now := clock(options.Now)

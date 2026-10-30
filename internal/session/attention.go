@@ -16,6 +16,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/atomicfile"
 	"github.com/Gaurav-Gosain/tuios/internal/lazyre"
 	"github.com/Gaurav-Gosain/tuios/internal/risk"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 )
 
 // The Inbox: one daemon-owned queue of everything waiting for the person.
@@ -174,6 +175,9 @@ type AttentionItem struct {
 	// note a finished turn carried, or the mail's subject. Control characters
 	// are removed, likely secrets are masked and it is cut to 160 bytes.
 	Summary string `json:"summary,omitempty"`
+	// RiskyFlags are, on a resume item, the flags in the command that turn
+	// off approvals or sandboxing (see ResumeWarning).
+	RiskyFlags []string `json:"risky_flags,omitempty"`
 	// Options are the answers reply-approval takes for this item, set only
 	// while RequestID is: once, always and deny, or the subset the harness can
 	// honour. See approvals.go.
@@ -653,6 +657,13 @@ func (a *attentionStore) noteAgentState(sessionName string, ev SessionEvent) {
 
 	switch state {
 	case AgentStateNeedsInput.Name():
+		if a.askShownLocked(sessionName, ev.Window, ev.hookMessage) {
+			// The pane shows its own open ask-human question as its state
+			// (ask_human_state.go). The ask item is the row for it, with
+			// the answers, so a question item beside it would only repeat
+			// the question without them.
+			break
+		}
 		it := base
 		it.Kind = AttentionQuestion
 		if ev.hookKind == "approval" {
@@ -1051,7 +1062,7 @@ func (a *attentionStore) list(q attentionQuery) ([]AttentionItem, map[string]int
 // SortAttention puts items in Inbox order: by kind in AttentionKindNames
 // order, then oldest first, then by id so the order is total.
 func SortAttention(items []AttentionItem) {
-	slices.SortFunc(items, func(x, y AttentionItem) int {
+	sortx.SortFunc(items, func(x, y AttentionItem) int {
 		if c := cmp.Compare(AttentionKindRank(x.Kind), AttentionKindRank(y.Kind)); c != 0 {
 			return c
 		}

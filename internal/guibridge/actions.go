@@ -54,6 +54,7 @@ var allowedActions = map[string]bool{
 	"nav_left": true, "nav_right": true, "nav_up": true, "nav_down": true,
 	// Sessions
 	"next_session": true, "prev_session": true,
+	"next_agent": true, "prev_agent": true,
 	// The same work under the leader and its sub-prefixes, which is where
 	// the renderer's own prefix resolver ends up.
 	"prefix_new_window": true, "prefix_close_window": true,
@@ -62,7 +63,7 @@ var allowedActions = map[string]bool{
 	"prefix_split_horizontal": true, "prefix_split_vertical": true,
 	"prefix_rotate_split": true, "prefix_equalize_splits": true,
 	"window_prefix_new": true, "window_prefix_close": true,
-	"window_prefix_next": true, "window_prefix_prev": true, "window_prefix_tiling": true,
+	"window_prefix_next": true, "window_prefix_prev": true, "window_prefix_tiling": true, "window_prefix_float": true,
 	"minimize_prefix_focused": true, "minimize_prefix_restore_all": true,
 }
 

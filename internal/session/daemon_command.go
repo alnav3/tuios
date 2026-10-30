@@ -40,12 +40,15 @@ var daemonOwnedCommands = map[string]bool{
 // the result. The CLI gives up sooner when its own --timeout is shorter.
 const tapeResultTTL = 6 * time.Hour
 
-// clientQueryCommands are the read-only names the attached client answers
-// itself, beside the tape commands. They are commands a caller can name too.
+// clientQueryCommands are the names the attached client answers itself,
+// beside the tape commands. They are commands a caller can name too. All but
+// ShareLook only read. ShareLook writes a screenshot and the clipboard of the
+// person at the client, which is why it needs one attached.
 var clientQueryCommands = map[string]bool{
 	"ListWindows":    true,
 	"GetSessionInfo": true,
 	"GetWindow":      true,
+	"ShareLook":      true,
 }
 
 // resolveCommandName turns the name a caller gave run-command into the one
@@ -96,7 +99,7 @@ func (d *Daemon) handleExecuteCommand(cs *connState, msg *Message) error {
 	LogBasic("Received execute command: %s (session=%s, args=%v)", payload.CommandType, payload.SessionName, payload.Args)
 
 	// Find the target session
-	session := d.findTargetSession(payload.SessionName)
+	session := d.findTargetSession(cs, payload.SessionName)
 	if session == nil {
 		LogBasic("Execute command: session not found")
 		return d.sendCommandResult(cs, payload.RequestID, false, "session not found")
@@ -119,7 +122,13 @@ func (d *Daemon) handleExecuteCommand(cs *connState, msg *Message) error {
 		// The client asked for a pane on the machine another pane is ssh'd
 		// into. The daemon reads that pane's processes, because it is the side
 		// that owns them. With no ssh client there it is an ordinary window.
-		if argv, env, ok := session.sshFollowArgv(payload.SSHFrom); ok {
+		argv, env, why, ok := session.sshFollowArgv(payload.SSHFrom)
+		if why != "" && cs.isTUIClient {
+			// An ssh runs there and is not followed. The client that asked
+			// says why on its dock.
+			_ = d.sendMessage(cs, MsgRemoteCommand, &RemoteCommandPayload{CommandType: "notice", TapeArgs: []string{why}})
+		}
+		if ok {
 			newWindowEnv = env
 			name := ""
 			if len(payload.Args) == 1 {
@@ -145,7 +154,15 @@ func (d *Daemon) handleExecuteCommand(cs *connState, msg *Message) error {
 			return d.sendCommandResult(cs, payload.RequestID, false,
 				"tape scripts need an attached client. A headless daemon has no renderer to run them")
 		}
-		onExit := func(ptyID string) { d.notifyPTYClosed(session.ID, ptyID) }
+		// A kept-open window is not reported closed, which is what makes an
+		// attached client close it. See the new-window verb.
+		keepOpen := payload.KeepOpen && payload.CommandType == "NewWindow" && len(payload.Args) > 1
+		onExit := func(ptyID string) {
+			if keepOpen {
+				return
+			}
+			d.notifyPTYClosed(session.ID, ptyID)
+		}
 		var data map[string]any
 		var err error
 		if payload.FocusIfShown && payload.CommandType == "NewWindow" {
@@ -175,7 +192,10 @@ func (d *Daemon) handleExecuteCommand(cs *connState, msg *Message) error {
 				data = map[string]any{"window_id": win.ID, "name": win.Title}
 			}
 		} else {
-			data, err = d.executeDaemonCommandEnv(session, payload.CommandType, payload.Args, payload.Cwd, payload.Workspace, newWindowEnv, onExit)
+			data, err = d.executeDaemonCommandEnv(session, payload.CommandType, payload.Args, NewWindowOptions{
+				Cwd: payload.Cwd, Workspace: payload.Workspace, Env: newWindowEnv,
+				Cols: payload.Cols, Rows: payload.Rows, keepOpen: keepOpen,
+			}, onExit)
 		}
 		if err != nil {
 			return d.sendCommandResult(cs, payload.RequestID, false, err.Error())
@@ -343,15 +363,23 @@ func (d *Daemon) routeToTUISync(tui *connState, requestID string, cmd *RemoteCom
 	}
 }
 
-// findTargetSession finds a session by name, or returns the most recently active session.
+// findTargetSession finds a session by name. With no name it is the session
+// of the pane the caller on cs runs in, and for a caller in no pane (the
+// person's CLI, a hook, a link) the most recently active session.
 // A name a session was renamed from still finds it: a pane started before the
 // rename keeps the old name in TUIOS_SESSION, and its commands send that.
-func (d *Daemon) findTargetSession(sessionName string) *Session {
+//
+// The pane's own session comes first because the most recent one is the
+// person's: an agent that left out -s used to read and type into whatever
+// session the person last touched, with nothing to tell it so.
+func (d *Daemon) findTargetSession(cs *connState, sessionName string) *Session {
 	if sessionName != "" {
 		sess, _ := d.manager.ResolveSession(sessionName)
 		return sess
 	}
-
+	if sess := d.callerSession(cs); sess != nil {
+		return sess
+	}
 	return d.manager.MostRecentSession()
 }
 

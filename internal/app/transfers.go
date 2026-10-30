@@ -12,8 +12,10 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/crashexit"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/sortx"
 )
 
 // The copies between machines on the client: a mirror of the daemon's
@@ -186,6 +188,7 @@ func listenForTransfers(ch <-chan tea.Msg) tea.Cmd {
 // runTransfersWatch keeps a watch running until ctx ends, starting over after
 // every failure with a growing wait.
 func runTransfersWatch(ctx context.Context, dial inboxDial, out chan<- tea.Msg) {
+	defer crashexit.Recover()
 	defer close(out)
 	wait := time.Second
 	for ctx.Err() == nil {
@@ -435,7 +438,7 @@ func (m *OS) applyTransfersSnapshot(msg transfersSnapshotMsg) {
 
 // sortTransferRows puts the newest copy first.
 func sortTransferRows(rows []session.TransferRow) {
-	slices.SortStableFunc(rows, func(a, b session.TransferRow) int {
+	sortx.SortStableFunc(rows, func(a, b session.TransferRow) int {
 		if c := cmp.Compare(b.Created, a.Created); c != 0 {
 			return c
 		}
@@ -528,7 +531,7 @@ func (m *OS) transfersLingerCmd() tea.Cmd {
 	}
 	st.lingerGen++
 	gen := st.lingerGen
-	return tea.Tick(left+50*time.Millisecond, func(time.Time) tea.Msg { return transfersLingerMsg{gen: gen} })
+	return m.tickUntilStop(left+50*time.Millisecond, func(time.Time) tea.Msg { return transfersLingerMsg{gen: gen} })
 }
 
 // applyTransfersLinger redraws once the linger ran out.
@@ -581,11 +584,19 @@ func (m *OS) markTransferSeen(id string) {
 	m.transfers.seen[id] = true
 }
 
-// transferPlace names a machine of a copy for the person: the host, or "this
-// machine".
+// transferPlace names a machine of a copy for the person: the host, or this
+// machine's name with "(this machine)" after it.
 func transferPlace(host string) string {
 	if host == "" || host == federation.LocalHostName {
-		return "this machine"
+		return thisMachineLabel()
+	}
+	return printableTitle(host)
+}
+
+// transferPlaceShort is transferPlace without the hint, for a panel row.
+func transferPlaceShort(host string) string {
+	if host == "" || host == federation.LocalHostName {
+		return thisMachineShort()
 	}
 	return printableTitle(host)
 }

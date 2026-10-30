@@ -146,6 +146,11 @@ type AgentReport struct {
 	// then is the pid known to name a process of this machine, and only then
 	// may its exit clear the pane. See harnessProc.
 	HarnessIsCaller bool
+	// harnessGone is set by the daemon when the report comes from a process
+	// in the pane whose harness no longer runs there (harnessLeftPane): a
+	// hook that landed after its harness quit. The harness record is then
+	// taken for exited, so the claim lapses once the pane is at its shell.
+	harnessGone bool
 	// SessionStart marks the report of a conversation starting or resuming,
 	// as the hook's SessionStart sends it. It only matters with SharedServer.
 	SessionStart bool
@@ -158,6 +163,16 @@ type AgentReport struct {
 	// is one of these right now. It is how a hook says "clear the block once
 	// the tool ran" without also turning a finished pane back to working.
 	IfState []AgentState
+	// Subagent is the subagent a needs_input report waits on, empty when the
+	// prompt is the pane's own agent's. A harness that runs subagents shows
+	// their prompts as its own, and only the subagent's next event says the
+	// prompt was answered.
+	Subagent string
+	// IfSubagent, when not empty, applies the report only if the window is on
+	// needs_input and waits on that subagent's prompt. It is how a subagent's hook clears the prompt
+	// it raised without clearing one the main agent or another subagent
+	// raised meanwhile.
+	IfSubagent string
 	// foreignPane says the harness that ran the hook does not run in the pane
 	// the report names. The verb handler sets it from harnessOutsidePane, and
 	// the report is then refused with foreign_pane before anything else is
@@ -443,12 +458,30 @@ func (s *Session) applyAgentReport(target string, r AgentReport) (AgentState, bo
 	applied := false
 	var holdAt int64
 	var heldWindow, heldPTY string
+	// heardOnly is an if_state refusal that cleared a silence: the state
+	// changes, so the mutation publishes, and the report is still refused.
+	heardOnly := false
 	err := s.mutateState(func(st *SessionState) error {
 		idx, err := findWindowStateIndex(st.Windows, target)
 		if err != nil {
 			return err
 		}
 		w := &st.Windows[idx]
+		if ask, asking := s.askShowLocked(w); asking {
+			// The pane shows a question from ask-human over its state. The
+			// report is about the state beneath it, judged and applied
+			// there, and the question stays on top unless the report is
+			// one the person has to see now (ask_human_state.go).
+			shown := w
+			beneath := *shown
+			ask.beneath.put(&beneath)
+			w = &beneath
+			defer func() {
+				if s.settleAskShowLocked(shown, &beneath, ask, applied) {
+					effective = AgentStateNeedsInput
+				}
+			}()
+		}
 		if r.foreignPane {
 			effective = w.AgentState
 			return errAgentReportRefused(agentRefusedForeignPane)
@@ -460,6 +493,19 @@ func (s *Session) applyAgentReport(target string, r AgentReport) (AgentState, bo
 		}
 		prev := w.AgentState
 		if len(r.IfState) > 0 && !slices.Contains(r.IfState, prev) {
+			effective = prev
+			// A conditional report that does not apply is still the agent
+			// speaking, and counts against a silence (agent_silent.go).
+			if s.noteHeardLocked(w, claim, held, r) {
+				heardOnly = true
+				return nil
+			}
+			return errAgentReportRefused(agentRefusedIfState)
+		}
+		// Checked against the state as well as the claim, so a report naming
+		// a subagent never applies to a pane that is not waiting on a prompt,
+		// whatever if_state the sender passed.
+		if r.IfSubagent != "" && (prev != AgentStateNeedsInput || !held || claim.subagent != r.IfSubagent) {
 			effective = prev
 			return errAgentReportRefused(agentRefusedIfState)
 		}
@@ -492,6 +538,9 @@ func (s *Session) applyAgentReport(target string, r AgentReport) (AgentState, bo
 		// the harness pid: that agent has gone.
 		next.sawProcess = claim.sawProcess && r.State != AgentStateNone
 		next.identity = identityAfterReport(claim, r, next.harness)
+		if r.State == AgentStateNeedsInput {
+			next.subagent = r.Subagent
+		}
 		switch {
 		case override:
 			next.blocker = true
@@ -544,7 +593,7 @@ func (s *Session) applyAgentReport(target string, r AgentReport) (AgentState, bo
 			if w.AgentSessionHarness == "" {
 				w.AgentSessionHarness = next.harness
 			}
-			s.setAgentHarnessPID(w.ID, r.HarnessPID, r.HarnessIsCaller)
+			s.setAgentHarnessPID(w.ID, r.HarnessPID, r.HarnessIsCaller, r.harnessGone)
 		}
 		// A pane cleared to none has no agent to describe, and metadata left
 		// behind would be drawn for whatever agent starts in it next. Nor a
@@ -565,6 +614,9 @@ func (s *Session) applyAgentReport(target string, r AgentReport) (AgentState, bo
 	})
 	if holdAt != 0 {
 		s.notePromptHoldFg(heldWindow, heldPTY, holdAt)
+	}
+	if err == nil && heardOnly {
+		return effective, false, agentRefusedIfState, nil
 	}
 	if errors.Is(err, errAgentClaimHeld) {
 		return effective, false, agentRefusedOutranked, nil

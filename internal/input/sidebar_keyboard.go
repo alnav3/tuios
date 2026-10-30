@@ -48,6 +48,21 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.ExitSidebarFocus()
 		return o, nil
 	}
+	// Quick look first. Its key opens the preview on a row of the listing and
+	// closes it from any row, and esc closes it before esc leaves the rail.
+	// Every other key goes on to the rail, so the preview takes nothing from
+	// it: j and k still move the cursor, and the preview follows them (see
+	// QuickLookSync, run after every input).
+	if act := lookupAction(o, msg, o.KeybindRegistry.GetSidebarFilesAction); act == sidebarActFileQuickLook &&
+		(o.QuickLookOpen() || o.SidebarCursorOnListing()) {
+		noteRailAction(o, act)
+		return o, o.SidebarQuickLook()
+	}
+	if key == "esc" && o.QuickLookOpen() {
+		o.CloseQuickLook()
+		return o, nil
+	}
+
 	// The files section's own keys are consulted first, and only while the
 	// cursor is on a row of the listing. Three of them share a key with a rail
 	// binding that already exists (r renames, x kills, a was free), so the row
@@ -55,7 +70,10 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// row the lookup finds nothing and the rail's own binding runs, unchanged.
 	if o.SidebarCursorOnFile() {
 		if act := lookupAction(o, msg, o.KeybindRegistry.GetSidebarFilesAction); act != "" {
-			o.NoteAction(act)
+			noteRailAction(o, act)
+			if o.LearnBlocksAction(act) {
+				return o, nil
+			}
 			return o, handleSidebarFileAction(act, o)
 		}
 	}
@@ -67,7 +85,7 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if o.SidebarCursorOnAgent() {
 		if act := lookupAction(o, msg, o.KeybindRegistry.GetSidebarAgentsAction); act != "" {
 			if cmd, handled := o.SidebarAgentAction(act); handled {
-				o.NoteAction(act)
+				noteRailAction(o, act)
 				return o, cmd
 			}
 		}
@@ -85,6 +103,25 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		// move the cursor whatever a user has put in the global section.
 		if m, cmd, ok := handleGlobalBinds(msg, o); ok {
 			return m, cmd
+		}
+
+		// The chords that walk workspaces, sessions and agent panes from a
+		// shell walk them from the rail too, by the same rule: only a
+		// reserved chord, and only a terminal-safe action. The rail is where
+		// a person reads the order they walk, and it was swallowing them.
+		if isReservedTerminalChord(msg) {
+			if act := lookupAction(o, msg, o.KeybindRegistry.GetAction); isTerminalSafeAction(act) {
+				if m, cmd, ok := dispatchAction(act, msg, o); ok {
+					return m, cmd
+				}
+			}
+		}
+
+		// A terminal focus key pointing back at the panes leaves the rail, so
+		// the key that walked into it from the outermost pane walks back out.
+		focus := lookupAction(o, msg, o.KeybindRegistry.GetTerminalModeAction)
+		if dir, ok := strings.CutPrefix(focus, "terminal_focus_"); ok && o.LeaveRailToward(dir) {
+			return o, nil
 		}
 
 		// esc leaves the rail when nothing else claims it. The scope swallows
@@ -105,7 +142,7 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// Workspace/session jumps share a numeric suffix.
 	if after, ok := strings.CutPrefix(action, sidebarActJumpPrefix); ok {
 		if n, err := strconv.Atoi(after); err == nil {
-			o.NoteAction(action)
+			noteRailAction(o, action)
 			o.SidebarJumpToSession(n)
 		}
 		return o, nil
@@ -149,10 +186,10 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		// session and filters it by who needs a human. Rail focus is kept, so
 		// closing the palette comes back to the row the cursor was on; a row that
 		// actually relocates the user drops it on the way out.
-		o.NoteAction(action)
+		noteRailAction(o, action)
 		return o, o.OpenCommandPalette()
 	case sidebarActFileSearch:
-		o.NoteAction(action)
+		noteRailAction(o, action)
 		return o, o.OpenFileSearch(true)
 	case sidebarActAgentFilter:
 		o.SidebarCycleAgentsFilter()
@@ -161,7 +198,7 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	case sidebarActMail:
 		// The mailbox, narrowed to the pane under the cursor when there is one.
 		// Rail focus is kept, like the palette, so closing it comes back here.
-		o.NoteAction(action)
+		noteRailAction(o, action)
 		return o, o.SidebarOpenMail()
 	case sidebarActNarrow:
 		// On the divider the two width keys move the split instead: narrow
@@ -202,7 +239,7 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		handled = false
 	}
 	if handled {
-		o.NoteAction(action)
+		noteRailAction(o, action)
 	}
 	// Two rows of the rail's file view answer with a command rather than with a
 	// state change: copying a path is a clipboard write. The switch above cannot
@@ -211,13 +248,22 @@ func handleSidebarKey(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	return o, o.TakeSidebarCmd()
 }
 
+// noteRailAction records a rail action the way Dispatch records the others,
+// and tells the browser build's tour about it, as Dispatch does.
+func noteRailAction(o *app.OS, action string) {
+	o.NoteAction(action)
+	if o.OnAction != nil {
+		o.OnAction(action)
+	}
+}
+
 // makeSidebarReorderHandler is the reorder action as the dispatcher takes it:
 // one handler per direction, both calling the same rail method the key calls.
 // A machine header's context menu is the caller that needs it; see machineMenu.
 func makeSidebarReorderHandler(delta int) ActionHandler {
 	return func(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		o.SidebarReorderCursor(delta)
-		return o, nil
+		return o, o.TakeSidebarCmd()
 	}
 }
 
@@ -259,6 +305,10 @@ func handleSidebarFileAction(action string, o *app.OS) tea.Cmd {
 		return o.SidebarFilePaste()
 	case sidebarActFileSend:
 		return o.SidebarFileSend()
+	case sidebarActFileInsertPath:
+		o.SidebarFileInsert()
+	case sidebarActFileQuickLook:
+		return o.SidebarQuickLook()
 	}
 	return nil
 }

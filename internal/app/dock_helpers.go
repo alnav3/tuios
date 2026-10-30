@@ -155,9 +155,9 @@ func (m *OS) dockTabs() config.DockTabsConfig {
 
 // dockTabWidth is the column span of a tab carrying label: a pill's (see
 // workspacePillWidth), or a flat tab's label and its column of padding either
-// side.
+// side. A flat tab with caps is as wide as a pill.
 func (m *OS) dockTabWidth(t *config.DockTabsConfig, label string) int {
-	if t.Flat() {
+	if t.Flat() && !t.Caps {
 		return lipgloss.Width(label) + 2
 	}
 	return workspacePillWidth(label, &m.Settings)
@@ -692,6 +692,29 @@ func (m *OS) prefixArmed() bool {
 		m.LayoutPrefixActive || m.TuiosPrefixActive || m.Menu != ""
 }
 
+// tiledModeLabel is the mode pill's label in terminal or window mode. With
+// tiling off it is the mode's own icon. With tiling on it is the tiling icon
+// and the next split, unless appearance.dock_mode_pill is "input": then the
+// mode's own icon keeps its place and the split letter alone says tiling is
+// on, so the two modes differ by more than colour (discussion 1182).
+//
+// The built-in icons carry their own padding. A configured one such as "TL"
+// does not, and the letter used to run into it ("TLV"), so a space goes
+// between them when the icon does not end in one.
+func (m *OS) tiledModeLabel(modeIcon, nextSplit string) string {
+	if !m.AutoTiling {
+		return modeIcon
+	}
+	icon := m.Settings.GetDockModeIconTiling()
+	if m.Settings.DockModePill == "input" {
+		icon = modeIcon
+	}
+	if nextSplit != "" && icon != "" && !strings.HasSuffix(icon, " ") {
+		icon += " "
+	}
+	return icon + nextSplit
+}
+
 // prefixOnPill reports whether the dock's mode pill shows the armed leader.
 // The floating badge takes over when the dock is hidden, when the plan has
 // no mode pill, or when appearance.dock_prefix_indicator is "badge".
@@ -706,6 +729,11 @@ func (m *OS) prefixPillShown() bool {
 	}
 	m.ensureDockPlan()
 	return m.dockPlan.Has(config.DockComponentMode)
+}
+
+// withLockIcon puts the lock state after a mode pill's label.
+func withLockIcon(label, icon string) string {
+	return strings.TrimRight(label, " ") + " " + icon
 }
 
 // buildDockLeftText builds the dock's left region: the mode pill's label, the
@@ -734,6 +762,18 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 		// too. See renderOverlays.
 		modeInfo.Color = theme.UI().Warning
 		modeLabel = m.Settings.GetDockModeIconPrefix()
+		// Lock mode says it is unlocked while the leader waits. See
+		// lock_mode.go.
+		if m.lockPillShown() {
+			modeLabel = withLockIcon(modeLabel, m.Settings.GetDockLockIcon(false))
+		}
+	case m.Nested() && (focusedWindow == nil || !focusedWindow.CopyModeVisible()):
+		// Nest mode: tuios is off for this client. The pill says so in the
+		// info colour, which no other mode wears, and names the one key that
+		// turns it back on. Copy mode has the keys while it is up, and its
+		// pill says so instead. See nest_mode.go.
+		modeInfo.Color = theme.UI().Info
+		modeLabel = m.nestLabel()
 	case m.SidebarFocused:
 		// The rail owns the keyboard: the mode pill is the authoritative "who has
 		// input" indicator, so it says so in accent, outranking the pane mode.
@@ -765,22 +805,16 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 		} else {
 			// Terminal mode
 			modeInfo.Color = theme.DockColorTerminal()
-			// Add tiling indicator for terminal mode (with split direction)
-			if m.AutoTiling {
-				modeLabel = m.Settings.GetDockModeIconTiling() + modeInfo.NextSplit
-			} else {
-				modeLabel = m.Settings.GetDockModeIconTerminal()
+			modeLabel = m.tiledModeLabel(m.Settings.GetDockModeIconTerminal(), modeInfo.NextSplit)
+			// Lock mode says every key but the leader goes to the pane.
+			if m.Locked() {
+				modeLabel = withLockIcon(modeLabel, m.Settings.GetDockLockIcon(true))
 			}
 		}
 	default:
 		// Window mode
 		modeInfo.Color = theme.DockColorWindow()
-		// Add tiling indicator for window mode (with split direction)
-		if m.AutoTiling {
-			modeLabel = m.Settings.GetDockModeIconTiling() + modeInfo.NextSplit
-		} else {
-			modeLabel = m.Settings.GetDockModeIconWindow()
-		}
+		modeLabel = m.tiledModeLabel(m.Settings.GetDockModeIconWindow(), modeInfo.NextSplit)
 	}
 
 	// Add zoom indicator. The workspace's zoomed pane, not the focused one: the
@@ -857,6 +891,7 @@ func (m *OS) buildDockLeftText() (modeLabel, trail, tape string, width int, mode
 	// The spotlight chip rides after the mode pill whether or not the plan
 	// lists the mode: it is the way out of a dimmed screen, not a component.
 	width += m.spotlightChipWidth()
+	width += lipgloss.Width(m.calmChip())
 	width += 4
 
 	return modeLabel, trail, tape, width, modeInfo

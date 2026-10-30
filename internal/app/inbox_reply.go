@@ -223,7 +223,7 @@ func (m *OS) openInboxReply(sessionID, windowID, who, context string, closeAfter
 	// is refused like one on a prompt, as its row reads.
 	if state, seq, _, ok := m.railPane(sessionID, windowID); ok {
 		if drawn, _ := m.railAgentState(windowID, state, seq); drawn == "needs_input" {
-			m.ShowNotification(who+" is waiting on a prompt. Answer it first ("+m.inboxKeyOr(config.ActionInboxPeek, "space")+" to peek).", "info", m.Settings.NotificationDuration)
+			m.ShowNotification(who+" is waiting on a prompt. Answer it first ("+m.inboxKeyOr(config.ActionInboxPeek, "space")+" to peek).", "warning", m.Settings.NotificationDuration)
 			return false
 		}
 	}
@@ -350,7 +350,7 @@ func (m *OS) SidebarAgentReply(sessionID, windowID string) (tea.Cmd, bool) {
 	}
 	state, _, label, ok := m.railPane(sessionID, windowID)
 	if !ok {
-		m.ShowNotification("That pane is on another machine. Attach there to reply", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("That pane is on another machine. Attach there to reply", "warning", m.Settings.NotificationDuration)
 		return nil, true
 	}
 	who := printableTitle(label)
@@ -462,8 +462,8 @@ func (m *OS) InboxReplyCancel() {
 	}
 }
 
-// InboxReplySend queues the reply. An empty reply sends nothing and keeps
-// the editor open. A reply with invisible characters, or larger than the
+// InboxReplySend queues the reply. An empty reply sends nothing, keeps the
+// editor open and says so. A reply with invisible characters, or larger than the
 // daemon takes, stays open with a line that says why.
 func (m *OS) InboxReplySend() tea.Cmd {
 	ed := m.Inbox.reply.editor
@@ -471,6 +471,8 @@ func (m *OS) InboxReplySend() tea.Cmd {
 		return nil
 	}
 	if ed.comp.Empty() {
+		// enter or Send on an empty draft says why nothing happened.
+		ed.comp.SetInfo("The reply is empty. Type a message to send it.")
 		return nil
 	}
 	if ed.comp.Automated() || m.ProcessingRemoteKeys {
@@ -857,7 +859,7 @@ func (m *OS) applyInboxQueueDropped(msg InboxQueueDroppedMsg) {
 		return
 	}
 	if msg.ID == "" {
-		m.ShowNotification("Nothing queued for "+msg.Who+" can be dropped: a message being typed cannot be taken back", "info", m.Settings.NotificationDuration)
+		m.ShowNotification("Nothing queued for "+msg.Who+" can be dropped: a message being typed cannot be taken back", "warning", m.Settings.NotificationDuration)
 		return
 	}
 	st := &m.Inbox.reply
@@ -915,8 +917,18 @@ func (m *OS) inboxReplyHints() ([]overlay.Hint, bool) {
 	if ed == nil {
 		return nil, false
 	}
-	return composerHints(ed.comp.Hints(overlay.UseASCII())), true
+	// The reply area's own line shows send, new line and image, so the
+	// footer keeps the other keys. Hints is the composer's cached slice: it
+	// is copied before it is cut.
+	hints := slices.DeleteFunc(slices.Clone(ed.comp.Hints(overlay.UseASCII())), func(h composer.Hint) bool {
+		return replyAreaHints[h.Label]
+	})
+	return composerHints(hints), true
 }
+
+// replyAreaHints are the labels of the composer's keys the reply area's own
+// line already shows.
+var replyAreaHints = map[string]bool{"send": true, "new line": true, "paste image": true}
 
 // sidebarAgentQueuedFigure is what a rail agent row shows at its right edge
 // in place of the elapsed time while messages wait in the pane's queue, empty

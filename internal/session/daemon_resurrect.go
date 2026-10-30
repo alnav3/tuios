@@ -28,6 +28,8 @@ func clearLiveAgent(w *WindowState) {
 	// count names messages nobody holds any more. The subagents the count
 	// below says ran in a process that is gone.
 	w.AgentQueued = 0
+	w.AgentDraftHeld = false
+	w.AgentSettled = false
 	w.AgentSubagents = 0
 	w.AgentSubagentList = nil
 	w.ForegroundCmd = ""
@@ -134,7 +136,9 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	// The saved id comes back, so a client that knew the session by its id
 	// (a phone bridge, a script) still finds it. State from before ids were
 	// saved has none and gets a new one.
-	sess, err := d.manager.CreateSession(state.Name, &SessionConfig{restoreID: state.SessionID, Space: state.Space}, width, height)
+	d.sessionOrderMu.Lock()
+	sess, err := d.manager.CreateSession(state.Name, &SessionConfig{restoreID: state.SessionID, Space: state.Space, Rank: d.restoredRankLocked(state.Rank)}, width, height)
+	d.sessionOrderMu.Unlock()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -203,6 +207,13 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 			debugLog("[DEBUG] dropping restored popup %s, a popup lives only as long as its command", shortID(w.ID))
 			continue
 		}
+		// The rail pane is a client's, started from its config on attach.
+		// Restored, it would be a shell under a mark that says it runs the
+		// command, and the client would keep it.
+		if w.Rail != "" {
+			debugLog("[DEBUG] dropping restored rail pane %s, the client starts it again", shortID(w.ID))
+			continue
+		}
 		// A TML surface lives in the daemon, so the daemon that held it took
 		// it along. Its window would come back empty.
 		if w.Kind == WindowKindTML {
@@ -242,6 +253,7 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 			// would name one this machine does not have.
 			w.AgentSessionID = ""
 			w.AgentSessionHarness = ""
+			w.AgentFlags = nil
 		}
 
 		// The window as it was saved, for the resume offer, which asks whether
@@ -306,7 +318,14 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	ids := make(map[string]WindowState, len(kept))
 	grants := make(map[string][]string)
 	startedBy := make(map[string]*PaneRef)
+	var notes map[string]string // most panes have none
 	for _, w := range kept {
+		if w.Note != "" {
+			if notes == nil {
+				notes = make(map[string]string)
+			}
+			notes[w.ID] = w.Note
+		}
 		if w.Grants != nil {
 			grants[w.ID] = w.Grants
 		}
@@ -346,9 +365,15 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 	sess.RestoreMasterLayouts(masterLayouts)
 	// The herdr tab keys are daemon-owned in the same way.
 	sess.RestoreWorkspaceTabKeys(tabKeys, nextTabKey)
+	// The task cards are daemon-owned in the same way. Every holder is let
+	// go: clearLiveAgent took every agent above, and a holder's pane may not
+	// have come back.
+	d.restoreTasks(sess, state.Tasks, state.NextTaskID)
 	// Whether the rail is shown is daemon-owned in the same way. See
 	// RestoreSidebar.
 	sess.RestoreSidebar(state.Sidebar)
+	// The return notes are daemon-owned in the same way. See RestoreNotes.
+	sess.RestoreNotes(state.Note, notes)
 	// The scratch mark is daemon-owned in the same way: UpdateState keeps
 	// only the marks canonical state already has, and a new session has none.
 	if len(scratchPanes) > 0 {
@@ -380,6 +405,7 @@ func (d *Daemon) restoreSessionOffers(state *SessionState) (*Session, []resumeOf
 				if saved, ok := ids[st.Windows[i].ID]; ok {
 					st.Windows[i].AgentSessionID = saved.AgentSessionID
 					st.Windows[i].AgentSessionHarness = saved.AgentSessionHarness
+					st.Windows[i].AgentFlags = saved.AgentFlags
 				}
 			}
 			return nil

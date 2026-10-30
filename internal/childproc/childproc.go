@@ -19,7 +19,6 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -38,23 +37,6 @@ func gitArgs(name string, args []string) []string {
 	return append([]string{"-c", "core.fsmonitor=false"}, args...)
 }
 
-// WithGitSettings adds the settings of gitArgs to env, for a program the
-// daemon runs that runs git itself, such as gh. They go in as
-// GIT_CONFIG_COUNT entries after any env already has.
-func WithGitSettings(env []string) []string {
-	n := 0
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "GIT_CONFIG_COUNT="); ok {
-			if c, err := strconv.Atoi(v); err == nil && c > 0 {
-				n = c
-			}
-		}
-	}
-	i := strconv.Itoa(n)
-	return append(env, "GIT_CONFIG_COUNT="+strconv.Itoa(n+1),
-		"GIT_CONFIG_KEY_"+i+"=core.fsmonitor", "GIT_CONFIG_VALUE_"+i+"=false")
-}
-
 // Command is exec.Command for a program that must not open a window.
 func Command(name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, gitArgs(name, args)...) //tuios:allow-exec the one place that hides it
@@ -69,3 +51,9 @@ func CommandContext(ctx context.Context, name string, args ...string) *exec.Cmd 
 	Hide(cmd)
 	return cmd
 }
+
+// OwnGroup starts cmd in a process group of its own and makes its context end
+// that whole group, so a command that started children of its own cannot
+// outlive its deadline through them. A no-op where there are no process
+// groups. cmd must come from CommandContext for the context to apply.
+func OwnGroup(cmd *exec.Cmd) { ownGroup(cmd) }

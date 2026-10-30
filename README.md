@@ -1,6 +1,3 @@
-> [!WARNING]
-> **An account on X called @tuiosdev is pretending to be tuios. It is not this project.** tuios has no X or Twitter account. It lives only at [tuios.dev](https://tuios.dev) and in this repository. There is no tuios token or presale. Please report that account if you see it.
-
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./assets/brand/banner-dark.png">
@@ -12,7 +9,7 @@
 
   <a href="https://github.com/Gaurav-Gosain/tuios/releases"><img src="https://img.shields.io/github/release/Gaurav-Gosain/tuios.svg" alt="Latest Release"></a>
   <a href="https://pkg.go.dev/github.com/Gaurav-Gosain/tuios?tab=doc"><img src="https://godoc.org/github.com/Gaurav-Gosain/tuios?status.svg" alt="GoDoc"></a>
-  <a href="https://deepwiki.com/Gaurav-Gosain/tuios"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+  <a href="https://deepwiki.com/Gaurav-Gosain/tuios"><img src="https://img.shields.io/badge/Ask-DeepWiki-1f6feb" alt="Ask DeepWiki"></a>
   <br>
   <a title="This tool is Tool of The Week on Terminal Trove, The $HOME of all things in the terminal" href="https://terminaltrove.com/"><img src="https://cdn.terminaltrove.com/media/badges/tool_of_the_week/png/terminal_trove_tool_of_the_week_green_on_dark_grey_bg.png" alt="Terminal Trove Tool of The Week" style="width: 250px;" /></a>
 </div>
@@ -28,7 +25,7 @@ Built on the Charm stack (Bubble Tea v2, Lipgloss v2), TUIOS features event-driv
 
 ## Documentation
 
-Full documentation is available at **[tuios.dev](https://tuios.dev)** (hosted) or in the [`docs/`](./docs/) folder. To try tuios without installing it, take the guided tour at **[tuios.dev/learn](https://tuios.dev/learn)**: the real app, compiled to WebAssembly, with a practice shell in every pane.
+Full documentation is available at **[tuios.dev](https://tuios.dev)** (hosted) or in the [`docs/`](./docs/) folder. To try tuios without installing it, take the guided tour at **[tuios.dev/learn](https://tuios.dev/learn)**: the real app, compiled to WebAssembly, with a practice shell in every pane. Already installed it? Run `tuios tutor` for the same tour in your own terminal. It changes nothing on your machine.
 
 What changed in v0.10.1 is in the [release notes](docs/release-notes/v0.10.1.md).
 
@@ -98,7 +95,7 @@ Put a release tag after the repo name to build that release. Without a tag, Nix 
 ### Other Methods
 
 ```bash
-# Quick install script (Linux/macOS)
+# Quick install script (Linux/macOS, and Windows from Git Bash or PowerShell with WSL)
 curl -fsSL https://raw.githubusercontent.com/Gaurav-Gosain/tuios/main/install.sh | bash
 
 # Go install
@@ -185,7 +182,7 @@ The guide is [docs/AGENT_STATE.md](docs/AGENT_STATE.md).
 - **MCP Server**: `tuios mcp` serves the same surface as MCP tools, read-only and held to the agent's own session unless you say otherwise
 - **tmux Shim**: `tuios tmux-shim` runs tools that drive tmux, such as Claude Code agent teams, with their panes opened as tuios panes
 - **Session Stash**: `tuios stash put` keeps a file for the session, so another agent can still open it
-- **Agent Skill**: `tuios --skill` prints the short guide an agent in a pane reads to drive tuios, and `tuios --skill TOPIC` the rest, recipes included
+- **Agent Skill**: `tuios --skill` prints the short guide an agent in a pane reads to drive tuios, and `tuios --skill TOPIC` the rest, recipes included. To move your tmux, zellij or herdr settings over, tell your agent: "Run `tuios --skill config` and move my tmux settings over."
 
 ### Machines
 - **Hosts**: `tuios hosts add` names another machine, reached over ssh. `tuios hosts tailnet` lists the machines on a Tailscale tailnet
@@ -392,58 +389,9 @@ govulncheck ./...          # Known vulnerabilities in what the build reaches
 
 Thank you to everyone who helps build tuios. To join them, read the [contributing guide](docs/CONTRIBUTING.md).
 
-<!-- contributors:start -->
 <p align="center">
-<a href="https://github.com/Gaurav-Gosain" title="Gaurav-Gosain"><img src="https://avatars.githubusercontent.com/u/55647468?s=128&amp;v=4" width="64" height="64" alt="Gaurav-Gosain" title="Gaurav-Gosain"></a>
-<a href="https://github.com/abhijit-s" title="abhijit-s"><img src="https://avatars.githubusercontent.com/u/20989130?s=128&amp;v=4" width="64" height="64" alt="abhijit-s" title="abhijit-s"></a>
-<a href="https://github.com/davidreuss" title="davidreuss"><img src="https://avatars.githubusercontent.com/u/6885?s=128&amp;v=4" width="64" height="64" alt="davidreuss" title="davidreuss"></a>
-<a href="https://github.com/cr2007" title="cr2007"><img src="https://avatars.githubusercontent.com/u/73425927?s=128&amp;v=4" width="64" height="64" alt="cr2007" title="cr2007"></a>
-<a href="https://github.com/SebaWag" title="SebaWag"><img src="https://avatars.githubusercontent.com/u/251644039?s=128&amp;v=4" width="64" height="64" alt="SebaWag" title="SebaWag"></a>
-<a href="https://github.com/Tim4c" title="Tim4c"><img src="https://avatars.githubusercontent.com/u/9990855?s=128&amp;v=4" width="64" height="64" alt="Tim4c" title="Tim4c"></a>
-<a href="https://github.com/drawde-nadroj" title="drawde-nadroj"><img src="https://avatars.githubusercontent.com/u/107078793?s=128&amp;v=4" width="64" height="64" alt="drawde-nadroj" title="drawde-nadroj"></a>
-<a href="https://github.com/kylesnowschwartz" title="kylesnowschwartz"><img src="https://avatars.githubusercontent.com/u/11069001?s=128&amp;v=4" width="64" height="64" alt="kylesnowschwartz" title="kylesnowschwartz"></a>
-<a href="https://github.com/SugarHashira" title="SugarHashira"><img src="https://avatars.githubusercontent.com/u/106308062?s=128&amp;v=4" width="64" height="64" alt="SugarHashira" title="SugarHashira"></a>
-<a href="https://github.com/vvicaretti" title="vvicaretti"><img src="https://avatars.githubusercontent.com/u/25300130?s=128&amp;v=4" width="64" height="64" alt="vvicaretti" title="vvicaretti"></a>
-<br>
-<a href="https://github.com/fonnesbeck" title="fonnesbeck"><img src="https://avatars.githubusercontent.com/u/81476?s=128&amp;v=4" width="64" height="64" alt="fonnesbeck" title="fonnesbeck"></a>
-<a href="https://github.com/masshirodev" title="masshirodev"><img src="https://avatars.githubusercontent.com/u/21976638?s=128&amp;v=4" width="64" height="64" alt="masshirodev" title="masshirodev"></a>
-<a href="https://github.com/NotAFlightRisk" title="NotAFlightRisk"><img src="https://avatars.githubusercontent.com/u/23277273?s=128&amp;v=4" width="64" height="64" alt="NotAFlightRisk" title="NotAFlightRisk"></a>
-<a href="https://github.com/LeeSamuel14" title="LeeSamuel14"><img src="https://avatars.githubusercontent.com/u/37692342?s=128&amp;v=4" width="64" height="64" alt="LeeSamuel14" title="LeeSamuel14"></a>
-<a href="https://github.com/noomz" title="noomz"><img src="https://avatars.githubusercontent.com/u/24957?s=128&amp;v=4" width="64" height="64" alt="noomz" title="noomz"></a>
-<a href="https://github.com/ShalokShalom" title="ShalokShalom"><img src="https://avatars.githubusercontent.com/u/6344099?s=128&amp;v=4" width="64" height="64" alt="ShalokShalom" title="ShalokShalom"></a>
-<a href="https://github.com/dreuss" title="dreuss"><img src="https://avatars.githubusercontent.com/u/472909?s=128&amp;v=4" width="64" height="64" alt="dreuss" title="dreuss"></a>
-<a href="https://github.com/Gsirawan" title="Gsirawan"><img src="https://avatars.githubusercontent.com/u/7770085?s=128&amp;v=4" width="64" height="64" alt="Gsirawan" title="Gsirawan"></a>
-<a href="https://github.com/JakeChop" title="JakeChop"><img src="https://avatars.githubusercontent.com/u/13514802?s=128&amp;v=4" width="64" height="64" alt="JakeChop" title="JakeChop"></a>
-<a href="https://github.com/nathan-poncet" title="nathan-poncet"><img src="https://avatars.githubusercontent.com/u/112613712?s=128&amp;v=4" width="64" height="64" alt="nathan-poncet" title="nathan-poncet"></a>
-<br>
-<a href="https://github.com/NSPC911" title="NSPC911"><img src="https://avatars.githubusercontent.com/u/87571998?s=128&amp;v=4" width="64" height="64" alt="NSPC911" title="NSPC911"></a>
-<a href="https://github.com/syz51" title="syz51"><img src="https://avatars.githubusercontent.com/u/54097388?s=128&amp;v=4" width="64" height="64" alt="syz51" title="syz51"></a>
-<a href="https://github.com/actes2" title="actes2"><img src="https://avatars.githubusercontent.com/u/101230792?s=128&amp;v=4" width="64" height="64" alt="actes2" title="actes2"></a>
-<a href="https://github.com/AdamMagued" title="AdamMagued"><img src="https://avatars.githubusercontent.com/u/197814922?s=128&amp;v=4" width="64" height="64" alt="AdamMagued" title="AdamMagued"></a>
-<a href="https://github.com/chenxin-yan" title="chenxin-yan"><img src="https://avatars.githubusercontent.com/u/71162231?s=128&amp;v=4" width="64" height="64" alt="chenxin-yan" title="chenxin-yan"></a>
-<a href="https://github.com/chexxor" title="chexxor"><img src="https://avatars.githubusercontent.com/u/843161?s=128&amp;v=4" width="64" height="64" alt="chexxor" title="chexxor"></a>
-<a href="https://github.com/ci4ic4" title="ci4ic4"><img src="https://avatars.githubusercontent.com/u/6495973?s=128&amp;v=4" width="64" height="64" alt="ci4ic4" title="ci4ic4"></a>
-<a href="https://github.com/Cjreek" title="Cjreek"><img src="https://avatars.githubusercontent.com/u/10603492?s=128&amp;v=4" width="64" height="64" alt="Cjreek" title="Cjreek"></a>
-<a href="https://github.com/dodorz" title="dodorz"><img src="https://avatars.githubusercontent.com/u/1287424?s=128&amp;v=4" width="64" height="64" alt="dodorz" title="dodorz"></a>
-<a href="https://github.com/ethanhawkes-gif" title="ethanhawkes-gif"><img src="https://avatars.githubusercontent.com/u/259455325?s=128&amp;v=4" width="64" height="64" alt="ethanhawkes-gif" title="ethanhawkes-gif"></a>
-<br>
-<a href="https://github.com/FaintFlower" title="FaintFlower"><img src="https://avatars.githubusercontent.com/u/310248465?s=128&amp;v=4" width="64" height="64" alt="FaintFlower" title="FaintFlower"></a>
-<a href="https://github.com/fdoving" title="fdoving"><img src="https://avatars.githubusercontent.com/u/26197922?s=128&amp;v=4" width="64" height="64" alt="fdoving" title="fdoving"></a>
-<a href="https://github.com/Guipegoraro" title="Guipegoraro"><img src="https://avatars.githubusercontent.com/u/97493836?s=128&amp;v=4" width="64" height="64" alt="Guipegoraro" title="Guipegoraro"></a>
-<a href="https://github.com/humaidq" title="humaidq"><img src="https://avatars.githubusercontent.com/u/10805493?s=128&amp;v=4" width="64" height="64" alt="humaidq" title="humaidq"></a>
-<a href="https://github.com/j4ng5y" title="j4ng5y"><img src="https://avatars.githubusercontent.com/u/44218998?s=128&amp;v=4" width="64" height="64" alt="j4ng5y" title="j4ng5y"></a>
-<a href="https://github.com/jacob-sabella" title="jacob-sabella"><img src="https://avatars.githubusercontent.com/u/179399841?s=128&amp;v=4" width="64" height="64" alt="jacob-sabella" title="jacob-sabella"></a>
-<a href="https://github.com/juancely" title="juancely"><img src="https://avatars.githubusercontent.com/u/13281333?s=128&amp;v=4" width="64" height="64" alt="juancely" title="juancely"></a>
-<a href="https://github.com/mathomp4" title="mathomp4"><img src="https://avatars.githubusercontent.com/u/2982494?s=128&amp;v=4" width="64" height="64" alt="mathomp4" title="mathomp4"></a>
-<a href="https://github.com/neomantra" title="neomantra"><img src="https://avatars.githubusercontent.com/u/26842?s=128&amp;v=4" width="64" height="64" alt="neomantra" title="neomantra"></a>
-<a href="https://github.com/ronisbr" title="ronisbr"><img src="https://avatars.githubusercontent.com/u/1068295?s=128&amp;v=4" width="64" height="64" alt="ronisbr" title="ronisbr"></a>
-<br>
-<a href="https://github.com/ryan4yin" title="ryan4yin"><img src="https://avatars.githubusercontent.com/u/22363274?s=128&amp;v=4" width="64" height="64" alt="ryan4yin" title="ryan4yin"></a>
-<a href="https://github.com/stevegt" title="stevegt"><img src="https://avatars.githubusercontent.com/u/591668?s=128&amp;v=4" width="64" height="64" alt="stevegt" title="stevegt"></a>
-<a href="https://github.com/ural89" title="ural89"><img src="https://avatars.githubusercontent.com/u/25570740?s=128&amp;v=4" width="64" height="64" alt="ural89" title="ural89"></a>
-<a href="https://github.com/zer0ken" title="zer0ken"><img src="https://avatars.githubusercontent.com/u/31297454?s=128&amp;v=4" width="64" height="64" alt="zer0ken" title="zer0ken"></a>
+<img alt="The word TUIOS spelled out in contributor avatars." src="./assets/contributors.svg" width="100%">
 </p>
-<!-- contributors:end -->
 
 ## License
 

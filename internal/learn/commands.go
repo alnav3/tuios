@@ -32,12 +32,7 @@ var Commands = []string{
 // error. See cmd/tuios-wasm/README.md for each command.
 func (m *Model) RunCommand(name string, args ...string) tea.Cmd {
 	o := m.OS
-	arg := func(i int) string {
-		if i < len(args) {
-			return args[i]
-		}
-		return ""
-	}
+	arg := func(i int) string { return argAt(args, i) }
 	switch name {
 	case "notify":
 		level := arg(1)
@@ -171,9 +166,11 @@ func (m *Model) RunCommand(name string, args ...string) tea.Cmd {
 }
 
 // reset puts the tour back where it started: no windows, workspace 1, tiling
-// on, window mode, the starting theme, and no overlay open.
+// on, window mode, the starting theme, the shipped keys, the rail closed, and
+// no overlay, beam or picture-in-picture.
 func (m *Model) reset() {
 	o := m.OS
+	o.HideShownScratch()
 	for i := len(o.Windows) - 1; i >= 0; i-- {
 		o.DeleteWindow(i)
 	}
@@ -189,6 +186,23 @@ func (m *Model) reset() {
 	o.ShowLogs = false
 	if o.ShowQuitMenu {
 		o.CloseQuitMenu()
+	}
+	if o.ShowInbox {
+		o.CloseInbox()
+	}
+	if o.ShowAgentMail {
+		o.CloseAgentMail()
+	}
+	o.CloseReview()
+	o.WorktreePromptCancel()
+	o.ClosePresetPicker()
+	o.CloseGotoPicker()
+	o.CloseHints()
+	o.SetSpotlight(false)
+	o.UnpinPiP()
+	if o.SidebarActive() {
+		o.ExitSidebarFocus()
+		o.ToggleSidebar()
 	}
 	o.PrefixActive = false
 	o.WorkspacePrefixActive = false
@@ -210,6 +224,9 @@ func (m *Model) reset() {
 	if m.theme != "" && m.theme != take(o).Theme {
 		_ = o.SetTheme(m.theme)
 	}
+	// A lesson can switch to another preset. The next one starts on the
+	// shipped keys.
+	_ = o.LearnApplyPreset(config.PresetTuios)
 	o.MarkAllDirty()
 }
 
@@ -323,7 +340,7 @@ func Actions() map[string]string {
 	return out
 }
 
-// pageSections are the config sections whose options only change how the
+// pageSection reports the config sections whose options only change how the
 // screen looks or how input moves through it.
 //
 // The rest name a host program, a file or folder, the daemon, or startup:
@@ -331,10 +348,16 @@ func Actions() map[string]string {
 // notifications.agent.command, daemon.*. None of them work in a browser tab,
 // where os/exec and the file system fail, but a page has no reason to reach
 // them, and a section added later stays shut until it is listed here.
-var pageSections = map[string]bool{
-	"appearance": true, "dock": true, "sidebar": true, "scrollbar": true,
-	"selection": true, "screensaver": true, "spotlight": true, "pip": true,
-	"hints": true, "panes": true, "scratch": true, "workspaces": true,
+//
+// A switch, not a map: a map is built at package init, in every tuios
+// process, and only the tour reads it.
+func pageSection(name string) bool {
+	switch name {
+	case "appearance", "dock", "sidebar", "scrollbar", "selection", "screensaver",
+		"spotlight", "pip", "hints", "panes", "scratch", "workspaces":
+		return true
+	}
+	return false
 }
 
 // pageSettable reports the registry path the page's set command may change
@@ -354,7 +377,7 @@ func pageSettable(path string) (string, bool) {
 		path = "appearance." + path
 		opt, ok = config.LookupOption(path)
 	}
-	if !ok || !pageSections[opt.Section] || config.ReachesHost(path) {
+	if !ok || !pageSection(opt.Section) || config.ReachesHost(path) {
 		return "", false
 	}
 	return path, true
@@ -367,4 +390,15 @@ func (m *Model) setTheme(name string) {
 	if err := m.OS.SetTheme(name); err == nil && m.OS.UserConfig != nil {
 		_ = config.SetOptionValue(m.OS.UserConfig, "appearance.theme", name)
 	}
+}
+
+// argAt is args[i], or empty past the end. Out of line, because the command
+// switch reads an argument at dozens of places.
+//
+//go:noinline
+func argAt(args []string, i int) string {
+	if i < len(args) {
+		return args[i]
+	}
+	return ""
 }

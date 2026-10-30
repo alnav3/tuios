@@ -36,6 +36,7 @@ type worktreeRow struct {
 	Base         string   `json:"base"`
 	Group        string   `json:"group"`
 	FanID        string   `json:"fan_id"`
+	Main         bool     `json:"main"`
 	Managed      bool     `json:"managed"`
 	Gone         bool     `json:"gone"`
 	State        string   `json:"state"`
@@ -66,7 +67,8 @@ repository and labels each by its branch. 'worktree ls' lists them with the
 agent state in each. 'worktree rm' removes one. It refuses to discard
 uncommitted work unless you say so, and it never deletes a branch.
 
-Worktrees go under $XDG_DATA_HOME/tuios/worktrees/<repo>/<branch>.`,
+Worktrees go under $XDG_DATA_HOME/tuios/worktrees/<repo>/<branch>, unless
+[worktree] path in config.toml puts them elsewhere.`,
 		Example: `  # A worktree on a new branch, and a session in it
   tuios worktree new feat/retry
 
@@ -250,7 +252,7 @@ branch that already exists here is refused, so nothing is overwritten.`,
 // newFanCommand builds `tuios fan` and `tuios fan keep`.
 func newFanCommand() *cobra.Command {
 	var fanAgents, fanEnv, fanPrompts, fanGrants []string
-	var fanRepo, fanBase, fanName, fanHost, fanJoin string
+	var fanRepo, fanBase, fanName, fanHost, fanJoin, fanTask, fanTaskSession string
 	var fanWait, fanJSON, fanClone bool
 	fanCmd := &cobra.Command{
 		Use:   "fan <count> <prompt>",
@@ -283,7 +285,7 @@ The branches are a stem, then stem-2, stem-3 and so on. The stem is 'fan/'
 and the first words of the prompt, or --name.
 
 --grants says what every agent may do through tuios: read, write, fan,
-files, respond, admin, or none. Without it they hold the default of
+files, task, respond, admin, or none. Without it they hold the default of
 [agents.permissions]. A fan run from a pane without admin gives them that
 pane's own grants.
 
@@ -294,6 +296,14 @@ did differently.
 
 When one result is the one you want, 'tuios fan keep <session>' removes the
 others. It refuses to discard their uncommitted work unless you say so.
+
+--task names the task card the fan works on, in this session or the one
+--task-session names. The card gets the fan's name and holds no pane, since
+the attempts work on it: 'tuios task claim --next' skips it while the fan
+lasts. With [tasks] auto_stage on it moves to doing, 'tuios fan verify' then
+moves it to verify, and back to doing when the check fails in every attempt,
+and a pull request from an attempt moves it to review, and to shipped once
+merged. Not with --host: the card is on this machine.
 
 --host runs the fan-out on another machine from the [hosts] table. The
 repository is the one the current directory is in, found there by its
@@ -312,6 +322,9 @@ pull HOST:SESSION' brings its work here.`,
 
   # From a branch, with a stem you chose, waiting until every prompt is sent
   tuios fan 2 --agent codex --base main --name try/retry --wait 'Add a retry.'
+
+  # Three attempts at task card t3, which then follows the fan's checks
+  tuios fan 3 --agent claude --task t3 'Add a retry with backoff.'
 
   # Keep the second one, and stash what the others did
   tuios fan keep api-fan-add-a-retry-with-2 --stash
@@ -341,10 +354,13 @@ pull HOST:SESSION' brings its work here.`,
 			if err != nil {
 				return err
 			}
+			if fanTask != "" && fanHost != "" && fanHost != "local" {
+				return fmt.Errorf("--task names a card of a session on this machine, and --host runs the fan on %s. Leave --task out, or run the fan here", fanHost)
+			}
 			return runFan(fanOptions{
 				host: fanHost, count: count, agents: fanAgents, prompt: prompt, prompts: fanPrompts, env: env,
 				explicitEnv: len(fanEnv) > 0, repo: fanRepo, base: fanBase, name: fanName, join: fanJoin, clone: fanClone,
-				grants: fanGrants,
+				grants: fanGrants, task: fanTask, taskSession: fanTaskSession,
 			}, fanWait, fanJSON)
 		},
 	}
@@ -355,11 +371,13 @@ pull HOST:SESSION' brings its work here.`,
 	fanCmd.Flags().StringVar(&fanBase, "base", "", "Ref every branch starts from (default: HEAD)")
 	fanCmd.Flags().StringVar(&fanName, "name", "", "Branch stem (default: fan/ and the first words of the prompt)")
 	fanCmd.Flags().StringVar(&fanJoin, "join", "", "Add the attempts to the fan of this session instead of starting a new fan")
+	fanCmd.Flags().StringVar(&fanTask, "task", "", "The task card the fan works on, such as t3")
+	fanCmd.Flags().StringVar(&fanTaskSession, "task-session", "", "The session of --task (default: this pane's session, else the most recently active)")
 	fanCmd.Flags().BoolVar(&fanWait, "wait", false, "Return only when every prompt is sent or given up on")
 	fanCmd.Flags().BoolVar(&fanJSON, "json", false, "Output result as JSON")
 	fanCmd.Flags().StringVar(&fanHost, "host", "", "Run the fan-out on this machine from the [hosts] table")
 	fanCmd.Flags().BoolVar(&fanClone, "clone", false, "With --host, clone the repository there when the host has no checkout")
-	fanCmd.Flags().StringSliceVar(&fanGrants, "grants", nil, "What every agent may do through tuios, comma separated: read, write, fan, files, respond, admin, or none (default: [agents.permissions], or the calling pane's own)")
+	fanCmd.Flags().StringSliceVar(&fanGrants, "grants", nil, "What every agent may do through tuios, comma separated: read, write, fan, files, task, respond, admin, or none (default: [agents.permissions], or the calling pane's own)")
 	_ = fanCmd.RegisterFlagCompletionFunc("host", completeConfiguredHosts)
 	_ = fanCmd.RegisterFlagCompletionFunc("grants", completeGrantNames)
 	_ = fanCmd.MarkFlagRequired("agent")
@@ -480,6 +498,8 @@ func runWorktreeNew(branch, repo, base, name, agent, host string, clone, detach,
 		RepoRoot      string `json:"repo_root"`
 		CreatedBranch bool   `json:"created_branch"`
 		Cloned        bool   `json:"cloned"`
+		Warning       string `json:"warning"`
+		HookError     string `json:"hook_error"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
@@ -493,6 +513,12 @@ func runWorktreeNew(branch, repo, base, name, agent, host string, clone, detach,
 	}
 	fmt.Printf("%s branch %s in %s%s.\n", verb, res.Branch, res.Path, t.on())
 	fmt.Printf("Created session '%s'%s.\n", res.Session, t.on())
+	if res.Warning != "" {
+		fmt.Fprintln(os.Stderr, "Warning: "+plainLine(res.Warning))
+	}
+	if res.HookError != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s. The worktree and the session are kept.\n", res.HookError)
+	}
 	if detach {
 		if host != "" {
 			fmt.Printf("Attach with 'tuios attach --host %s %s'.\n", host, res.Session)
@@ -764,6 +790,9 @@ type fanOptions struct {
 	join string
 	// grants is --grants, nil when it was not passed.
 	grants []string
+	// task and taskSession are --task and --task-session: the card the fan
+	// works on.
+	task, taskSession string
 }
 
 // fanCallerEnv builds the environment fan sends: PATH always, so the daemon
@@ -840,6 +869,12 @@ func runFan(o fanOptions, wait, jsonOutput bool) error {
 	if len(o.grants) > 0 {
 		params["grants"] = o.grants
 	}
+	if o.task != "" {
+		params["task"] = o.task
+	}
+	if o.taskSession != "" {
+		params["task_session"] = o.taskSession
+	}
 	t, err := dialHost(o.host)
 	if err != nil {
 		return err
@@ -864,11 +899,17 @@ func runFan(o fanOptions, wait, jsonOutput bool) error {
 		Agent    string `json:"agent"`
 		Command  string `json:"command"`
 		Sessions []struct {
-			Session string `json:"session"`
-			Branch  string `json:"branch"`
-			Path    string `json:"path"`
-			Command string `json:"command"`
+			Session   string `json:"session"`
+			Branch    string `json:"branch"`
+			Path      string `json:"path"`
+			Command   string `json:"command"`
+			HookError string `json:"hook_error"`
 		} `json:"sessions"`
+		Warning string `json:"warning"`
+		Task    *struct {
+			ID string `json:"id"`
+		} `json:"task"`
+		TaskNote string `json:"task_note"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
@@ -881,6 +922,20 @@ func runFan(o fanOptions, wait, jsonOutput bool) error {
 				line += "  " + s.Command
 			}
 			fmt.Println(line)
+		}
+		if res.Warning != "" {
+			fmt.Fprintln(os.Stderr, "Warning: "+plainLine(res.Warning))
+		}
+		for _, s := range res.Sessions {
+			if s.HookError != "" {
+				fmt.Fprintf(os.Stderr, "Warning: %s: %s. The worktree and the session are kept.\n", s.Session, s.HookError)
+			}
+		}
+		switch {
+		case res.Task != nil:
+			fmt.Printf("Task %s follows the fan.\n", plainLine(res.Task.ID))
+		case res.TaskNote != "":
+			fmt.Println(plainLine(res.TaskNote))
 		}
 		if t.host != "" {
 			fmt.Printf("Watch them with 'tuios worktree ls --host %s --group %s'. Keep one with 'tuios fan keep %s:<session>', or bring its work here with 'tuios worktree pull %s:<session>'.\n", t.host, res.Group, t.host, t.host)
@@ -1111,7 +1166,9 @@ func completeWorktreeSessions(_ *cobra.Command, _ []string, _ string) ([]string,
 	}
 	names := make([]string, 0, len(rows))
 	for _, r := range rows {
-		names = append(names, r.Session)
+		if !r.Main {
+			names = append(names, r.Session)
+		}
 	}
 	return names, cobra.ShellCompDirectiveNoFileComp
 }

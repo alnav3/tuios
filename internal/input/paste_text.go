@@ -37,6 +37,8 @@ func textFieldPaste(o *app.OS) func(string) tea.Cmd {
 	case o.ShowSessionClose, o.DaemonRestartOpen(), o.HintsOpen(), o.PaneLabelsOpen(),
 		o.ShowQuitMenu, o.ContextMenuActive():
 		return nil
+	case o.PathPickerOpen():
+		return o.PathPickerType
 	case o.ReviewOpen():
 		if !o.ReviewEditing() {
 			return nil
@@ -57,14 +59,13 @@ func textFieldPaste(o *app.OS) func(string) tea.Cmd {
 		return typed(o.FilePromptType)
 	case o.WorktreePromptOpen():
 		return typed(o.WorktreePromptType)
-	case o.PluginApprovalOpen():
+	case o.PluginApprovalOpen(), o.IntegrationAskOpen():
 		return nil
 	case o.CopyDialogOpen():
 		return typed(o.CopyDialogPaste)
 	case o.TransfersOwnsKeys(), o.ShowTapeReview:
 		return nil
-	case o.SidebarFocused && !o.ShowHelp && !o.ShowCommandPalette && !o.ShowAgentMail && !o.ShowInbox &&
-		!o.MessageViewOpen() && !o.ShowLogs:
+	case o.SidebarFocused && !o.PanelOwnsKeyboard():
 		return nil
 	case o.ShowTapeManager:
 		if o.TapeManager == nil || o.TapeManager.Mode != app.TapeManagerNaming {

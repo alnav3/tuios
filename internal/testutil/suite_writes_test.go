@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -109,6 +110,10 @@ func seedUsedHome(t *testing.T, home string) {
 
 // runSuite runs every package in the module against home as the whole of the
 // developer's environment.
+// packagesEnv names the packages the child suite tests, apart by spaces,
+// instead of ./internal/... ./cmd/... ./pkg/....
+const packagesEnv = "TUIOS_ISOLATION_PACKAGES"
+
 func runSuite(t *testing.T, home string) (string, error) {
 	t.Helper()
 	root := moduleRootFrom(t)
@@ -128,7 +133,34 @@ func runSuite(t *testing.T, home string) (string, error) {
 		childMarker+"=1",
 	)
 
-	cmd := exec.Command("go", "test", "-count=1", "./internal/...", "./cmd/...", "./pkg/...")
+	pkgs := []string{"./internal/...", "./cmd/...", "./pkg/..."}
+	// CI names the packages a pull request can affect, so the guard runs
+	// the tests that could have changed what they write.
+	if list := strings.Fields(os.Getenv(packagesEnv)); len(list) > 0 {
+		pkgs = list
+	}
+	split := []string{}
+	for _, p := range []string{"internal/app", "internal/session"} {
+		if slices.ContainsFunc(pkgs, func(q string) bool {
+			return strings.HasSuffix(q, "/"+p) || q == "./"+p || strings.HasPrefix(q, "./internal/...") || strings.HasPrefix(q, "./...")
+		}) {
+			split = append(split, "./"+p)
+		}
+	}
+	cmd := exec.Command("go", append([]string{"test", "-count=1"}, pkgs...)...)
+	// internal/app and internal/session run their tests one after another
+	// for over three minutes each, so the child suite took as long as the
+	// rest of the unit tests together. scripts/go-test-lanes.sh splits them
+	// across four processes. It needs bash 4 for its arrays, which macOS
+	// does not ship, so plain go test stays the fallback.
+	lanes := filepath.Join(root, "scripts", "go-test-lanes.sh")
+	if _, err := os.Stat(lanes); err == nil && len(split) > 0 && exec.Command("bash", "-c", `[ "${BASH_VERSINFO[0]}" -ge 4 ]`).Run() == nil {
+		cmd = exec.Command("bash", append([]string{lanes, "-count=1", "--"}, pkgs...)...)
+		env = append(env,
+			"SPLIT="+strings.Join(split, " "),
+			"LOG="+filepath.Join(t.TempDir(), "lanes.log"),
+		)
+	}
 	cmd.Dir = root
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()

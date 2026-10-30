@@ -89,35 +89,59 @@ type SessionKilledMsg struct {
 }
 
 // listenOnce returns a command that reads one value from ch and turns it into
-// a message with wrap. It returns a nil command for a nil channel, and the
-// command yields nil once the channel is closed, so the listener stops instead
-// of spinning. The caller re-arms it after each message it handles.
-func listenOnce[T any](ch <-chan T, wrap func(T) tea.Msg) tea.Cmd {
+// a message with wrap. It returns a nil command for a nil channel. The command
+// yields nil once stop is closed, which is what ends the listener of a session
+// that has ended (nothing closes ch itself), or once ch is closed, so the
+// listener stops instead of spinning. A nil stop never ends it. The caller
+// re-arms it after each message it handles.
+func listenOnce[T any](stop <-chan struct{}, ch <-chan T, wrap func(T) tea.Msg) tea.Cmd {
 	if ch == nil {
 		return nil
 	}
 	return func() tea.Msg {
-		v, ok := <-ch
-		if !ok {
+		select {
+		case v, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			return wrap(v)
+		case <-stop:
 			return nil
 		}
-		return wrap(v)
 	}
 }
 
 // ListenForSessionKill waits for a kill of another session to finish.
 func ListenForSessionKill(ch chan SessionKilledMsg) tea.Cmd {
-	return listenOnce(ch, func(res SessionKilledMsg) tea.Msg { return res })
+	return listenSessionKillUntil(nil, ch)
+}
+
+// listenSessionKillUntil is ListenForSessionKill for a session that ends: the
+// command returns nil once stop is closed.
+func listenSessionKillUntil(stop <-chan struct{}, ch chan SessionKilledMsg) tea.Cmd {
+	return listenOnce(stop, ch, func(res SessionKilledMsg) tea.Msg { return res })
 }
 
 // ListenForSessionCreate waits for a detached-session creation to finish.
 func ListenForSessionCreate(ch chan SessionCreatedMsg) tea.Cmd {
-	return listenOnce(ch, func(res SessionCreatedMsg) tea.Msg { return res })
+	return listenSessionCreateUntil(nil, ch)
+}
+
+// listenSessionCreateUntil is ListenForSessionCreate for a session that ends:
+// the command returns nil once stop is closed.
+func listenSessionCreateUntil(stop <-chan struct{}, ch chan SessionCreatedMsg) tea.Cmd {
+	return listenOnce(stop, ch, func(res SessionCreatedMsg) tea.Msg { return res })
 }
 
 // ListenForClipboardSet creates a command that listens for OSC 52 clipboard set events.
 func ListenForClipboardSet(ch chan ClipboardSetMsg) tea.Cmd {
-	return listenOnce(ch, func(msg ClipboardSetMsg) tea.Msg { return msg })
+	return listenClipboardSetUntil(nil, ch)
+}
+
+// listenClipboardSetUntil is ListenForClipboardSet for a session that ends: the
+// command returns nil once stop is closed.
+func listenClipboardSetUntil(stop <-chan struct{}, ch chan ClipboardSetMsg) tea.Cmd {
+	return listenOnce(stop, ch, func(msg ClipboardSetMsg) tea.Msg { return msg })
 }
 
 // ScriptCommandMsg represents a command from a tape script to be executed.
@@ -368,16 +392,17 @@ func (m *OS) Init() tea.Cmd {
 		m.listenSidebarSession(),
 		m.refreshSidebarSessions(),
 		m.armTick(m.framePeriod()),
-		ListenForWindowExits(m.WindowExitChan),
-		ListenForPTYData(m.PTYDataChan),
-		ListenForClipboardSet(m.PendingClipboardSet),
-		ListenForSessionCreate(m.sessionCreateChan()),
-		ListenForAttachedHosts(m.attachedHostsChan()),
-		ListenForSessionKill(m.sessionKillChan()),
-		ListenForNotification(m.ensureNotificationChan()),
-		ListenForCwdChange(m.ensureCwdChangeChan()),
-		listenForFileChange(m.fileWatchChan(), time.Time{}),
-		ListenForNvimNavigation(m.ensureNvimNavigationChan()),
+		listenWindowExitsUntil(m.stopSignal(), m.WindowExitChan),
+		listenPTYDataUntil(m.stopSignal(), m.PTYDataChan),
+		listenClipboardSetUntil(m.stopSignal(), m.PendingClipboardSet),
+		listenSessionCreateUntil(m.stopSignal(), m.sessionCreateChan()),
+		listenAttachedHostsUntil(m.stopSignal(), m.attachedHostsChan()),
+		listenSessionKillUntil(m.stopSignal(), m.sessionKillChan()),
+		listenNotificationUntil(m.stopSignal(), m.ensureNotificationChan()),
+		listenCwdChangeUntil(m.stopSignal(), m.ensureCwdChangeChan()),
+		listenForFileChange(m.stopSignal(), m.fileWatchChan(), time.Time{}),
+		listenNvimNavigationUntil(m.stopSignal(), m.ensureNvimNavigationChan()),
+		listenDnDUntil(m.stopSignal(), m.ensureDnDInbox()),
 	}
 
 	// Ask an SSH client's terminal whether it draws sixel. See sixel_probe.go.
@@ -421,12 +446,12 @@ func (m *OS) Init() tea.Cmd {
 
 	// Listen for state sync from other clients (daemon/SSH/web mode)
 	if m.StateSyncChan != nil {
-		cmds = append(cmds, ListenForStateSync(m.StateSyncChan))
+		cmds = append(cmds, listenStateSyncUntil(m.stopSignal(), m.StateSyncChan))
 	}
 
 	// Listen for client join/leave events (daemon/SSH/web mode)
 	if m.ClientEventChan != nil {
-		cmds = append(cmds, ListenForClientEvents(m.ClientEventChan))
+		cmds = append(cmds, listenClientEventsUntil(m.stopSignal(), m.ClientEventChan))
 	}
 
 	// The TML surfaces the daemon pushes, and what their inputs left to do.
@@ -458,13 +483,13 @@ func (m *OS) Init() tea.Cmd {
 	}
 
 	// Listen for the daemon events that end this client.
-	if cmd := ListenForDaemonExit(m.daemonExitChan()); cmd != nil {
+	if cmd := listenDaemonExitUntil(m.stopSignal(), m.daemonExitChan()); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
 
 	// Listen for verbs the daemon routed here.
 	if m.RemoteCommandChan != nil {
-		cmds = append(cmds, ListenForRemoteCommands(m.RemoteCommandChan))
+		cmds = append(cmds, listenRemoteCommandsUntil(m.stopSignal(), m.RemoteCommandChan))
 	}
 
 	// If this is a restored daemon session, enable callbacks after a delay
@@ -496,13 +521,25 @@ func (m *OS) Init() tea.Cmd {
 // ListenForWindowExits creates a command that listens for window process exits.
 // It safely reads from the exit channel and converts exit signals to messages.
 func ListenForWindowExits(exitChan chan string) tea.Cmd {
-	return listenOnce(exitChan, func(windowID string) tea.Msg { return WindowExitMsg{WindowID: windowID} })
+	return listenWindowExitsUntil(nil, exitChan)
+}
+
+// listenWindowExitsUntil is ListenForWindowExits for a session that ends: the
+// command returns nil once stop is closed.
+func listenWindowExitsUntil(stop <-chan struct{}, exitChan chan string) tea.Cmd {
+	return listenOnce(stop, exitChan, func(windowID string) tea.Msg { return WindowExitMsg{WindowID: windowID} })
 }
 
 // ListenForStateSync creates a command that listens for state sync from other clients.
 // It safely reads from the sync channel and converts state to messages for the update loop.
 func ListenForStateSync(syncChan chan StateSyncMsg) tea.Cmd {
-	return listenOnce(syncChan, func(sync StateSyncMsg) tea.Msg { return sync })
+	return listenStateSyncUntil(nil, syncChan)
+}
+
+// listenStateSyncUntil is ListenForStateSync for a session that ends: the
+// command returns nil once stop is closed.
+func listenStateSyncUntil(stop <-chan struct{}, syncChan chan StateSyncMsg) tea.Cmd {
+	return listenOnce(stop, syncChan, func(sync StateSyncMsg) tea.Msg { return sync })
 }
 
 // ListenForClientEvents creates a command that listens for client join/leave events.
@@ -514,7 +551,13 @@ func ListenForStateSync(syncChan chan StateSyncMsg) tea.Cmd {
 // a phone turned sideways got the columns it had before, because the effective
 // size the daemon recalculated was sitting in a channel nobody was reading.
 func ListenForClientEvents(eventChan chan ClientEvent) tea.Cmd {
-	return listenOnce(eventChan, clientEventMsg)
+	return listenClientEventsUntil(nil, eventChan)
+}
+
+// listenClientEventsUntil is ListenForClientEvents for a session that ends: the
+// command returns nil once stop is closed.
+func listenClientEventsUntil(stop <-chan struct{}, eventChan chan ClientEvent) tea.Cmd {
+	return listenOnce(stop, eventChan, clientEventMsg)
 }
 
 // clientEventMsg maps a ClientEvent to the message the update loop handles.
@@ -668,9 +711,19 @@ func autoScrollTick() tea.Cmd {
 // ListenForPTYData returns a Cmd that blocks until a PTY reader signals
 // new data, then sends a PTYDataMsg to trigger re-rendering.
 func ListenForPTYData(ch <-chan struct{}) tea.Cmd {
+	return listenPTYDataUntil(nil, ch)
+}
+
+// listenPTYDataUntil is ListenForPTYData for a session that ends: the command
+// returns nil once stop is closed.
+func listenPTYDataUntil(stop <-chan struct{}, ch <-chan struct{}) tea.Cmd {
 	return func() tea.Msg {
-		<-ch
-		return PTYDataMsg{}
+		select {
+		case <-ch:
+			return PTYDataMsg{}
+		case <-stop:
+			return nil
+		}
 	}
 }
 
@@ -771,7 +824,7 @@ func (m *OS) foreignSessionRefreshTick(after time.Duration) tea.Cmd {
 		return nil
 	}
 	gen := m.foreignTickGen
-	return tea.Tick(after, func(time.Time) tea.Msg {
+	return m.tickUntilStop(after, func(time.Time) tea.Msg {
 		return ForeignSessionRefreshTickMsg{Gen: gen}
 	})
 }
@@ -853,6 +906,8 @@ type foreignSessionsChangedMsg struct{}
 // one somebody writes. One comparison, once, is the whole cost, and it answers
 // nil without allocating for a client whose rail has no files section.
 func (m *OS) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Nest mode does not outlive a window mode a message left the client in.
+	defer m.settleNest()
 	// The frame the last View composed is stored now: write it. Nothing
 	// else changes, so the View after this message serves the same frame.
 	if _, ok := msg.(flushMsg); ok {
@@ -959,6 +1014,12 @@ func (m *OS) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// rail's size are what its command is told, and the layout is what says
 	// whether it runs at all.
 	railSync := m.RailCustomSyncCmd()
+	// The rail pane on the same beat: the layout, the rail's size and the
+	// session's windows are what decide whether it is asked for, sized,
+	// streamed or left alone. See rail_pane.go.
+	if pane := m.RailPaneSyncCmd(); pane != nil {
+		railSync = tea.Batch(railSync, pane)
+	}
 	// Same shape as the files sync: the rail opening is one of the fifty
 	// handlers, and the poll it re-plans is armed here rather than in each of
 	// the five places that can open it.
@@ -986,6 +1047,11 @@ func (m *OS) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// turn that ended with no input is read now. A flag check when not.
 	if side := m.CockpitSideWanted(); side != nil {
 		agents = tea.Batch(agents, side)
+	}
+	// The selected agent's artifacts, read once and again when a surface
+	// opens or closes.
+	if arts := m.CockpitArtifactsWanted(); arts != nil {
+		agents = tea.Batch(agents, arts)
 	}
 	// A verdict the open fan comparison does not show yet is read now. A
 	// nil check when the comparison is closed.
@@ -1082,7 +1148,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Unless a frame went out less than a frame period ago: then the
 		// output waits for the frame at the end of the period, and the panes
 		// keep their new-output flags until it comes. See paneFrameWait.
-		listen := ListenForPTYData(m.PTYDataChan)
+		listen := listenPTYDataUntil(m.stopSignal(), m.PTYDataChan)
 		open, changed, due := m.takePaneOutput(time.Now())
 		// Nothing marked means nothing to draw: the output was on a hidden
 		// pane, or it was kitty graphics the passthrough already wrote.
@@ -1140,6 +1206,9 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case threadGrewMsg:
 		return m, m.applyThreadGrew(msg)
 
+	case LearnTranscriptGrewMsg:
+		return m, m.applyLearnTranscriptGrew(msg)
+
 	case threadWatchEnded:
 		m.applyThreadWatchEnded(msg)
 		return m, m.InboxThreadFetch()
@@ -1152,13 +1221,30 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.applyReplyPreview(msg)
 		return m, nil
 
+	case quickLookMsg:
+		cmd := m.applyQuickLook(msg)
+		m.renderSkipped = false
+		return m, cmd
+
 	case ckCheckpointsMsg:
 		m.applyCheckpoints(msg)
+		return m, nil
+	case ckTaskMsg:
+		m.applyCard(msg)
+		return m, nil
+	case ckTakeMsg:
+		m.applyTake(msg)
 		return m, nil
 	case ckCompareMsg:
 		return m, m.applyCompare(msg)
 	case ckFanActMsg:
 		return m, m.applyFanAct(msg)
+	case tmlPlacedMsg:
+		m.applyTMLPlaced(msg)
+		return m, nil
+	case ckArtifactsMsg:
+		m.applyCockpitArtifacts(msg)
+		return m, nil
 	case ckLivePrimeMsg:
 		m.applyLivePrime(msg)
 		return m, nil
@@ -1459,10 +1545,10 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case AttachedHostsMsg:
 		m.applyAttachedHosts(msg)
-		return m, ListenForAttachedHosts(m.attachedHostsChan())
+		return m, listenAttachedHostsUntil(m.stopSignal(), m.attachedHostsChan())
 
 	case SessionCreatedMsg:
-		cmd := ListenForSessionCreate(m.sessionCreateChan())
+		cmd := listenSessionCreateUntil(m.stopSignal(), m.sessionCreateChan())
 		if msg.OpenGen != 0 {
 			return m, tea.Batch(cmd, m.finishHostOpen(msg))
 		}
@@ -1497,7 +1583,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, cmd
 
 	case SessionKilledMsg:
-		cmd := ListenForSessionKill(m.sessionKillChan())
+		cmd := listenSessionKillUntil(m.stopSignal(), m.sessionKillChan())
 		if msg.Err != nil {
 			// A kill the worktree-deletion note asked for failed: the failed
 			// kill announces itself, so the next kill's note must not be
@@ -1529,7 +1615,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// appearance.selection.osc52_write's decision. See clipboard_osc52.go.
 		return m, tea.Batch(
 			m.paneClipboardWrite(msg),
-			ListenForClipboardSet(m.PendingClipboardSet),
+			listenClipboardSetUntil(m.stopSignal(), m.PendingClipboardSet),
 		)
 
 	case linkOpenFailedMsg:
@@ -1539,8 +1625,13 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Guest desktop notification or bell delivered off the PTY goroutine;
 		// apply it here on the Bubble Tea goroutine where notification state is
 		// owned, and where the pane it came from can be named safely.
-		if msg.Bell && msg.WindowID != "" {
-			m.noteWindowBell(msg.WindowID)
+		if msg.Bell {
+			if msg.WindowID != "" {
+				m.noteWindowBell(msg.WindowID)
+			}
+			if !m.ringBell() {
+				return m, listenNotificationUntil(m.stopSignal(), m.PendingNotification)
+			}
 		}
 		if msg.WindowID != "" {
 			m.ShowNotificationFrom(msg.Message, msg.Type, msg.Duration,
@@ -1548,27 +1639,52 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		} else {
 			m.ShowNotification(msg.Message, msg.Type, msg.Duration)
 		}
-		return m, ListenForNotification(m.PendingNotification)
+		return m, listenNotificationUntil(m.stopSignal(), m.PendingNotification)
 
 	case CwdChangedMsg:
 		// OSC 7 working-directory change delivered off the PTY goroutine. Filter
 		// to the focused window and schedule a debounced project-tape check. This
 		// never executes anything; it only decides whether to look.
 		cmd := m.onCwdChange(msg)
-		return m, tea.Batch(cmd, ListenForCwdChange(m.PendingCwdChange))
+		return m, tea.Batch(cmd, listenCwdChangeUntil(m.stopSignal(), m.PendingCwdChange))
 
 	case fileDirChangedMsg:
-		// The listed folder changed on disk. See sidebar_files_watch.go.
-		return m, tea.Batch(m.refreshChangedFolder(), listenForFileChange(m.fileWatchChan(), msg.at))
+		// The listed folder, or a folder open in the tree, changed on disk.
+		// See sidebar_files_watch.go. A change that names nothing is the
+		// root's: a daemon push and an older watch say only that.
+		root, dirs := m.fileWatch.takeDirty()
+		cmd := m.refreshChangedTree(dirs, root)
+		if root || len(dirs) == 0 {
+			cmd = tea.Batch(m.refreshChangedFolder(), cmd)
+		}
+		return m, tea.Batch(cmd, listenForFileChange(m.stopSignal(), m.fileWatchChan(), msg.at))
+	case LearnFilesChangedMsg:
+		// A file of the browser build's fake shell changed. See learn_mode.go.
+		return m, m.learnFilesChanged()
+	case fileTreeListMsg:
+		// A folder open in the tree, read on its own goroutine.
+		cmd := m.HandleFileTreeList(msg)
+		m.renderSkipped = false
+		return m, cmd
 	case NvimNavigationMsg:
 		m.onNvimNavigation(msg)
-		return m, ListenForNvimNavigation(m.PendingNvimNavigation)
+		return m, listenNvimNavigationUntil(m.stopSignal(), m.PendingNvimNavigation)
+	case dndWakeMsg:
+		// A pane's program sent drag and drop messages. See dnd.go.
+		m.handleDnDWake()
+		m.renderSkipped = false
+		return m, listenDnDUntil(m.stopSignal(), m.ensureDnDInbox())
 
 	case fileListMsg:
 		// A directory read that finished on its own goroutine. The handler drops
 		// a reply whose generation has been superseded, so a slow mount cannot
 		// overwrite the listing the user is looking at now.
 		m.HandleFileList(msg)
+		m.renderSkipped = false
+		return m, nil
+
+	case pathPickerListMsg:
+		m.HandlePathPickerList(msg)
 		m.renderSkipped = false
 		return m, nil
 
@@ -1630,7 +1746,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// client is in now.
 		if m.SessionName == msg.Name {
 			m.QuitSession()
-			return m, tea.Quit
+			return m, m.QuitCmd()
 		}
 		m.KillOtherSession(msg.Name)
 		return m, nil
@@ -1654,7 +1770,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if len(m.Windows) == 0 {
 			m.Mode = WindowManagementMode
 		}
-		return m, ListenForWindowExits(m.WindowExitChan)
+		return m, listenWindowExitsUntil(m.stopSignal(), m.WindowExitChan)
 
 	case EnableCallbacksMsg:
 		// Re-enable VT emulator callbacks after buffered output has settled
@@ -1699,7 +1815,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// a time, so the listener is armed again here.
 		m.pruneWindowKeyedState()
 		m.renderSkipped = true
-		listen := ListenForClientEvents(m.ClientEventChan)
+		listen := listenClientEventsUntil(m.stopSignal(), m.ClientEventChan)
 		if _, refresh := m.foreignSessionRefreshPlan(); refresh {
 			return m, tea.Batch(refreshForeignSessionsCmd(m.DaemonClient), listen)
 		}
@@ -1742,7 +1858,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case PasteRefusedMsg:
 		m.ShowNotification(msg.Message, "error", m.Settings.NotificationDuration)
-		return m, ListenForClientEvents(m.ClientEventChan)
+		return m, listenClientEventsUntil(m.stopSignal(), m.ClientEventChan)
 
 	case TMLInputFailedMsg:
 		m.ShowNotification(msg.Text, "warning", m.Settings.NotificationDuration)
@@ -1756,6 +1872,9 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case TMLClockMsg:
 		return m, m.handleTMLClock()
+
+	case TMLViewFlushMsg:
+		return m, m.handleTMLViewFlush(msg.id)
 
 	case TMLActionFailedMsg:
 		m.ShowNotification(msg.Text, "warning", m.Settings.NotificationDuration)
@@ -1783,7 +1902,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		} else {
 			m.renderSkipped = true
 		}
-		return m, ListenForClientEvents(m.ClientEventChan)
+		return m, listenClientEventsUntil(m.stopSignal(), m.ClientEventChan)
 
 	case HostsChangedMsg:
 		// The daemon's host table changed under this client. The poll is armed
@@ -1796,7 +1915,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// link change waited for the minute backstop poll, and in that minute
 		// the picker offered machines that were down and refused ones that
 		// were up.
-		return m, tea.Batch(refreshFederationCmd(), ListenForClientEvents(m.ClientEventChan))
+		return m, tea.Batch(refreshFederationCmd(), listenClientEventsUntil(m.stopSignal(), m.ClientEventChan))
 
 	case HostTestDoneMsg:
 		// Storing the results is the whole handler. The ssh children ran in the
@@ -1867,7 +1986,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case tea.KeyPressMsg, tea.KeyReleaseMsg, tea.MouseClickMsg, tea.MouseMotionMsg,
 		tea.MouseReleaseMsg, tea.MouseWheelMsg, tea.ClipboardMsg,
-		tea.PasteMsg, tea.PasteStartMsg, tea.PasteEndMsg:
+		tea.PasteMsg, tea.PasteStartMsg, tea.PasteEndMsg, StripTouchMsg:
 		// Reset idle counter on any user input to restore full tick rate
 		// A resize drag is live only while the pointer is still reporting. This
 		// is what lets the deferral in resize_deferral.go expire when a mouse
@@ -1941,12 +2060,19 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			shakeCmd = m.noteShakeMotion(mm, time.Now())
 		}
 
+		// A key typed while a paste reads its buffer waits for the paste.
+		// See pasteHold.
+		input := m.fixHostKeyMods(msg)
+		if m.holdKeyForPaste(input) {
+			return m, shakeCmd
+		}
+
 		// Delegate to the registered input handler
 		handler := getInputHandler()
 		if handler == nil {
 			return m, tea.Batch(shakeCmd, m.armScreensaver())
 		}
-		newModel, cmd := handler(m.fixHostKeyMods(msg), m)
+		newModel, cmd := handler(input, m)
 		if shakeCmd != nil {
 			cmd = tea.Batch(cmd, shakeCmd)
 		}
@@ -1976,10 +2102,11 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the frame period (see nextWake) and draws the last position the
 		// pointer reached. A pointer at rest never sets it, so the idle tick
 		// stays idle. A press, a release or a key is not motion and draws at
-		// once.
+		// once. The period runs from the end of the last frame, written: see
+		// motionBudgetFrom.
 		if _, isMotion := msg.(tea.MouseMotionMsg); isMotion {
 			now := time.Now()
-			if now.Sub(m.lastInteractionRender) < m.framePeriod() {
+			if now.Sub(m.motionBudgetFrom()) < m.framePeriod() {
 				m.renderSkipped = true
 				m.pointerMotionPending = true
 			} else {
@@ -2120,7 +2247,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// every guest answers with land in ViewportResizeSettledMsg instead.
 		// An open image view needs its picture at the new size, and a side
 		// column the new width hides lets its live pane go.
-		if cmd := tea.Batch(m.CockpitImagePicture(), m.cockpitLiveFollow()); cmd != nil {
+		if cmd := tea.Batch(m.CockpitImagePicture(), m.cockpitLiveFollow(), m.QuickLookSync()); cmd != nil {
 			return m, tea.Batch(settle, cmd)
 		}
 		return m, settle
@@ -2221,6 +2348,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			oldWindowCount := m.windowCountForNotice()
 			oldWorkspace := m.CurrentWorkspace
 			oldWindows := m.windowLabelsForNotice()
+			oldMade := m.panesMadeForNotice()
 
 			if err := m.ApplyStateSyncFrom(msg.State, msg.SourceID); err != nil {
 				m.LogError("Failed to apply state sync: %v", err)
@@ -2237,6 +2365,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 				// Show notifications for significant changes
 				newWindowCount := m.windowCountForNotice()
+				newMade := m.panesMadeForNotice()
 				newWorkspace := m.CurrentWorkspace
 
 				// Window count change notification. A window that moved to
@@ -2244,6 +2373,9 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				// not made.
 				if note, ok := m.windowMoveNotice(msg.State, oldWindows); ok {
 					m.ShowNotification(note, "info", 2*time.Second)
+				} else if newMade == oldMade {
+					// Only TML surfaces came or went. A program put them on
+					// the screen, and the person did not make a window.
 				} else if newWindowCount > oldWindowCount {
 					m.ShowNotification(fmt.Sprintf("Window created (%d total)", newWindowCount), "info", 2*time.Second)
 				} else if newWindowCount < oldWindowCount {
@@ -2257,6 +2389,10 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				}
 				// After the count note, so the dock draws this one.
 				m.flushPiPNote()
+				if note := m.heldNotice; note != "" {
+					m.heldNotice = ""
+					m.ShowNotification(note, "info", m.Settings.NotificationDuration)
+				}
 
 				// A rename by this client or any other arrives on this push, so
 				// an open switcher follows it without being reopened.
@@ -2268,10 +2404,14 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 		// Continue listening for more state syncs
-		return m, tea.Batch(ListenForStateSync(m.StateSyncChan), m.refreshSidebarSessions())
+		return m, tea.Batch(listenStateSyncUntil(m.stopSignal(), m.StateSyncChan), m.refreshSidebarSessions())
 
 	case ScratchOpenedMsg:
 		m.handleScratchOpened(msg)
+		return m, nil
+
+	case RailPaneOpenedMsg:
+		m.handleRailPaneOpened(msg)
 		return m, nil
 
 	case CommandRanMsg:
@@ -2286,7 +2426,12 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case PasteBufferFetchedMsg:
-		return m, m.handlePasteBufferFetched(msg)
+		cmd := m.handlePasteBufferFetched(msg)
+		if msg.held {
+			// The paste is in, or failed, so the keys typed after it go now.
+			cmd = tea.Batch(cmd, m.releasePasteHold())
+		}
+		return m, cmd
 
 	case PasteBuffersLoadedMsg:
 		m.handlePasteBuffersLoaded(msg)
@@ -2315,6 +2460,15 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.refreshSwitcherItems()
 		return m, m.refreshListingCmd()
 
+	case SessionOrderAppliedMsg:
+		return m, m.applySessionOrderResult(msg)
+
+	case StripSnapMsg:
+		if m.SnapStrip(msg) && m.IsDaemonSession {
+			m.SyncStateToDaemon()
+		}
+		return m, nil
+
 	case listingRefreshedMsg:
 		m.refreshSwitcherItems()
 		return m, nil
@@ -2324,7 +2478,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sessionClients = msg.ClientCount
 		m.ShowNotification(fmt.Sprintf("Client joined (%d connected)", msg.ClientCount), "info", 2*time.Second)
 		// Continue listening for more client events
-		return m, ListenForClientEvents(m.ClientEventChan)
+		return m, listenClientEventsUntil(m.stopSignal(), m.ClientEventChan)
 
 	case AgentMailMsg:
 		// A message an agent left, or a receipt for one an agent read. Applied
@@ -2332,7 +2486,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// goroutine.
 		m.noteAgentMail(msg.Payload)
 		m.noteAgentsSeen()
-		return m, ListenForClientEvents(m.ClientEventChan)
+		return m, listenClientEventsUntil(m.stopSignal(), m.ClientEventChan)
 
 	case agentIntegrationMsg:
 		m.agentIntegrationInstalled = true
@@ -2348,10 +2502,10 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case AgentMailLoadMsg:
 		// A session switch asked for the new session's ring. The read runs in
 		// the command, off this goroutine.
-		return m, tea.Batch(m.agentMailLoad(), ListenForClientEvents(m.ClientEventChan))
+		return m, tea.Batch(m.agentMailLoad(), listenClientEventsUntil(m.stopSignal(), m.ClientEventChan))
 
 	case AgentMailMarkMsg:
-		return m, tea.Batch(m.agentMailMarkRead(msg.Thread), ListenForClientEvents(m.ClientEventChan))
+		return m, tea.Batch(m.agentMailMarkRead(msg.Thread), listenClientEventsUntil(m.stopSignal(), m.ClientEventChan))
 
 	case AgentMailLoadedMsg:
 		m.applyAgentMailLoaded(msg)
@@ -2434,9 +2588,23 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case scrollbackEditorDoneMsg:
 		return m, m.applyScrollbackEditorDone(msg)
 
+	case clearScrollbackDoneMsg:
+		m.applyClearScrollbackDone(msg)
+		return m, nil
+
 	case ReviewDiffMsg:
 		m.applyReviewDiff(msg)
+		if msg.Err == nil && msg.Gen == m.review.gen && m.review.open {
+			return m, m.reviewIndexCmd()
+		}
 		return m, nil
+
+	case ReviewIndexMsg:
+		m.applyReviewIndex(msg)
+		return m, nil
+
+	case ReviewStagedMsg:
+		return m, m.applyReviewStaged(msg)
 
 	case ReviewNotesMsg:
 		m.applyReviewNotes(msg)
@@ -2478,6 +2646,10 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.applyInboxResumed(msg)
 		return m, nil
 
+	case InboxBulkResumedMsg:
+		m.applyInboxBulkResumed(msg)
+		return m, nil
+
 	case InboxReleasedMsg:
 		m.applyInboxReleased(msg)
 		return m, nil
@@ -2500,7 +2672,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.sessionClients = msg.ClientCount
 		m.ShowNotification(fmt.Sprintf("Client left (%d connected)", msg.ClientCount), "info", 2*time.Second)
 		// Continue listening for more client events
-		return m, ListenForClientEvents(m.ClientEventChan)
+		return m, listenClientEventsUntil(m.stopSignal(), m.ClientEventChan)
 
 	case SessionResizeMsg:
 		// The box the panes are laid out in from here on is this answer's,
@@ -2542,6 +2714,16 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if sizeChanged {
 				m.ShowNotification(fmt.Sprintf("Session size: %dx%d (%d clients)", msg.Width, msg.Height, msg.ClientCount), "info", 2*time.Second)
 			}
+		} else if m.DaemonClient.SessionSizedBySelf() {
+			// The box stayed and this client sets the size now. No retile
+			// runs, and the client before it can have left PTYs at sizes of its
+			// own: a renderer takes its insets off each pane. The daemon
+			// ignores a size a PTY already has.
+			for _, w := range m.Windows {
+				if w.DaemonMode && w.DaemonResizeFunc != nil {
+					_ = w.DaemonResizeFunc(w.ContentWidth(), w.ContentHeight())
+				}
+			}
 		}
 		// The layout just worked out from this answer is pushed, whoever
 		// caused it, unless this client already pushed one for it. Nothing
@@ -2559,19 +2741,19 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// loop closes: this client's own reserve is a function of the render
 		// width alone, so the second round finds it unmoved and sends nothing.
 		// Continue listening for more client events
-		return m, tea.Batch(ListenForClientEvents(m.ClientEventChan), m.refreshSidebarSessions())
+		return m, tea.Batch(listenClientEventsUntil(m.stopSignal(), m.ClientEventChan), m.refreshSidebarSessions())
 
 	case ForceRefreshMsg:
 		// Force re-render
 		m.MarkAllDirty()
 		// Continue listening for more client events
-		return m, ListenForClientEvents(m.ClientEventChan)
+		return m, listenClientEventsUntil(m.stopSignal(), m.ClientEventChan)
 
 	case DaemonDisconnectedMsg:
 		// A restart from the app stops the daemon on purpose. The dialog
 		// shows the steps, and the client goes on until they end.
 		if m.noteRestartDisconnect() {
-			return m, ListenForDaemonExit(m.daemonExitChan())
+			return m, listenDaemonExitUntil(m.stopSignal(), m.daemonExitChan())
 		}
 		// The daemon connection was lost and cannot be recovered; quit cleanly
 		// so the user is not left staring at a frozen, unresponsive session.
@@ -2588,7 +2770,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// armed again for the next connection's end. Without it the
 			// first drop was the last one heard, and a link that dropped a
 			// second time left a frozen session with no reconnect.
-			listen := ListenForDaemonExit(m.daemonExitChan())
+			listen := listenDaemonExitUntil(m.stopSignal(), m.daemonExitChan())
 			if cmd := m.beginHostReconnect(msg.Err); cmd != nil {
 				return m, tea.Batch(cmd, listen)
 			}
@@ -2605,20 +2787,20 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m, listen
 			}
 			m.ExitReason = ExitHostLost
-			return m, tea.Quit
+			return m, m.QuitCmd()
 		}
 		// The daemon on this machine may be restarting: wait a moment for
 		// the new one, and attach to the session it restored.
 		if cmd := m.beginDaemonReconnect(); cmd != nil {
-			return m, tea.Batch(cmd, ListenForDaemonExit(m.daemonExitChan()))
+			return m, tea.Batch(cmd, listenDaemonExitUntil(m.stopSignal(), m.daemonExitChan()))
 		}
 		if m.ReconnectingToDaemon() {
-			return m, ListenForDaemonExit(m.daemonExitChan())
+			return m, listenDaemonExitUntil(m.stopSignal(), m.daemonExitChan())
 		}
 		if !m.QuitRequested {
 			m.ExitReason = ExitDaemonLost
 		}
-		return m, tea.Quit
+		return m, m.QuitCmd()
 
 	case daemonReconnectTickMsg:
 		return m, m.handleDaemonReconnectTick(msg)
@@ -2638,7 +2820,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case SessionEndedMsg:
 		// The old daemon ending its sessions is part of a restart.
 		if m.restart.running() {
-			return m, ListenForDaemonExit(m.daemonExitChan())
+			return m, listenDaemonExitUntil(m.stopSignal(), m.daemonExitChan())
 		}
 		// The session was destroyed underneath this client. Its windows are
 		// gone and its PTYs are closed, so there is nothing left to render and
@@ -2661,7 +2843,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.DaemonClient != nil && m.DaemonClient.DetachedReason() != "" {
 			m.ExitReason = ExitDetached
 		}
-		return m, tea.Quit
+		return m, m.QuitCmd()
 
 	case omarchyFollowMsg:
 		m.applyOmarchyPalette(msg.palette)
@@ -2739,6 +2921,15 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.MarkAllDirty()
 		return m, cmd
 
+	case lookShareAuthorMsg:
+		// gh answered with the login. The export reads the config, so it
+		// runs here. See look_share.go.
+		return m, m.handleLookShareAuthor(msg)
+
+	case lookShareDoneMsg:
+		m.handleLookShareDone(msg)
+		return m, nil
+
 	case screenshotCopiedMsg:
 		// The clipboard helper answered. Nothing waited for it, which is the
 		// point: this only decides where to say what it said.
@@ -2815,7 +3006,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Execute remote command from CLI. The listener is re-armed on every
 		// path out of this case, including the early returns, or a channel-fed
 		// host would take exactly one routed verb per session.
-		relisten := ListenForRemoteCommands(m.RemoteCommandChan)
+		relisten := listenRemoteCommandsUntil(m.stopSignal(), m.RemoteCommandChan)
 		var err error
 		// persistCmd writes a routed config change to disk, off this goroutine.
 		var persistCmd tea.Cmd
@@ -2849,6 +3040,19 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					_ = m.DaemonClient.SendCommandResultWithData(msg.RequestID, true, "command executed", resultData)
 				}
 				return m, relisten
+			case "ShareLook":
+				// tuios look share: the client has the screen to capture and
+				// the terminal that carries the clipboard. TapeArgs are the
+				// name and the author, either one empty. The result is sent
+				// when the share is done. See look_share.go.
+				var name, author string
+				if len(msg.TapeArgs) > 0 {
+					name = msg.TapeArgs[0]
+				}
+				if len(msg.TapeArgs) > 1 {
+					author = msg.TapeArgs[1]
+				}
+				return m, tea.Batch(m.ShareLook(name, author, msg.RequestID), relisten)
 			case "GetWindow":
 				// Return info about a specific window (read-only, no notification)
 				if len(msg.TapeArgs) > 0 {
@@ -2890,7 +3094,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if err == nil {
 				// Keys will be processed sequentially via RemoteKeyMsg
 				// Show notification now, result will be sent after all keys processed
-				m.ShowNotification(notificationMsg, "info", m.Settings.NotificationDuration)
+				m.showRemoteNotice(notificationMsg)
 				return m, tea.Batch(cmd, relisten)
 			}
 		// capture_pane never arrives here: the daemon renders the pane from its
@@ -3052,6 +3256,14 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				_ = m.DaemonClient.SendCommandResult(msg.RequestID, true, "command executed")
 			}
 			return m, tea.Batch(func() tea.Msg { return remoteSwitchSessionMsg{name: name} }, relisten)
+		case "notice":
+			// A line from the daemon for the dock, such as why a split did
+			// not follow ssh. Nothing changed, so nothing is pushed.
+			if len(msg.TapeArgs) > 0 {
+				m.heldNotice = msg.TapeArgs[0]
+				m.ShowNotification(m.heldNotice, "info", m.Settings.NotificationDuration)
+			}
+			return m, relisten
 		case "refresh_dock":
 			// Re-run one component now, or every one when unnamed.
 			name := ""
@@ -3070,7 +3282,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			cmd, err = m.executeTapeScript(msg.TapeScript, msg.RequestID)
 			if err == nil {
 				if m.tapeStatusShown() {
-					m.ShowNotification(notificationMsg, "info", m.Settings.NotificationDuration)
+					m.showRemoteNotice(notificationMsg)
 				}
 				return m, tea.Batch(cmd, relisten)
 			}
@@ -3094,7 +3306,7 @@ func (m *OS) handleMsg(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if err != nil {
 			m.ShowNotification(fmt.Sprintf("Remote error: %v", err), "error", m.Settings.NotificationDuration)
 		} else if notificationMsg != "" {
-			m.ShowNotification(notificationMsg, "info", m.Settings.NotificationDuration)
+			m.showRemoteNotice(notificationMsg)
 		}
 
 		// Send result back if we have a daemon client

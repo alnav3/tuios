@@ -8,7 +8,6 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
-	"github.com/Gaurav-Gosain/tuios/internal/theme"
 	"github.com/Gaurav-Gosain/tuios/pkg/fuzzy"
 )
 
@@ -33,13 +32,14 @@ func GetHelpCategories(registry *config.KeybindRegistry, s *config.Settings) []H
 			Name: "Window Management",
 			Bindings: generateCategoryBindings(registry, "Window Management", []string{
 				"new_window", "new_window_ssh", "close_window", "rename_window",
-				"minimize_window", "restore_all", "toggle_zoom", "toggle_pip", "toggle_spotlight",
+				"minimize_window", "restore_all", "toggle_zoom", "toggle_pip", "focus_rail_pane", "toggle_spotlight",
 				"next_window", "prev_window",
 				"terminal_next_window", "terminal_prev_window",
 				"terminal_focus_left", "terminal_focus_right",
 				"terminal_focus_up", "terminal_focus_down",
 				"copy_selection", "focus_sidebar",
-				"next_session", "prev_session",
+				"next_session", "prev_session", "next_host", "prev_host",
+				"next_agent", "prev_agent",
 				"toggle_multifocus_active", "toggle_multifocus_all", "close_workspace",
 			}),
 		},
@@ -184,23 +184,30 @@ func isReviewHelpBinding(b HelpBinding) bool {
 // means different things, and the Inbox's own keys were in no section.
 const HelpCategoryAgents = "Agents"
 
+// appendHelpBinding adds a row for keys, without the blank ones, when any are
+// left. It is out of line because the generators below call it at dozens of
+// places.
+//
+//go:noinline
+func appendHelpBinding(bindings *[]HelpBinding, keys []string, desc, cat string) {
+	var live []string
+	for _, k := range keys {
+		if k = strings.TrimSpace(k); k != "" {
+			live = append(live, k)
+		}
+	}
+	if len(live) > 0 {
+		*bindings = append(*bindings, HelpBinding{Keys: live, Description: desc, Category: cat})
+	}
+}
+
 // generateAgentBindings lists the Agents section. Every key is read from the
 // config, chord included, so a rebound key shows as it is bound.
 func generateAgentBindings(registry *config.KeybindRegistry, s *config.Settings) []HelpBinding {
 	const cat = HelpCategoryAgents
 	presses := config.PressesByAction(registry)
 	var bindings []HelpBinding
-	add := func(keys []string, desc string) {
-		var live []string
-		for _, k := range keys {
-			if k = strings.TrimSpace(k); k != "" {
-				live = append(live, k)
-			}
-		}
-		if len(live) > 0 {
-			bindings = append(bindings, HelpBinding{Keys: live, Description: desc, Category: cat})
-		}
-	}
+	add := func(keys []string, desc string) { appendHelpBinding(&bindings, keys, desc, cat) }
 	for _, action := range []string{"prefix_inbox", "prefix_next_attention", "prefix_next_finished", "prefix_review", "prefix_mail", "prefix_jump_notif", "prefix_agents_settings"} {
 		desc := config.ActionDescriptions[action]
 		add(presses[action], desc)
@@ -238,12 +245,13 @@ func generateAgentBindings(registry *config.KeybindRegistry, s *config.Settings)
 	add([]string{"1-9"}, "Agents view: answer a held approval or a question by its number")
 	for _, action := range []string{
 		config.ActionInboxAllow, config.ActionInboxAllowAlways, config.ActionInboxReply, config.ActionInboxDenyReason,
-		config.ActionInboxPeek, config.ActionInboxGo, config.ActionInboxWrite, config.ActionInboxNewAgent, config.ActionInboxCompare,
+		config.ActionInboxPeek, config.ActionInboxGo, config.ActionInboxWrite, config.ActionInboxNewAgent, config.ActionInboxCompare, config.ActionInboxArtifact,
+		config.ActionInboxBoard, config.ActionInboxTake,
 		config.ActionInboxDismiss, config.ActionInboxResume, config.ActionInboxPassOn, config.ActionInboxFilter,
 		config.ActionInboxSelect, config.ActionInboxMailbox, config.ActionInboxReview, config.ActionInboxSnooze,
-		config.ActionInboxUndo, config.ActionInboxShowSnoozed, config.ActionInboxMark, config.ActionInboxMarkAll,
+		config.ActionInboxSettle, config.ActionInboxUndo, config.ActionInboxShowSnoozed, config.ActionInboxMark, config.ActionInboxMarkAll,
 		config.ActionInboxViewPane, config.ActionInboxOpen, config.ActionInboxBack,
-		config.ActionInboxTabPrev, config.ActionInboxTabNext, config.ActionInboxExpand,
+		config.ActionInboxTabPrev, config.ActionInboxTabNext, config.ActionInboxExpand, config.ActionInboxFold,
 		config.ActionInboxDetailDown, config.ActionInboxDetailUp,
 	} {
 		inbox(action, config.ActionDescriptions[action])
@@ -255,9 +263,19 @@ func generateAgentBindings(registry *config.KeybindRegistry, s *config.Settings)
 	inbox(config.ActionMailReply, "Mailbox: reply in the open thread")
 	inbox(config.ActionMailFocusPane, "Mailbox: go to the pane that last wrote")
 	inbox(config.ActionMailNew, "Mailbox: write a new message to an agent")
-	// The review overlay's own keys, which are not bindings, like the
+	// The review overlay's hunk and file motions, read from
+	// [keybindings.review], so a rebound key shows as it is bound.
+	review := func(action, desc string) { add(registry.GetReviewKeys(action), desc) }
+	review(config.ActionReviewNextHunk, "Review: next hunk")
+	review(config.ActionReviewPrevHunk, "Review: previous hunk")
+	review(config.ActionReviewNextFile, "Review: next file")
+	review(config.ActionReviewPrevFile, "Review: previous file")
+	for _, action := range []string{config.ActionReviewStageHunk, config.ActionReviewUnstageHunk,
+		config.ActionReviewStageFile, config.ActionReviewUnstageFile, config.ActionReviewUndoStage} {
+		review(action, config.ActionDescriptions[action])
+	}
+	// The overlay's other keys are its own and not bindings, like the
 	// scrollback browser's. See review_input.go.
-	add([]string{"] [", "} {"}, "Review: next or previous hunk, next or previous file")
 	add([]string{"c", "C"}, "Review: a note on the line, or on the whole hunk")
 	add([]string{"e", "x"}, "Review: edit or resolve the note under the cursor")
 	add([]string{"S"}, "Review: send the unsent notes to the agent, typed when it is at rest")
@@ -277,6 +295,7 @@ const HelpCategorySidebar = "Sidebar"
 // usual auto-selection.
 func (m *OS) OpenHelpAtCategory(name string) {
 	m.ShowHelp = true
+	m.helpBackToAgents = false
 	m.HelpScrollOffset = 0
 	m.HelpSearchMode = false
 	m.HelpSearchQuery = ""
@@ -287,6 +306,16 @@ func (m *OS) OpenHelpAtCategory(name string) {
 			return
 		}
 	}
+}
+
+// HelpClosed is called after the help overlay closes. Help opened from the
+// agents view opens that view again, on the agent it was on.
+func (m *OS) HelpClosed() {
+	if !m.helpBackToAgents {
+		return
+	}
+	m.helpBackToAgents = false
+	m.OpenInbox("")
 }
 
 // HelpStepCategory moves the help's section strip by delta under the list
@@ -328,11 +357,15 @@ func generateCategoryBindings(registry *config.KeybindRegistry, categoryName str
 // generateWorkspaceBindings generates all workspace-related bindings
 func generateWorkspaceBindings(registry *config.KeybindRegistry, s *config.Settings) []HelpBinding {
 	bindings := []HelpBinding{}
+	// Every live key from every section. GetKeys stops at the first section
+	// that names the action, and the workspaces section always does from the
+	// defaults, so a key bound in [keybindings.global] never showed (#1085).
+	presses := config.PressesByAction(registry)
 
 	// Add all 9 workspace switches
 	for i := 1; i <= 9; i++ {
 		action := fmt.Sprintf("switch_workspace_%d", i)
-		keys := registry.GetKeys(action)
+		keys := presses[action]
 		if len(keys) > 0 {
 			bindings = append(bindings, HelpBinding{
 				Action:      action,
@@ -346,7 +379,7 @@ func generateWorkspaceBindings(registry *config.KeybindRegistry, s *config.Setti
 	// Add all 9 move and follow actions
 	for i := 1; i <= 9; i++ {
 		action := fmt.Sprintf("move_and_follow_%d", i)
-		keys := registry.GetKeys(action)
+		keys := presses[action]
 		if len(keys) > 0 {
 			bindings = append(bindings, HelpBinding{
 				Action:      action,
@@ -359,7 +392,7 @@ func generateWorkspaceBindings(registry *config.KeybindRegistry, s *config.Setti
 
 	for i := 1; i <= 9; i++ {
 		action := fmt.Sprintf("send_to_workspace_%d", i)
-		keys := registry.GetKeys(action)
+		keys := presses[action]
 		if len(keys) > 0 {
 			bindings = append(bindings, HelpBinding{
 				Action:      action,
@@ -514,6 +547,8 @@ func generateSidebarBindings(registry *config.KeybindRegistry, s *config.Setting
 		fileRow("file_edit", "Files: edit a text file in the configured editor"),
 		fileRow("file_copy_path", "Files: copy the path of the file or folder"),
 		fileRow("file_send", "Files: send the file or folder to a host"),
+		fileRow("file_insert_path", "Files: paste the path into the focused pane"),
+		fileRow("file_quick_look", "Files: show a preview of the file or folder"),
 	)
 
 	// The Copies panel's keys, live while it is open. They are read from
@@ -572,6 +607,7 @@ func generateListBindings() []HelpBinding {
 	const cat = "Modes"
 	return []HelpBinding{
 		{Keys: []string{"ctrl+u"}, Description: "Lists: clear a typed filter", Category: cat},
+		{Keys: []string{"alt+backspace", "ctrl+w"}, Description: "Text fields: delete the last word", Category: cat},
 		{Keys: []string{"wheel"}, Description: "Lists: scroll the list under the pointer", Category: cat},
 		{Keys: []string{"/"}, Description: "Settings: search every tab", Category: cat},
 		{Keys: []string{"1-9"}, Description: "Settings: go to that tab", Category: cat},
@@ -591,6 +627,7 @@ func generateCopyModeBindings(registry *config.KeybindRegistry, s *config.Settin
 	var bound []HelpBinding
 	for _, row := range []struct{ action, desc string }{
 		{config.ActionCopyModeLineStart, "Line start"},
+		{config.ActionCopyModeFirstNonBlank, "First nonblank"},
 		{config.ActionCopyModeLineEnd, "Line end"},
 	} {
 		if keys := registry.GetCopyModeKeys(row.action); len(keys) > 0 {
@@ -630,8 +667,10 @@ func copyModeKeys(leader string) []HelpBinding {
 		{Keys: []string{"/, ?"}, Description: "Search forward/backward", Category: "Copy Mode"},
 		{Keys: []string{"n, N"}, Description: "Repeat search/reverse", Category: "Copy Mode"},
 		{Keys: []string{"v, V"}, Description: "Visual char/line", Category: "Copy Mode"},
+		{Keys: []string{"o"}, Description: "Other end of selection", Category: "Copy Mode"},
 		{Keys: []string{"y, c"}, Description: "Yank to clipboard", Category: "Copy Mode"},
 		{Keys: []string{"i, q, Esc"}, Description: "Exit copy mode", Category: "Copy Mode"},
+		{Keys: []string{"ctrl+c"}, Description: "Exit copy mode from any state. Nothing is copied", Category: "Copy Mode"},
 	}
 }
 
@@ -797,12 +836,12 @@ func generatePrefixBindings(registry *config.KeybindRegistry, s *config.Settings
 		"prefix_split_horizontal", "prefix_split_vertical", "prefix_rotate_split",
 		"prefix_equalize_splits", "prefix_layout",
 		"prefix_scrollback", "prefix_screenshot", "prefix_command_palette", "prefix_session_switcher",
-		"prefix_workspace_switcher", "choose_tree", "goto_picker",
+		"prefix_workspace_switcher", "choose_tree", "goto_picker", "new_worktree", "set_note",
 		"prefix_toggle_sidebar", "prefix_toggle_spotlight", "prefix_explore",
 		"prefix_jump_notif", "prefix_last_message", "prefix_mail", "prefix_inbox", "prefix_next_attention",
-		"toggle_scratch", "paste_image", "paste_buffer", "choose_buffer", "prefix_transfers",
-		config.ActionEditScrollback,
-		"hints", "hints_all_panes", "display_panes", config.ActionCopyModeSearchForward, config.ActionCopyModeSearchBackward,
+		"toggle_scratch", "toggle_calm", "paste_image", "paste_buffer", "choose_buffer", "prefix_transfers",
+		config.ActionEditScrollback, config.ActionClearScrollback,
+		"hints", "hints_all_panes", "display_panes", "pick_path", config.ActionCopyModeSearchForward, config.ActionCopyModeSearchBackward,
 		// prefix_review and prefix_next_finished are listed only in the
 		// Agents section, which waits for an agent to have been seen.
 	}
@@ -951,7 +990,7 @@ func (m *OS) RenderHelpMenu() (string, overlay.Geometry) {
 		m.HelpCategory = len(categories) - 1
 	}
 
-	pal := theme.UI()
+	pal := m.overlayUI()
 	inSearch := m.HelpSearchMode
 
 	var bindings []HelpBinding

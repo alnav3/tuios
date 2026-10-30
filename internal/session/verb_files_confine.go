@@ -117,13 +117,32 @@ var linkDenyCredentialHome = []string{
 	// The PowerShell profiles, which are shell start files too.
 	"Documents/PowerShell",
 	"Documents/WindowsPowerShell",
+	// Claude Code's login and the MCP servers it runs.
+	".claude.json",
+	// The sops age keys, which decrypt every file sops encrypted.
+	".config/sops/age",
+	"Library/Application Support/sops/age",
+	"AppData/Roaming/sops/age",
+	// Atuin's sync key, session and history, and the config that names
+	// their paths and the sync server.
+	".local/share/atuin",
+	".config/atuin",
+	// Ollama's signing key, and the API keys of Gemini CLI, its fork Qwen
+	// Code, and Hermes Agent.
+	".ollama/id_ed25519",
+	".gemini/.env",
+	".qwen/.env",
+	".hermes/.env",
+	"AppData/Local/hermes/.env",
 }
 
 // linkDenyWriteOnlyHome is the rest of the write deny list: login items,
-// which run a program but hold no secret, and the folders of tools whose
+// which run a program but hold no secret, the folders of tools whose
 // credential file the read deny list names on its own (~/.claude,
-// ~/.codex, ~/.docker, ~/.config/gh). A link may read the rest of those
-// folders, and may change none of them.
+// ~/.codex, ~/.docker, ~/.config/gh), and the config folders of the agent
+// harnesses tuios integrates (internal/integration), which name the hooks,
+// plugins, extensions and MCP servers the tool runs. A link may read the
+// rest of those folders, and may change none of them.
 var linkDenyWriteOnlyHome = []string{
 	".config/autostart",
 	"Library/LaunchAgents",
@@ -132,6 +151,25 @@ var linkDenyWriteOnlyHome = []string{
 	".claude",
 	".codex",
 	".config/gh",
+	// The agent harnesses tuios installs hooks, plugins or extensions into.
+	".gemini",
+	".config/opencode",
+	".config/amp",
+	".copilot",
+	".config/crush",
+	".cursor",
+	".config/devin",
+	"AppData/Roaming/devin",
+	".factory",
+	".grok",
+	".hermes",
+	"AppData/Local/hermes",
+	".config/kilo",
+	".kimi-code",
+	".pi/agent",
+	".omp/agent",
+	".qoder",
+	".qwen",
 	// The Windows start folder.
 	"AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup",
 }
@@ -175,7 +213,6 @@ var linkReadDenyOnlyHome = []string{
 	"Library/Keychains",
 	".claude/.credentials.json",
 	".config/claude/.credentials.json",
-	".claude.json",
 	".codex/auth.json",
 	".npmrc",
 	".pypirc",
@@ -205,6 +242,8 @@ var linkReadDenyOnlyHome = []string{
 	".lesshst",
 	".viminfo",
 	".local/state/nvim/shada",
+	".local/share/zsh/history",
+	".local/state/zsh/history",
 	// Browser profiles: cookies are signed-in sessions.
 	".mozilla",
 	".config/google-chrome",
@@ -216,10 +255,71 @@ var linkReadDenyOnlyHome = []string{
 	"Library/Application Support/BraveSoftware",
 	"Library/Cookies",
 	"Library/Safari",
+	// Browsers and mail installed as snaps and flatpaks keep their
+	// profiles here: the snap's own home, and a flatpak's whole data.
+	"snap/firefox/common/.mozilla",
+	"snap/chromium/common/chromium",
+	"snap/thunderbird/common/.thunderbird",
+	".var/app",
+	// Mail, chat and editor state: signed-in sessions and tokens.
+	".thunderbird",
+	"Library/Thunderbird",
+	".config/Code",
+	"Library/Application Support/Code",
+	".config/Cursor",
+	"Library/Application Support/Cursor",
+	"AppData/Roaming/Cursor",
+	".config/Signal",
+	"Library/Application Support/Signal",
+	".config/discord",
+	"Library/Application Support/discord",
+	".config/Slack",
+	"Library/Application Support/Slack",
+	".local/share/TelegramDesktop",
+	// Crypto wallets.
+	".bitcoin",
+	".electrum",
+	".ethereum",
+	".monero",
+	".litecoin",
+	".config/solana",
+	".config/Exodus",
+	"Library/Application Support/Bitcoin",
+	"Library/Application Support/Exodus",
+	"Library/Application Support/Electrum",
+	"AppData/Roaming/Bitcoin",
+	"AppData/Roaming/Electrum",
+	"AppData/Roaming/Exodus",
 	// Password managers and the tokens of other tools.
 	".config/Bitwarden",
 	".config/1Password",
 	".config/github-copilot",
+	// The logins of agent harnesses, and Cursor's MCP servers, whose env
+	// often holds API keys.
+	".gemini/oauth_creds.json",
+	".gemini/mcp-oauth-tokens.json",
+	".local/share/opencode/auth.json",
+	".local/share/opencode/mcp-auth.json",
+	".qwen/oauth_creds.json",
+	".local/share/kilo/auth.json",
+	".local/share/kilo/mcp-auth.json",
+	".pi/agent/auth.json",
+	// oh-my-pi, a Pi fork, keeps its logins in a SQLite database, and the
+	// write-ahead log beside it holds the newest of them.
+	".omp/agent/agent.db",
+	".omp/agent/agent.db-wal",
+	".local/share/amp/secrets.json",
+	".copilot/config.json",
+	".cursor/mcp.json",
+	// Cloud and tunnel CLI credentials.
+	".oci",
+	".config/doctl",
+	"Library/Application Support/doctl",
+	"AppData/Roaming/doctl",
+	".config/ngrok",
+	"Library/Application Support/ngrok",
+	"AppData/Local/ngrok",
+	".ngrok2",
 	// Windows credentials and the DPAPI keys that open them.
 	"AppData/Roaming/Microsoft/Credentials",
 	"AppData/Local/Microsoft/Credentials",
@@ -233,6 +333,25 @@ var linkReadDenyOnlyHome = []string{
 type fileFS struct {
 	root *os.Root
 	dir  string
+	// link says the write came from another machine: a linked machine or a
+	// paired device. A file it commits gets the sender's mode the way cp and
+	// scp without -p give it, under this process's umask, and never with
+	// group or world write. See commitMode.
+	link bool
+}
+
+// commitMode is the mode a committed file gets for the sender's perm. The
+// person's own copy, and a pane's, keep the bits as sent, as the docs
+// promise. A copy from another machine is masked by the umask and loses
+// group and world write, so a file another local user could change never
+// arrives that way on a shared machine. The execute bits stay, so a script
+// that arrives still runs.
+func (f fileFS) commitMode(perm uint32) os.FileMode {
+	m := os.FileMode(perm & 0o777)
+	if f.link {
+		m &^= os.FileMode(processUmask) | 0o022
+	}
+	return m
 }
 
 // rel is path relative to the root.
@@ -933,7 +1052,7 @@ func (d *Daemon) linkWriteFS(cs *connState, paths ...string) (fileFS, *verbError
 	if err != nil {
 		return fileFS{}, fileError("open", chosen, err)
 	}
-	return fileFS{root: r, dir: chosen}, nil
+	return fileFS{root: r, dir: chosen, link: true}, nil
 }
 
 // receiveFolder is the folder a copy to this machine lands in when it names

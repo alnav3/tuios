@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
@@ -96,6 +97,14 @@ func printKeybindReport(rep config.KeybindReport) {
 		fmt.Println("  Another copy-mode key also uses these keys. Change them in config.toml.")
 		for _, p := range rep.CopyModeProblems {
 			fmt.Printf("  %-22s %s [copy_mode.%s]\n", p.Key, p.Problem, p.Action)
+		}
+	}
+
+	if len(rep.ReviewProblems) > 0 {
+		fmt.Printf("\nREVIEW KEYS (%s)\n", config.EvidenceCertain)
+		fmt.Println("  The review overlay also uses these keys. Change them in config.toml.")
+		for _, p := range rep.ReviewProblems {
+			fmt.Printf("  %-22s %s [review.%s]\n", p.Key, p.Problem, p.Action)
 		}
 	}
 
@@ -199,7 +208,12 @@ func printKeybindReport(rep config.KeybindReport) {
 			case r.Use != "":
 				use += fmt.Sprintf(" To keep the keys, bind them to %s.", r.Use)
 			}
-			fmt.Printf("  %-22s %s in [keybindings.%s].%s\n", r.Action, strings.Join(r.Keys, ", "), r.Section, use)
+			// Quoted, a key such as "," stands out from the punctuation around it.
+			keys := make([]string, len(r.Keys))
+			for i, k := range r.Keys {
+				keys[i] = strconv.Quote(k)
+			}
+			fmt.Printf("  %-22s %s in [keybindings.%s].%s\n", r.Action, strings.Join(keys, ", "), r.Section, use)
 		}
 	}
 

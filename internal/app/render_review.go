@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/diffview"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/review"
@@ -85,13 +86,6 @@ func reviewPaint(segs []reviewSeg, width int, bg color.Color) string {
 	if width <= 0 {
 		return ""
 	}
-	style := func(fg color.Color, bold bool) lipgloss.Style {
-		s := lipgloss.NewStyle().Foreground(fg).Bold(bold)
-		if bg != nil {
-			s = s.Background(bg)
-		}
-		return s
-	}
 	var b strings.Builder
 	used := 0
 	for _, sg := range segs {
@@ -106,17 +100,45 @@ func reviewPaint(segs []reviewSeg, width int, bg color.Color) string {
 			if ansi.StringWidth(ell) >= room {
 				text = ansi.Truncate(sg.text, room, "")
 			}
-			b.WriteString(style(sg.fg, sg.bold).Render(text))
+			b.WriteString(reviewSGR(sg.fg, bg, sg.bold, text))
 			used += ansi.StringWidth(text)
 			break
 		}
-		b.WriteString(style(sg.fg, sg.bold).Render(sg.text))
+		b.WriteString(reviewSGR(sg.fg, bg, sg.bold, sg.text))
 		used += w
 	}
 	if used < width {
-		b.WriteString(style(nil, false).Render(strings.Repeat(" ", width-used)))
+		b.WriteString(reviewSGR(nil, bg, false, strings.Repeat(" ", width-used)))
 	}
 	return b.String()
+}
+
+// reviewSGR is the bytes lipgloss renders for text in bold, fg and bg, without
+// the style machinery: bold, then the foreground, then the background, each
+// only when set. A nil colour and lipgloss.NoColor{} are left out, as lipgloss
+// leaves them out (ansi.Style would write NoColor as black); a
+// *lipgloss.NoColor is written, as lipgloss writes it. Text holding a tab, a
+// carriage return or a newline goes through lipgloss, which lays those out
+// where an SGR would not.
+func reviewSGR(fg, bg color.Color, bold bool, text string) string {
+	if strings.ContainsAny(text, "\t\r\n") {
+		s := lipgloss.NewStyle().Foreground(fg).Bold(bold)
+		if bg != nil {
+			s = s.Background(bg)
+		}
+		return s.Render(text)
+	}
+	var st ansi.Style
+	if bold {
+		st = st.Bold()
+	}
+	if fg != nil && fg != (lipgloss.NoColor{}) {
+		st = st.ForegroundColor(fg)
+	}
+	if bg != nil && bg != (lipgloss.NoColor{}) {
+		st = st.BackgroundColor(bg)
+	}
+	return st.Styled(text)
 }
 
 // reviewSpaces is n blank cells on bg.
@@ -502,9 +524,10 @@ func reviewFrame(w, h int, title string, body []string, border, bg color.Color) 
 	return strings.Join(lines, "\n")
 }
 
-// reviewHintStrip draws key hints the way every footer does, keys bright and
-// labels muted, on the overlay's ground like the rest of the frame.
-func reviewHintStrip(hints []overlay.Hint, pal overlay.Palette) string {
+// reviewHintParts returns one rendered string per hint, keys bright and labels
+// muted on the overlay's ground, with the Enter glyph mapped and no joins, so
+// reviewHints can measure each hint and reviewHintStrip can join them.
+func reviewHintParts(hints []overlay.Hint, pal overlay.Palette) []string {
 	key := lipgloss.NewStyle().Foreground(pal.AccentBright).Background(pal.Surface).Bold(true)
 	label := lipgloss.NewStyle().Foreground(pal.FgDim).Background(pal.Surface)
 	parts := make([]string, 0, len(hints))
@@ -515,28 +538,45 @@ func reviewHintStrip(hints []overlay.Hint, pal overlay.Palette) string {
 		}
 		parts = append(parts, key.Render(k)+label.Render(" "+h.Label))
 	}
-	return strings.Join(parts, reviewSpaces(2, pal.Surface))
+	return parts
+}
+
+// reviewHintStrip draws key hints the way every footer does, joining the
+// hints of reviewHintParts with two spaces on the overlay's ground.
+func reviewHintStrip(hints []overlay.Hint, pal overlay.Palette) string {
+	return strings.Join(reviewHintParts(hints, pal), reviewSpaces(2, pal.Surface))
 }
 
 // reviewHints draws key hints in width cells: as many as fit, in order, with
 // the last one always shown. A cell of margin is kept on both sides; with it
 // on the left only, a strip that fitted to the cell ran into the frame's
-// right edge.
+// right edge. Each hint is rendered once and fitted by the width of its own
+// render, so the strip is the one reviewHintStrip would draw for the hints
+// that fit.
 func reviewHints(hints []overlay.Hint, width int, pal overlay.Palette) string {
 	if len(hints) == 0 {
 		return reviewSpaces(width, pal.Surface)
 	}
-	last := hints[len(hints)-1]
-	room := width - 2 - ansi.StringWidth(reviewHintStrip([]overlay.Hint{last}, pal))
-	var fit []overlay.Hint
-	for _, h := range hints[:len(hints)-1] {
-		try := append(append([]overlay.Hint{}, fit...), h)
-		if ansi.StringWidth(reviewHintStrip(try, pal))+2 > room {
+	parts := reviewHintParts(hints, pal)
+	n := len(parts) - 1
+	room := width - 2 - ansi.StringWidth(parts[n])
+	// used is the width of the hints kept so far with their joins.
+	used := 0
+	keep := make([]string, 0, len(parts))
+	for _, p := range parts[:n] {
+		w := ansi.StringWidth(p)
+		next := w
+		if len(keep) > 0 {
+			next = used + 2 + w
+		}
+		if next+2 > room {
 			continue
 		}
-		fit = try
+		used = next
+		keep = append(keep, p)
 	}
-	strip := reviewSpaces(1, pal.Surface) + reviewHintStrip(append(fit, last), pal)
+	keep = append(keep, parts[n])
+	strip := reviewSpaces(1, pal.Surface) + strings.Join(keep, reviewSpaces(2, pal.Surface))
 	return strip + reviewSpaces(width-ansi.StringWidth(strip), pal.Surface)
 }
 
@@ -871,10 +911,28 @@ func (d reviewDraw) rowBody(row reviewRow, st overlay.RowState) string {
 			bg = reviewCursorTint(bg, pal, st)
 		}
 		head, ctx := reviewSplitHeader(reviewText(d.file.Hunks[row.hunk].Header))
-		return markCell(bg) + reviewPaint([]reviewSeg{
+		// How much of the hunk is in the index, from the index diffs read
+		// while the overlay is open, at the right end of the row. Words, so
+		// it reads at every depth.
+		var stage reviewSeg
+		switch d.m.review.reviewHunkMark(d.file, row.hunk) {
+		case reviewInIndex:
+			stage = reviewSeg{overlay.Readable(pal.Success, bg), "staged ", true}
+		case reviewInIndex | reviewInWork:
+			stage = reviewSeg{overlay.Readable(pal.Warning, bg), "partly staged ", true}
+		}
+		left := rest
+		if stage.text != "" {
+			left = max(rest-ansi.StringWidth(stage.text)-2, 0)
+		}
+		line := reviewPaint([]reviewSeg{
 			{overlay.Readable(pal.Info, bg), " " + head, false},
 			{overlay.Readable(pal.FgDim, bg), ctx, false},
-		}, rest, bg)
+		}, left, bg)
+		if stage.text != "" {
+			line += reviewPaint([]reviewSeg{{stage.fg, "  " + stage.text, true}}, rest-left, bg)
+		}
+		return markCell(bg) + line
 	case reviewRowLine:
 		if d.split {
 			return d.splitLine(row, st, markCell)
@@ -1062,6 +1120,21 @@ func (m *OS) reviewPromptLine(label, draft string, hints []overlay.Hint, width i
 	return line + keys + reviewSpaces(1, pal.Surface)
 }
 
+// reviewKey is the first key the config binds a review action to, for its
+// hint, or "" when it binds the action to nothing.
+func (m *OS) reviewKey(action string) string {
+	reg := m.KeybindRegistry
+	if reg == nil {
+		reg = defaultInboxKeys()
+	}
+	for _, k := range reg.GetReviewKeys(action) {
+		if k = strings.TrimSpace(k); k != "" {
+			return k
+		}
+	}
+	return ""
+}
+
 // reviewKeyHints are the review's keys that do something where the cursor
 // is, most wanted first. The footer shows as many as fit, and always esc.
 func (m *OS) reviewKeyHints() []overlay.Hint {
@@ -1080,12 +1153,17 @@ func (m *OS) reviewKeyHints() []overlay.Hint {
 		} else {
 			add("c", "note")
 		}
+		m.reviewStageHints(add)
 	}
 	if n := r.unsentNotes(); n > 0 && !against {
 		add("S", "send "+reviewCount(n, "note"))
 	}
-	add("]", "next hunk")
-	add("}", "next file")
+	if key := m.reviewKey(config.ActionReviewNextHunk); key != "" {
+		add(key, "next hunk")
+	}
+	if key := m.reviewKey(config.ActionReviewNextFile); key != "" {
+		add(key, "next file")
+	}
 	if e := r.currentFile(); e != nil && reviewSplitFits(e.file, m.reviewRowsWidth()) {
 		if m.reviewSplitOn(m.reviewRowsWidth()) {
 			add("s", "unified")

@@ -1383,7 +1383,10 @@ taking the address of the receive variables made them escape.
 window's `outputWriter` each made a 256 KiB batch buffer when their goroutine
 started, so every client and pane subscription on the daemon, and every daemon
 window on the client, held 256 KiB whether or not the pane ever printed. Both
-start from a nil slice now; the first output grows it and the capacity is kept.
+start from a nil slice now; the first output grows it. The capacity was kept for
+the life of the stream when this entry was written; "2026-10 the output batch
+buffers" below lets a batch past 32 KiB go once the stream has been idle for a
+second.
 
 | heap after GC, per idle instance | before | after |
 |---|---|---|
@@ -1642,8 +1645,8 @@ byte over two million random pairs of nil, basic, indexed, RGBA, theme-resolved
 and truecolor colours with random attributes, and
 `TestPaletteSGRChangesAllocateNothing` pins the fast path at zero allocations.
 Themed ANSI 0 to 15 resolve to RGBA and truecolor is RGB, so both still go to
-uv, and the ghostty backend renders through `uv.Line.Render` and gets nothing
-from this.
+uv, and the ghostty backend renders through `grid.Render` as well, so it gets
+the same gain.
 
 `TestCompositorSkipsCleanWindows` compared one dirty pane against half of all
 nine dirty. With a pane this cheap to render the frame's fixed cost dominated
@@ -1660,6 +1663,138 @@ allocations against 199.
 | `ClientFrame/panes-9/compose` allocs/op | 42.49k | 11.78k | -72%, B/op -17% |
 | `RenderTerminalUnfocused` allocs/op | 127 | 13 | CPU `~` |
 | `KeystrokeFrame/panes-4` | | | `~` |
+
+**Cell pairs that cannot join skip the grapheme segmenter** (`emulator.go`).
+`grid.Render` asks `clustersJoin` about every pair of neighbouring non-blank
+cells, to know where a cluster break is needed, and for anything but two ASCII
+bytes that concatenated the pair and ran `ansi.FirstGraphemeCluster` on it. A
+screen of box drawing, blocks, braille and Powerline separators is nothing but
+such pairs. `neverJoins` now answers for U+0020 to U+02FF, U+2100 to U+2BFF and
+U+E000 to U+F8FF: UAX #29 joins across a boundary only when one side is CR or
+LF, Hangul jamo, Extend, ZWJ, SpacingMark, Prepend, a regional indicator or an
+Indic conjunct class, and no rune in those ranges is any of them. When the last
+rune of the left cell and the first rune of the right cell are both in them the
+pair is answered without the concatenation or the segmenter. The first range
+starts at U+0020 so that CR, which joins LF, is never taken. Both backends
+render through `grid.Render`, the ghostty one by returning the active
+buffer's render, so this reaches both.
+`TestClusterJoinAgreesWithTheSegmenter` holds `clustersJoin` to the segmenter
+over every ordered pair of single-rune cells in the three ranges, each of them
+against the runes that do join in both orders, those runes against each other,
+and 1,592 multi-rune pairs (8 named ones, such as a ZWJ tail before an extended
+pictographic, plus 24 multi-rune cells paired 66 ways).
+`TestClusterJoinAgreesWithTheSegmenterAtRangeEdges` covers the runes just
+outside the ranges, where combining blocks that do join sit, beside every rune
+inside them, and cells whose first rune joins the cell before while their last
+rune never joins. `TestRenderingASymbolScreenSkipsTheSegmenter` bounds the
+allocations of a symbol screen at 400 against 10,238 before.
+
+Method: `BenchmarkRenderSymbolScreen` (a 207x55 screen of box drawing frames,
+block bars, braille, a Powerline separator and ASCII text, every row full,
+coloured by indexed foregrounds only so every pen change stays on `penDiff`'s
+table) built as two test binaries, the base and the change, run alternately for
+eight rounds at a fixed `-test.benchtime 200x` with `-test.cpu 1` under `nice`
+and `taskset`, compared with `benchstat`.
+
+| | before | after | |
+|---|---|---|---|
+| `RenderSymbolScreen` CPU per op | 1225 us | 608 us | -50.4% (p<0.001) |
+| `RenderSymbolScreen` allocs/op | 10,238 | 20 | -99.8% |
+| `RenderSymbolScreen` B/op | 282.6 KiB | 206.7 KiB | -26.9% |
+
+**The screen text is written into one builder** (`grid.go`). `grid.String`
+joined `row.String()` for every row. `uv.Line.String` allocates a
+`strings.Builder` and a `bytes.Buffer` per row and runs `Cell.Equal` against
+`EmptyCell` on every cell, which compares colour interfaces. Tape waits poll
+it (`tape_script.go`, `os_tape_executor.go`), on both backends, so a 207x55
+screen of text cost about 400 allocations on every tick. `writeLineText` now
+writes each row into one builder local to `String` with the rules of
+`uv.Line.String` cell by cell: a zero cell is skipped without releasing
+anything, a cell that `isBlankCell` accepts is one pending blank, any other
+cell releases the pending blanks and writes its content, and blanks still
+pending at the end of the row are dropped. The blanks are counted, not buffered, and `isBlankCell`
+holds exactly when `Equal(&uv.EmptyCell)` does for the pinned ultraviolet, so a
+styled blank, a linked blank and an unstyled empty cell of width 1 all still
+count as text. `String` reads `g.ext` and writes nothing, because both callers
+run it under a read lock beside other readers.
+`TestGridStringMatchesTheLines` holds the result to the rows' `uv.Line.String`
+joined with newlines, on random grids and on fixed rows with every one of those
+cells before content and at the row's end; `TestGridStringBudget` bounds the
+allocations of a 207x55 screen of text at 40.
+
+Method: `BenchmarkEmulatorString` (`Emulator.String()` on a 207x55 screen of
+printable ASCII lines with some styled runs) built as two test binaries, the
+base and the change, built with Go 1.26.10 and run alternately for ten
+rounds at a fixed `-test.benchtime 500x` with `-test.cpu 1` under `nice` on
+one core (`taskset -c 2`), compared with `benchstat`, on an Intel Core Ultra 9
+185H under WSL2.
+
+| | before | after | |
+|---|---|---|---|
+| `EmulatorString` CPU per op | 149.5 us | 77.6 us | -48.1% (p<0.001) |
+| `EmulatorString` allocs/op | 409 | 17 | -95.8% |
+| `EmulatorString` B/op | 72.5 KiB | 42.4 KiB | -41.5% |
+
+**Each row stops at its written extent** (`grid.go`). `writeLineText` still
+walked every cell of a row to find the blanks it drops at the row's end, though
+the grid already records where the written cells stop: `g.ext[y]` bounds every
+cell that is not a plain blank, and every writer keeps it. `String` now hands
+`writeLineText` only `row[:min(g.ext[y], len(row))]`; the `min` is defensive,
+since every row is `g.width` long. The cut is the same bytes as before, and
+`TestGridExtentHoldsUnderGeneratedInput` checks it: after every step of its
+generated input, on both screens, `String` must equal the rows' `uv.Line.String`
+joined with newlines.
+
+Method: 207x55 grids built in four cases, (a) every row 207 printable
+characters, (b) a shell screen of 30 lines of `$ ` plus 10 to 80 characters
+then `\x1b[K` (seeded), (c) case (a) followed by `\x1b[2J\x1b[H$ `, (d) three
+short lines on a fresh emulator, plus `BenchmarkEmulatorString`. Two test
+binaries, the base and the change, built and checked with `go version` as
+Go 1.26.10, run alternately for eight rounds at `-test.benchtime 2000x` with
+`-test.cpu 1` under `nice` on one core, compared with `benchstat`, on an Intel
+Core Ultra 9 185H under WSL2. These settings differ from the entry above
+(500x, ten rounds), so its 77.6 us is not comparable to the base here.
+
+| | before | after | |
+|---|---|---|---|
+| (a) full screen | 140.9 us | 139.1 us | ~ (p=0.96) |
+| (b) shell screen | 37.3 us | 19.0 us | -49.1% (p<0.001) |
+| (c) after a clear | 42.0 us | 2.1 us | -94.9% (p<0.001) |
+| (d) fresh emulator | 3.3 us | 1.4 us | -57.1% (p<0.001) |
+| `EmulatorString` | 110.3 us | 94.1 us | -14.7% (p<0.001) |
+
+Allocations and bytes per op are unchanged in every case.
+
+**A printable ASCII byte skips the grapheme segmenter in loom** (`loom/canvas.go`).
+`nextGrapheme` cuts one character at a time for `canvas.text`, `width`,
+`truncate` and `atomize`, and ran `ansi.FirstGraphemeCluster` on every one of
+them, plain ASCII included. It was about 36% of the `BenchmarkRenderTable200`
+profile, and a table is mostly ASCII text. A printable ASCII byte (0x20 to
+0x7e) followed by another byte below 0x80, or by the end of the string, is a
+one-cell cluster of itself, because UAX #29 joins across that boundary only
+for CR, LF, Extend, ZWJ, SpacingMark, Prepend and the like, and none of them
+is printable ASCII. `nextGrapheme` now answers that case first, without the
+segmenter. Control bytes, DEL and any byte at or above 0x80 on either side
+still take the old path, so the control, invalid UTF-8 and width clamp rules
+are unchanged, including the segmenter joining a lone lead byte onto the ASCII
+byte before it (`"a\xc2"`).
+`TestNextGraphemeAgreesWithTheSegmenter` holds `nextGrapheme` to a copy of the
+old function on the cluster, the width and the remainder, over every byte
+below 0x80, every pair of them, every one followed by each byte from 0x80 to
+0xff and by a set of non-ASCII starts, and seeded random strings consumed to
+the end. `TestNextGraphemeBudget` requires the change to take at most half the
+time of the segmenter path over a 4000 byte ASCII line.
+
+Method: `BenchmarkRenderTable200` built as two test binaries, the base and the
+change, run alternately for ten rounds at a fixed `-test.benchtime 300x` with
+`-test.cpu 1` under `nice` and `taskset` on one core, compared with
+`benchstat`. Intel Core Ultra 9 185H, Linux (WSL2), Go 1.26.10.
+
+| | before | after | |
+|---|---|---|---|
+| `RenderTable200` CPU per op | 823.0 us | 525.3 us | -36.2% (p<0.001) |
+| `RenderTable200` allocs/op | 1,748 | 1,748 | `~` |
+| `RenderTable200` B/op | 45.54 KiB | 45.54 KiB | `~` |
 
 ### Measured and deliberately not changed
 
@@ -1853,7 +1988,9 @@ five patterns, which would otherwise fail only on first use).
   allocations.
 - **`outputChan`**, 4096 slots and about 224 KB per pane at attach. The
   producer drops data when it is full, so shrinking it trades memory for silent
-  loss until backpressure is redesigned.
+  loss until backpressure is redesigned. Revisited in "2026-10 the client's
+  output queue": the bound and the drop rule stay, and the slots are no longer
+  reserved up front.
 - **`RestoreTerminalStates`**, serial `GetTerminalState` round trips at about
   0.2 ms per pane on top of about 2 ms fixed, and **`ensureAttachTarget`**, an
   extra verb connection of 0.4 to 0.6 ms at attach.
@@ -2133,6 +2270,66 @@ call per key. What is left of a first frame and a jump to the end is chroma
 tokenising the lines on screen (`regexp2` and `chroma.matchRules`, about 80%
 of the bytes), which is upstream.
 
+The footer's hints were fitted by building the strip for every prefix with
+`reviewHintStrip` and measuring it, so n hints cost O(n^2) styled renders on
+every review frame. `reviewHints` now renders each hint once, measures each
+render, and fits by summing widths plus two cells per join against the same room
+and margin, so its output is byte-identical. Eight interleaved rounds of the
+base and branch test binaries (`-benchtime=300x`, cores 12-17 of an Intel Core
+Ultra 9 185H, benchstat):
+
+| `ReviewFrame` | before | after | |
+|---|---|---|---|
+| `unified/cached` allocs/op | 7557 | 6122 | -19% |
+| `unified/cached` B/op | 824 KiB | 780 KiB | -5.4% |
+| `unified/cached` time | 1.28 ms | 1.10 ms | -14% (p=0.005) |
+| `split/cached` allocs/op | 8949 | 7514 | -16% |
+| `split/cached` B/op | 1047 KiB | 1003 KiB | -4.2% |
+| `split/cached` time | 1.73 ms | 1.57 ms | -9.4% (p=0.038) |
+
+The time spread is 10 to 13% per side on a shared laptop, so the allocation
+figures are the firm ones; the time rows are the measured medians with their
+p-values.
+
+A cached frame, the one a held key repeats, spent about a fifth of its CPU in
+`reviewPaint`, most of that in `lipgloss.Style.Render`, which builds and
+resolves a style for every segment of every row, and about a tenth in
+`ansi.StringWidth`, which `CodeRanges` ran on every code line twice. `reviewPaint`
+now writes each segment's escape directly (`reviewSGR`: bold, then the
+foreground, then the background, the order lipgloss writes them), so its bytes
+are the ones lipgloss rendered. A colour that is nil or `lipgloss.NoColor{}`
+(every ground and the default ink at 16 colours) is left out, as before, so
+the terminal's own colours still show at 16 colours. Text holding a tab, a
+carriage return or a newline still goes through lipgloss, because it lays a
+tab out as four spaces, joins `\r\n` into `\n` and styles each line of a
+multi-line text on its own, and an escape does none of that; the review text
+passes through `reviewText`, which drops controls, but a daemon's error
+message does not. `CodeRanges` takes the width of a line of printable ASCII
+(0x20 to 0x7E) from its byte count and the width of the styled result from the
+branch it took, instead of walking both; any other text, and a negative
+offset, keeps the walk. The cockpit's code blocks and diff cards draw through
+`CodeRanges` too and gain the same shortcut. Eight interleaved rounds of the
+base and branch test binaries (go1.26.10, `-benchtime=200x`, cores 6-11 of an
+Intel Core Ultra 9 185H, benchstat):
+
+| `ReviewFrame` | before | after | |
+|---|---|---|---|
+| `unified/cached` allocs/op | 6122 | 5536 | -9.6% |
+| `unified/cached` B/op | 780.1 KiB | 766.0 KiB | -1.8% |
+| `unified/cached` time | 1.34 ms | 1.03 ms | -23% (p=0.001) |
+| `split/cached` allocs/op | 7514 | 6928 | -7.8% |
+| `split/cached` B/op | 1002.6 KiB | 988.5 KiB | -1.4% |
+| `split/cached` time | 2.05 ms | 1.63 ms | -20% (p=0.001) |
+| `unified/page` allocs/op | 34.68k | 34.10k | -1.7% |
+| `unified/page` B/op | 2.98 MiB | 2.96 MiB | -0.5% |
+| `unified/page` time | 5.03 ms | 4.58 ms | ~ (p=0.328) |
+
+The time spread is 10 to 25% per side on a shared laptop, so the allocation
+figures are the firm ones. No row of `BenchmarkReviewFrame` is slower, and the
+cached rows of `BenchmarkReviewFrameDepth` at 256 and 16 colours are 21 to 32%
+faster (p=0.000), so the frame at those depths still costs no more than a
+truecolor one.
+
 ### Measured and deliberately not changed
 
 - **`applyInboxEvents`** now costs 11 us, 7.4 KiB and 43 allocations for a
@@ -2154,8 +2351,9 @@ of the bytes), which is upstream.
 
 ### Binary size budget
 
-`.github/workflows/binary-size.yml` runs `scripts/binary-size.sh` on every pull
-request and push to main. It builds tuios the way the release does
+`.github/workflows/binary-size.yml` runs `scripts/binary-size.sh` on every push
+to main, and on every pull request that can change the binary. `ci.yml` calls
+it. It builds tuios the way the release does
 (`CGO_ENABLED=0`, `-trimpath`, `-ldflags "-s -w"`) for linux/amd64 and
 darwin/arm64 with the Go version go.mod names, prints the size, and fails when
 a binary is over the ceiling.
@@ -2170,6 +2368,42 @@ Each pull request states its size cost in its body: the change in bytes for
 each target, from that comment or from a local run of `scripts/binary-size.sh`
 on main and on the branch. If the cost is large, say what grew and why it is
 worth the bytes.
+
+#### Where the bytes go
+
+Measured on main at add25c5d (Go 1.26.10, linux/amd64, release flags):
+48,521,378 bytes. Machine code is 24.8 MB and the function table (`.gopclntab`)
+is 15.8 MB, so each byte of code costs about 1.6 bytes of file. Read-only data
+is 6.3 MB. All embedded files together are 0.6 MB, and every large one is
+already compressed. `go tool nm -size` on a build without `-s -w` gives the
+size of each function.
+
+A generic sort links one copy of the sort for each element type it sorts.
+`slices.SortFunc` on a slice of structs costs 15 to 21 KB of code for each
+struct type, and `slices.SortStableFunc` about 6 KB. `sort.Slice` and
+`sort.SliceStable` are linked once. They give the same order as the generic
+sorts, and `sort.Slice` is as fast for a list of a few hundred elements. On a
+path that runs once per action, sort a slice of structs with `sort.Slice`. Keep
+the generic sort on the render path, on a path that runs once per key, and for
+a list that can hold thousands of elements, where `sort.Slice` measured 10 to
+40% slower. `sort.SliceStable` is about 1.6 times slower than
+`slices.SortStableFunc`.
+
+An inlined helper costs its bytes at each call site, and the file carries about
+1.6 bytes for each byte of code. To find one, run `go tool objdump` on a build
+without `-s -w` and add up the bytes per source line. A short line with a large
+total is a helper inlined at many sites. `overlay.Style` was the largest: 441
+call sites, each with a copy of `lipgloss.Style`. It now carries
+`//go:noinline`. A helper that runs once per action, or that returns a large
+struct, should carry it too.
+
+A map literal of slices compiles to code that runs at every start. A map literal
+of arrays of constants compiles to data. `verbCapabilities` uses this form.
+
+`internal/tarpack` packs text that a package reads rarely, and unpacks it on
+first use. Lessons take 357 us and 283 KB of short-lived memory on the first
+read. Plugin files take 207 us and 139 KB. Neither runs unless the tutor, Learn
+mode or an integration command runs.
 
 The per-target budgets below are history. Every pull request had to edit them,
 so every landing made the open pull requests rebase on a conflict in
@@ -3300,6 +3534,51 @@ text drawings. The build before it measured 46,141,602 and 42,841,586 bytes
 so it adds 32,768 and 17,168 bytes. No dependency was added. The new budgets
 leave 4,198 bytes of room.
 
+Six more cold sorts over struct elements went through internal/sortx: the CLI
+option search, the look take-over's config write, the spawn sheet's agents and
+machines, and hint mode's Find and settle. With Go 1.26.10, as CI builds it,
+the cut is 53,248 bytes on linux/amd64 and 67,104 on darwin/arm64. Sorts on
+render, key, event or broadcast paths, and over a type a hot path also sorts,
+keep slices.
+
+The sketch stable sorts over struct elements cut 65,536 bytes from linux/amd64
+and 51,632 from darwin/arm64. js.Sort (arrays of 64 or more elements), the
+requirement diagram's end lists and the text flowchart's end lists now go
+through sort.SliceStable, which is compiled once, where each used to compile
+its own copy of slices.SortStableFunc. The order is the same, ties included,
+because both run the same algorithm. Each call allocates about 3 times, and
+the layout runs once per source and width in loom, once per Show, Resize or
+Redraw of the area for text diagrams (internal/mermaid/live.go), never per
+compositor frame. On origin/main at dfc93341d (Go 1.26.10, as CI builds it)
+the build measured 47,972,514 and 44,528,114 bytes, and the branch measured
+47,906,978 and 44,476,482. The binary stays under the 50 MB ceiling.
+
+The sketch tokenizers and their shared helpers stay out of line. The 69
+closures inside the tokenize functions of the agentflow, flowchart, block,
+requirement and usecase lexers are methods on an unexported lexer struct, as
+the class lexer's are, with the state they captured as fields and the same
+preallocated capacities. Each small lexer method called from more than one
+site carries a bare `//go:noinline`, as the class lexer's do, and so do 15
+small helpers (js.IsSpace, Trim, TrimStart and TrimEnd; util.IsSpace, IsDigit
+and IsWord; types.NewPeleError and Throw; the common.Reader Kind, Text, Take
+and Accept; svg.SeriesColor and MarkerTrim). The most called of them (js.Trim
+at 281 sites, Reader.Kind at 309, js.IsSpace at 211) were inlined at hundreds
+of sites. The pragmas are what keep the cut: without them the small methods
+are inlined at every site again. The lexers run once per source and width in
+loom and once per Show, Resize or Redraw in internal/mermaid/live.go, never
+per compositor frame (the per-frame motion draw works on a raster scene and
+never reaches them). The cut is 319,488 bytes on linux/amd64 and 280,576 on
+darwin/arm64 for tuios, and 315,392 and 280,576 for tuios-web. On origin/main
+at 70bbad3c8 (Go 1.26.10, as CI builds it, in workspace mode) tuios measured
+48,115,874 and 44,697,154 bytes and tuios-web 52,650,146 and 49,625,426, and
+the branch measured 47,796,386 and 44,416,578 for tuios and 52,334,754 and
+49,344,850 for tuios-web. A GOWORK=off release build takes the cut once the
+root go.mod pin of tuios.dev/sketch moves, which is the third commit of the
+PR. BenchmarkRenderCorpus on one core with 20 runs per side shows no
+significant change in time (24.38 ms and 24.11 ms, p=0.95, and in a second
+run 24.64 ms and 25.44 ms, p=0.081; Go 1.26.10) and the same bytes and
+allocations per op. The binary stays under the 50 MB ceiling.
+
 To raise the ceiling, do it on purpose in its own commit: change `ceiling` in
 `scripts/binary-size.sh`, record the new value and the reason here, and say in
 the commit message what grew and why it is worth the bytes. A Go version bump
@@ -3390,8 +3669,19 @@ The scrim costs about what the spotlight does, a quarter of a millisecond on a
 full 207x55 frame, and only on frames drawn while a modal is open; a modal left
 open over quiet panes draws none. The compositor rows are within noise.
 
-The shimmer asks for at most 15 frames a second, and only while a working
-agent's row is on screen. Each is a frame with nothing dirty plus the pass. A
+The shimmer asks for at most 8 frames a second (it was 15), and only while a
+working agent's row is on screen. A tick that finds a frame composed within the
+last interval for another reason, such as pane output, draws nothing, because
+that frame carried the band already. Frames sent to the host a second, counted
+as synchronized-output ends on a pty capture, with one agent marked working:
+
+| Case | Before | After |
+|---|---|---|
+| shimmer only | 8.4 | 4.4 |
+| shimmer and a pane that prints 10 times a second | 17.4 | 10.0 |
+
+The shimmer only figure is below the rate asked for because a frame equal to the
+last one is not sent, and the band is off the name for part of each sweep. Each is a frame with nothing dirty plus the pass. A
 hovered overflowing rail row (the marquee) costs more per frame, because the
 rail is never served from its cache while it scrolls
 (`BenchmarkSidebarAgentsRebuild`, about 345 µs).
@@ -3484,6 +3774,36 @@ benchmark's repeated reads used to find it in the cache.
 `TestCopyModeSearchKeyBudget` holds one search key to 4 MB, and
 `TestHistoryCaptureBudget` holds the locked part of a history save to 4 MB.
 Both fail on the tree before this change, at 258 MB and 24.7 MB.
+
+## 2026-10 copy-mode search, one-byte cells
+
+Measured on an Intel Core Ultra 9 185H with `GOMAXPROCS=6` under
+`taskset -c 0-5`, on a shared host at a load average of 5 to 6. The base and
+branch test binaries were built with `go test -c` and run alternately, 16
+rounds each, as `<bin> -test.run '^$'
+-test.bench '^BenchmarkCopyModeSearch(Key|Typing)$' -test.benchmem
+-test.count 1`, and compared with benchstat on the pooled rounds.
+
+`searchLine.add` runs once per cell of the whole history on every search key,
+and about 63% of `CopyModeSearchKey` was in it. A cell of one ASCII byte, the
+common cell, now appends its byte (folded as before) and its index and
+returns, skipping the decode loop and the fill loop. The text, the cell
+indexes and the columns are the ones the generic path builds. A wide cell
+whose content is one ASCII byte takes the fast path and records the same
+entries; empty, sixel, multi-byte and combining cells take the generic path.
+
+| Benchmark | before | after |
+|---|---|---|
+| `CopyModeSearchKey` | 8.959 ms | 6.990 ms (-21.97%, p=0.000) |
+| `CopyModeSearchTyping` | 29.35 ms | 24.87 ms (-15.24%, p=0.003) |
+
+B/op and allocs/op are identical (386.6 KiB and 505 per key, 8.111 MiB and
+17.65k per 16 keys). Single 8-round runs gave a Typing p between 0.007 and
+0.105 on this host, so the Key result is the firm one.
+
+The copy-mode search tests in `internal/input` pin the behaviour,
+`TestMultiCopyCountBeforeYankTakesEverySelection` pins the case fold, and the
+e2e `TestCopyModeSearchColumnInScrollback` pins the columns.
 
 ## 2026-10 emulator allocations, scroll window, idle ticker, memory trim
 
@@ -3972,7 +4292,8 @@ a limit and not a reservation.
   token there.
 - A queue that grew past 16 slots gives its array back after it has stayed
   empty for one second (`queueTrimAfter`). The attach stream trims on a timer
-  it arms only for such a queue. `stream-pane` trims on its one-second tick.
+  it arms for such a queue, and also for a batch larger than 32 KiB ("2026-10
+  the output batch buffers" below). `stream-pane` trims on its one-second tick.
 
 ### Numbers
 
@@ -4024,6 +4345,224 @@ trim.
   subscribers. Those runs also used the two-lock drain, so part of the cost
   was the harness. The one-second trim keeps the steady flood at the
   old cost.
+
+## 2026-10 the client's output queue
+
+Each daemon pane on the client made its output queue whole with the pane: a
+channel of 4096 chunks, 56 bytes a slot, about 229 KB before the pane printed
+anything. The startup-pass ledger kept `outputChan` because shrinking it
+traded memory for silent loss. This entry keeps the 4096-slot bound and the
+drop rule and only stops reserving the slots up front, as the daemon's
+subscriber queue entry above did for its channel.
+
+### What changed
+
+- `outputQueue` (`internal/terminal/output_queue.go`) replaces
+  `Window.outputChan`. It is a ring behind a mutex that starts empty, doubles
+  from 16 slots with the backlog, and stops at the same 4096. A chunk the
+  bound refuses is dropped, as before. Its method set is the one `ptyQueue`
+  has: `push`, `pop`, `oversized`, `trim`, `len`, `close` and a wake channel.
+- `outputWriter` takes chunks until the queue is empty and only then waits on
+  the one-slot wake channel. A push that makes the queue non-empty leaves a
+  token there. The order, the batch cut at a resize or a drain sentinel,
+  `queuedBytes`, `maxQueuedBytes` and the epochs are unchanged.
+- A queue that grew past 16 slots gives its array back after it has stayed
+  empty for one second. The writer arms a timer for that when the queue is
+  empty and either oversized or holding a batch larger than 32 KiB ("2026-10
+  the output batch buffers" below), and stops it when it returns.
+- `DrainPendingOutput` waits for a free slot at the bound, polling at
+  `queueRoomPoll` as `waitForQueueRoom` does, so its sentinel is never
+  dropped. `Close` closes the queue, so a late sender queues nothing.
+- A window not built by `NewDaemonWindow` has no queue, and the daemon-only
+  paths stay no-ops for it.
+
+### Numbers
+
+`TestIdleDaemonPanesReserveNoOutputQueue` builds 50 daemon windows at 120x36
+with 1000 lines of scrollback and reads `HeapAlloc` after two `runtime.GC()`
+calls, before and after, with the windows reachable.
+`TestFloodedDaemonPanesGiveBackTheirQueue` builds 20 windows at 12x6 with 1
+line of scrollback. Each window has its writer stalled with `LockIO`, takes
+one chunk, settles 200 ms, is sent 5000 more chunks of one numbered line
+("N\r\n") so the queue grows to its bound, and is released and drained with
+`DrainPendingOutput`. After all 20, the test idles 1.5 s and reads the heap
+the same way. The figures below are the logged per-window readings of those
+two tests, three runs each, main and branch interleaved (main, branch, main,
+branch, main, branch), run as `nice -n 10 taskset -c 0-11 go test -count=1 -v
+-run '^(TestIdleDaemonPanesReserveNoOutputQueue|TestFloodedDaemonPanesGiveBackTheirQueue)$'
+./internal/terminal/`. The branch runs are in the branch worktree. The main
+runs are in a detached worktree of 14b4b4ec8 with only
+`daemon_window_memory_test.go` copied in from the branch;
+`output_queue_test.go` stays out of it because it needs the new type. The
+budgets in the test file fail on main, and the readings are the logged values.
+
+| per window | main | branch |
+|---|---|---|
+| idle, 50 windows | 281780, 281997, 281890 B | 52468, 52584, 52361 B |
+| after a burst and 1.5 s idle, 20 windows | 313731, 313101, 313184 B | 84016, 83946, 84089 B |
+
+An idle pane saves about 229 KB. After the same burst and idle second, a
+branch window holds about 229 KB less than a main window, the grown array given
+back; an idle branch window holds about 229 KB less than an idle main window.
+
+### Invariants held
+
+- Chunks reach the emulator in the order they arrived, and the 4097th chunk
+  queued behind a stalled writer is dropped, as with the channel.
+- A drain sentinel is never dropped: at the bound it waits for room, then
+  blocks until everything queued before it is applied, and returns when the
+  window closes.
+- The writer holds the queue lock only for a push or a pop, never across an
+  emulator write.
+
+## 2026-10 the catch-up ring grows with the output
+
+Every pane reserved a 64 KiB catch-up ring (`outputBuffer`) when it was
+installed, whether or not it ever printed more than a prompt. A pane at a shell
+prompt holds about 100 bytes of it. At 50 idle panes that was 3.1 MiB of the
+daemon's heap, held for as long as the panes live.
+
+### What changed
+
+- The ring starts nil. `appendToBuffer` grows it before it stores a chunk that
+  does not fit the room left: to the smallest power of two, at least 1 KiB,
+  that holds the bytes kept plus the chunk, capped at `outputRingMax` (64 KiB,
+  the bound as before). Only then do the tail-keep and half-buffer shift run,
+  on the ring's current length. A ring at 64 KiB never grows and behaves as it
+  did.
+- The resize-mark prune and the graphics span prune measure the ring as
+  `max(len(outputBuffer), outputRingMax)`, so a ring that is still short drops
+  the marks and spans the full ring would, and keeps the ones it keeps.
+
+### Numbers
+
+Heap: a throwaway test in the `session` package, not kept in the tree. It
+builds the in-process test daemon (`newTestDaemonSession`), reads
+`runtime.MemStats.HeapAlloc` after two `runtime.GC()` calls, adds 50 windows
+with `sh -c "sleep 1; printf 'ring-probe> '; sleep 30"`, waits 3 s, collects
+twice again and reads `HeapAlloc` once more. The figure is the difference. It
+also sums `cap(outputBuffer)` over the 50 panes. Three runs of each of main and
+branch, interleaved, `nice -n 10` on cores 6 to 11.
+
+| | main | branch |
+|---|---|---|
+| heap added by 50 panes | 9.05, 9.05, 9.06 MB | 5.83, 5.83, 5.84 MB |
+| rings, summed `cap(outputBuffer)` | 3,276,800 B | 51,200 B |
+| saved per pane, from the heap figures | | about 64.5 KB |
+
+Right after the window is added the ring has no array; once the prompt is
+printed it holds 1 KiB.
+
+Output path: `go test -run '^$' -bench 'BenchmarkPTY(OutputChunk|Broadcast)$'
+-benchmem`, six runs of each test binary (main and branch) interleaved,
+`nice -n 10` on cores 6 to 11, benchstat. Both benchmarks build their `PTY` with
+a 64 KiB ring, so the ring never grows in them; they measure the `max` in the
+two prunes and nothing else.
+
+| | main | branch | |
+|---|---|---|---|
+| OutputChunk, 0 subscribers | 965 ns | 869 ns | ~ (p=0.13) |
+| OutputChunk, 1 subscriber | 966 ns | 903 ns | ~ (p=0.065) |
+| OutputChunk, 4 subscribers | 985 ns | 888 ns | -9.9% (p=0.009) |
+| Broadcast, 1 subscriber | 348 ns | 313 ns | -10.1% (p=0.015) |
+| Broadcast, 4 subscribers | 489 ns | 477 ns | ~ (p=0.49) |
+| Broadcast, 16 subscribers | 1.04 µs | 1.12 µs | ~ (p=0.12) |
+
+Four of six rows show no change. Two read as faster at p below 0.05, but the
+runs spread by 8% to 28% on a machine in use and the code on this path differs
+by one comparison, so they are not claimed as a gain. Bytes and allocations
+per op are the same on both (0 B and 0 allocs, 1 B at 16 subscribers).
+
+`TestAnIdlePaneHoldsNoCatchUpRing` holds the budget. It adds one window to the
+test daemon, reads `cap(outputBuffer)` under `outputMu` right away and wants 0,
+then polls for up to 10 s until `outputBuffer[:outputPos]` holds the prompt
+and wants a capacity of at most 4096. On main it reads 65,536 at both points.
+`TestAGrowingRingHoldsWhatTheFixedRingHolds` holds the invariant. It is a
+seeded differential over 240 pairs of `PTY` values, one with a 64 KiB ring and
+one with none, driven by the same appends (chunks of 1 B to 80 KiB, or small
+appends that cross every size from 1 KiB to 64 KiB) and at least two
+`Resize` calls while the growing ring is short. After every append the
+returned position, `outputSeq`, `outputPos`, `outputBuffer[:outputPos]` and
+the whole `resizeMarks` slice must be equal.
+
+### Invariants held
+
+- After any sequence of appends, `outputSeq`, `outputPos` and
+  `outputBuffer[:outputPos]` equal what the fixed 64 KiB ring holds, as do the
+  resize marks. The catch-up and replay code is unchanged.
+- The ring is reassigned only inside `appendToBuffer`, and every append and
+  `broadcast` pair already holds `streamMu`, which is what lets `broadcast`
+  read the ring's length without `outputMu`.
+
+## 2026-10 the output batch buffers
+
+Both stream writers coalesce what is queued into one batch of up to 256 KiB,
+and the batch kept its capacity for as long as the stream lived. The two queue
+entries above give a grown queue back after a second, but only for a queue past
+16 slots. A flood of large chunks fills the batch without growing the queue:
+16 chunks of 16 KiB make one 256 KiB batch and leave the queue at 16 slots, so
+the trim timer never armed and each stream kept about 256 KiB for life. That is
+one buffer for every client and pane pair on the daemon and one for every
+daemon pane on the client. This revokes "the first output grows it and the
+capacity is kept" in "The output batch buffers grow on first use" above, which
+is amended in place.
+
+### What changed
+
+- `streamPTYOutput` and `outputWriter` arm the same one-second trim timer when
+  the queue is empty and either the queue is oversized or the batch is larger
+  than 32 KiB (`streamBatchKeep`, `outputBatchKeep`).
+- When the timer fires, the queue is trimmed as before and a batch past 32 KiB
+  is set to nil. The next chunk grows a new one.
+- The batch is let go only on the timer, between batches, with the queue empty.
+  A stream that is never idle for a second keeps its buffer, as the queue
+  trim does.
+
+### Numbers
+
+Heap is `HeapAlloc` after two `runtime.GC()` calls (the daemon's frame buffers
+sit in a sync.Pool and survive one GC), read before the stream or windows
+exist and again with them reachable, minus the first. Run as a throwaway
+program on cores 6-11, three runs each, main and branch interleaved.
+
+Daemon: one subscriber stream on `streamPTYOutput`, 16 chunks of 16 KiB of
+numbered lines pushed onto its queue with the frame interval set to one second.
+The queue stays at 16 slots. Read 200 ms after the batch went out, and again
+1.5 s after that.
+
+Client: 6 daemon windows at 12x6 with 1 line of scrollback, each with its
+writer stalled by `LockIO`, sent 15 chunks of 16 KiB of numbered lines, released
+and drained with `DrainPendingOutput`. The queue stays at 16 slots. Read
+straight after the drain, and again 1.5 s later; figures are bytes per window.
+
+| | main | branch |
+|---|---|---|
+| daemon stream, 200 ms after the flood | 279816, 279832, 279848 B | 280224, 280144, 280224 B |
+| daemon stream, 1.7 s after the flood | 280056, 279848, 279864 B | 1744, 1776, 1856 B |
+| client window, straight after the drain | 311244, 335878, 335876 B | 336105, 325752, 336140 B |
+| client window, 1.5 s later | 311262, 335916, 335913 B | 57630, 56813, 57646 B |
+
+The early readings match on both sides, so a batch is still kept for the
+second. The client window keeps about 57 KB that the daemon stream does not: the
+emulator, its scrollback and the screen buffers a window needs once it has
+printed.
+
+`stream_batch_trim_test.go` (session) and `output_batch_trim_test.go`
+(terminal) hold these as budgets. Each takes its baseline once the heap has
+stayed within 16 KiB for three seconds, so garbage and timers left by earlier
+tests are not counted. The early reading is taken 475 ms in, late inside the
+600 ms guard, so a batch let go before the second is up fails it. A second
+burst must then arrive whole and in order: the daemon test compares the frame
+payloads with the burst, and the client test gives the window room for the whole
+burst and checks every line of it.
+
+### Measured and deliberately not changed
+
+- **Letting the batch go at every drain.** The two queue entries rejected the
+  same thing for the array: a bursty pane regrows it at every burst. The batch
+  goes on the same one-second timer for the same reason.
+- **A timer for every idle stream.** The timer arms only for an oversized queue
+  or an oversized batch, so a stream that never flooded arms none.
 
 ## 2026-10 allocations on the output path
 
@@ -4490,3 +5029,390 @@ View per event):
 A settings frame at 320x80 still costs about 5.7 ms. `renderSettings` is 1.9
 ms of that, mostly `ansi.StringWidth` in the row layout. With one frame per
 period, that cost no longer builds a queue.
+
+## 2026-10 the motion budget starts when the frame ends (#1058)
+
+On v0.11.0, hover over the settings panel still trailed the pointer on a wide
+screen. The motion budget counted one frame period from the start of the last
+compose. A compose that took longer than one period had used up the whole
+budget before it returned, so the next motion event composed again. That
+event was already old: it had waited in Bubble Tea's queue during the
+compose. So every event composed a frame, as before #1059, and the queue
+grew for as long as the pointer moved.
+
+A settings frame at 320x80 costs about 6 ms here, and a rail hover frame
+about 2 ms. A frame period is 16.7 ms at the default 60 fps and 6.9 ms at
+144 fps. So the panel crosses the period first, on a slower machine, a wider
+screen or a higher `max_fps`, and the rail does not.
+
+### What changed
+
+The budget counts from the end of the compose. The events that queued during
+the compose drain without a frame, and the next frame is at most one period
+plus one compose behind the pointer.
+
+### Numbers
+
+`drive.py` as in the section above, 500 reports a second for 4 s, settings
+open. Lag is the time from the last report to the last frame byte.
+
+| Size | max_fps | | lag | client CPU | frames written |
+|---|---|---|---|---|---|
+| 320x80 | 60 | before | 13 ms | 47% | 219 |
+| | | after | 19 ms | 38% | 176 |
+| 320x80 | 240 | before | 7638 ms | 143% | 1633 |
+| | | after | 14 ms | 82% | 358 |
+| 400x100 | 144 | before | 5950 to 12072 ms | 127 to 149% | 947 to 1118 |
+| | | after | 20 to 509 ms | 70 to 77% | 181 to 212 |
+
+At 60 fps this machine composes inside the period, and the two builds behave
+the same. `TestSettingsHoverKeepsUpWithThePointer` drives the 400x100,
+240 fps case through the real binary.
+
+## 2026-10 the motion budget also waits for the frame's write (#1058)
+
+After the change above, `TestSettingsHoverKeepsUpWithThePointer` still failed
+in CI now and then, with the hover 5 to 6 s behind the pointer. A trace of the
+client on a loaded machine showed why. Bubble Tea writes a frame from its own
+goroutine and holds a lock while it parses, diffs and writes it. The event
+loop takes the same lock to store the view of every message. So the loop
+stopped for the whole write, which at 400x100 on a loaded machine is about as
+long as the compose. When it came back, the budget counted from the end of
+the compose had run out, and the first queued event composed again. The loop
+took one or two events per compose and write, and the reports piled up in
+the input reader.
+
+### What changed
+
+The frame writers (`PostRenderWriter`, `FrameHookWriter`) note when they
+finish writing a frame. The motion budget runs from the later of the end of
+the compose and the end of that write (`motionBudgetFrom`).
+
+### Numbers
+
+`drive.py`, 400x100, `max_fps = 240`, settings open, 500 reports a second
+for 4 s. The client runs on two cores with four busy loops on them.
+
+| | lag | frames written |
+|---|---|---|
+| before | 5186 to 6384 ms | 168 to 217 |
+| after | 27 to 56 ms | 102 to 121 |
+
+At 320x80 and 60 fps with no load, both builds write 177 frames, with 8 and
+13 ms of lag.
+
+## 2026-10 tuios.dev/tml patch path copy
+
+A patch to a tml store no longer copies the whole state to change one value.
+`Store.Set`, which runs once per keystroke in a form, takes about a third of
+the time on a 200-row table state. On Go 1.26.10, `TestStoreSetBudget` counts
+20 allocations per `Store.Set` instead of 421, and loom's `BenchmarkStoreApply`
+counts 21 instead of 422.
+
+### What changed
+
+- `applyPatch` clones only the maps and arrays on each operation's path, from
+  the root down to the operation's parent, and shares every other container
+  with the state it started from. A patch of more than 8 operations, or one
+  with a `move`, copies the whole tree as before: each operation clones its
+  own path, so a long patch would clone the same containers again and again,
+  and a `move` removes before it adds, which shifts the array indexes its add
+  path names.
+- A store copies its root once, on its first patch, so the caller's map is
+  never shared and nil maps and slices become empty ones as before. Later
+  versions of the state share the containers a patch did not touch, so a
+  caller must not change a map or slice it got from `State`.
+- Results, sizes and errors are the same as before for every patch. A
+  differential test against the full-copy code holds this, and a chain of
+  patches leaves every earlier state unchanged.
+- `cappedSize` measures a float without allocating its string. This matters
+  under the race detector and on Go 1.27 (about 400 allocations per patch on
+  this state there), and not in a normal Go 1.26.10 build.
+
+### Numbers
+
+Intel Core Ultra 9 185H, Linux (WSL2), Go 1.26.10, one core, other work on the
+machine. loom's `BenchmarkStoreApply` and `BenchmarkPatchOneBinding` as test
+binaries built from the base and from the branch, run alternately eight times
+each (1 s per run), compared with `benchstat`:
+
+| | before | after |
+|---|---:|---:|
+| `BenchmarkStoreApply` time | 99.7 µs | 34.0 µs |
+| `BenchmarkStoreApply` allocations | 422 | 21 |
+| `BenchmarkStoreApply` bytes | 70.0 KiB | 1.0 KiB |
+| `BenchmarkPatchOneBinding` time | 20.9 µs | 16.0 µs |
+| `BenchmarkPatchOneBinding` allocations | 52 | 52 |
+
+`BenchmarkPatchOneBinding` times the redraw only, with the patch outside the
+timer, so its allocations do not move; its time difference is within the
+spread of the runs (22% and 14%).
+
+The cost still grows with the state. After the patch, `Store.Apply` walks the
+whole new tree to measure its size, and for a store made from a document it
+walks the tree again to check the document's limits. This change removes the
+copy and its allocations, not those walks.
+
+### Measured and deliberately not changed
+
+- The `cappedSize` and measure walks, which keep the cost of a keystroke
+  proportional to the size of the state.
+
+## 2026-10 the client drops the decoded scrollback lines
+
+Scrolling a pane back decodes every history row it shows into a fresh line
+and keeps it in the scrollback's line cache (up to 256 lines or 65,536 cells,
+about 7.3 MB at 112 bytes a cell). After the pane is scrolled down again
+nothing reads the cache, and it was held for the pane's life.
+
+### What changed
+
+- `Emulator.ReleaseScrollbackCache` drops the main screen's cache map and its
+  cell count under the cache lock. It leaves the ring and the generation
+  alone, and a line already handed out stays valid.
+- The client's emulator release (`TryReleaseEmulatorScratch`, at most once
+  every 30 s, only after a frame changed) calls it beside the reflow scratch
+  and alternate screen releases.
+
+### Numbers
+
+`GOTOOLCHAIN=go1.26.10`. End to end, `TestClientReleasesScrollbackCache` runs
+two clients over the real daemon, each with four tiled panes in a 240x72
+terminal. The panes are 118x68, 118x33, 58x33 and 58x33, as `stty size` prints
+them in the test. Both clients scroll every pane back to its oldest line, page
+down through about 200 lines and return, and the test compares the heap gap
+between the client that releases and the one that keeps the cache. Run with
+`-v` on this branch, the gap went from -120 KiB before the scrolling to
+8120 KiB after it, so the releasing client held 8240 KiB (2060 KiB a pane)
+less.
+
+Cost: after a release the next render decodes the lines of a scrolled pane
+again. A throwaway program outside the tree (`GOTOOLCHAIN=go1.26.10`, one
+emulator per pane size with 600 lines of scrollback) calls
+`ReleaseScrollbackCache` and then `ScrollbackLine` for as many lines as the
+pane has rows, 200 times per pane. The median time and allocation of one
+decode of a screen of history:
+
+| pane | rows | median | p90 | allocated |
+|---|---|---|---|---|
+| 118x68 | 68 | 464 us | 1.16 ms | 910 KiB |
+| 118x33 | 33 | 69 us | 370 us | 442 KiB |
+| 58x33 | 33 | 30 us | 208 us | 215 KiB |
+| 58x33 | 33 | 30 us | 221 us | 215 KiB |
+
+The four panes together are 593 us at the median, once every 30 s while a
+pane stays scrolled.
+
+The libghostty backend's `scrollCache` (`vt/ghostty_scrollback.go`) holds the
+same kind of cache and is not covered.
+
+## 2026-10 an ended session's timers
+
+An SSH or web session that ends is let go at once, not when its timers fire.
+A `tea.Tick` command waits on its timer inside bubbletea's command goroutine,
+which holds the Program and the model until the timer fires, so every ended
+session kept its heap and about a dozen goroutines for the length of its
+longest pending tick: up to 30 s for the maintenance tick, minutes with the
+screensaver on. On Go 1.26.10, eight sessions that close together were still
+about 20 MiB over the baseline at the 10 s deadline and were back only after
+about 32 s (poll 27) in the default config, a minute or more with the
+screensaver on; they now leave under 1 MiB at the first poll.
+
+### What changed
+
+- `OS.tickUntilStop` is `tea.Tick` that also returns when `Cleanup` closes
+  `stopSignal`, and stops its timer then. The timer and the stop channel are
+  taken when the command is armed, as `tea.Tick` takes its timer, so a live
+  session gets the same message at the same time.
+- The timers that wait a second or more and can be armed on a served session
+  use it: the maintenance tick (`armTick`), the screensaver arm, the TML
+  clock, the foreign session listing poll, the federation poll, the sidebar
+  session retry, the host reconnect wait, the worktree-remove quit dwell, the
+  paste timeout, the transfers linger, the inbox alert settle, the subagent
+  hide, the review compare tick and the tape finish refresh.
+- `InboxAgentsTick`, a one-minute timer that only `CloseInbox` stopped, also
+  returns when the session ends.
+
+### Numbers
+
+Intel Core Ultra 9 185H, Linux (WSL2), Go 1.26.10 (`go version` checked on the
+test binaries), cores 6 to 11, other work on the machine. The release tests of
+`internal/server` open eight SSH clients, close them, and poll the process.
+
+| | before | after |
+|---|---:|---:|
+| default config, poll 1 | +136 goroutines, 21.17 MiB | +19 goroutines, 0.69 MiB |
+| default config, last poll | +110 goroutines, 20.52 MiB at poll 11 (16 s, test failed) | poll 1 passed (6.4 s) |
+| screensaver on (1 min), poll 1 | +87 goroutines, 21.18 MiB | +0 goroutines, 0.84 MiB |
+| screensaver on, last poll | +59 goroutines, 20.59 MiB at poll 11 (14 s, test failed) | poll 1 passed (4.3 s) |
+
+"Before" is the new tests on the unchanged code, which fail at their 10 s
+deadline; the old test needed 45 s.
+
+The cost of arming a tick, which runs at the frame rate while anything moves.
+A scratch benchmark outside the tree called `m.armTick(framePeriod)` on a
+bare `OS`, as test binaries built from the base and from the branch, run
+alternately eight times each (1 s per run), compared with `benchstat`:
+
+| | before | after |
+|---|---:|---:|
+| time per arm | 278.6 ns | 294.2 ns (+5.6%) |
+| bytes per arm | 288 | 296 |
+| allocations per arm | 5 | 5 |
+
+The extra 8 bytes are the larger closure; the time is the `stopMu` lock
+`stopSignal` takes. `BenchmarkIdleTick` is unchanged: an idle tick arms no
+timer (#787).
+
+### Measured and deliberately not changed
+
+- Every other `tea.Tick` in `internal/app` waits under a second: the
+  daemon reconnect wait (500 ms, never armed on a served client), the drop
+  preview (120 ms by default), the frame and motion ticks, the settles and
+  debounces. They hold a session for at most that long.
+- The 3 s `time.After` in `link_opener.go`, which runs only after a link is
+  opened.
+- The `time.AfterFunc` closures (`cockpit.go`, `sixel_symbols.go`), which hold
+  no goroutine while they wait.
+
+## 2026-10 the escape-string buffer is given back when a pane is idle
+
+The vt parser keeps one buffer for the payload of an OSC, DCS, SOS, PM or APC
+string. It starts at 4 KiB (`seqParserInitialData`) and doubles towards the
+4 MiB cap, so a sixel image or an OSC 52 write of just over 1 MiB leaves a
+2 MiB buffer and one of 3 MiB leaves 4 MiB, in the daemon's emulator and in the
+client's, for the pane's life. Commit 5d4243c2d, which made the buffer grow on
+demand, states the cost: "A pane that never receives a large payload never pays
+for one, and a pane that does keeps the grown buffer, which is the cost it had
+before." The idle release now removes that cost, and a pane that never grew pays
+nothing for it.
+
+### What changed
+
+- `seqParser.releaseData` replaces the buffer with a freshly allocated 4 KiB one
+  (a reslice would keep the grown array alive) and sets `dataLen` to 0. It does
+  nothing unless the parser is at the ground state and the buffer is larger than
+  `seqParserInitialData`.
+- `Emulator.ReleaseReflowScratch` calls it. The daemon runs that every 30 s
+  while a pane's activity latch is up, and the client after a frame changed.
+
+### Why the idle sweep and not the end of the sequence
+
+The emulator already has a precedent for the other choice: `dropPending` in
+`vt/snapshot_state.go` frees the pending-input buffer at the end of a sequence
+when it grew past `pendingKeepCap` (64 KiB). The same could be done for this
+buffer, dropping it when a string sequence is dispatched. That would regrow the
+buffer on every large payload, where the sweep regrows it at most once per 30 s
+release. The end-of-sequence drop is an option, not built.
+
+### Numbers
+
+Heap: a throwaway test in package `vt`, not kept in the tree, built with
+`GOTOOLCHAIN=go1.26.10`, run on cores 0 to 5 under the memory cap. It writes
+one test-only APC (`ESC _ X x...x ESC \`, first byte not `G`, so no built-in
+handler keeps it) into `NewEmulator(80, 24)`, calls `runtime.GC()` twice, reads
+`HeapAlloc`, calls `ReleaseReflowScratch`, collects twice and reads it again.
+Two runs of the branch and one of the base, the values within a few hundred
+bytes of each other.
+
+| payload (body plus header) | buffer | heap, base, after the release | heap, branch, after the release |
+|---|---:|---:|---:|
+| 1 MiB + 1 KiB (1,049,600 B) | 2,097,152 B | 3,013,688 B | 920,872 B |
+| 3 MiB (3,145,728 B) | 4,194,304 B | 5,112,792 B | 928,624 B |
+
+The branch gives back 2,092,816 B and 4,190,160 B, the grown buffer less the
+4,096 B that replaces it. A parser that never grew keeps its slice, with no
+allocation.
+
+### Regrowth for a pane that keeps receiving large payloads
+
+The release is not limited to idle panes, so such a pane regrows the buffer once
+per 30 s release. Measured the same way, one payload written after a release:
+
+- A payload that arrives in one `Write` allocates the final buffer once and
+  copies nothing: 2,097,187 B for the 1 MiB + 1 KiB payload and 4,194,309 B for
+  3 MiB, one allocation, about 0.2 ms (1 MiB) and 0.4 ms (3 MiB) more write time
+  than with the buffer kept.
+- A payload that arrives in small reads grows by doubling, 9 doublings to 2 MiB
+  and 10 to 4 MiB. Allocation: 4,186,112 B (1 MiB) and 8,380,416 B (3 MiB),
+  about 0.5 to 0.7 ms and 0.8 to 0.9 ms. Copying: 2,093,056 B and 4,190,208 B,
+  about 0.2 to 0.4 ms and 0.25 to 0.3 ms.
+
+That is the first-payload cost the base already pays once per pane, repeated
+once per release interval and only while payloads of that size keep arriving. A
+variant that skips the release for a buffer used since the last one would remove
+it; it is not built.
+
+### Measured and deliberately not changed
+
+- A pane left inside a string sequence (a guest killed mid-sixel, an ESC whose
+  backslash never came) keeps its grown buffer. The release needs the ground
+  state, because dropping the buffer mid-sequence would cut the payload.
+
+## 2026-10 tuios.dev/shot opaque PNG encode
+
+A screenshot with no transparent pixel encodes in well under half the time,
+about 2.3 times faster, and `tuios screenshot` and the preview panel wait that
+much less. The price is a larger file on Go 1.26: 2 to 4% on the code-like
+capture measured below. On Go 1.27, whose `compress/flate` was rewritten, the
+file is about the same size. On a busier capture the file can come out smaller
+(see Numbers), so the size depends on the capture.
+
+### What changed
+
+- `EncodePNG` writes an opaque, non-empty raster itself: an 8-bit RGB PNG with
+  one IDAT of `zlib.BestSpeed` rows, each led by filter byte 0. `image/png`
+  tries all five filters on every row of an RGBA image at any compression
+  level, and that search was about 37% of the CPU of a framed screenshot. Rows
+  are read through `Stride` and `Rect`, so a sub-image encodes what it shows.
+- An empty raster and a raster with any transparent pixel keep
+  `png.Encoder{CompressionLevel: png.BestSpeed}`: the empty one returns the
+  same error as before, and the transparent one keeps its alpha.
+
+### Numbers
+
+Intel Core Ultra 9 185H, Linux (WSL2), Go 1.26.10, one core, other work on the
+machine. The capture is the 120x40 code-like grid of `TestOpaquePNGEncodeBudget`
+at scale 2 (one line of code per row, two background colours, a coloured span
+every 17 columns; bare 2040x1320), bare and framed (window, shadow, wash,
+padding 24), and the preview is the framed capture shrunk to 900x600. That test
+logs the two size ratios. A scratch benchmark, not committed, encodes the three
+rasters. It was built as test binaries from the base and from the branch, run
+alternately 10 times each under `nice -n 10 taskset -c 2` with `-test.cpu 1`,
+and compared with `benchstat`:
+
+| | before | after |
+|---|---:|---:|
+| framed encode time | 72.9 ms | 31.2 ms |
+| bare encode time | 60.9 ms | 26.5 ms |
+| preview encode time | 15.3 ms | 7.2 ms |
+| framed file | 610,008 B | 632,881 B |
+| bare file | 561,868 B | 573,743 B |
+| preview payload | 250,630 B | 238,890 B |
+
+The framed file is 1.037 and the bare file 1.021 times the stdlib's size. The
+preview payload comes out smaller and stays under the 512 KB the preview test
+holds it to.
+
+On a busy grid, where every cell has its own colours, the unfiltered file comes
+out smaller: the framed capture goes from 1,372,976 B to 1,315,082 B, the bare
+one from 1,352,993 B to 1,310,083 B and the preview from 543,465 B to
+490,680 B. The encode time there goes from 87.3 ms to 41.4 ms (framed), from
+83.8 ms to 39.9 ms (bare) and from 23.0 ms to 11.4 ms (preview). The size
+depends on the capture; the encode time gain holds on both grids.
+
+On Go 1.27.3 the same pinned grid gives a file 0.983 (bare) and 0.990 (framed)
+times the stdlib's size. Go 1.25 gives byte-identical output to Go 1.26.10 for
+both encoders.
+
+### Measured and deliberately not changed
+
+- The Sub filter (filter byte 1 on every row, the design the finding first
+  proposed). Measured with the same method (scratch benchmark, 10 alternating
+  rounds, `nice -n 10 taskset -c 2`, `-test.cpu 1`, `-test.benchtime 10x`,
+  benchstat, Go 1.26.10) on the pinned 120x40 code-like grid at scale 2,
+  against the same rows unfiltered. The compressed stream grew from 573,686 B
+  to 646,841 B for the bare capture (1.128 times) and from 632,824 B to
+  723,706 B for the framed one (1.144 times). It was also slower: 29.0 ms
+  against 31.3 ms bare (+7.8%) and 33.4 ms against 36.4 ms framed (+8.8%).
+  Sub makes the file larger and the encode slower, so unfiltered rows stay.

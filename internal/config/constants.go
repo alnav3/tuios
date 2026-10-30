@@ -175,6 +175,10 @@ var (
 	// (Nerd Font: nf-fa-keyboard)
 	DockModeIconPrefix string
 
+	// DockModeIconLocked and DockModeIconUnlocked follow the mode icon while
+	// keybindings.lock is on (Nerd Font: nf-fa-lock, nf-fa-unlock).
+	DockModeIconLocked, DockModeIconUnlocked string
+
 	// DockIconTerminalCount is the icon for terminal count (Nerd Font: nf-fa-terminal)
 	DockIconTerminalCount string
 
@@ -213,6 +217,8 @@ func init() {
 	DockModeIconTerminal = " " + fa.Terminal.String() + " "
 	DockModeIconTiling = " " + fa.Th.String() + " "
 	DockModeIconPrefix = " " + fa.Keyboard.String() + " "
+	DockModeIconLocked = fa.Lock.String()
+	DockModeIconUnlocked = fa.Unlock.String()
 	DockIconTerminalCount = fa.Terminal.String()
 	DockIconWorkspaceCount = fa.ThLarge.String()
 	DockIconLeaveRunning = fa.SignOut.String()
@@ -249,6 +255,10 @@ const (
 
 	// DockModeIconPrefixASCII is the ASCII fallback for the armed leader
 	DockModeIconPrefixASCII = " P "
+	// DockModeIconLockedASCII and DockModeIconUnlockedASCII are the lock
+	// state without Nerd Fonts.
+	DockModeIconLockedASCII   = "LOCK"
+	DockModeIconUnlockedASCII = "UNLOCK"
 
 	// DockIconTerminalCountASCII is the ASCII fallback for terminal count
 	DockIconTerminalCountASCII = "win"
@@ -483,7 +493,7 @@ const SidebarDefaultSections = "sessions:25,terminals,files:25,agents:34"
 // section the rail does not draw, and that is the only way to turn one off:
 // there is no second switch per section, because a switch cannot say where a
 // thing goes and two spacers would have no switch to share.
-var SidebarSectionNames = []string{"sessions", "terminals", "files", "agents", "git", SidebarSectionCustom}
+var SidebarSectionNames = []string{"sessions", "terminals", "files", "agents", "git", SidebarSectionCustom, SidebarSectionPane}
 
 // SidebarSectionCustom is the rail section whose rows are the output of a
 // command the user writes, configured in [appearance.sidebar.custom]. It is
@@ -528,6 +538,20 @@ const (
 var SidebarFolderClicks = []string{
 	SidebarFolderClickNavigate, SidebarFolderClickCd, SidebarFolderClickBoth,
 }
+
+// Files section styles, for appearance.sidebar.files_style.
+//
+// List is the default and the style the section has always had: one folder,
+// a ".." row to go up, and a folder row that walks the listing into it. Tree
+// keeps one root and opens a folder in place under its row, the way neo-tree
+// does, so a person can look into two folders at once without losing either.
+const (
+	SidebarFilesList = "list"
+	SidebarFilesTree = "tree"
+)
+
+// SidebarFilesStyles lists the valid values for appearance.sidebar.files_style.
+var SidebarFilesStyles = []string{SidebarFilesList, SidebarFilesTree}
 
 // Rail header cases. See AppearanceConfig.RailHeaderCase.
 //
@@ -758,6 +782,23 @@ const (
 	ScrollColumnWidthDefault = 55
 )
 
+// ScrollColumnPresetFractions turns appearance.scroll_column_presets into the
+// widths scroll_cycle_width steps through, as fractions of the screen. A value
+// at or below zero, or above ScrollColumnWidthCeiling, is dropped (validation
+// warns about it), and the rest are sorted and deduplicated, because the cycle
+// walks the list upward and wraps to its first entry. Nil means "use the
+// built-in presets", which is what an empty or wholly invalid list gets.
+func ScrollColumnPresetFractions(percents []int) []float64 {
+	var out []float64
+	for _, p := range percents {
+		if p > 0 && p <= ScrollColumnWidthCeiling {
+			out = append(out, float64(p)/100)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
 // How far one wheel event walks the scrolling layout's strip, in cells.
 //
 // It is a flat number of cells rather than a fraction of the visible width
@@ -933,6 +974,20 @@ func (s *Settings) GetDockModeIconPrefix() string {
 		return DockModeIconPrefixASCII
 	}
 	return DockModeIconPrefix
+}
+
+// GetDockLockIcon returns the lock state the mode pill shows while
+// keybindings.lock is on, for the current glyph set.
+func (s *Settings) GetDockLockIcon(locked bool) string {
+	switch {
+	case locked && s.NerdFontsOff():
+		return DockModeIconLockedASCII
+	case locked:
+		return DockModeIconLocked
+	case s.NerdFontsOff():
+		return DockModeIconUnlockedASCII
+	}
+	return DockModeIconUnlocked
 }
 
 // GetDockIconLeaveRunning returns the leave-running icon for the current glyph set.
@@ -1499,6 +1554,10 @@ const (
 	// already on screen and is dismissed by the next click either way, so nothing
 	// is served by letting another panel cover it.
 	ZIndexContextMenu = 1500
+
+	// ZIndexPathPicker is the z-index for the path picker. It is anchored at
+	// a pane's cursor like the context menu, and sits just under it.
+	ZIndexPathPicker = 1490
 
 	// ZIndexScreensaver is the z-index for the idle screen saver. It is above
 	// everything, notifications included: the saver covers the screen, and a

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 )
 
@@ -37,16 +38,13 @@ type NotificationMsg struct {
 // ListenForNotification creates a command that waits for the next guest
 // notification and delivers it to the Update loop as a NotificationMsg.
 func ListenForNotification(ch chan NotificationMsg) tea.Cmd {
-	if ch == nil {
-		return nil
-	}
-	return func() tea.Msg {
-		notif, ok := <-ch
-		if !ok {
-			return nil
-		}
-		return notif
-	}
+	return listenNotificationUntil(nil, ch)
+}
+
+// listenNotificationUntil is ListenForNotification for a session that ends: the
+// command returns nil once stop is closed.
+func listenNotificationUntil(stop <-chan struct{}, ch chan NotificationMsg) tea.Cmd {
+	return listenOnce(stop, ch, func(notif NotificationMsg) tea.Msg { return notif })
 }
 
 // ensureNotificationChan lazily creates the notification channel. It is only
@@ -150,9 +148,21 @@ func (m *OS) setupNotificationPassthrough(window *terminal.Window) {
 			// Channel full, drop (non-blocking).
 		}
 
-		// The literal bell is intentionally not forwarded to the host: gating it
-		// on focus would require reading OS window state (m.Windows/m.FocusedWindow)
-		// from this PTY goroutine, which races the Update goroutine. The visual
-		// bell above already identifies the window that rang.
+		// The BEL itself is not written from here. notifications.bell decides
+		// whether it reaches the host terminal, and the Update goroutine owns
+		// that setting, so ringBell writes it when it handles this message.
 	}
+}
+
+// ringBell carries out notifications.bell for one rate-limited pane bell, on
+// the Update goroutine. It writes the BEL to the host terminal when the mode
+// forwards, through the same writer as the agent alert bell, so a served
+// client gets it on its own connection. It reports whether the dock should
+// also show the bell message.
+func (m *OS) ringBell() bool {
+	mode := m.Settings.Bell
+	if mode == config.BellForward || mode == config.BellBoth {
+		m.writeHostSequence([]byte{0x07})
+	}
+	return mode == config.BellToast || mode == config.BellBoth || mode == ""
 }

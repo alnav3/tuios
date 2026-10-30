@@ -70,6 +70,11 @@ const (
 	sidebarActFileCopyPath = "file_copy_path"
 	// sidebarActFileSend sends the row's file or folder to another machine.
 	sidebarActFileSend = "file_send"
+	// sidebarActFileInsertPath pastes the row's path into the focused pane.
+	sidebarActFileInsertPath = "file_insert_path"
+	// sidebarActFileQuickLook opens and closes the preview of the row. It
+	// reads and changes nothing, so it is live while file actions are off.
+	sidebarActFileQuickLook = "file_quick_look"
 	// jump_1..jump_9 are matched by prefix; see HandleSidebarKey.
 	sidebarActJumpPrefix = "jump_"
 )
@@ -223,6 +228,10 @@ func (d *ActionDispatcher) registerHandlers() {
 	d.Register("new_session", handleNewSession)
 	d.Register("next_session", handleNextSession)
 	d.Register("prev_session", handlePrevSession)
+	d.Register("next_host", handleNextHost)
+	d.Register("prev_host", handlePrevHost)
+	d.Register("next_agent", handleNextAgent)
+	d.Register("prev_agent", handlePrevAgent)
 
 	// Session switching (1-9), by the rail's own order
 	for i := 1; i <= 9; i++ {
@@ -241,6 +250,7 @@ func (d *ActionDispatcher) registerHandlers() {
 	// route through the same OS methods, so the two cannot drift apart)
 	d.Register("settings_sidebar", handleSettingsSidebar)
 	d.Register("rename_session", handleRenameSession)
+	d.Register("set_note", handleSetNote)
 	d.Register("rename_workspace", handleRenameWorkspace)
 	d.Register("kill_session", handleKillSession)
 	d.Register("kill_session_next", handleKillSessionNext)
@@ -258,6 +268,9 @@ func (d *ActionDispatcher) registerHandlers() {
 	// Both open the same dialog; see worktree_prompt.go for the verb behind it.
 	d.Register("session_new_worktree", handleSessionNewWorktree)
 	d.Register("repo_new_worktree", handleRepoNewWorktree)
+	// The third way in, by key: the repository of the focused pane's folder.
+	d.Register("new_worktree", handleNewWorktree)
+	d.Register("repo_toggle_fold", handleRepoToggleFold)
 
 	// The rail's file actions. They are dispatched by key from HandleSidebarKey,
 	// which reads its own scope, and they are registered here because the files
@@ -271,7 +284,7 @@ func (d *ActionDispatcher) registerHandlers() {
 		sidebarActFileCreate, sidebarActFileRename, sidebarActFileDelete,
 		sidebarActFileDeleteAll, sidebarActFileCopy, sidebarActFileCut,
 		sidebarActFilePaste, sidebarActFileOpen, sidebarActFileEdit,
-		sidebarActFileCopyPath, sidebarActFileSend,
+		sidebarActFileCopyPath, sidebarActFileSend, sidebarActFileInsertPath, sidebarActFileQuickLook,
 	} {
 		d.Register(action, makeSidebarFileHandler(action))
 	}
@@ -294,6 +307,7 @@ func (d *ActionDispatcher) registerHandlers() {
 	d.Register("toggle_spotlight", handleToggleSpotlight)
 	d.Register("prefix_toggle_spotlight", handleToggleSpotlight)
 	d.Register("toggle_pip", handleTogglePiP)
+	d.Register("focus_rail_pane", handleFocusRailPane)
 
 	// Multifocus actions (see multifocus_actions.go)
 	d.registerMultifocusHandlers()
@@ -312,6 +326,8 @@ func (d *ActionDispatcher) registerHandlers() {
 }
 
 // Register adds an action handler
+//
+//go:noinline
 func (d *ActionDispatcher) Register(action string, handler ActionHandler) {
 	d.handlers[action] = handler
 }
@@ -451,6 +467,17 @@ func handleSetAccent(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // handleSetSessionAccent opens the same picker on a session: the row's own
 // session when the action came from a rail menu, and the attached one when it
 // came from a key.
+// handleSetNote opens the note editor on the session whose row the menu was
+// opened on, else the attached session.
+func handleSetNote(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	name := o.TakeMenuSession()
+	if name == "" {
+		name = o.SessionName
+	}
+	o.BeginEditNote(name)
+	return o, nil
+}
+
 func handleSetSessionAccent(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	name := o.TakeMenuSession()
 	if name == "" {
@@ -635,6 +662,13 @@ func handleToggleTiling(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	} else {
 		o.ShowNotification("Tiling off", "info", o.Settings.NotificationDuration)
 	}
+	return o, nil
+}
+
+// handleToggleFloating floats the focused pane or tiles it. A TML surface
+// moves between a popup and a tiled pane, and keeps its state.
+func handleToggleFloating(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.ToggleFloating()
 	return o, nil
 }
 
@@ -1041,6 +1075,8 @@ func handleToggleHelp(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	o.ShowHelp = !o.ShowHelp
 	if o.ShowHelp {
 		o.HelpScrollOffset = 0 // Reset scroll when opening
+	} else {
+		o.HelpClosed()
 	}
 	return o, nil
 }
@@ -1049,6 +1085,7 @@ func handleQuit(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// Close help if showing
 	if o.ShowHelp {
 		o.ShowHelp = false
+		o.HelpClosed()
 		return o, nil
 	}
 	return requestQuit(o)
@@ -1072,6 +1109,16 @@ func handleToggleSpotlight(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // unpins the pinned one. See internal/app/pip.go.
 func handleTogglePiP(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	o.TogglePiP()
+	return o, nil
+}
+
+// handleFocusRailPane gives the keyboard to the rail's pane section. With no
+// pane on the screen it says how to put one there.
+func handleFocusRailPane(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if !o.FocusRailPane() {
+		o.ShowNotification("The rail shows no pane. Add pane to appearance.sidebar.sections and set [appearance.sidebar.pane] command.",
+			"info", o.Settings.NotificationDuration)
+	}
 	return o, nil
 }
 
@@ -1159,6 +1206,30 @@ func handlePrevSession(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	return o, nil
 }
 
+// handleNextHost and handlePrevHost step to the next or previous machine:
+// this one first, then the [hosts] table, as the rail lists them.
+func handleNextHost(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.CycleHost(1)
+	return o, nil
+}
+
+func handlePrevHost(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.CycleHost(-1)
+	return o, nil
+}
+
+// handleNextAgent and handlePrevAgent walk the agent panes in the order the
+// rail's agents section lists them, across sessions.
+func handleNextAgent(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.CycleAgent(1)
+	return o, nil
+}
+
+func handlePrevAgent(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.CycleAgent(-1)
+	return o, nil
+}
+
 // handleOpenSettings opens the settings overlay. Bound to "," in mode_control,
 // which the default layout binds too; mode_control is consulted after layout, so
 // settings wins and `keybinds doctor` names the resize bind it shadows.
@@ -1213,6 +1284,21 @@ func handleSessionNewWorktree(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // group header the menu was opened on.
 func handleRepoNewWorktree(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	o.BeginWorktreePromptForRepo(o.TakeMenuRepo())
+	return o, nil
+}
+
+// handleNewWorktree opens the worktree dialog on the repository of the focused
+// pane's folder, or says why it cannot.
+func handleNewWorktree(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.BeginWorktreePromptForFocusedPane()
+	return o, nil
+}
+
+// handleRepoToggleFold folds or opens the repository's group the menu was
+// opened on: the fold gesture a repo header's activation gives up when
+// group_main points the header at the main checkout's session.
+func handleRepoToggleFold(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.SidebarToggleRepoCollapsed(o.TakeMenuRepo())
 	return o, nil
 }
 

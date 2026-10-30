@@ -16,7 +16,7 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/session"
-	"github.com/Gaurav-Gosain/tuios/internal/theme"
+	"github.com/Gaurav-Gosain/tuios/internal/textedit"
 )
 
 // The questions a copy asks: cancel a copy, answer a file that is there,
@@ -178,6 +178,11 @@ func (m *OS) CopyDialogKey(key, text string) tea.Cmd {
 		return nil
 	}
 	if d.kind == copyDialogSendDir {
+		if textedit.IsWordDeleteKey(key) {
+			d.input = textedit.DropLastWord(d.input)
+			d.err = ""
+			return nil
+		}
 		switch key {
 		case "enter":
 			return m.CopyDialogActivate(0)
@@ -268,7 +273,7 @@ func (m *OS) CopyDialogActivate(idx int) tea.Cmd {
 			d.err = "Type a folder."
 			return nil
 		}
-		if !strings.HasPrefix(dir, "/") && !strings.HasPrefix(dir, "~") {
+		if !session.IsHostPath(dir) {
 			d.err = "Type a full path, or one that starts with ~."
 			return nil
 		}
@@ -760,7 +765,7 @@ func conflictLines(row session.TransferRow) []string {
 // renderCopyDialog draws the open question, with its clickable rows.
 func (m *OS) renderCopyDialog() (string, overlay.Geometry, []overlayRowHit) {
 	d := m.transfers.dialog
-	pal := theme.UI()
+	pal := m.overlayUI()
 	bg := pal.Canvas
 	width := overlay.DialogFitWidth(copyDialogWidth, m.GetRenderWidth())
 

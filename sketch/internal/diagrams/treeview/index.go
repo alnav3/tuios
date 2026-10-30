@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/treeview/index.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/treeview/index.ts at 8aff183be57021b533f319a29341a529be934b08.
 
 // Package treeview draws Mermaid's treeView diagram: a file tree, as an indented list with
 // guide lines, icons and descriptions.

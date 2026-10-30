@@ -125,11 +125,20 @@ func FilterMouseMotion(model tea.Model, msg tea.Msg) tea.Msg {
 		return msg
 	}
 
+	// On Windows, ConPTY puts a NUL before a shifted character, which the
+	// decoder reads as Ctrl+Space. It goes before anything reads keys.
+	if msg = m.dropConPTYShiftNUL(msg); msg == nil {
+		return nil
+	}
+
 	// A report at a negative position reaches here in pieces, the last of
 	// them as typed keys. It is put back together before anything reads keys.
 	if msg = m.rejoinSplitMouse(msg); msg == nil {
 		return nil
 	}
+
+	// tuios-web's report of a finger's sideways drag. See strip_touch.go.
+	msg = stripTouchReport(msg)
 
 	// A terminal asked for SGR-pixel reports sends the pointer in pixels.
 	// Everything below, and everything in Update, works in cells.
@@ -158,6 +167,12 @@ func FilterMouseMotion(model tea.Model, msg tea.Msg) tea.Msg {
 	m.NotePointerSeen(mouse.X, mouse.Y)
 
 	if m.Dragging || m.Resizing {
+		return msg
+	}
+
+	// A drag between panes over OSC 72 follows the pointer, and the press
+	// before it waits for the pointer to move. See dnd.go.
+	if m.DnDActive() {
 		return msg
 	}
 
@@ -206,7 +221,7 @@ func FilterMouseMotion(model tea.Model, msg tea.Msg) tea.Msg {
 	// only do if it is told the pointer moved. This filter is a whitelist that
 	// drops every motion event it does not recognise, so a hover handler added
 	// anywhere downstream is dead until the event is allowed through here.
-	if m.ContextMenuActive() {
+	if m.ContextMenuActive() || m.PathPickerOpen() {
 		return msg
 	}
 
@@ -230,7 +245,7 @@ func FilterMouseMotion(model tea.Model, msg tea.Msg) tea.Msg {
 	// and hover in the sidebar band needs motion to track the row under the
 	// pointer. HoverActive keeps one more event flowing after the pointer
 	// leaves the band, which is the event that clears the stale highlight.
-	if m.SidebarDragActive() || m.SidebarEdgeActive() || m.SidebarSplitActive() {
+	if m.SidebarDragActive() || m.SidebarEdgeActive() || m.SidebarSplitActive() || m.FileDragActive() {
 		// A held divider may move outside the rail's old column band;
 		// dropping that motion would leave the width fixed at its old size.
 		return msg

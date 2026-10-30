@@ -97,7 +97,7 @@ func (m *OS) sessionSwitcherRow(item sessiontree.Node, selected bool, rowBg colo
 	right := overlay.Style(rowBg).Foreground(pal.FgMute).Render(panePlural(item.WindowCount))
 	if glyph, glyphColor := agentMark(item.AgentState, item.DoneSeen, item.Subagents, pal); glyph != "" && !down {
 		right += overlay.Style(rowBg).Foreground(glyphColor).
-			Bold(sidebarAttention(item.AgentState)).Render(" " + glyph)
+			Bold(sidebarAttention(item.AgentState)).Render(" " + agentMarkCellRight(glyph))
 	}
 	if item.IsCurrent {
 		right = overlay.Style(rowBg).Foreground(pal.Success).Render("current  ") + right
@@ -139,10 +139,17 @@ func (m *OS) sessionSwitcherRow(item sessiontree.Node, selected bool, rowBg colo
 	if down {
 		labelColor = pal.FgMute
 	}
-	left := mark + overlay.Style(rowBg).Foreground(labelColor).Bold(selected).
-		Render(overlay.Truncate(printableTitle(title), avail))
+	label := overlay.Truncate(printableTitle(title), avail)
+	left := mark + overlay.Style(rowBg).Foreground(labelColor).Bold(selected).Render(label)
 	if identity != "" {
 		left += overlay.Style(rowBg).Foreground(pal.FgMute).Render(identity)
+	}
+	// The return note follows the label in muted ink, cut to the room the
+	// row has left, and dropped when that room is too small to say anything.
+	if note := item.Note; note != "" {
+		if room := avail - lipgloss.Width(label) - 2; room >= railNoteMin {
+			left += overlay.Style(rowBg).Foreground(pal.FgMute).Render("  " + overlay.Truncate(printableTitle(note), room))
+		}
 	}
 	return listRowSpans(width, listRowMarker(selected), left, right, rowBg, pal)
 }

@@ -33,6 +33,11 @@ import (
 //   - macOS: osascript's clipboard info, then pngpaste when it is installed
 //     and the clipboard as «class PNGf» when it is not.
 //   - Windows: PowerShell's System.Windows.Forms.Clipboard.
+//   - WSL: the same, through powershell.exe. The terminal runs on Windows, so
+//     the screenshot is on the Windows clipboard. WSLg sets WAYLAND_DISPLAY
+//     and DISPLAY as well, but its bridge carries only text: xclip and
+//     wl-paste there list no image when Windows holds one. WSL is checked
+//     before them for that reason.
 //
 // The client runs on the person's machine in every case this is used for:
 // imagePasteReason refuses a browser tab and a remote SSH client, whose
@@ -72,12 +77,15 @@ const (
 	imageClipX11
 	imageClipDarwin
 	imageClipWindows
+	imageClipWSL
 )
 
 // imageClipboard reads images from one platform's clipboard.
 type imageClipboard struct {
 	backend imageClipboardBackend
 	env     imageClipboardEnv
+	// powershell is the PowerShell to run, for the Windows and WSL backends.
+	powershell string
 }
 
 // Bounds on the helper processes. Listing the types is a question the paste
@@ -196,6 +204,9 @@ func detectImageClipboard(env imageClipboardEnv) *imageClipboard {
 		}
 		return nil
 	}
+	if ps := wslPowerShell(env); ps != "" {
+		return &imageClipboard{backend: imageClipWSL, env: env, powershell: ps}
+	}
 	if env.getenv("XDG_RUNTIME_DIR") != "" && env.getenv("WAYLAND_DISPLAY") != "" && env.lookPath("wl-paste") {
 		return &imageClipboard{backend: imageClipWayland, env: env}
 	}
@@ -209,10 +220,31 @@ func detectImageClipboard(env imageClipboardEnv) *imageClipboard {
 		}
 	case "windows":
 		if env.lookPath("powershell") {
-			return &imageClipboard{backend: imageClipWindows, env: env}
+			return &imageClipboard{backend: imageClipWindows, env: env, powershell: "powershell"}
 		}
 	}
 	return nil
+}
+
+// wslDefaultPowerShell is where Windows keeps PowerShell, under the default
+// automount root. It is used when the Windows PATH is not appended to the
+// distribution's (appendWindowsPath=false in wsl.conf).
+const wslDefaultPowerShell = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+// wslPowerShell returns the powershell.exe a client under WSL reads the
+// Windows clipboard with, or "" when this is not WSL or none can be run.
+// WSL names the distribution and the interop socket in every process it
+// starts, and a shell inherits them.
+func wslPowerShell(env imageClipboardEnv) string {
+	if env.goos != "linux" || (env.getenv("WSL_DISTRO_NAME") == "" && env.getenv("WSL_INTEROP") == "") {
+		return ""
+	}
+	for _, ps := range []string{"powershell.exe", wslDefaultPowerShell} {
+		if env.lookPath(ps) {
+			return ps
+		}
+	}
+	return ""
 }
 
 // windowsClipTypes prints image/png and text/plain, one per line, for what
@@ -231,6 +263,26 @@ const windowsClipImage = `Add-Type -AssemblyName System.Windows.Forms; Add-Type 
 // names them that way. An empty clipboard is no types and no error.
 func (c *imageClipboard) Types(ctx context.Context) ([]string, error) {
 	return c.typesWithin(ctx, imageClipTypesTimeout)
+}
+
+// darwinHasText reports whether the macOS clipboard holds text, through
+// pbpaste. ok is false when this is not macOS, pbpaste is missing, or it did
+// not answer within limit. pbpaste is asked for no bytes at all: the first
+// byte it writes is the answer, and it is killed there.
+func (c *imageClipboard) darwinHasText(ctx context.Context, limit time.Duration) (hasText, ok bool) {
+	if c.backend != imageClipDarwin || !c.env.lookPath("pbpaste") {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	out, err := c.env.run(ctx, 0, "pbpaste")
+	switch {
+	case errors.Is(err, errClipboardTooLarge):
+		return true, true
+	case err != nil:
+		return false, false
+	}
+	return len(out) > 0, true
 }
 
 // errClipTypesUnsupported is a tool that says it cannot list the clipboard
@@ -253,8 +305,8 @@ func (c *imageClipboard) typesWithin(ctx context.Context, limit time.Duration) (
 		if err == nil {
 			return darwinClipTypes(string(out)), nil
 		}
-	case imageClipWindows:
-		out, err = c.env.run(ctx, imageClipTypesMax, "powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipTypes)
+	case imageClipWindows, imageClipWSL:
+		out, err = c.env.run(ctx, imageClipTypesMax, c.powershell, "-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipTypes)
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -360,8 +412,8 @@ func (c *imageClipboard) ReadImage(ctx context.Context, types []string) ([]byte,
 		out, err = c.env.run(ctx, session.PasteImageMaxBytes, "xclip", "-selection", "clipboard", "-t", kind, "-o")
 	case imageClipDarwin:
 		out, err = c.readDarwin(ctx, kind)
-	case imageClipWindows:
-		out, err = c.env.run(ctx, int64(base64.StdEncoding.EncodedLen(session.PasteImageMaxBytes))+64, "powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipImage)
+	case imageClipWindows, imageClipWSL:
+		out, err = c.env.run(ctx, int64(base64.StdEncoding.EncodedLen(session.PasteImageMaxBytes))+64, c.powershell, "-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipImage)
 		if err == nil {
 			out, err = base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
 		}

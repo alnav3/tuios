@@ -83,6 +83,9 @@ type PasteBufferFetchedMsg struct {
 	// local store asks the same.
 	asked   string
 	version uint64
+	// held says the read held the keys typed after the paste key. See
+	// pasteHold.
+	held bool
 }
 
 // PasteBufferDeletedMsg reports a delete from the chooser.
@@ -257,10 +260,11 @@ func (m *OS) pasteBufferNamed(name, window string, version uint64) tea.Cmd {
 	if version != 0 {
 		params["version"] = version
 	}
+	m.pasteHold.pending++
 	return func() tea.Msg {
 		raw, err := call("show-buffer", params)
 		if err != nil {
-			return PasteBufferFetchedMsg{Name: name, Window: window, Err: err, asked: name, version: version}
+			return PasteBufferFetchedMsg{Name: name, Window: window, Err: err, asked: name, version: version, held: true}
 		}
 		var res struct {
 			Name    string `json:"name"`
@@ -268,7 +272,7 @@ func (m *OS) pasteBufferNamed(name, window string, version uint64) tea.Cmd {
 			DataB64 string `json:"data_b64"`
 		}
 		if err := json.Unmarshal(raw, &res); err != nil {
-			return PasteBufferFetchedMsg{Name: name, Window: window, Err: err, asked: name}
+			return PasteBufferFetchedMsg{Name: name, Window: window, Err: err, asked: name, held: true}
 		}
 		data := res.Data
 		if res.DataB64 != "" {
@@ -277,8 +281,63 @@ func (m *OS) pasteBufferNamed(name, window string, version uint64) tea.Cmd {
 				data = string(b)
 			}
 		}
-		return PasteBufferFetchedMsg{Name: res.Name, Data: data, Window: window}
+		return PasteBufferFetchedMsg{Name: res.Name, Data: data, Window: window, held: true}
 	}
+}
+
+// pasteHold keeps the keys typed while a paste reads its buffer from the
+// daemon (#1016). The read runs off the update loop, so without the hold a
+// key typed right after the paste key reaches the pane first, and an Enter
+// runs the line without the paste. tmux pastes at once, so a key typed after
+// the paste key always comes after the paste. The hold gives the same order:
+// the keys wait, and go to the input handler in order once the paste is in.
+//
+// The read has a timeout (pasteBufferTimeout), and its answer always comes
+// back as a PasteBufferFetchedMsg, so the hold always ends.
+type pasteHold struct {
+	// pending is how many reads have not answered yet.
+	pending int
+	// keys are the held messages, in the order they came.
+	keys []tea.Msg
+}
+
+// holdKeyForPaste keeps msg for later and reports true while a paste reads
+// its buffer. Only keyboard input is held: the pointer acts on what is on the
+// screen now.
+func (m *OS) holdKeyForPaste(msg tea.Msg) bool {
+	if m.pasteHold.pending == 0 {
+		return false
+	}
+	switch msg.(type) {
+	case tea.KeyPressMsg, tea.KeyReleaseMsg, tea.PasteMsg, tea.PasteStartMsg, tea.PasteEndMsg:
+		m.pasteHold.keys = append(m.pasteHold.keys, msg)
+		return true
+	}
+	return false
+}
+
+// releasePasteHold ends one read. When none is left, it gives the held keys
+// to the input handler in the order they came. A held key can start another
+// paste: the keys after it are held again, behind that paste.
+func (m *OS) releasePasteHold() tea.Cmd {
+	if m.pasteHold.pending > 0 {
+		m.pasteHold.pending--
+	}
+	handler := getInputHandler()
+	var cmds []tea.Cmd
+	for m.pasteHold.pending == 0 && len(m.pasteHold.keys) > 0 {
+		msg := m.pasteHold.keys[0]
+		m.pasteHold.keys = m.pasteHold.keys[1:]
+		if handler == nil {
+			continue
+		}
+		_, cmd := handler(msg, m)
+		cmds = append(cmds, cmd)
+	}
+	if len(m.pasteHold.keys) == 0 {
+		m.pasteHold.keys = nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // handlePasteBufferFetched pastes a fetched buffer into the pane it was asked
@@ -361,12 +420,15 @@ func (m *OS) PasteIntoFocused(text string) bool {
 // characters, so text holding ESC[201~ cannot end the bracketed paste early
 // and have the rest run as typed input.
 func (m *OS) PasteIntoWindow(w *terminal.Window, text string) bool {
-	// A TML surface has no field that takes text yet, and its PTY only
-	// holds the place, so a paste there goes nowhere. Say so rather than
-	// lose it unseen.
+	// A TML surface takes a paste into its focused text field. Its PTY only
+	// holds the place, so a paste with no field to take it goes nowhere:
+	// say so rather than lose it unseen.
 	if m.DrawsTML(w) {
-		m.ShowNotification("This surface takes no pasted text.", "warning", m.Settings.NotificationDuration)
-		return false
+		if !m.TMLPaste(w, text) {
+			m.ShowNotification("Select a text field in the surface first.", "warning", m.Settings.NotificationDuration)
+			return false
+		}
+		return true
 	}
 	if w.InImplicitCopyMode() {
 		w.ExitCopyMode()

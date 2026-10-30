@@ -216,6 +216,8 @@ func runE2E(m *testing.M) int {
 type startOpts struct {
 	// cols and rows size the PTY. Zero means 120x40.
 	cols, rows int
+	// dir is the calling client's directory. Empty uses the harness workdir.
+	dir string
 	// args are extra tuios command-line flags, e.g. "--shared-borders".
 	args []string
 	// env are extra KEY=VALUE entries layered over the isolated defaults.
@@ -378,6 +380,13 @@ func startIn(t *testing.T, base string, o startOpts) *tuitest.Terminal {
 	if gorace := os.Getenv("GORACE"); gorace != "" {
 		env = append(env, "GORACE="+gorace)
 	}
+	// GOCOVERDIR is forwarded for the same reason: the test map job runs each
+	// test against a tuios built with -cover, and a client that never sees the
+	// directory writes no coverage, which would make the test look like it
+	// never reached the client code.
+	if dir := os.Getenv("GOCOVERDIR"); dir != "" {
+		env = append(env, "GOCOVERDIR="+dir)
+	}
 	env = append(env, o.env...)
 
 	cols, rows := o.cols, o.rows
@@ -425,12 +434,16 @@ func startIn(t *testing.T, base string, o startOpts) *tuitest.Terminal {
 		}
 	})
 
+	clientDir := o.dir
+	if clientDir == "" {
+		clientDir = workDirIn(t, base)
+	}
 	opts := []tuitest.Option{
 		tuitest.WithSize(cols, rows),
 		tuitest.WithTerm("xterm-256color"),
 		tuitest.WithEnv(env...),
 		tuitest.WithLog(logFile),
-		tuitest.WithDir(workDirIn(t, base)),
+		tuitest.WithDir(clientDir),
 	}
 	if o.out != nil {
 		opts = append(opts, tuitest.WithOutputMirror(o.out))
@@ -573,6 +586,19 @@ func newWindow(t *testing.T, term *tuitest.Terminal) {
 	}, uiTimeout); err != nil {
 		t.Fatalf("no new window after 'n' (count %d -> %d): %v\n%s",
 			before, countWindows(term.Screen()), err, term.Snapshot())
+	}
+}
+
+// waitDockWorkspace blocks until the dock status field names workspace ws.
+// Call it after a key that switches workspace and before newWindow: the count
+// is per workspace, so a count read before the switch is drawn is the old
+// workspace's, and newWindow then waits for one more than that forever.
+func waitDockWorkspace(t *testing.T, term *tuitest.Terminal, ws int) {
+	t.Helper()
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return dockWorkspace(s) == ws
+	}, uiTimeout); err != nil {
+		t.Fatalf("the dock never showed workspace %d: %v\n%s", ws, err, term.Snapshot())
 	}
 }
 
@@ -1172,7 +1198,7 @@ func enableTiling(t *testing.T, term *tuitest.Terminal, markers ...string) {
 	t.Helper()
 	if !settledTiling(t, term) {
 		if len(markers) == 0 {
-			// notifications linger for config.NotificationDuration (6s), so this is
+			// notifications linger for config.NotificationDuration (2s), so this is
 			// the budget for an earlier one to expire. In practice it is already
 			// gone and this returns immediately.
 			if err := term.WaitFor(func(s tuitest.Screen) bool {
@@ -1387,15 +1413,30 @@ func xdgDir(base, key string) string {
 	// Seven hex digits, not more, because what the socket budget leaves for
 	// this whole short path once a named server's longest socket is paid for
 	// (see shortPathSocket) has single digits of room in it.
-	sum := sha256.Sum256([]byte(base))
-	short := filepath.Join(shortRuntimeRoot, hex.EncodeToString(sum[:4])[:7])
-	if n := len(filepath.Join(short, shortPathSocket)); n > unixSocketPathMax {
-		panic(fmt.Sprintf("e2e: the redirected runtime dir %s leaves a %d byte socket path, over the %d byte limit -- pid %d has an unusually long decimal form, or this machine's /tmp is not where it is expected to be",
-			short, n, unixSocketPathMax, os.Getpid()))
-	}
-	prior, already := redirected.LoadOrStore(short, base)
-	if already && prior.(string) != base {
-		panic(fmt.Sprintf("e2e: %s and %s both hash to the short runtime path %s -- widen the hash in xdgDir", base, prior, short))
+	//
+	// Seven digits collide now and then across a few hundred roots in one
+	// process, and the budget has no room for an eighth. So a root whose name
+	// is taken by another one tries the next name in its own sequence. The
+	// sequence is fixed per root and the claims are kept for the process, so a
+	// second call for the same root walks to the same answer.
+	var short string
+	var already bool
+	for i := 0; ; i++ {
+		seed := base
+		if i > 0 {
+			seed = fmt.Sprintf("%s#%d", base, i)
+		}
+		sum := sha256.Sum256([]byte(seed))
+		short = filepath.Join(shortRuntimeRoot, hex.EncodeToString(sum[:4])[:7])
+		if n := len(filepath.Join(short, shortPathSocket)); n > unixSocketPathMax {
+			panic(fmt.Sprintf("e2e: the redirected runtime dir %s leaves a %d byte socket path, over the %d byte limit -- pid %d has an unusually long decimal form, or this machine's /tmp is not where it is expected to be",
+				short, n, unixSocketPathMax, os.Getpid()))
+		}
+		var prior any
+		prior, already = redirected.LoadOrStore(short, base)
+		if !already || prior.(string) == base {
+			break
+		}
 	}
 	mustMkdir(short)
 	if !already {

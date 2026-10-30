@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/xychart/index.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/xychart/index.ts at 8aff183be57021b533f319a29341a529be934b08.
 
 // Package xychart draws Mermaid's xychart: bar and line series over a category or
 // numeric axis.

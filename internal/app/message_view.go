@@ -11,7 +11,6 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/Gaurav-Gosain/tuios/internal/overlay"
-	"github.com/Gaurav-Gosain/tuios/internal/theme"
 )
 
 // The message view is the one place a message is read in full.
@@ -116,6 +115,9 @@ func (m *OS) notifSourceName(t *NotifTarget) string {
 	}
 	if t.Thread != 0 {
 		return "Agent mail"
+	}
+	if t.AgentInstall != "" {
+		return ""
 	}
 	if w := m.windowByID(t.WindowID); w != nil {
 		if name := printableTitle(m.railTitleShown(w)); name != "" {
@@ -226,8 +228,12 @@ func (m *OS) messageViewHints() []overlay.Hint {
 		{Key: "j/k", Label: "scroll"},
 		{Key: "y", Label: "copy"},
 	}
-	if m.msgView.entry.goesSomewhere() {
-		hints = append(hints, overlay.Hint{Key: "enter", Label: "go to source"})
+	if e := m.msgView.entry; e.goesSomewhere() {
+		label := "go to source"
+		if e.Target.AgentInstall != "" {
+			label = "install"
+		}
+		hints = append(hints, overlay.Hint{Key: "enter", Label: label})
 	}
 	return append(hints, overlay.Hint{Key: "esc", Label: "close"})
 }
@@ -297,7 +303,7 @@ func (m *OS) renderMessageView(layers []*lipgloss.Layer) []*lipgloss.Layer {
 	if !m.msgView.open {
 		return layers
 	}
-	pal := theme.UI()
+	pal := m.overlayUI()
 	bg := pal.Surface
 	width, lines, rows, maxScroll, hints := m.messageViewLayout()
 	m.msgView.scroll = max(0, min(m.msgView.scroll, maxScroll))

@@ -300,9 +300,16 @@ func TestHerdrPluginTrustAndHooks(t *testing.T) {
 // herdrPluginCall branch cut from herdrAPICall, both runs fail as
 // unsupported; with cmd.Dir cut from Runner.Start, the cwd check fails;
 // with the grant check cut from herdrPluginLogList, the read-only pane
-// reads the log.
+// reads the log; with the HoldLease call cut from pluginHost.run, herdr's
+// cleanup gets the lease of the running install.
+//
+// The last part runs a plugin from an install herdr 0.9.4 and later make,
+// with herdr's .in-use marker. While its action runs, an exclusive flock on
+// the marker without waiting, which is how herdr's cleanup asks before it
+// deletes an old install, is refused. Before the run and after it, it is
+// taken, so the daemon holds the lease only while the command runs.
 func TestHerdrPluginActions(t *testing.T) {
-	_, base := pluginClient(t, pluginsConfig(t, []string{"e2e.actions"}, "actions"))
+	_, base := pluginClient(t, pluginsConfig(t, []string{"e2e.actions", herdrLeaseID}, "actions"))
 	const id = "e2e.actions"
 	root := pluginFixture(t, "actions")
 	crushPanes(t, base, "w1")
@@ -377,6 +384,106 @@ func TestHerdrPluginActions(t *testing.T) {
 			t.Errorf("plugin %s from a read-only pane: exit %d, stdout %q, stderr %q; want herdr's forbidden error", name, st.code, st.out, st.err)
 		}
 	}
+
+	checkHerdrInstallLease(t, base)
+}
+
+// herdrLeaseID is the plugin checkHerdrInstallLease installs as herdr does.
+const herdrLeaseID = "e2e.lease"
+
+// checkHerdrInstallLease makes an install as herdr plugin install makes it,
+// github-installations/<plugin>/<install>/checkout with an .in-use marker
+// beside the checkout, lists it in herdr's plugins.json, and runs its action.
+// While the action runs, herdr's cleanup cannot get the marker's lock.
+func checkHerdrInstallLease(t *testing.T, base string) {
+	t.Helper()
+	herdrDir := filepath.Join(xdgDir(base, "XDG_CONFIG_HOME"), "herdr")
+	install := filepath.Join(herdrDir, "plugins", "github-installations", herdrLeaseID, "4242-0")
+	checkout := filepath.Join(install, "checkout")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `id = "` + herdrLeaseID + `"
+name = "E2E lease"
+version = "1.0.0"
+min_herdr_version = "0.9.5"
+
+[[actions]]
+id = "hold"
+title = "Hold"
+contexts = ["pane"]
+command = ["sh", "-c", "touch \"$HERDR_PLUGIN_STATE_DIR/held\"; while [ ! -e \"$HERDR_PLUGIN_STATE_DIR/go\" ]; do sleep 0.1; done; echo released"]
+`
+	if err := os.WriteFile(filepath.Join(checkout, "herdr-plugin.toml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(install, ".in-use")
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg, _ := json.Marshal([]map[string]any{{
+		"plugin_id": herdrLeaseID, "manifest_path": filepath.Join(checkout, "herdr-plugin.toml"),
+		"plugin_root": checkout, "source": map[string]any{"kind": "github", "managed_path": checkout},
+	}})
+	if err := os.WriteFile(filepath.Join(herdrDir, "plugins.json"), reg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// cleanupLock is herdr's reclaim: an exclusive flock without waiting.
+	// It reports whether the lock was taken, and drops it at once.
+	cleanupLock := func() bool {
+		f, err := os.OpenFile(marker, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err != nil && err != syscall.EWOULDBLOCK {
+			t.Fatalf("flock %s: %v", marker, err)
+		}
+		return err == nil
+	}
+	if !cleanupLock() {
+		t.Fatal("the install's lease is held before its plugin runs")
+	}
+
+	if out, err := tuiosCLI(t, base, "plugins", "run", herdrLeaseID, "hold"); err != nil {
+		t.Fatalf("plugins run %s hold: %v\n%s", herdrLeaseID, err, out)
+	}
+	waitFile := func(p string) {
+		deadline := time.Now().Add(2 * uiTimeout)
+		for {
+			if _, err := os.Stat(p); err == nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				out, _ := tuiosCLI(t, base, "plugins", "log")
+				t.Fatalf("%s never appeared. Plugin log:\n%s", p, out)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	waitFile(filepath.Join(pluginState(base, herdrLeaseID), "held"))
+	held := cleanupLock()
+	if err := os.WriteFile(filepath.Join(pluginState(base, herdrLeaseID), "go"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatal("herdr's cleanup got the lease of an install whose plugin command runs")
+	}
+
+	deadline := time.Now().Add(uiTimeout)
+	for !cleanupLock() {
+		if time.Now().After(deadline) {
+			out, _ := tuiosCLI(t, base, "plugins", "log")
+			t.Fatalf("the lease is still held after the command ended. Plugin log:\n%s", out)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	logs, _ := herdrCall(t, base, "plugin.log.list", map[string]any{"plugin_id": herdrLeaseID})["logs"].([]any)
+	if len(logs) != 1 || logs[0].(map[string]any)["status"] != "succeeded" {
+		t.Fatalf("the held run did not end as succeeded: %v", logs)
+	}
 }
 
 // TestHerdrPluginPanes opens a plugin's popup from outside every pane, and
@@ -385,10 +492,15 @@ func TestHerdrPluginActions(t *testing.T) {
 // variables, and the marker it prints is on screen. popup.close and
 // plugin.pane.close close them.
 //
+// The split pane tags the pane it was opened from with a metadata token, as
+// herdr-sidebar tags each preview pane it opens, and the token is on that
+// pane's record. A plain pane that tags another pane is still refused.
+//
 // Negative controls (NEGATIVE_CONTROLS.md, "herdr plugins"): with Env cut
 // from the NewWindowOptions in herdrPluginPaneOpen, the pane env files lack
 // the entrypoint; with Popup forced false, the popup opens as a tile and
-// the window count check fails.
+// the window count check fails; with the pluginPaneMetadataTarget call cut
+// from herdrPane, the plugin pane's tag is refused.
 func TestHerdrPluginPanes(t *testing.T) {
 	term, base := pluginClient(t, pluginsConfig(t, []string{"e2e.panes"}, "panes"))
 	const id = "e2e.panes"
@@ -454,8 +566,25 @@ func TestHerdrPluginPanes(t *testing.T) {
 	if envValue(side, "entry") != "side" || envValue(side, "pane") != paneID || envValue(side, "cwd") != root {
 		t.Fatalf("the split pane saw (opened as %s):\n%s", paneID, side)
 	}
+	// The split pane tagged the pane focused when it opened.
+	mark := waitPluginFile(t, base, id, "mark.out", "code=")
+	_, target, _ := strings.Cut(mark, "code=0 target=")
+	target = strings.TrimSpace(target)
+	if target == "" || target == paneID {
+		t.Fatalf("the plugin pane could not tag the pane it was opened from:\n%s", mark)
+	}
+	tagged := herdrCall(t, base, "pane.get", map[string]any{"pane_id": target})
+	if got := dig(tagged, "pane", "tokens", "e2e-mark"); got != "from-plugin-pane" {
+		t.Fatalf("%s holds e2e-mark %v after the plugin pane tagged it: %v", target, got, tagged)
+	}
+	// A plain pane may still tag only itself.
+	plain := runHerdrSteps(t, base, "w1", "plain-mark", "step mark \"$H\" pane report-metadata "+paneID+" --source e2e.plain --token e2e-mark=from-w1\n")
+	if st := plain["mark"]; st.code == 0 || !strings.Contains(st.out+st.err, "may report only for itself") {
+		t.Fatalf("a plain pane tagged the plugin pane: exit %d, stdout %q, stderr %q", st.code, st.out, st.err)
+	}
 	savePluginArtifact(t, base, id, "pane-pop.env")
 	savePluginArtifact(t, base, id, "pane-side.env")
+	savePluginArtifact(t, base, id, "mark.out")
 	if res := herdrCall(t, base, "plugin.pane.close", map[string]any{"pane_id": paneID}); res["type"] != "plugin_pane_closed" {
 		t.Fatalf("plugin.pane.close answered %v", res)
 	}

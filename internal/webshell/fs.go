@@ -1,10 +1,13 @@
 package webshell
 
 import (
+	"io/fs"
+	"os"
 	"path"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // fsMu guards files, fsDirs and the fake git repository. Every pane shares
@@ -89,8 +92,11 @@ Things to try here:
 
 // files is the whole fake filesystem. Directories are implied by the paths.
 // Every pane shares it, so a file one pane creates is visible in the others.
-var files = map[string]string{
-	Home + "/README.md": `# Welcome to tuios
+var files map[string]string
+
+func initFiles() {
+	files = map[string]string{
+		Home + "/README.md": `# Welcome to tuios
 
 Everything here runs in your browser: the window manager, this
 shell, all of it. Nothing to install, nothing sent anywhere.
@@ -105,19 +111,19 @@ Things to try:
                        watch tuios drive itself
   help                 everything this shell knows
 `,
-	Home + "/notes.txt": `Things to remember
+		Home + "/notes.txt": `Things to remember
 - Ctrl+B is the prefix key. Press it, let go, then press the next key.
 - Ctrl+B then Esc leaves typing mode, so you can move windows around.
 - i goes back to typing in the window.
 - Ctrl+B then ? shows every key.
 `,
-	Home + "/todo.md": `- [x] open tuios
+		Home + "/todo.md": `- [x] open tuios
 - [ ] open a second window
 - [ ] tile them
 - [ ] switch to workspace 2
 - [ ] let the agent ask for something
 `,
-	Home + "/demo.tape": `# A short tour that tuios plays by itself.
+		Home + "/demo.tape": `# A short tour that tuios plays by itself.
 # Run it with: tuios tape play demo.tape
 Sleep 600ms
 WindowManagementMode
@@ -148,7 +154,7 @@ NextWindow
 Sleep 500ms
 TerminalMode
 `,
-	Home + "/party.tape": `# Three programs, a zoom and a trip to workspace 2, all typed by tuios.
+		Home + "/party.tape": `# Three programs, a zoom and a trip to workspace 2, all typed by tuios.
 # Run it with: tuios tape play party.tape
 WindowManagementMode
 EnableTiling
@@ -186,26 +192,91 @@ Type "fastfetch"
 Enter
 Sleep 300ms
 `,
-	ProjectDir + "/go.mod":        helloGoMod,
-	ProjectDir + "/main.go":       helloMain,
-	ProjectDir + "/greet.go":      helloGreetWork,
-	ProjectDir + "/greet_test.go": helloTest,
-	ProjectDir + "/README.md":     helloReadme,
-	ProjectDir + "/TODO.md":       "- shout at people, but kindly\n",
-	Home + "/projects/website/index.html": `<!doctype html>
+		ProjectDir + "/go.mod":        helloGoMod,
+		ProjectDir + "/main.go":       helloMain,
+		ProjectDir + "/greet.go":      helloGreetWork,
+		ProjectDir + "/greet_test.go": helloTest,
+		ProjectDir + "/README.md":     helloReadme,
+		ProjectDir + "/TODO.md":       "- shout at people, but kindly\n",
+		Home + "/projects/website/index.html": `<!doctype html>
 <title>hi</title>
 <link rel="stylesheet" href="style.css">
 <h1>it works</h1>
 `,
-	Home + "/projects/website/style.css": `h1 { color: hotpink; }
+		Home + "/projects/website/style.css": `h1 { color: hotpink; }
 `,
-	ConfigPath:  configText("", "rounded", "default"),
-	"/etc/motd": "Be kind to your terminal.\n",
+		ConfigPath: configText("", "rounded", "default", nil),
+		Home + "/deploy.tml": `<tml version="1" title="Deploy api">
+  <state>{"envs": ["staging", "production"], "deploy": {"tag": "v1.4.0", "env": "staging"}}</state>
+  <form on-submit="close(state.deploy)" pad="1">
+    <kv>
+      <item k="Service" v="api"/>
+      <item k="Change" v="12 files, +210 -64"/>
+      <item k="Checks" v="all passed" role="success"/>
+    </kv>
+    <input name="tag" label="Tag" bind="state.deploy.tag" required="true"/>
+    <text role="dim">Target: pick one with enter</text>
+    <list items="state.envs" as="env" select="single" on-select="set('state.deploy.env', event.item)">
+      <row gap="1"><text w="12">{env}</text><badge if="env == state.deploy.env" role="accent">picked</badge></row>
+    </list>
+    <row gap="2">
+      <button kind="primary" submit="true">Deploy</button>
+      <button key="esc" on-press="close(null)">Cancel</button>
+    </row>
+  </form>
+</tml>
+`,
+		Home + "/status.tml": `<tml version="1" title="api status">
+  <state>{"services": [
+      {"name": "api", "state": "up", "p95": "84 ms"},
+      {"name": "worker", "state": "up", "p95": "210 ms"},
+      {"name": "db", "state": "slow", "p95": "640 ms"}],
+    "rps": [120, 132, 128, 150, 171, 165, 190, 184, 201, 196, 220, 214]}</state>
+  <col gap="1">
+    <table rows="state.services" key="name">
+      <column field="name" title="Service" w="fill"/>
+      <column field="state" title="State"/>
+      <column field="p95" title="p95" align="right"/>
+    </table>
+    <bar data="state.rps" h="4" title="Requests a second, last hour"/>
+    <mermaid>
+flowchart LR
+  lb[load balancer] --> api --> db[(postgres)]
+  api --> worker
+    </mermaid>
+  </col>
+</tml>
+`,
+		Home + "/flow.mmd": `flowchart TD
+  push[git push] --> ci{tests pass?}
+  ci -->|yes| stage[deploy to staging]
+  ci -->|no| fix[fix and push again]
+  fix --> push
+  stage --> check{looks good?}
+  check -->|yes| prod[deploy to production]
+  check -->|no| fix
+`,
+		Home + "/sales.csv": `month,online,store
+Jan,42,31
+Feb,47,29
+Mar,55,33
+Apr,61,30
+May,58,34
+Jun,72,36
+Jul,80,35
+Aug,77,38
+`,
+		"/etc/motd": "Be kind to your terminal.\n",
+	}
 }
 
-var fsDirs = map[string]bool{}
+var fsDirs map[string]bool
 
-func init() {
+func initFsDirs() {
+	fsDirs = map[string]bool{}
+}
+
+func initFileDirs() {
 	for p := range files {
 		addParents(p)
 	}
@@ -236,24 +307,34 @@ func readFile(p string) (string, bool) {
 // writeFile creates or replaces a file. The parent has to exist.
 func writeFile(p, content string, appendTo bool) bool {
 	fsMu.Lock()
-	defer fsMu.Unlock()
 	if !fsDirs[path.Dir(p)] || fsDirs[p] {
+		fsMu.Unlock()
 		return false
 	}
 	if appendTo {
 		content = files[p] + content
 	}
 	files[p] = content
+	fsMu.Unlock()
+	filesChanged()
 	return true
 }
 
 // ConfigPath is the fake tuios config file.
 const ConfigPath = Home + "/.config/tuios/config.toml"
 
+// ConfigLine is one more option for config.toml: its dotted path, such as
+// appearance.sidebar.row_style, and its value as TOML spells it, quotes and
+// all.
+type ConfigLine struct {
+	Path  string
+	Value string
+}
+
 // configText is the config file for these looks. An empty theme is tuios's
 // own colours, and "default" glyphs are the shipped set, so neither is
-// written.
-func configText(theme, border, glyphs string) string {
+// written. Each extra line goes under the table its path names.
+func configText(theme, border, glyphs string, extra []ConfigLine) string {
 	var b strings.Builder
 	b.WriteString("[appearance]\n")
 	if theme != "" {
@@ -269,43 +350,144 @@ func configText(theme, border, glyphs string) string {
 		b.WriteString(glyphs)
 		b.WriteString("\"\n")
 	}
+	// The [appearance] keys first: a TOML table's keys end where the next
+	// table starts.
+	var tables []string
+	byTable := map[string][]string{}
+	for _, l := range extra {
+		i := strings.LastIndexByte(l.Path, '.')
+		if i < 0 {
+			continue
+		}
+		table, line := l.Path[:i], l.Path[i+1:]+" = "+l.Value+"\n"
+		if table == "appearance" {
+			b.WriteString(line)
+			continue
+		}
+		if _, ok := byTable[table]; !ok {
+			tables = append(tables, table)
+		}
+		byTable[table] = append(byTable[table], line)
+	}
+	for _, t := range tables {
+		b.WriteString("\n[")
+		b.WriteString(t)
+		b.WriteString("]\n")
+		for _, line := range byTable[t] {
+			b.WriteString(line)
+		}
+	}
 	b.WriteString("\n[keybindings]\nleader_key = \"ctrl+b\"\n")
 	return b.String()
 }
 
 // WriteConfig rewrites the config file to match the looks the tour is
 // showing, so cat config.toml shows what the reader picked.
-func WriteConfig(theme, border, glyphs string) {
+func WriteConfig(theme, border, glyphs string, extra ...ConfigLine) {
+	ready()
 	if border == "" {
 		border = "rounded"
 	}
 	fsMu.Lock()
 	defer fsMu.Unlock()
-	files[ConfigPath] = configText(theme, border, glyphs)
+	files[ConfigPath] = configText(theme, border, glyphs, extra)
 }
 
 func mkdir(p string) bool {
 	fsMu.Lock()
-	defer fsMu.Unlock()
-	if !fsDirs[path.Dir(p)] || fsDirs[p] {
-		return false
+	ok := fsDirs[path.Dir(p)] && !fsDirs[p]
+	if _, isFile := files[p]; isFile {
+		ok = false
 	}
-	if _, ok := files[p]; ok {
-		return false
+	if ok {
+		fsDirs[p] = true
 	}
-	fsDirs[p] = true
-	return true
+	fsMu.Unlock()
+	if ok {
+		filesChanged()
+	}
+	return ok
 }
 
 func remove(p string) bool {
 	fsMu.Lock()
-	defer fsMu.Unlock()
-	if _, ok := files[p]; ok {
-		delete(files, p)
-		return true
+	_, ok := files[p]
+	delete(files, p)
+	fsMu.Unlock()
+	if ok {
+		filesChanged()
 	}
-	return false
+	return ok
 }
+
+// filesChanged tells tuios that a file was written, made or removed, so the
+// rail's files section reads its folder again. On a real machine a watch on
+// the folder does that.
+func filesChanged() { emit(Event{Type: EventFilesChanged}) }
+
+// IsDir reports whether p is a directory of the fake filesystem.
+func IsDir(p string) bool {
+	ready()
+	return isDir(p)
+}
+
+// IsFile reports whether p is a file of the fake filesystem.
+func IsFile(p string) bool {
+	ready()
+	_, ok := readFile(p)
+	return ok
+}
+
+// ReadDir lists a directory of the fake filesystem for tuios's files
+// section, in place of the disk read a real machine makes. It reads up to
+// limit entries, and capped says there were more.
+func ReadDir(dir string, limit int) (entries []fs.DirEntry, capped bool, err error) {
+	ready()
+	dir = path.Clean(dir)
+	if !isDir(dir) {
+		if IsFile(dir) {
+			return nil, false, &fs.PathError{Op: "readdir", Path: dir, Err: fs.ErrInvalid}
+		}
+		return nil, false, &fs.PathError{Op: "open", Path: dir, Err: fs.ErrNotExist}
+	}
+	for _, e := range list(dir) {
+		if limit > 0 && len(entries) >= limit {
+			return entries, true, nil
+		}
+		size := 0
+		if !e.dir {
+			c, _ := readFile(dir + "/" + e.name)
+			size = len(c)
+		}
+		entries = append(entries, dirEntry{name: e.name, dir: e.dir, size: int64(size)})
+	}
+	return entries, false, nil
+}
+
+// dirEntry is one name of a ReadDir listing.
+type dirEntry struct {
+	name string
+	dir  bool
+	size int64
+}
+
+func (e dirEntry) Name() string               { return e.name }
+func (e dirEntry) IsDir() bool                { return e.dir }
+func (e dirEntry) Type() fs.FileMode          { return e.mode().Type() }
+func (e dirEntry) Info() (fs.FileInfo, error) { return e, nil }
+func (e dirEntry) Size() int64                { return e.size }
+func (e dirEntry) ModTime() time.Time         { return started }
+func (e dirEntry) Sys() any                   { return nil }
+func (e dirEntry) Mode() fs.FileMode          { return e.mode() }
+
+func (e dirEntry) mode() fs.FileMode {
+	if e.dir {
+		return fs.ModeDir | 0o755
+	}
+	return 0o644
+}
+
+var _ os.DirEntry = dirEntry{}
 
 // resolve turns a path typed at the prompt into an absolute path.
 func resolve(cwd, p string) string {

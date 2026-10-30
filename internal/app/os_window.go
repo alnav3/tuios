@@ -13,8 +13,14 @@ import (
 )
 
 // ToggleFloating toggles the focused window between floating and tiled mode.
+// A TML surface moves between a popup and a tiled pane instead, with its
+// state, through the daemon: see tml_place.go.
 func (m *OS) ToggleFloating() {
 	fw := m.GetFocusedWindow()
+	if m.DrawsTML(fw) {
+		m.queueTMLCmd(m.tmlTogglePlacement(fw))
+		return
+	}
 	// A popup is always floating. Tiling one put it in the layout tree, where
 	// it took a slot from the panes and every peer read the tree back.
 	if fw == nil || fw.IsPopup || fw.IsScratch {
@@ -24,52 +30,62 @@ func (m *OS) ToggleFloating() {
 	fw.IsFloating = !fw.IsFloating
 
 	if fw.IsFloating {
-		// Lift the pane out of the tiling structure. The strip and the tree are
-		// asked the way a peer's sync asks them (ApplyStateSync): the BSP call
-		// used to be the only one here, and it does nothing under a scrolling
-		// layout, so the float kept its column and the strip laid an empty slot
-		// out where it had been, while every peer removed it.
-		if m.AutoTiling {
-			if m.UseScrollingLayout {
-				// Not ScrollingOnWindowRemoved: that is for a pane that closed
-				// and moves the focus to the strip's column, and the pane the
-				// user just floated is the pane they are still in.
-				sl := m.GetOrCreateScrollingLayout()
-				sl.RemoveWindow(m.GetWindowIntID(fw.ID))
-				m.ScrollingSetPositions()
-			} else if m.UseBSPLayout {
-				m.RemoveWindowFromBSPTree(fw)
-			} else {
-				// Master-stack has no tree to take the pane out of. The BSP
-				// call above ends in ApplyBSPLayout, which would lay the
-				// rest out as BSP.
-				m.TileAllWindows()
-			}
-		}
-		fw.SetTiled(false)
-		fw.InvalidateCache()
-		m.RecalcZOrder()
+		m.liftFromLayout(fw)
 		m.ShowNotification("Window: floating", "info", m.Settings.NotificationDuration)
 	} else {
-		// Re-add to tiling layout when unfloating
-		if m.AutoTiling {
-			if m.UseScrollingLayout {
-				intID := m.GetWindowIntID(fw.ID)
-				sl := m.GetOrCreateScrollingLayout()
-				if !sl.HasWindow(intID) {
-					sl.AddColumn(intID)
-				}
-				m.TileAllWindows()
-			} else if m.UseBSPLayout {
-				m.AddWindowToBSPTree(fw)
-			} else {
-				m.TileAllWindows()
-			}
-		}
-		fw.InvalidateCache()
-		m.RecalcZOrder()
+		m.addToLayout(fw)
 		m.ShowNotification("Window: tiled", "info", m.Settings.NotificationDuration)
 	}
+}
+
+// liftFromLayout takes a window that just floated out of the tiling
+// structure.
+func (m *OS) liftFromLayout(fw *terminal.Window) {
+	// Lift the pane out of the tiling structure. The strip and the tree are
+	// asked the way a peer's sync asks them (ApplyStateSync): the BSP call
+	// used to be the only one here, and it does nothing under a scrolling
+	// layout, so the float kept its column and the strip laid an empty slot
+	// out where it had been, while every peer removed it.
+	if m.AutoTiling {
+		if m.UseScrollingLayout {
+			// Not ScrollingOnWindowRemoved: that is for a pane that closed
+			// and moves the focus to the strip's column, and the pane the
+			// user just floated is the pane they are still in.
+			sl := m.GetOrCreateScrollingLayout()
+			sl.RemoveWindow(m.GetWindowIntID(fw.ID))
+			m.ScrollingSetPositions()
+		} else if m.UseBSPLayout {
+			m.RemoveWindowFromBSPTree(fw)
+		} else {
+			// Master-stack has no tree to take the pane out of. The BSP
+			// call above ends in ApplyBSPLayout, which would lay the
+			// rest out as BSP.
+			m.TileAllWindows()
+		}
+	}
+	fw.SetTiled(false)
+	fw.InvalidateCache()
+	m.RecalcZOrder()
+}
+
+// addToLayout puts a window that stopped floating into the tiling layout.
+func (m *OS) addToLayout(fw *terminal.Window) {
+	if m.AutoTiling {
+		if m.UseScrollingLayout {
+			intID := m.GetWindowIntID(fw.ID)
+			sl := m.GetOrCreateScrollingLayout()
+			if !sl.HasWindow(intID) {
+				sl.AddColumn(intID)
+			}
+			m.TileAllWindows()
+		} else if m.UseBSPLayout {
+			m.AddWindowToBSPTree(fw)
+		} else {
+			m.TileAllWindows()
+		}
+	}
+	fw.InvalidateCache()
+	m.RecalcZOrder()
 }
 
 // installPassthroughs registers every emulator callback for a window, under
@@ -87,6 +103,7 @@ func (m *OS) installPassthroughs(window *terminal.Window) {
 	m.setupClipboardPassthrough(window)
 	m.setupNotificationPassthrough(window)
 	m.setupNvimNavigation(window)
+	m.setupDnD(window)
 	window.UnlockIO()
 }
 
@@ -651,6 +668,12 @@ func (m *OS) AddWindowIn(dir, name string, command ...string) *OS {
 // addDaemonWindow is AddWindowIn in a daemon session. sshFrom names a window
 // the daemon follows into ssh, empty for none; see ssh_split.go.
 func (m *OS) addDaemonWindow(dir, name, sshFrom string, command []string) *OS {
+	return m.addDaemonWindowWith(dir, name, sshFrom, command, false)
+}
+
+// addDaemonWindowWith is addDaemonWindow with keepOpen, which keeps the
+// window after command exits. See ExecuteCommandPayload.KeepOpen.
+func (m *OS) addDaemonWindowWith(dir, name, sshFrom string, command []string, keepOpen bool) *OS {
 	var args []string
 	if name != "" || len(command) > 0 {
 		// The name always travels when a command does, because the args are
@@ -674,7 +697,16 @@ func (m *OS) addDaemonWindow(dir, name, sshFrom string, command []string) *OS {
 		}
 		m.PreselectionDir = layout.PreselectionNone
 	}
-	if err := m.DaemonClient.SendNewWindowIntent(dir, ws, sshFrom, "NewWindow", args...); err != nil {
+	// The size the pane will be placed at, so the daemon starts its process
+	// at it. See newPaneBox. Zero when this client cannot tell.
+	cols, rows, _ := m.newPaneContentSize()
+	send := func() error {
+		if keepOpen && len(command) > 0 {
+			return m.DaemonClient.SendRunIntent(dir, ws, cols, rows, true, name, command...)
+		}
+		return m.DaemonClient.SendNewWindowIntentSized(dir, ws, cols, rows, sshFrom, "NewWindow", args...)
+	}
+	if err := send(); err != nil {
 		m.LogError("Failed to ask the daemon for a new window: %v", err)
 		m.windowIntentErr = err
 		m.CancelPendingSplit()
@@ -695,6 +727,14 @@ func (m *OS) addLocalWindow(dir, name string, command []string) *OS {
 	m.LogInfo("Creating new window: %s (workspace %d)", title, m.CurrentWorkspace)
 
 	x, y, width, height := m.NewWindowPlacement()
+	// In a tiled layout the pane is born at its tile's size, so the process
+	// starts at the size it keeps. See newPaneBox. NewWindowIn gives the
+	// process the box less a border on each side.
+	if m.AutoTiling {
+		if cols, rows, ok := m.newPaneContentSize(); ok {
+			width, height = cols+2, rows+2
+		}
+	}
 
 	window, err := terminal.NewWindowIn(dir, newID, title, x, y, width, height, len(m.Windows), m.WindowExitChan, m.PTYDataChan, m.Settings.ScrollbackLines, command...)
 	if err != nil {
@@ -916,6 +956,7 @@ func (m *OS) DeleteWindow(i int) *OS {
 	// Clean up window resources
 	deletedWindow := m.Windows[i]
 	m.clearNvimNavigation(deletedWindow.ID)
+	m.dndWindowClosed(deletedWindow.ID)
 	m.pipSourceClosed(deletedWindow)
 	m.LogInfo("Deleting window: %s (index: %d, ID: %s)", deletedWindow.Title(), i, shortID(deletedWindow.ID))
 

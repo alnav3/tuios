@@ -1,4 +1,4 @@
-// Ported from pele src/diagrams/wardley/index.ts at 8fad23bd51783e4df1204e177a7fb0d2a30dcd13.
+// Ported from pele src/diagrams/wardley/index.ts at 8aff183be57021b533f319a29341a529be934b08.
 
 // Package wardley draws Mermaid's wardley map: components of a value chain placed by their
 // visibility to the user and their evolution, with links, pipelines, trends, annotations and

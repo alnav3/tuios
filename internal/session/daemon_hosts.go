@@ -3,6 +3,7 @@ package session
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -120,6 +121,10 @@ func (d *Daemon) applyUserConfig(cfg *config.UserConfig, byPerson bool) {
 	d.manager.SetPreferredShell(cfg.Appearance.PreferredShell)
 	d.manager.SetHerdrProtocol(cfg.Agents.HerdrProtocol)
 	d.manager.SetReturnWhenEmpty(cfg.Workspaces.ReturnsWhenEmpty())
+	d.manager.SetDragAndDrop(cfg.Panes.DragAndDrop)
+	// Where a new worktree goes widens nothing a pane may do: a pane that can
+	// write the file can already run git worktree add itself.
+	d.SetWorktreePath(cfg.Worktree.Path)
 	if d.buffers != nil {
 		d.buffers.SetLimits(cfg.PasteBuffers.Resolved())
 	}
@@ -136,6 +141,8 @@ func (d *Daemon) applyUserConfig(cfg *config.UserConfig, byPerson bool) {
 	d.approvalsWaiting.Store(approvalsWait)
 	d.SetRecapTestPatterns(cfg.Agents.Recap.Resolved().TestPatterns)
 	d.SetQueueMax(cfg.Agents.Queue.MaxEntries())
+	// It changes only what a pane is shown as, so a file change applies.
+	d.SetAgentSilentAfter(resolveSilentAfter(silentAfterFromConfig(cfg.Agents)))
 	// A file change only turns the wake off. A process in a pane can write
 	// the file, and the wake types into panes, so turning it on waits for
 	// tuios config apply from outside tuios, or a daemon restart, as a wider
@@ -147,6 +154,9 @@ func (d *Daemon) applyUserConfig(cfg *config.UserConfig, byPerson bool) {
 	}
 	d.SetMailWake(wake)
 	d.SetCheckpoints(cfg.Agents.Checkpoints)
+	// Moving cards types nothing and runs nothing, so a file change applies
+	// either way.
+	d.taskAutoOff.Store(!cfg.Tasks.AutoStageOn())
 	// A new notification destination waits like a new host does.
 	d.notify.reload(cfg.Notify, byPerson)
 	perms := PanePermissionsFromConfig(cfg.Agents.Permissions)
@@ -275,9 +285,21 @@ func (d *Daemon) reloadLinkPolicies(next map[string]config.HostConfig) (waits bo
 		if now.FilesMinFree < was.FilesMinFree {
 			widened = true
 		}
+		// files_max_entries 0 is no bound, the widest value.
+		bound := func(n int64) int64 {
+			if n <= 0 {
+				return math.MaxInt64
+			}
+			return n
+		}
+		maxEntries := now.FilesMaxEntries
+		if bound(now.FilesMaxEntries) > bound(was.FilesMaxEntries) {
+			maxEntries = was.FilesMaxEntries
+			widened = true
+		}
 		h := next[key]
 		h.Allow, h.HoldMail, h.HostedGrace, h.FilesRoots = allow, &hold, grace.String(), roots
-		h.FilesReadRoots, h.FilesMinFree = readRoots, strconv.FormatInt(minFree, 10)
+		h.FilesReadRoots, h.FilesMinFree, h.FilesMaxEntries = readRoots, strconv.FormatInt(minFree, 10), &maxEntries
 		merged[key] = h
 	}
 	d.SetLinkPolicies(merged)

@@ -55,7 +55,7 @@ type sectionMaps struct {
 	debugPrefix, tapePrefix, layoutPrefix, tuiosPrefix    map[string]string
 	terminalMode, global, script, sidebar, sidebarFiles   map[string]string
 	sidebarAgents, inbox, inboxPeek, mail, copyMode       map[string]string
-	transfers, lists                                      map[string]string
+	transfers, lists, review                              map[string]string
 	// menus holds each declared menu (see MenuConfig), by name.
 	menus map[string]map[string]string
 }
@@ -126,6 +126,7 @@ func (r *KeybindRegistry) buildMappings() {
 		mail:            r.sectionKeyMap(kb.Mail),
 		transfers:       r.sectionKeyMap(kb.Transfers),
 		copyMode:        r.sectionKeyMap(kb.CopyMode),
+		review:          r.sectionKeyMap(kb.Review),
 		menus:           make(map[string]map[string]string, len(kb.Menus)),
 	}
 	for _, name := range kb.MenuNames() {
@@ -389,6 +390,18 @@ func (r *KeybindRegistry) GetTransfersAction(key string) string {
 	return r.lookupKey(key, r.sections.transfers)
 }
 
+// GetReviewAction returns the action a key runs in the review overlay, or ""
+// for a key the section does not bind. The overlay reads its other keys itself.
+func (r *KeybindRegistry) GetReviewAction(key string) string {
+	return r.lookupKey(key, r.sections.review)
+}
+
+// GetReviewKeys is GetKeys for the review overlay, for its key hints and the
+// help overlay.
+func (r *KeybindRegistry) GetReviewKeys(action string) []string {
+	return r.config.Keybindings.Review[action]
+}
+
 // GetTransfersKeys is GetKeys for the Copies panel, for its key hints and the
 // help overlay.
 func (r *KeybindRegistry) GetTransfersKeys(action string) []string {
@@ -555,7 +568,7 @@ func buildPressesByAction(r *KeybindRegistry) map[string][]string {
 // no chord that would say so.
 func contextOnlyScope(scope string) bool {
 	switch scope {
-	case ScopeSidebar, ScopeSidebarFiles, ScopeSidebarAgents, ScopeScript, ScopeLists, ScopeInbox, ScopeInboxPeek, ScopeMail, ScopeTransfers, ScopeCopyMode:
+	case ScopeSidebar, ScopeSidebarFiles, ScopeSidebarAgents, ScopeScript, ScopeLists, ScopeInbox, ScopeInboxPeek, ScopeMail, ScopeTransfers, ScopeCopyMode, ScopeReview:
 		return true
 	case ScopeGUI:
 		// Only the GUI reads these keys. A terminal's help that listed
@@ -597,7 +610,9 @@ var ActionDescriptions = map[string]string{
 	"file_open":           "Files: open this folder, or copy this file's path",
 	"file_edit":           "Files: edit this text file in a new pane",
 	"file_copy_path":      "Files: copy the path of this file or folder",
+	"file_quick_look":     "Files: show a preview of this file or folder",
 	"file_send":           "Files: send this file or folder to a host",
+	"file_insert_path":    "Files: paste the path into the focused pane",
 	// The Copies panel: the copies between machines.
 	"transfers_down":   "Copies: next copy",
 	"transfers_up":     "Copies: previous copy",
@@ -629,7 +644,7 @@ var ActionDescriptions = map[string]string{
 	"inbox_peek":         "Agents view: read the prompt here and answer it",
 	"inbox_dismiss":      "Agents view: dismiss what needs you on the row",
 	"inbox_reply":        "Agents view: reply to the agent or the mail, or reject the held approval",
-	"inbox_resume":       "Agents view: resume the conversation in its pane",
+	"inbox_resume":       "Agents view: resume the conversation in its pane, or every marked one",
 	"inbox_pass_on":      "Agents view: pass held mail on to the agent it was for",
 	"inbox_filter":       "Agents view: show only what needs you, then each kind, then every agent",
 	"inbox_select":       "Agents view: search the agents, with selector terms such as harness:codex",
@@ -640,7 +655,8 @@ var ActionDescriptions = map[string]string{
 	"inbox_view_pane":    "Agents view: zoom the selected agent's pane, and come back with the same key",
 	"inbox_review":       "Agents view: review the changes in the agent's pane",
 	"inbox_snooze":       "Agents view: snooze what needs you on the row, then 1 to 4 for how long",
-	"inbox_undo":         "Agents view: undo the last dismiss or snooze",
+	"inbox_undo":         "Agents view: undo the last dismiss, snooze or settle",
+	"inbox_settle":       "Agents view: settle the agent, or every marked one. Put away until it needs you",
 	"inbox_show_snoozed": "Agents view: show or hide the snoozed rows",
 	"inbox_deny_reason":  "Agents view: reject the approval or plan and say why",
 	"inbox_new_agent":    "Agents view: start a new agent",
@@ -651,12 +667,16 @@ var ActionDescriptions = map[string]string{
 	"inbox_open":         "Agents view: open the focus on a narrow screen, or show every row of a long group",
 	"inbox_back":         "Agents view: go back from the focus on a narrow screen",
 	"inbox_help":         "Agents view: show every key",
-	"inbox_mark":         "Agents view: mark the agent for a bulk answer",
+	"inbox_mark":         "Agents view: mark the agent or Resume row for a bulk answer",
 	"inbox_mark_all":     "Agents view: mark every agent shown, or clear the marks",
 	"inbox_tab_prev":     "Agents view: the focus's tab to the left",
 	"inbox_tab_next":     "Agents view: the focus's tab to the right",
 	"inbox_expand":       "Agents view: show every line of every card in the thread, or fold them again",
+	"inbox_fold":         "Agents view: fold or open the group of the row under the cursor",
 	"inbox_compare":      "Agents view: compare the attempts of the fan under the cursor, ask a judge, keep one",
+	"inbox_board":        "Agents view: show the task board, or the agents again",
+	"inbox_take":         "Agents view: take the card for the focused pane",
+	"inbox_artifact":     "Agents view: open what the agent has shown, such as a TML form, and use it",
 
 	// The rail's agent rows. They act only while the cursor is on an agent
 	// row, and a key they share with a rail binding keeps its rail meaning on
@@ -698,10 +718,12 @@ var ActionDescriptions = map[string]string{
 	// Reached from the rail's session row and its menu; the row carries which
 	// session, so it has no key of its own.
 	"set_session_accent": "Session color",
+	"set_note":           "Write a note for the session: what it is for or what comes next",
 	"minimize_window":    "Minimize window",
 	"restore_all":        "Restore all minimized",
 	"toggle_zoom":        "Toggle zoom (fullscreen)",
 	"toggle_pip":         "Pin or unpin the picture-in-picture view",
+	"focus_rail_pane":    "Type into the pane in the rail",
 	"start_screensaver":  "Start the screen saver now",
 	"screenshot":         "Pick what to screenshot",
 	"screenshot_window":  "Screenshot this window",
@@ -765,12 +787,12 @@ var ActionDescriptions = map[string]string{
 	"swap_right":                "Swap right",
 	"swap_up":                   "Swap up",
 	"swap_down":                 "Swap down",
-	"resize_master_shrink":      "Decrease master width",
-	"resize_master_grow":        "Increase master width",
+	"resize_master_shrink":      "Decrease pane width",
+	"resize_master_grow":        "Increase pane width",
 	"resize_height_shrink":      "Decrease focused window height",
 	"resize_height_grow":        "Increase focused window height",
-	"resize_master_shrink_left": "Decrease master width from left edge",
-	"resize_master_grow_left":   "Increase master width from left edge",
+	"resize_master_shrink_left": "Decrease pane width from left edge",
+	"resize_master_grow_left":   "Increase pane width from left edge",
 	"resize_height_shrink_top":  "Decrease focused window height from top edge",
 	"resize_height_grow_top":    "Increase focused window height from top edge",
 	"resize_width_10":           "Set focused window width to 10%",
@@ -831,6 +853,10 @@ var ActionDescriptions = map[string]string{
 	"focus_sidebar":       "Focus sidebar",
 	"next_session":        "Next session",
 	"prev_session":        "Previous session",
+	"next_host":           "Go to the next machine",
+	"prev_host":           "Go to the previous machine",
+	"next_agent":          "Next agent pane, in the rail's order",
+	"prev_agent":          "Previous agent pane, in the rail's order",
 	"switch_session_1":    "Switch to session 1",
 	"switch_session_2":    "Switch to session 2",
 	"switch_session_3":    "Switch to session 3",
@@ -850,17 +876,31 @@ var ActionDescriptions = map[string]string{
 	"clear_selection": "Clear the text selection",
 	"hints":           "Label the text on the pane to copy it",
 	"display_panes":   "Label the panes and focus one by its label",
+	"pick_path":       "Pick a file or folder and type its path at the cursor",
 	"toggle_scratch":  "Show or hide the scratch terminal",
+	"toggle_calm":     "Calm mode",
 	"hints_all_panes": "Label the text on all panes to copy it",
 
 	// The scrollback in the editor (prefix E, ctrl+g in copy mode)
 	ActionEditScrollback: "Open the scrollback in the editor",
+	// No default key (cmd+k in other terminals)
+	ActionClearScrollback: "Clear the scrollback and the screen above the prompt",
 
 	// Copy mode search (no default keybinding)
 	ActionCopyModeSearchForward:  "Enter copy mode and search forward",
 	ActionCopyModeSearchBackward: "Enter copy mode and search backward",
 	ActionCopyModeLineStart:      "Copy mode: go to the start of the line",
-	ActionCopyModeLineEnd:        "Copy mode: go to the end of the line",
+	ActionCopyModeFirstNonBlank:  "Copy mode: go to the first nonblank character of the line",
+	ActionCopyModeLineEnd:        "Copy mode: go to the last nonblank character of the line",
+	ActionReviewNextHunk:         "Review: next hunk, going on into the next file",
+	ActionReviewPrevHunk:         "Review: previous hunk, going back into the previous file",
+	ActionReviewNextFile:         "Review: next file",
+	ActionReviewPrevFile:         "Review: previous file",
+	ActionReviewStageHunk:        "Review: stage the hunk under the cursor",
+	ActionReviewUnstageHunk:      "Review: unstage the hunk under the cursor",
+	ActionReviewStageFile:        "Review: stage the whole file",
+	ActionReviewUnstageFile:      "Review: unstage the whole file",
+	ActionReviewUndoStage:        "Review: undo the last stage or unstage",
 
 	// Session lifecycle (context menu rows; no default keybinding)
 	"settings_sidebar":  "Sidebar settings",
@@ -929,6 +969,7 @@ var ActionDescriptions = map[string]string{
 	"break_pane":                "Move the focused pane to the first empty workspace, and follow it",
 	"last_session":              "Go back to the last session",
 	"send_prefix":               "Send the leader key to the focused pane",
+	"nest":                      "Send every key to the pane, the leader too, until nest_exit_key",
 	"move_workspace_left":       "Swap this workspace with the one before it",
 	"move_workspace_right":      "Swap this workspace with the one after it",
 	"send_to_workspace_1":       "Send the focused pane to workspace 1",
@@ -966,6 +1007,7 @@ var ActionDescriptions = map[string]string{
 	"prefix_workspace_switcher": "Open the workspace switcher",
 	"choose_tree":               "Find a pane in every session and go to it",
 	"goto_picker":               "Go to an agent, session, workspace or pane",
+	"new_worktree":              "Make a worktree session in the focused pane's repository",
 	"prefix_layout":             "Enter layout prefix",
 
 	// Tape Prefix
@@ -1018,6 +1060,7 @@ var ActionDescriptions = map[string]string{
 	"window_prefix_next":   "Focus the next window",
 	"window_prefix_prev":   "Focus the previous window",
 	"window_prefix_tiling": "Turn tiling on or off",
+	"window_prefix_float":  "Float the pane or tile it. A TML popup becomes a pane, and a TML pane a popup",
 	"prefix_tuios":         "Open the tuios menu: the tuios keys a preset moved",
 	"open_keybind_presets": "Choose the keys: tuios, tmux, screen or zellij",
 }

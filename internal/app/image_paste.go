@@ -184,13 +184,44 @@ func probeImageCmd(clip *imageClipboard, window string, mode imagePasteMode) tea
 		msg := imageProbeMsg{window: window, mode: mode}
 		// The paste key's text paste waits behind this ask, so the key gives
 		// it a short bound. Past it the text is pasted, and the key does not
-		// ask again.
+		// ask again. An empty paste has nothing waiting behind it, so it takes
+		// the full bound: a clipboard tool run for the first time can take
+		// longer than the key's bound to start, and a timeout here turns the
+		// ask off for every later empty paste.
 		limit := imageClipTypesTimeout
-		if mode != imagePasteAction {
+		if mode == imagePasteKey {
 			limit = imageClipKeyTimeout
 		}
+		// On macOS the type ask is osascript, whose start alone takes longer
+		// than the key's bound (#1179). pbpaste answers in milliseconds
+		// whether there is text. Text means the text paste, at once. No
+		// text means no text paste waits, so the type ask gets the full
+		// bound, and a slow answer does not stop the key from asking again.
+		nothingWaits := false
+		if mode != imagePasteAction {
+			if hasText, ok := clip.darwinHasText(ctx, imageClipKeyTimeout); ok {
+				if hasText && mode == imagePasteKey {
+					msg.fallback = true
+					return msg
+				}
+				limit = imageClipTypesTimeout
+				nothingWaits = !hasText || mode == imagePasteEmpty
+			}
+		}
+		// Under WSL the type ask is powershell.exe, a Windows process started
+		// across the interop bridge. Its start takes about the key's whole
+		// bound when it is warm, and can outlast the full bound when it is
+		// cold. A timeout there is a slow start, not a tool that cannot
+		// answer, so it does not turn the ask off: one press of the paste key
+		// would otherwise turn off the empty paste Windows Terminal sends for
+		// an image.
+		slowStart := clip.backend == imageClipWSL
 		types, err := clip.typesWithin(ctx, limit)
 		if err != nil && mode != imagePasteAction {
+			if (nothingWaits || slowStart) && !errors.Is(err, errClipTypesUnsupported) {
+				msg.fallback = mode == imagePasteKey
+				return msg
+			}
 			msg.fallback = mode == imagePasteKey
 			msg.keyProbeOff = true
 			return msg
@@ -346,7 +377,7 @@ func (m *OS) applyImagePasted(msg ImagePastedMsg) {
 		m.ShowNotification("The image was saved but its path was not pasted: "+err.Error(), "error", m.Settings.NotificationDuration*2)
 		return
 	}
-	where := "this machine"
+	where := thisMachineLabel()
 	if msg.Host != "" {
 		where = msg.Host
 	}

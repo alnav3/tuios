@@ -72,9 +72,12 @@ func (d *ActionDispatcher) registerPrefixHandlers() {
 	d.Register("prefix_quit", handlePrefixQuit)
 	d.Register("hints", handleOpenHints)
 	d.Register("toggle_scratch", handleToggleScratch)
+	d.Register("toggle_calm", handleToggleCalm)
 	d.Register(config.ActionEditScrollback, handleEditScrollback)
+	d.Register(config.ActionClearScrollback, handleClearScrollback)
 	d.Register("hints_all_panes", handleOpenHintsAllPanes)
 	d.Register("display_panes", handleDisplayPanes)
+	d.Register("pick_path", handleOpenPathPicker)
 	d.Register(config.ActionCopyModeSearchForward, handleCopyModeSearchForward)
 	d.Register(config.ActionCopyModeSearchBackward, handleCopyModeSearchBackward)
 
@@ -95,6 +98,7 @@ func (d *ActionDispatcher) registerPrefixHandlers() {
 	d.Register("window_prefix_next", handlePrefixNextWindow)
 	d.Register("window_prefix_prev", handlePrefixPrevWindow)
 	d.Register("window_prefix_tiling", handleToggleTiling)
+	d.Register("window_prefix_float", handleToggleFloating)
 	d.Register("window_prefix_cancel", handlePrefixCancel)
 	d.registerPrefixTreeHandlers()
 
@@ -151,8 +155,9 @@ func (d *ActionDispatcher) registerPrefixHandlers() {
 // direction. It runs the same geometry the FocusDirection tape command does
 // rather than a second rule: the nearest pane whose facing edge lies that way
 // and whose span overlaps this one's, ties going to the earlier pane. At the
-// edge of the layout there is no such pane and focus stays put; it does not
-// wrap.
+// edge of the layout there is no such pane and focus stays put, unless
+// appearance.focus_wrap is on: then a tiled layout wraps to the pane on the
+// far side (see findWindowInDirection).
 //
 // The scrolling layout is one strip of columns, and left and right step along
 // it with its own navigation, which returns to the window a column was last on.
@@ -363,6 +368,11 @@ func handlePrefixSelection(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 func handlePrefixScrollback(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	OpenScrollbackBrowser(o)
 	return o, nil
+}
+
+// handleClearScrollback clears the focused pane's scrollback.
+func handleClearScrollback(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	return o, o.ClearScrollback()
 }
 
 // handleEditScrollback opens the focused pane's scrollback in the editor.
@@ -646,4 +656,9 @@ func handleTerminalExitMode(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 // internal/app/scratch.go.
 func handleToggleScratch(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	return o, o.ToggleScratch()
+}
+
+// handleToggleCalm turns calm mode on and off. See app/calm.go.
+func handleToggleCalm(_ tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	return o, o.ToggleCalm()
 }

@@ -23,6 +23,22 @@ func wheelIsHorizontal(b tea.MouseButton) bool {
 func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	horizontal := wheelIsHorizontal(msg.Button)
 
+	// The path picker scrolls under the pointer. A wheel anywhere else is
+	// swallowed while it is up, so the pane it types into does not scroll
+	// away from the prompt under it.
+	if o.PathPickerOpen() {
+		wm := msg.Mouse()
+		if !horizontal {
+			o.PathPickerWheel(wm.X, wm.Y, msg.Button == tea.MouseWheelUp)
+		}
+		return o, nil
+	}
+
+	// Quick look scrolls its text under the pointer.
+	if wm := msg.Mouse(); !horizontal && o.QuickLookWheel(wm.X, wm.Y, msg.Button == tea.MouseWheelUp) {
+		return o, nil
+	}
+
 	// Scroll the floating overlay panel under the cursor (help, settings,
 	// palette, theme picker, session/layout lists).
 	if o.OverlayActive() {
@@ -45,7 +61,7 @@ func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	if wm := msg.Mouse(); !o.OverlayActive() {
 		if w := o.SidebarSessionPaneAt(wm.X, wm.Y); w != nil {
 			if !horizontal {
-				if w.Terminal != nil && w.Terminal.HasMouseMode() {
+				if paneTakesMouse(o, w) {
 					if tx, ty, inside := w.ScreenToTerminal(wm.X, wm.Y); inside {
 						event := uv.MouseWheelEvent{X: tx, Y: ty, Button: uv.MouseButton(wm.Button), Mod: uv.KeyMod(wm.Mod)}
 						for range max(o.Settings.ScrollLines, 1) {
@@ -67,6 +83,9 @@ func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 						scrollCopyModeDown(w, &o.Settings)
 					}
 				}
+				// The rail pane is drawn from the rail's cache, which a
+				// scroll of its history has to move.
+				o.TouchRailPane(w)
 			}
 			return o, nil
 		}
@@ -124,11 +143,12 @@ func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			if o.Settings.NiriReverseScroll {
 				dir = -1
 			}
+			step := 0
 			switch msg.Button {
 			case tea.MouseWheelUp:
-				o.ScrollingScrollViewport(-1 * dir)
+				step = -1 * dir
 			case tea.MouseWheelDown:
-				o.ScrollingScrollViewport(1 * dir)
+				step = 1 * dir
 			// A horizontal wheel moves the viewport under the same modifier as
 			// a vertical one, rather than on its own: answering it unmodified
 			// walked the whole layout sideways whenever someone scrolled back
@@ -137,11 +157,15 @@ func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 			// strip and the user's hand does not know which axis their terminal
 			// chose to report.
 			case tea.MouseWheelLeft:
-				o.ScrollingScrollViewport(-1 * dir)
+				step = -1 * dir
 			case tea.MouseWheelRight:
-				o.ScrollingScrollViewport(1 * dir)
+				step = 1 * dir
 			}
-			return o, nil
+			o.ScrollingScrollViewport(step)
+			// With niri_scroll_snap on, the strip lines up on a column once
+			// the steps stop, the next one in the way they went. See
+			// app/strip_snap.go.
+			return o, o.ScheduleStripSnap(step)
 		}
 	}
 
@@ -149,7 +173,7 @@ func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 	// This allows applications like vim, less, htop to handle their own scrolling
 	if o.Mode == app.TerminalMode {
 		focusedWindow := o.GetFocusedWindow()
-		if focusedWindow != nil && focusedWindow.Terminal != nil && focusedWindow.Terminal.HasMouseMode() {
+		if paneTakesMouse(o, focusedWindow) {
 			mouse := msg.Mouse()
 			// Convert to terminal-relative coordinates (0-based)
 			termX, termY, inContent := focusedWindow.ScreenToTerminal(mouse.X, mouse.Y)
@@ -184,7 +208,7 @@ func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 				if focusedWindow.InCopyMode() {
 					// Already in copy mode: scroll up
 					scrollCopyModeUp(focusedWindow, &o.Settings)
-				} else if o.Mode == app.TerminalMode && focusedWindow.Terminal != nil && !focusedWindow.Terminal.HasMouseMode() && !focusedWindow.IsAltScreen() && focusedWindow.ScrollbackLen() > 0 {
+				} else if o.Mode == app.TerminalMode && focusedWindow.Terminal != nil && !paneTakesMouse(o, focusedWindow) && !focusedWindow.IsAltScreen() && focusedWindow.ScrollbackLen() > 0 {
 					// No mouse tracking, not alt screen, and there is history to
 					// show: turn the wheel and the view scrolls. Copy mode is the
 					// only thing that can render scrollback, so it is switched on
@@ -229,5 +253,33 @@ func handleMouseWheel(msg tea.MouseWheelMsg, o *app.OS) (*app.OS, tea.Cmd) {
 		}
 	}
 
+	return o, nil
+}
+
+// handleStripTouch moves the strip with a finger's sideways drag on
+// tuios-web, and snaps it when the finger lifts. See app/strip_touch.go.
+//
+// The report reaches nothing but the strip: not an overlay, the rail, a
+// docked session, the picture-in-picture view or the log viewer, where a
+// sideways wheel reaches nothing either, and not a pane in another layout.
+// The page cannot tell any of those apart, so it is decided here, at the cell
+// the drag started on.
+func handleStripTouch(msg app.StripTouchMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	if !o.AutoTiling || !o.UseScrollingLayout || o.OverlayActive() || o.ShowLogs {
+		return o, nil
+	}
+	if o.SidebarSessionPaneAt(msg.X, msg.Y) != nil || (o.SidebarActive() && o.SidebarBandContains(msg.X, msg.Y)) || pipOwns(msg.X, msg.Y, o) {
+		return o, nil
+	}
+	switch msg.Kind {
+	case app.StripTouchLift:
+		o.SnapStripNow()
+	case app.StripTouchLeft:
+		o.ScrollingScrollViewportCells(-msg.Cells)
+		o.CancelStripSnap()
+	case app.StripTouchRight:
+		o.ScrollingScrollViewportCells(msg.Cells)
+		o.CancelStripSnap()
+	}
 	return o, nil
 }

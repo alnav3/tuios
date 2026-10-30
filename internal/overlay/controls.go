@@ -26,10 +26,28 @@ func UseASCII() bool {
 	return ascii.Load()
 }
 
+// nerdFonts, when true, says the terminal's font draws Nerd Font icons, the
+// private use area glyphs. It is mirrored from the config every frame, as
+// ascii is. It starts false, so a caller that runs before the first frame
+// keeps the old, safe answer.
+var nerdFonts atomic.Bool
+
+// SetNerdFonts records whether the font draws Nerd Font icons.
+func SetNerdFonts(v bool) {
+	nerdFonts.Store(v)
+}
+
+// UseNerdFonts reports whether the font draws Nerd Font icons.
+func UseNerdFonts() bool {
+	return nerdFonts.Load()
+}
+
 // Style returns a fresh lipgloss style already backgrounded with bg. Every
 // fragment on a panel row must carry that row's background, otherwise a bare
 // foreground style emits an ANSI reset that punches a transparent hole through
 // the solid fill when the panel is composited over other content.
+//
+//go:noinline
 func Style(bg color.Color) lipgloss.Style {
 	return lipgloss.NewStyle().Background(bg)
 }
