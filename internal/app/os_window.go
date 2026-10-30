@@ -811,6 +811,13 @@ func (m *OS) addLocalWindow(dir, name string, command []string) *OS {
 	// into and cannot see.
 	m.FocusWindow(len(m.Windows) - 1)
 
+	// The column is inserted after the focused one, and with a wide column the
+	// least-scroll rule FocusWindow uses counts the sliver that pokes in at the
+	// right edge as visible, so the new pane keeps the focus while almost all
+	// of it stays off screen. Asking for a pane is the explicit case that rule
+	// leaves for ScrollToFocusedColumn: show all of it.
+	m.RevealFocusedColumn()
+
 	return m
 }
 

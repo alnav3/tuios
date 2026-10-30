@@ -1123,6 +1123,24 @@ func (m *OS) ApplyStateSyncFrom(state *session.SessionState, sourceID string) er
 	// A pane a switch to an empty workspace asked for has arrived.
 	m.settlePaneRequests()
 
+	// A pane the session made and this sync brought is a pane somebody asked
+	// for, and it is the case the least-scroll rule that adoptScrollStrip
+	// applied cannot answer. Its column was inserted after the focused one, so
+	// with a wide column (scroll_column_width near the cap) the new column
+	// starts at the edge of the view and only a sliver of it pokes in, which
+	// counts as "some of it is on screen" and leaves the strip where it was.
+	// The keys are in the new pane and the user cannot see it. Show all of it,
+	// as a keyboard step to a pane does.
+	//
+	// After the sizes settle and the pane requests, so the reveal measures the
+	// strip it will be drawn on against the focus this sync settled, and after
+	// adoptScrollStrip, so the deferred push carries this offset rather than
+	// the one the session held before the pane existed.
+	if fw := m.GetFocusedWindow(); fw != nil && fw.Workspace == m.CurrentWorkspace &&
+		slices.Contains(created, fw) {
+		m.RevealFocusedColumn()
+	}
+
 	// After the sizes settle, so a pane primed here takes its snapshot at
 	// the size it is shown at.
 	m.reconcilePaneStreams()

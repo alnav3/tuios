@@ -539,7 +539,12 @@ func (m *OS) ReleaseClickReveal(x, y int) {
 }
 
 // ScrollingOnWindowAdded adds a new window to the scrolling layout.
-// Only adds the column. FocusWindow handles viewport and positioning.
+//
+// It only adds and focuses the column. Whether the strip should move for it is
+// not answered here: a pane that was just asked for is the explicit case for
+// RevealFocusedColumn, and the paths that make one call it once focus has
+// landed (see addLocalWindow and ApplyStateSyncFrom). Adding a column for a
+// peer's sync says nothing about where this client is looking.
 func (m *OS) ScrollingOnWindowAdded(w *terminal.Window) {
 	sl := m.GetOrCreateScrollingLayout()
 	intID := m.GetWindowIntID(w.ID)
