@@ -1645,6 +1645,12 @@ var optionSpecs = []Option{
 		Description: "When you switch to a workspace with no panes, open a new pane there. It starts in the folder of the pane you came from",
 		Default:     "false",
 	},
+	// Read by the client on each switch, so a change applies at once.
+	{
+		Path: "workspaces.exact_numbers", Type: OptionBool, Section: "workspaces",
+		Description: "Switch to the workspace number you asked for, even when the numbers below it hold no panes",
+		Default:     "false",
+	},
 }
 
 // optionsByPath indexes the registry for lookup. Built once at init so a caller

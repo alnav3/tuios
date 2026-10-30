@@ -90,6 +90,8 @@ whatever workspace is second now. Closing a pane or a workspace closes up
 the numbers above an empty place, and so does `exit` typed in a pane's own
 shell. A pane whose program exits on its own (a command, `close_on_exit`)
 renumbers nothing, so a number you read stays good until a close or a move.
+`workspaces.exact_numbers = true` makes a switch land on the number asked
+for even while the numbers below it are empty.
 
 ## Opening a pane and running work in it
 

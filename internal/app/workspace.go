@@ -61,8 +61,16 @@ func (m *OS) workspaceTabKey(ws int) int {
 // new one, unless a pane is on its way to it. Landing there at once, rather
 // than on 5 until the daemon renumbers it, keeps a pane opened right after the
 // switch on the workspace the user sees.
+//
+// workspaces.exact_numbers turns that around: the switch lands on the number
+// asked for, so opt+3 with only workspace 1 holding a pane shows the empty 3
+// and leaves 2 empty. A session with no daemon has no numbering to close up,
+// so it always lands on the number asked for.
 func (m *OS) newWorkspaceSlot(workspace int) int {
 	if !m.IsDaemonSession || session.IsScratchWorkspace(workspace) {
+		return workspace
+	}
+	if m.UserConfig != nil && m.UserConfig.Workspaces.ExactNumbers {
 		return workspace
 	}
 	last := 0

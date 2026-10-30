@@ -10992,3 +10992,19 @@ A follow-up commit adds `TestNotificationLevelErrorStillLogsAWarning`. This cont
 | Control: what was cut | Where it fails | Verdict |
 | --- | --- | --- |
 | The rule that a warning always goes to the log: `showNotification` skips it when `log_hidden` is false | `TestNotificationLevelErrorStillLogsAWarning`: "ASSERTION: the log viewer does not list the warning" | **caught** |
+
+## workspaces.exact_numbers
+
+`TestWorkspaceExactNumbersSwitch` and `TestWorkspaceExactNumbersSetLive`
+turn the option on, in the file and with set-config, and press opt+3 with only
+workspace 1 holding a pane. Run on 2026-10-30 on Linux against a build with
+the option's line cut from `newWorkspaceSlot` (`internal/app/workspace.go`),
+built to its own binary.
+
+| Control: what was cut | Where it fails | Verdict |
+| --- | --- | --- |
+| The `ExactNumbers` return in `newWorkspaceSlot`, so a switch past the last workspace holding a pane opens the next one | `TestWorkspaceExactNumbersSwitch`: "opt+3 with only workspace 1 populated: the dock never read 3:0"; `TestWorkspaceExactNumbersSetLive`: "opt+3 with the option set live: the dock never read 3:0" | **caught** |
+
+Both tests pass on the fixed build, and `TestWorkspaceExactNumbersSetLive`
+passes its first phase on the cut build: with the option off, opt+3 lands on 2
+there too.

@@ -730,6 +730,7 @@ func (m *OS) settingsCategories() []settingsCategory {
 			opt("launcher.keep_open"),
 			opt("workspaces.return_when_empty"),
 			opt("workspaces.new_window_when_empty"),
+			opt("workspaces.exact_numbers"),
 			opt("worktree.path"),
 		}),
 	}

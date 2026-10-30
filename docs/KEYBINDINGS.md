@@ -1180,6 +1180,11 @@ work in window mode and in terminal mode.
 | `move_and_follow_1` to `move_and_follow_9` | `opt+shift+N` | `alt+shift+N` | Sends the focused pane to workspace N and shows workspace N. |
 | `send_to_workspace_1` to `send_to_workspace_9` | `ctrl+opt+N` | `ctrl+alt+N` | Sends the focused pane to workspace N and stays on this workspace. Focus goes to another pane here. |
 
+`switch_workspace_N` lands on the number after the last workspace holding a
+pane, so `Alt+3` with only workspace 1 populated opens workspace 2. Set
+`workspaces.exact_numbers = true` to land on N instead. See
+[CONFIGURATION.md](CONFIGURATION.md#workspace-numbers).
+
 `send_to_workspace_N` needs a terminal that reports Ctrl and Alt with a digit.
 A legacy terminal sends `ctrl+alt+N` as `alt+N`, or as a control character for
 most digits. The Kitty keyboard protocol reports the key, and so does xterm's

@@ -200,6 +200,9 @@ question about the screen. Do not change them unless the person asks.
 - `workspaces.new_window_when_empty = true` opens a pane when the person
   switches to an empty workspace by key or click. `move_and_follow`,
   `xpanes`, `select-workspace` and `run-command` switches open none.
+- `workspaces.exact_numbers = true` makes a switch land on the number asked
+  for even when the numbers below it hold no panes: `opt+3` with only
+  workspace 1 populated shows workspace 3 and leaves 2 empty.
 - `Ctrl+B =` (or `tuios set-layout --equalize`) gives tiled panes equal
   shares. In the master-stack layout it puts the master back at its
   configured ratio.

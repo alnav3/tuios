@@ -960,6 +960,19 @@ number stays on it. A pane put directly on a higher number, with
 `tuios new-window --workspace 7` or `send_to_workspace_7`, keeps that number
 until the numbers below it close up.
 
+To land on the number you pressed instead, even with the numbers below it
+empty, turn on:
+
+```toml
+[workspaces]
+exact_numbers = true
+```
+
+With it on, `Alt+3` shows workspace 3 while workspace 2 holds nothing. The
+dock shows the numbers that exist, so 1 and 3. A pane put on 3 keeps the
+number until a close or a move below it closes the gap. `tuios set-config
+workspaces.exact_numbers true` changes it while tuios runs.
+
 ## When a workspace becomes empty
 
 When the last pane on the workspace on screen closes, tuios shows the

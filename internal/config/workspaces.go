@@ -16,6 +16,11 @@ type WorkspacesConfig struct {
 	// starts in the directory of the pane focused on the workspace they
 	// came from (default: false).
 	NewWindowWhenEmpty bool `toml:"new_window_when_empty"`
+	// ExactNumbers switches to the workspace number the person asked for,
+	// even when that number is past the last workspace holding a pane. Off,
+	// such a switch lands on the first number after that one instead, so a
+	// press of opt+3 with workspace 2 empty opens 2 (default: false).
+	ExactNumbers bool `toml:"exact_numbers"`
 }
 
 // ReturnsWhenEmpty reports whether return_when_empty is on. Unset means on.
